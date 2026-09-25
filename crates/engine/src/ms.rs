@@ -48,6 +48,12 @@ impl<T: PartialEq + Clone> Ms<T> {
         }
     }
 
+    /// `ms_remove` when the caller already knows the item's index:
+    /// swap-with-last removal of `items[i]`.
+    pub(crate) fn remove_at(&mut self, i: usize) -> T {
+        self.items.swap_remove(i)
+    }
+
     /// `ms_take`: round-robin removal. NOT simple FIFO -- see ms.c's
     /// comment; with an even number of elements and several `take()` calls
     /// in a row (no intervening `append`), the order can deviate from pure

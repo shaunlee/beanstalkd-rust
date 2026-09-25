@@ -68,17 +68,20 @@ async fn run(mut rx: mpsc::UnboundedReceiver<EngineMsg>, cfg: EngineConfig, sys:
     let mut conns: HashMap<ConnId, mpsc::UnboundedSender<Response>> = HashMap::new();
     let mut outbox: Outbox = Vec::new();
 
+    // One timer for the actor's lifetime, re-armed only when the engine's
+    // next deadline changes (most messages leave it unchanged).
+    let sleep = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(sleep);
+    let mut armed: Option<u64> = None;
+
     loop {
         let deadline = engine.next_deadline();
-        let sleep = async {
-            match deadline {
-                Some(nanos) => {
-                    let target = tokio_deadline(epoch, nanos);
-                    tokio::time::sleep_until(target).await;
-                }
-                None => std::future::pending::<()>().await,
+        if deadline != armed {
+            if let Some(nanos) = deadline {
+                sleep.as_mut().reset(tokio_deadline(epoch, nanos));
             }
-        };
+            armed = deadline;
+        }
 
         tokio::select! {
             msg = rx.recv() => {
@@ -110,15 +113,18 @@ async fn run(mut rx: mpsc::UnboundedReceiver<EngineMsg>, cfg: EngineConfig, sys:
                 // See docs/COMPAT.md engine item 5: an immediate tick after
                 // every call resolves DEADLINE_SOON/TIMED_OUT decisions that
                 // depend on time having "moved" past a boundary reached by
-                // this very call.
+                // this very call. (It returns at once when nothing is due.)
                 engine.tick(now, &mut outbox);
-                deliver(&conns, &outbox);
+                deliver(&conns, &mut outbox);
             }
-            () = sleep => {
+            () = &mut sleep, if armed.is_some() => {
+                // The timer has fired; re-arm it on the next iteration even
+                // if the deadline is unchanged.
+                armed = None;
                 let now = epoch.elapsed().as_nanos() as u64;
                 outbox.clear();
                 engine.tick(now, &mut outbox);
-                deliver(&conns, &outbox);
+                deliver(&conns, &mut outbox);
             }
         }
     }
@@ -135,14 +141,14 @@ fn tokio_deadline(epoch: std::time::Instant, nanos: u64) -> TokioInstant {
     TokioInstant::from_std(std_target)
 }
 
-/// Delivers every reply in `outbox`, in order, to each connection's reply
+/// Delivers (and removes) every reply in `outbox`, in order, to each connection's reply
 /// channel. A missing or closed receiver (connection already gone) is
 /// silently ignored: the engine must never block on, or fail because of, a
 /// single connection.
-fn deliver(conns: &HashMap<ConnId, mpsc::UnboundedSender<Response>>, outbox: &Outbox) {
-    for (conn, resp) in outbox {
-        if let Some(tx) = conns.get(conn) {
-            let _ = tx.send(resp.clone());
+fn deliver(conns: &HashMap<ConnId, mpsc::UnboundedSender<Response>>, outbox: &mut Outbox) {
+    for (conn, resp) in outbox.drain(..) {
+        if let Some(tx) = conns.get(&conn) {
+            let _ = tx.send(resp);
         }
     }
 }

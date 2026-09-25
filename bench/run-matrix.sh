@@ -6,7 +6,8 @@
 # bench/summarize.py.
 #
 # Environment overrides (defaults in brackets):
-#   REF_BIN     reference binary      [.ref/beanstalkd/beanstalkd]
+#   REF_BIN     reference binary      [.ref/beanstalkd-opt/beanstalkd, the -O2
+#               build from `scripts/build-ref.sh --optimized`]
 #   RS_BIN      beanstalkd-rs binary  [$CARGO_TARGET_DIR/release/beanstalkd-rs]
 #   BENCH_BIN   bstk-bench binary     [$CARGO_TARGET_DIR/release/bstk-bench]
 #   SCENARIOS   ["put-reserve-delete producers-consumers put-only"]
@@ -17,11 +18,14 @@
 #   DURATION    seconds per run [5]
 #   OUT_CSV     [bench-results.csv]
 #   BENCH_ARGS  extra bstk-bench arguments (e.g. "--threads 4")
+#   IDLE_CONNS     ["0"]  values for --idle-conns (scaling scenario)
+#   DELAYED_TUBES  ["0"]  --delayed-tubes, paired with each IDLE_CONNS value
+#                  by position (e.g. IDLE_CONNS="0 10000" DELAYED_TUBES="0 10000")
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
-REF_BIN="${REF_BIN:-$ROOT/.ref/beanstalkd/beanstalkd}"
+REF_BIN="${REF_BIN:-$ROOT/.ref/beanstalkd-opt/beanstalkd}"
 RS_BIN="${RS_BIN:-$TARGET/release/beanstalkd-rs}"
 BENCH_BIN="${BENCH_BIN:-$TARGET/release/bstk-bench}"
 SCENARIOS="${SCENARIOS:-put-reserve-delete producers-consumers put-only}"
@@ -32,9 +36,15 @@ RUNS="${RUNS:-3}"
 DURATION="${DURATION:-5}"
 OUT_CSV="${OUT_CSV:-bench-results.csv}"
 BENCH_ARGS="${BENCH_ARGS:-}"
+IDLE_CONNS="${IDLE_CONNS:-0}"
+DELAYED_TUBES="${DELAYED_TUBES:-0}"
+read -r -a idle_list <<<"$IDLE_CONNS"
+read -r -a delayed_list <<<"$DELAYED_TUBES"
+[ "${#idle_list[@]}" -eq "${#delayed_list[@]}" ] || {
+  echo "run-matrix: IDLE_CONNS and DELAYED_TUBES need the same number of values" >&2; exit 1; }
 
 for b in "$REF_BIN" "$RS_BIN" "$BENCH_BIN"; do
-  [ -x "$b" ] || { echo "run-matrix: missing binary $b" >&2; exit 1; }
+  [ -x "$b" ] || { echo "run-matrix: missing binary $b (reference: scripts/build-ref.sh --optimized; ours: cargo build --release -p bstk-server -p bstk-bench)" >&2; exit 1; }
 done
 
 free_port() {
@@ -54,7 +64,7 @@ wait_port() {
 SERVER_PID=""
 trap '[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true' EXIT
 
-[ -s "$OUT_CSV" ] || echo "server,scenario,conns,body_size,pipeline,run,ops_per_sec,server_cpu_pct,put_p50_us,put_p99_us,put_p999_us,reserve_p50_us,reserve_p99_us,reserve_p999_us,delete_p50_us,delete_p99_us,delete_p999_us,load_avg" >"$OUT_CSV"
+[ -s "$OUT_CSV" ] || echo "server,scenario,conns,body_size,pipeline,run,ops_per_sec,server_cpu_pct,put_p50_us,put_p99_us,put_p999_us,reserve_p50_us,reserve_p99_us,reserve_p999_us,delete_p50_us,delete_p99_us,delete_p999_us,load_avg,idle_conns,delayed_tubes" >"$OUT_CSV"
 
 # Extracts a numeric field from the bench's JSON line ("" if absent).
 field() {
@@ -67,6 +77,9 @@ for scenario in $SCENARIOS; do
     if [ "$scenario" = producers-consumers ] && [ "$conns" -lt 2 ]; then conns=2; fi
     for body in $BODIES; do
       for pipeline in $PIPELINES; do
+       for li in "${!idle_list[@]}"; do
+        idle="${idle_list[$li]}"
+        delayed="${delayed_list[$li]}"
         for run in $(seq 1 "$RUNS"); do
           for server in ref rs; do
             if [ "$server" = ref ]; then bin="$REF_BIN"; else bin="$RS_BIN"; fi
@@ -77,19 +90,20 @@ for scenario in $SCENARIOS; do
             load="$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}' || echo "")"
             # shellcheck disable=SC2086
             if out="$("$BENCH_BIN" --addr "127.0.0.1:$port" --conns "$conns" --duration "$DURATION" \
-                --scenario "$scenario" --body-size "$body" --pipeline "$pipeline" --json $BENCH_ARGS 2>&1)"; then
+                --scenario "$scenario" --body-size "$body" --pipeline "$pipeline" --idle-conns "$idle" --delayed-tubes "$delayed" \
+                --json $BENCH_ARGS 2>&1)"; then
               json="$(printf '%s\n' "$out" | sed -n 's/^JSON //p')"
               row="$server,$scenario,$conns,$body,$pipeline,$run"
               for f in ops_per_sec server_cpu_pct put_p50_us put_p99_us put_p999_us \
                        reserve_p50_us reserve_p99_us reserve_p999_us delete_p50_us delete_p99_us delete_p999_us; do
                 row="$row,$(field "$json" "$f")"
               done
-              echo "$row,$load" >>"$OUT_CSV"
-              printf '%-4s %-20s conns=%-3s body=%-5s pipe=%-3s run=%s  %s ops/s  cpu=%s%%\n' \
-                "$server" "$scenario" "$conns" "$body" "$pipeline" "$run" \
+              echo "$row,$load,$idle,$delayed" >>"$OUT_CSV"
+              printf '%-4s %-20s conns=%-3s body=%-5s pipe=%-3s idle=%-5s delayed=%-5s run=%s  %s ops/s  cpu=%s%%\n' \
+                "$server" "$scenario" "$conns" "$body" "$pipeline" "$idle" "$delayed" "$run" \
                 "$(field "$json" ops_per_sec)" "$(field "$json" server_cpu_pct)"
             else
-              echo "FAILED: $server $scenario conns=$conns body=$body pipeline=$pipeline run=$run" >&2
+              echo "FAILED: $server $scenario conns=$conns body=$body pipeline=$pipeline idle=$idle delayed=$delayed run=$run" >&2
               printf '%s\n' "$out" >&2
               failures=$((failures + 1))
             fi
@@ -98,6 +112,7 @@ for scenario in $SCENARIOS; do
             SERVER_PID=""
           done
         done
+       done
       done
     done
   done

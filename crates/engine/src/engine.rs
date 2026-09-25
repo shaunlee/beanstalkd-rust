@@ -1,7 +1,25 @@
 //! The deterministic beanstalkd state machine. Ground truth for every rule
 //! implemented here is `.ref/beanstalkd/{prot,conn,tube,job,ms,heap}.c`.
+//!
+//! Every time-driven event is kept in an ordered index, so `tick` and
+//! `next_deadline` cost O(log n) instead of scanning every tube and
+//! connection:
+//!
+//! * `conn_ticks`: each connection's `conntickat` (the earliest of its
+//!   reserve timeout, the safety margin of its soonest reserved job, and
+//!   that job's TTR expiry), like the reference's connection heap.
+//! * `delay_heads`: the deadline of the soonest delayed job of each tube.
+//! * `pauses`: the unpause time of each paused tube.
+//!
+//! `dispatchable` holds the tubes that have both waiting connections and
+//! ready jobs, the only ones `process_queue` can act on. Each index is
+//! updated by the helper that changes its inputs (`refresh_conn_tick`,
+//! `refresh_delay_head`, `refresh_dispatchable`, `set_pause` /
+//! `clear_expired_pauses`). The frozen pre-index engine in
+//! `crates/engine-oracle` is the behavioral reference for all of this (see
+//! the `oracle` test module).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
 
@@ -10,12 +28,15 @@ use bstk_proto::{
     URGENT_THRESHOLD,
 };
 
-use crate::model::{ConnState, JobRec, JobState, PendingPut, TubeState};
+use crate::model::{ConnState, JobRec, JobState, PendingPut, TubeId, TubeState};
 use crate::ms::Ms;
 use crate::{ConnId, EngineConfig, NANOS_PER_SEC, Nanos, Outbox, SysInfo};
 
 /// `SAFETY_MARGIN` in conn.c: 1 second.
 const SAFETY_MARGIN: Nanos = NANOS_PER_SEC;
+
+/// "default" is created first and never destroyed, so it always has id 0.
+const DEFAULT_TUBE: TubeId = 0;
 
 pub struct Engine {
     cfg: EngineConfig,
@@ -26,18 +47,33 @@ pub struct Engine {
     next_job_id: JobId,
     jobs: HashMap<JobId, JobRec>,
 
-    tubes: HashMap<TubeName, TubeState>,
+    /// Tube slab, indexed by `TubeId`; `None` marks a free slot.
+    tubes: Vec<Option<TubeState>>,
+    free_tube_ids: Vec<TubeId>,
+    tube_ids: HashMap<TubeName, TubeId>,
     /// Mirrors the reference's global `tubes` `Ms` array: insertion order,
-    /// with swap-removal on GC. Drives list-tubes output order.
-    tube_order: Ms<TubeName>,
+    /// with swap-removal on GC. Drives list-tubes output order and the
+    /// tie-break between equal delayed-job deadlines.
+    tube_order: Ms<TubeId>,
 
     conns: HashMap<ConnId, ConnState>,
+
+    /// `(conntickat, conn)` for every connection that has one.
+    conn_ticks: BTreeSet<(Nanos, ConnId)>,
+    /// `(deadline of the soonest delayed job, tube)` for every tube with
+    /// delayed jobs.
+    delay_heads: BTreeSet<(Nanos, TubeId)>,
+    /// `(unpause_at, tube)` for every tube with `pause > 0`.
+    pauses: BTreeSet<(Nanos, TubeId)>,
+    /// Tubes with both waiting connections and ready jobs.
+    dispatchable: BTreeSet<TubeId>,
 
     // Global counters (see `struct stats global_stat` and friends in dat.h).
     ready_ct: u64,
     urgent_ct: u64,
     reserved_ct: u64,
     buried_ct: u64,
+    delayed_ct: u64,
     waiting_ct: u64,
     total_jobs_ct: u64,
     timeout_ct: u64,
@@ -82,13 +118,20 @@ impl Engine {
             draining: false,
             next_job_id: 1,
             jobs: HashMap::new(),
-            tubes: HashMap::new(),
+            tubes: Vec::new(),
+            free_tube_ids: Vec::new(),
+            tube_ids: HashMap::new(),
             tube_order: Ms::new(),
             conns: HashMap::new(),
+            conn_ticks: BTreeSet::new(),
+            delay_heads: BTreeSet::new(),
+            pauses: BTreeSet::new(),
+            dispatchable: BTreeSet::new(),
             ready_ct: 0,
             urgent_ct: 0,
             reserved_ct: 0,
             buried_ct: 0,
+            delayed_ct: 0,
             waiting_ct: 0,
             total_jobs_ct: 0,
             timeout_ct: 0,
@@ -120,17 +163,23 @@ impl Engine {
             cmd_pause_tube: 0,
         };
         // The "default" tube is immortal (see TubeState::refs / gc_tube_if_orphan).
-        e.find_or_make_tube(&TubeName::default_tube());
+        let default = e.find_or_make_tube(&TubeName::default_tube());
+        debug_assert_eq!(default, DEFAULT_TUBE);
         e
     }
 
     pub fn connect(&mut self, _now: Nanos, conn: ConnId) {
-        let default = TubeName::default_tube();
-        self.find_or_make_tube(&default);
-        let t = self.tubes.get_mut(&default).expect("default tube exists");
-        t.using_ct += 1;
-        t.watching_ct += 1;
-        self.conns.insert(conn, ConnState::new(default));
+        if let Some(t) = self.tube_mut(DEFAULT_TUBE) {
+            t.using_ct += 1;
+            t.watching_ct += 1;
+        }
+        if let Some(old) = self.conns.insert(conn, ConnState::new(DEFAULT_TUBE))
+            && let Some(k) = old.tick_key
+        {
+            // Connection ids are never reused; keep the index consistent
+            // anyway.
+            self.conn_ticks.remove(&(k, conn));
+        }
         self.cur_conns += 1;
         self.tot_conns += 1;
     }
@@ -151,9 +200,8 @@ impl Engine {
             .unwrap_or_default();
         for job_id in reserved {
             self.do_unreserve(conn, job_id);
-            if let Some(j) = self.jobs.get(&job_id) {
-                let tube = j.tube.clone();
-                self.insert_ready(&tube, job_id);
+            if let Some(tube) = self.jobs.get(&job_id).map(|j| j.tube) {
+                self.insert_ready(tube, job_id);
             }
             self.process_queue(now, out);
         }
@@ -161,27 +209,29 @@ impl Engine {
         // `ms_clear(&c->watch)` deletes index 0 repeatedly (swap with last),
         // dropping each tube's reference in that order. Tube destruction
         // order decides the survivors' order in the global tube list.
-        let watched: Vec<TubeName> = self
+        let watched: Vec<TubeId> = self
             .conns
             .get_mut(&conn)
             .map(|c| c.watch.clear_in_delete_order())
             .unwrap_or_default();
         for t in watched {
-            if let Some(ts) = self.tubes.get_mut(&t) {
+            if let Some(ts) = self.tube_mut(t) {
                 ts.watching_ct = ts.watching_ct.saturating_sub(1);
             }
-            self.gc_tube_if_orphan(&t);
+            self.gc_tube_if_orphan(t);
         }
 
-        if let Some(c) = self.conns.get(&conn) {
-            let use_tube = c.use_tube.clone();
-            if let Some(ts) = self.tubes.get_mut(&use_tube) {
+        if let Some(use_tube) = self.conns.get(&conn).map(|c| c.use_tube) {
+            if let Some(ts) = self.tube_mut(use_tube) {
                 ts.using_ct = ts.using_ct.saturating_sub(1);
             }
-            self.gc_tube_if_orphan(&use_tube);
+            self.gc_tube_if_orphan(use_tube);
         }
 
         if let Some(c) = self.conns.remove(&conn) {
+            if let Some(k) = c.tick_key {
+                self.conn_ticks.remove(&(k, conn));
+            }
             if c.is_producer {
                 self.cur_producers = self.cur_producers.saturating_sub(1);
             }
@@ -292,89 +342,64 @@ impl Engine {
     }
 
     pub fn tick(&mut self, now: Nanos, out: &mut Outbox) {
-        // 1. Delayed jobs whose deadline has passed.
-        loop {
-            let due = self
-                .soonest_delayed_job()
-                .filter(|&(deadline, _, _)| deadline <= now);
-            let Some((_, tube, id)) = due else { break };
-            self.remove_delayed(&tube, id);
-            self.insert_ready(&tube, id);
+        // Nothing is due before the earliest indexed deadline. This is the
+        // common case: the server ticks after every message.
+        match self.next_deadline() {
+            Some(d) if d <= now => {}
+            _ => return,
+        }
+
+        // 1. Delayed jobs whose deadline has passed, soonest first.
+        while let Some((deadline, tube, id)) = self.soonest_delayed_job() {
+            if deadline > now {
+                break;
+            }
+            self.remove_delayed(tube, id);
+            self.insert_ready(tube, id);
             self.process_queue(now, out);
         }
 
-        // 2. Tube pauses whose expiry has passed, in tube_order order.
-        let names: Vec<TubeName> = self.tube_order.items.clone();
-        for name in names {
-            let due = self
-                .tubes
-                .get(&name)
-                .map(|t| t.pause > 0 && t.unpause_at <= now)
-                .unwrap_or(false);
-            if due {
-                if let Some(t) = self.tubes.get_mut(&name) {
-                    t.pause = 0;
-                }
-                self.process_queue(now, out);
-            }
+        // 2. Tube pauses whose expiry has passed. `process_queue` clears
+        // every expired pause before dispatching (as the reference's
+        // `next_awaited_job` does), so one call covers all of them.
+        if self.pauses.first().is_some_and(|&(at, _)| at <= now) {
+            self.process_queue(now, out);
         }
 
         // 3. Connections with a due TTR/margin/explicit-timeout event,
-        // processed one at a time (recomputing the earliest each round,
-        // since processing one connection can change others' schedules via
-        // process_queue reassignment). Each connection is handled at most
-        // once per tick() call: `conn_timeout` drains every one of *its*
-        // overdue reserved jobs and reaches a final, stable decision, so a
-        // second pass over the same still-due connection (e.g. an exact
-        // boundary case where the deadline equals `now`, mirroring the
-        // reference's strict `>=` check, which yields a genuine no-op)
-        // cannot make further progress and must not be retried.
-        let mut processed: std::collections::HashSet<ConnId> = std::collections::HashSet::new();
+        // processed one at a time in `(tickat, conn)` order (re-reading the
+        // index each round, since processing one connection can change
+        // others' schedules via process_queue reassignment). Each
+        // connection is handled at most once per tick() call:
+        // `conn_timeout` drains every one of *its* overdue reserved jobs and
+        // reaches a final, stable decision, so a second pass over the same
+        // still-due connection (e.g. an exact boundary case where the
+        // deadline equals `now`, mirroring the reference's strict `>=`
+        // check, which yields a genuine no-op) cannot make further progress
+        // and must not be retried.
+        let mut processed: HashSet<ConnId> = HashSet::new();
         loop {
-            let mut best: Option<(Nanos, ConnId)> = None;
-            for &cid in self.conns.keys() {
-                if processed.contains(&cid) {
-                    continue;
-                }
-                if let Some(t) = self.conn_tickat(cid) {
-                    best = Some(match best {
-                        None => (t, cid),
-                        Some((bt, bid)) => {
-                            if (t, cid) < (bt, bid) {
-                                (t, cid)
-                            } else {
-                                (bt, bid)
-                            }
-                        }
-                    });
-                }
-            }
-            match best {
-                Some((t, cid)) if t <= now => {
-                    processed.insert(cid);
-                    self.conn_timeout(cid, now, out);
-                }
-                _ => break,
-            }
+            let next = self
+                .conn_ticks
+                .iter()
+                .take_while(|&&(t, _)| t <= now)
+                .find(|&&(_, cid)| !processed.contains(&cid))
+                .map(|&(_, cid)| cid);
+            let Some(cid) = next else { break };
+            processed.insert(cid);
+            self.conn_timeout(cid, now, out);
         }
     }
 
     pub fn next_deadline(&self) -> Option<Nanos> {
-        let mut best: Option<Nanos> = None;
-        if let Some((d, _, _)) = self.soonest_delayed_job() {
-            best = Some(best.map_or(d, |b| b.min(d)));
-        }
-        for t in self.tubes.values() {
-            if t.pause > 0 {
-                best = Some(best.map_or(t.unpause_at, |b| b.min(t.unpause_at)));
-            }
-        }
-        for &cid in self.conns.keys() {
-            if let Some(t) = self.conn_tickat(cid) {
-                best = Some(best.map_or(t, |b| b.min(t)));
-            }
-        }
-        best
+        [
+            self.delay_heads.first().map(|&(d, _)| d),
+            self.pauses.first().map(|&(d, _)| d),
+            self.conn_ticks.first().map(|&(d, _)| d),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     pub fn set_draining(&mut self, on: bool) {
@@ -386,29 +411,140 @@ impl Engine {
 // Internal helpers
 // ---------------------------------------------------------------------
 impl Engine {
-    fn find_or_make_tube(&mut self, name: &TubeName) {
-        if !self.tubes.contains_key(name) {
-            self.tubes
-                .insert(name.clone(), TubeState::new(name.clone()));
-            self.tube_order.append(name.clone());
+    fn tube(&self, id: TubeId) -> Option<&TubeState> {
+        self.tubes.get(id).and_then(Option::as_ref)
+    }
+
+    fn tube_mut(&mut self, id: TubeId) -> Option<&mut TubeState> {
+        self.tubes.get_mut(id).and_then(Option::as_mut)
+    }
+
+    fn tube_name(&self, id: TubeId) -> TubeName {
+        self.tube(id)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(TubeName::default_tube)
+    }
+
+    fn find_or_make_tube(&mut self, name: &TubeName) -> TubeId {
+        if let Some(&id) = self.tube_ids.get(name) {
+            return id;
         }
+        let state = TubeState::new(name.clone(), self.tube_order.len());
+        let id = match self.free_tube_ids.pop() {
+            Some(id) => {
+                self.tubes[id] = Some(state);
+                id
+            }
+            None => {
+                self.tubes.push(Some(state));
+                self.tubes.len() - 1
+            }
+        };
+        self.tube_ids.insert(name.clone(), id);
+        self.tube_order.append(id);
+        id
     }
 
     /// Destroys a tube if it has no more uses, watchers or jobs. "default"
     /// is immortal (mirrors the permanent reference held by the reference
     /// implementation's static `default_tube` pointer).
-    fn gc_tube_if_orphan(&mut self, name: &TubeName) {
-        if name.as_str() == "default" {
+    fn gc_tube_if_orphan(&mut self, id: TubeId) {
+        if id == DEFAULT_TUBE {
             return;
         }
-        let orphan = self.tubes.get(name).map(|t| t.refs() == 0).unwrap_or(false);
-        if orphan {
-            self.tubes.remove(name);
-            self.tube_order.remove(name);
+        if !self.tube(id).is_some_and(|t| t.refs() == 0) {
+            return;
+        }
+        let Some(t) = self.tubes.get_mut(id).and_then(Option::take) else {
+            return;
+        };
+        self.tube_ids.remove(&t.name);
+        if t.pause > 0 {
+            self.pauses.remove(&(t.unpause_at, id));
+        }
+        if let Some(d) = t.delay_head {
+            self.delay_heads.remove(&(d, id));
+        }
+        if t.dispatchable {
+            self.dispatchable.remove(&id);
+        }
+        // `ms_remove`: swap-with-last; the moved tube takes this position.
+        self.tube_order.remove_at(t.pos);
+        if let Some(&moved) = self.tube_order.items.get(t.pos)
+            && let Some(m) = self.tube_mut(moved)
+        {
+            m.pos = t.pos;
+        }
+        self.free_tube_ids.push(id);
+    }
+
+    /// Re-derives whether `tube` belongs in `dispatchable`.
+    fn refresh_dispatchable(&mut self, tube: TubeId) {
+        let Some(t) = self.tubes.get_mut(tube).and_then(Option::as_mut) else {
+            return;
+        };
+        let want = !t.waiting_conns.is_empty() && !t.ready.is_empty();
+        if want != t.dispatchable {
+            t.dispatchable = want;
+            if want {
+                self.dispatchable.insert(tube);
+            } else {
+                self.dispatchable.remove(&tube);
+            }
         }
     }
 
-    fn insert_ready(&mut self, tube: &TubeName, id: JobId) {
+    /// Re-derives `tube`'s entry in `delay_heads`.
+    fn refresh_delay_head(&mut self, tube: TubeId) {
+        let Some(t) = self.tubes.get_mut(tube).and_then(Option::as_mut) else {
+            return;
+        };
+        let head = t.delayed.first().map(|&(d, _)| d);
+        if head != t.delay_head {
+            if let Some(old) = t.delay_head {
+                self.delay_heads.remove(&(old, tube));
+            }
+            if let Some(new) = head {
+                self.delay_heads.insert((new, tube));
+            }
+            t.delay_head = head;
+        }
+    }
+
+    /// Re-derives `cid`'s entry in `conn_ticks`. Must run after every change
+    /// to the connection's reserved jobs, their deadlines, or its waiting
+    /// state.
+    fn refresh_conn_tick(&mut self, cid: ConnId) {
+        let Some(c) = self.conns.get_mut(&cid) else {
+            return;
+        };
+        let new = conn_tickat(c);
+        if new != c.tick_key {
+            if let Some(old) = c.tick_key {
+                self.conn_ticks.remove(&(old, cid));
+            }
+            if let Some(n) = new {
+                self.conn_ticks.insert((n, cid));
+            }
+            c.tick_key = new;
+        }
+    }
+
+    /// Clears every pause that has expired by `now`, as the reference's
+    /// `next_awaited_job` does for each tube it visits.
+    fn clear_expired_pauses(&mut self, now: Nanos) {
+        while let Some(&(at, tube)) = self.pauses.first() {
+            if at > now {
+                break;
+            }
+            self.pauses.pop_first();
+            if let Some(t) = self.tube_mut(tube) {
+                t.pause = 0;
+            }
+        }
+    }
+
+    fn insert_ready(&mut self, tube: TubeId, id: JobId) {
         let pri = match self.jobs.get_mut(&id) {
             Some(j) => {
                 j.state = JobState::Ready;
@@ -417,57 +553,65 @@ impl Engine {
             }
             None => return,
         };
-        if let Some(t) = self.tubes.get_mut(tube) {
+        if let Some(t) = self.tube_mut(tube) {
             t.ready.insert((pri, id));
+            if pri < URGENT_THRESHOLD {
+                t.stat.urgent_ct += 1;
+            }
         }
         self.ready_ct += 1;
         if pri < URGENT_THRESHOLD {
             self.urgent_ct += 1;
-            if let Some(t) = self.tubes.get_mut(tube) {
-                t.stat.urgent_ct += 1;
-            }
         }
+        self.refresh_dispatchable(tube);
     }
 
-    fn remove_ready(&mut self, tube: &TubeName, id: JobId) {
+    fn remove_ready(&mut self, tube: TubeId, id: JobId) {
         let pri = self.jobs.get(&id).map(|j| j.pri).unwrap_or(0);
-        if let Some(t) = self.tubes.get_mut(tube) {
+        if let Some(t) = self.tube_mut(tube) {
             t.ready.remove(&(pri, id));
+            if pri < URGENT_THRESHOLD {
+                t.stat.urgent_ct = t.stat.urgent_ct.saturating_sub(1);
+            }
         }
         self.ready_ct = self.ready_ct.saturating_sub(1);
         if pri < URGENT_THRESHOLD {
             self.urgent_ct = self.urgent_ct.saturating_sub(1);
-            if let Some(t) = self.tubes.get_mut(tube) {
-                t.stat.urgent_ct = t.stat.urgent_ct.saturating_sub(1);
-            }
         }
+        self.refresh_dispatchable(tube);
     }
 
-    fn insert_delayed(&mut self, tube: &TubeName, id: JobId, deadline: Nanos) {
+    fn insert_delayed(&mut self, tube: TubeId, id: JobId, deadline: Nanos) {
         if let Some(j) = self.jobs.get_mut(&id) {
             j.state = JobState::Delayed;
             j.reserver = None;
             j.deadline_at = deadline;
         }
-        if let Some(t) = self.tubes.get_mut(tube) {
-            t.delayed.insert((deadline, id));
+        if let Some(t) = self.tube_mut(tube)
+            && t.delayed.insert((deadline, id))
+        {
+            self.delayed_ct += 1;
         }
+        self.refresh_delay_head(tube);
     }
 
-    fn remove_delayed(&mut self, tube: &TubeName, id: JobId) {
+    fn remove_delayed(&mut self, tube: TubeId, id: JobId) {
         let deadline = self.jobs.get(&id).map(|j| j.deadline_at).unwrap_or(0);
-        if let Some(t) = self.tubes.get_mut(tube) {
-            t.delayed.remove(&(deadline, id));
+        if let Some(t) = self.tube_mut(tube)
+            && t.delayed.remove(&(deadline, id))
+        {
+            self.delayed_ct = self.delayed_ct.saturating_sub(1);
         }
+        self.refresh_delay_head(tube);
     }
 
-    fn insert_buried(&mut self, tube: &TubeName, id: JobId) {
+    fn insert_buried(&mut self, tube: TubeId, id: JobId) {
         if let Some(j) = self.jobs.get_mut(&id) {
             j.state = JobState::Buried;
             j.reserver = None;
             j.bury_ct += 1;
         }
-        if let Some(t) = self.tubes.get_mut(tube) {
+        if let Some(t) = self.tube_mut(tube) {
             t.buried.push_back(id);
             t.stat.buried_ct += 1;
         }
@@ -476,8 +620,8 @@ impl Engine {
 
     /// Removes a specific job from the buried FIFO (used by delete and
     /// kick-job, which can target any buried job, not just the front).
-    fn remove_buried(&mut self, tube: &TubeName, id: JobId) -> bool {
-        let removed = match self.tubes.get_mut(tube) {
+    fn remove_buried(&mut self, tube: TubeId, id: JobId) -> bool {
+        let removed = match self.tube_mut(tube) {
             Some(t) => match t.buried.iter().position(|&x| x == id) {
                 Some(pos) => {
                     t.buried.remove(pos);
@@ -494,58 +638,59 @@ impl Engine {
         removed
     }
 
-    fn pop_buried_front(&mut self, tube: &TubeName) -> Option<JobId> {
-        let id = self.tubes.get_mut(tube).and_then(|t| t.buried.pop_front());
-        if id.is_some() {
-            if let Some(t) = self.tubes.get_mut(tube) {
-                t.stat.buried_ct = t.stat.buried_ct.saturating_sub(1);
-            }
-            self.buried_ct = self.buried_ct.saturating_sub(1);
-        }
-        id
+    fn pop_buried_front(&mut self, tube: TubeId) -> Option<JobId> {
+        let t = self.tube_mut(tube)?;
+        let id = t.buried.pop_front()?;
+        t.stat.buried_ct = t.stat.buried_ct.saturating_sub(1);
+        self.buried_ct = self.buried_ct.saturating_sub(1);
+        Some(id)
     }
 
     /// `conn_reserve_job`: assigns `job_id` to `cid`, sets its TTR
     /// deadline, and updates every reserved-job counter.
     fn do_reserve(&mut self, cid: ConnId, job_id: JobId, now: Nanos) {
-        let (tube, ttr) = match self.jobs.get(&job_id) {
-            Some(j) => (j.tube.clone(), j.ttr),
-            None => return,
+        let Some(j) = self.jobs.get_mut(&job_id) else {
+            return;
         };
-        let deadline = now + (ttr as Nanos) * NANOS_PER_SEC;
-        if let Some(j) = self.jobs.get_mut(&job_id) {
-            j.state = JobState::Reserved;
-            j.reserver = Some(cid);
-            j.deadline_at = deadline;
-            j.reserve_ct += 1;
-        }
+        let tube = j.tube;
+        let deadline = now + (j.ttr as Nanos) * NANOS_PER_SEC;
+        j.state = JobState::Reserved;
+        j.reserver = Some(cid);
+        j.deadline_at = deadline;
+        j.reserve_ct += 1;
         if let Some(c) = self.conns.get_mut(&cid) {
             c.reserved_fifo.push(job_id);
             c.reserved_by_deadline.insert((deadline, job_id));
         }
         self.reserved_ct += 1;
-        if let Some(t) = self.tubes.get_mut(&tube) {
+        if let Some(t) = self.tube_mut(tube) {
             t.stat.reserved_ct += 1;
         }
+        self.refresh_conn_tick(cid);
     }
 
     /// Removes `job_id` from `cid`'s reservation bookkeeping and decrements
     /// the reserved-job counters. Does not change the job's state; the
     /// caller decides what happens to the job next.
     fn do_unreserve(&mut self, cid: ConnId, job_id: JobId) {
-        let deadline = self.jobs.get(&job_id).map(|j| j.deadline_at).unwrap_or(0);
-        let tube = self.jobs.get(&job_id).map(|j| j.tube.clone());
+        let (deadline, tube) = match self.jobs.get_mut(&job_id) {
+            Some(j) => {
+                j.reserver = None;
+                (j.deadline_at, Some(j.tube))
+            }
+            None => (0, None),
+        };
         if let Some(c) = self.conns.get_mut(&cid) {
-            c.reserved_fifo.retain(|&x| x != job_id);
+            if let Some(i) = c.reserved_fifo.iter().position(|&x| x == job_id) {
+                c.reserved_fifo.remove(i);
+            }
             c.reserved_by_deadline.remove(&(deadline, job_id));
         }
-        if let Some(j) = self.jobs.get_mut(&job_id) {
-            j.reserver = None;
-        }
         self.reserved_ct = self.reserved_ct.saturating_sub(1);
-        if let Some(t) = tube.and_then(|t| self.tubes.get_mut(&t)) {
+        if let Some(t) = tube.and_then(|t| self.tube_mut(t)) {
             t.stat.reserved_ct = t.stat.reserved_ct.saturating_sub(1);
         }
+        self.refresh_conn_tick(cid);
     }
 
     fn enqueue_waiting_conn(&mut self, cid: ConnId, wait_deadline: Option<Nanos>) {
@@ -553,17 +698,22 @@ impl Engine {
             Some(c) => {
                 c.waiting = true;
                 c.wait_deadline = wait_deadline;
-                c.watch.items.clone()
+                std::mem::take(&mut c.watch)
             }
             None => return,
         };
         self.waiting_ct += 1;
-        for t in watched {
-            if let Some(ts) = self.tubes.get_mut(&t) {
+        for &t in &watched.items {
+            if let Some(ts) = self.tube_mut(t) {
                 ts.stat.waiting_ct += 1;
                 ts.waiting_conns.append(cid);
             }
+            self.refresh_dispatchable(t);
         }
+        if let Some(c) = self.conns.get_mut(&cid) {
+            c.watch = watched;
+        }
+        self.refresh_conn_tick(cid);
     }
 
     fn do_remove_waiting_conn(&mut self, cid: ConnId) {
@@ -571,60 +721,59 @@ impl Engine {
             Some(c) if c.waiting => {
                 c.waiting = false;
                 c.wait_deadline = None;
-                c.watch.items.clone()
+                std::mem::take(&mut c.watch)
             }
             _ => return,
         };
         self.waiting_ct = self.waiting_ct.saturating_sub(1);
-        for t in watched {
-            if let Some(ts) = self.tubes.get_mut(&t) {
+        for &t in &watched.items {
+            if let Some(ts) = self.tube_mut(t) {
                 ts.stat.waiting_ct = ts.stat.waiting_ct.saturating_sub(1);
                 ts.waiting_conns.remove(&cid);
             }
+            self.refresh_dispatchable(t);
         }
+        if let Some(c) = self.conns.get_mut(&cid) {
+            c.watch = watched;
+        }
+        self.refresh_conn_tick(cid);
     }
 
     /// `process_queue`: repeatedly assigns the globally best (pri, id)
     /// ready job to a waiting connection, across every watched/unpaused
     /// tube, until no more assignments are possible. Mirrors
     /// `next_awaited_job`'s side effect of auto-clearing expired pauses.
+    ///
+    /// Only `dispatchable` tubes (waiters and ready jobs) can match. The
+    /// order they are visited in does not matter: `(pri, id)` is unique, so
+    /// the minimum is the same whichever tube is seen first.
     fn process_queue(&mut self, now: Nanos, out: &mut Outbox) {
+        self.clear_expired_pauses(now);
         loop {
-            let names: Vec<TubeName> = self.tube_order.items.clone();
-            let mut best: Option<(u32, JobId, TubeName)> = None;
-            for name in &names {
-                let Some(t) = self.tubes.get_mut(name) else {
+            let mut best: Option<(u32, JobId, TubeId)> = None;
+            for &tid in &self.dispatchable {
+                let Some(t) = self.tube(tid) else {
                     continue;
                 };
+                // Every pause left after `clear_expired_pauses` is still
+                // in effect.
                 if t.pause > 0 {
-                    if t.unpause_at > now {
-                        continue;
-                    }
-                    t.pause = 0;
+                    continue;
                 }
-                if !t.waiting_conns.is_empty()
-                    && let Some(&(pri, id)) = t.ready.iter().next()
+                if let Some(&(pri, id)) = t.ready.first()
+                    && best.is_none_or(|(bp, bid, _)| (pri, id) < (bp, bid))
                 {
-                    let better = match &best {
-                        None => true,
-                        Some((bp, bid, _)) => (pri, id) < (*bp, *bid),
-                    };
-                    if better {
-                        best = Some((pri, id, name.clone()));
-                    }
+                    best = Some((pri, id, tid));
                 }
             }
             let Some((_, id, tube)) = best else { break };
-            self.remove_ready(&tube, id);
-            let cid = match self
-                .tubes
-                .get_mut(&tube)
-                .and_then(|t| t.waiting_conns.take())
-            {
-                Some(c) => c,
+            self.remove_ready(tube, id);
+            let taken = self.tube_mut(tube).and_then(|t| t.waiting_conns.take());
+            self.refresh_dispatchable(tube);
+            let Some(cid) = taken else {
                 // Defensive: mirrors the reference's `if (c == NULL)` guard;
-                // should not happen since we just checked non-empty above.
-                None => continue,
+                // should not happen since the tube was dispatchable.
+                continue;
             };
             self.do_remove_waiting_conn(cid);
             self.do_reserve(cid, id, now);
@@ -638,26 +787,26 @@ impl Engine {
     }
 
     /// `soonest_delayed_job`: the delayed job with the smallest deadline
-    /// across all tubes. Ties are broken by tube array order (first tube,
-    /// in `tube_order` order, with the smallest deadline wins), matching
-    /// the reference's strict `<` comparison over `tubes.items` in order.
-    fn soonest_delayed_job(&self) -> Option<(Nanos, TubeName, JobId)> {
-        let mut best: Option<(Nanos, TubeName, JobId)> = None;
-        for name in &self.tube_order.items {
-            let Some(t) = self.tubes.get(name) else {
+    /// across all tubes. Ties are broken by tube array order (the tube
+    /// earliest in `tube_order` wins), matching the reference's strict `<`
+    /// comparison over `tubes.items` in order.
+    fn soonest_delayed_job(&self) -> Option<(Nanos, TubeId, JobId)> {
+        let &(deadline, _) = self.delay_heads.first()?;
+        let mut best: Option<(usize, TubeId)> = None;
+        for &(_, tid) in self
+            .delay_heads
+            .range((deadline, 0)..=(deadline, TubeId::MAX))
+        {
+            let Some(t) = self.tube(tid) else {
                 continue;
             };
-            if let Some(&(deadline, id)) = t.delayed.iter().next() {
-                let better = match &best {
-                    None => true,
-                    Some((bd, _, _)) => deadline < *bd,
-                };
-                if better {
-                    best = Some((deadline, name.clone(), id));
-                }
+            if best.is_none_or(|(pos, _)| t.pos < pos) {
+                best = Some((t.pos, tid));
             }
         }
-        best
+        let (_, tube) = best?;
+        let &(d, id) = self.tube(tube)?.delayed.first()?;
+        Some((d, tube, id))
     }
 
     fn conn_deadline_soon(&self, cid: ConnId, now: Nanos) -> bool {
@@ -674,32 +823,10 @@ impl Engine {
         let Some(c) = self.conns.get(&cid) else {
             return false;
         };
-        c.watch.items.iter().any(|t| {
-            self.tubes
-                .get(t)
-                .map(|ts| !ts.ready.is_empty())
-                .unwrap_or(false)
-        })
-    }
-
-    /// `conntickat`: the absolute time at which this connection next needs
-    /// attention, if any.
-    fn conn_tickat(&self, cid: ConnId) -> Option<Nanos> {
-        let c = self.conns.get(&cid)?;
-        let margin: i128 = if c.waiting { SAFETY_MARGIN as i128 } else { 0 };
-        let mut t: Option<i128> = None;
-        if let Some((deadline, _)) = c.soonest_reserved() {
-            t = Some(deadline as i128 - margin);
-        }
-        if c.waiting
-            && let Some(wd) = c.wait_deadline
-        {
-            t = Some(match t {
-                Some(v) => v.min(wd as i128),
-                None => wd as i128,
-            });
-        }
-        t.map(|v| v.max(0) as Nanos)
+        c.watch
+            .items
+            .iter()
+            .any(|&t| self.tube(t).is_some_and(|ts| !ts.ready.is_empty()))
     }
 
     /// `conn_timeout`: drains every reserved job of `cid` whose TTR has
@@ -722,14 +849,14 @@ impl Engine {
             if deadline >= now {
                 break;
             }
-            let tube = self.jobs.get(&job_id).map(|j| j.tube.clone());
+            let tube = self.jobs.get(&job_id).map(|j| j.tube);
             self.do_unreserve(cid, job_id);
             self.timeout_ct += 1;
             if let Some(j) = self.jobs.get_mut(&job_id) {
                 j.timeout_ct += 1;
             }
             if let Some(tube) = tube {
-                self.insert_ready(&tube, job_id);
+                self.insert_ready(tube, job_id);
             }
             self.process_queue(now, out);
         }
@@ -770,13 +897,53 @@ impl Engine {
         }
     }
 
-    fn kick_to_ready(&mut self, tube: &TubeName, id: JobId, now: Nanos, out: &mut Outbox) {
+    fn kick_to_ready(&mut self, tube: TubeId, id: JobId, now: Nanos, out: &mut Outbox) {
         if let Some(j) = self.jobs.get_mut(&id) {
             j.kick_ct += 1;
         }
         self.insert_ready(tube, id);
         self.process_queue(now, out);
     }
+
+    fn use_tube_of(&self, cid: ConnId) -> TubeId {
+        self.conns.get(&cid).map_or(DEFAULT_TUBE, |c| c.use_tube)
+    }
+
+    /// Body of the job `pick` selects from `cid`'s used tube, as a FOUND
+    /// reply (NOT_FOUND if there is none).
+    fn peek_used_tube(&self, cid: ConnId, pick: impl Fn(&TubeState) -> Option<JobId>) -> Response {
+        let top = self.tube(self.use_tube_of(cid)).and_then(pick);
+        match top {
+            Some(id) => {
+                let body = self
+                    .jobs
+                    .get(&id)
+                    .map(|j| j.body.clone())
+                    .unwrap_or_default();
+                Response::Found { id, body }
+            }
+            None => Response::NotFound,
+        }
+    }
+}
+
+/// `conntickat`: the absolute time at which this connection next needs
+/// attention, if any.
+fn conn_tickat(c: &ConnState) -> Option<Nanos> {
+    let margin: i128 = if c.waiting { SAFETY_MARGIN as i128 } else { 0 };
+    let mut t: Option<i128> = None;
+    if let Some((deadline, _)) = c.soonest_reserved() {
+        t = Some(deadline as i128 - margin);
+    }
+    if c.waiting
+        && let Some(wd) = c.wait_deadline
+    {
+        t = Some(match t {
+            Some(v) => v.min(wd as i128),
+            None => wd as i128,
+        });
+    }
+    t.map(|v| v.max(0) as Nanos)
 }
 
 // ---------------------------------------------------------------------
@@ -821,16 +988,12 @@ impl Engine {
             return;
         }
 
-        let tube = self
-            .conns
-            .get(&cid)
-            .map(|c| c.use_tube.clone())
-            .unwrap_or_else(TubeName::default_tube);
-        self.find_or_make_tube(&tube);
+        // The used tube always exists: the connection holds a reference.
+        let tube = self.use_tube_of(cid);
 
         let job = JobRec {
             id,
-            tube: tube.clone(),
+            tube,
             pri,
             delay,
             ttr,
@@ -846,20 +1009,20 @@ impl Engine {
             kick_ct: 0,
         };
         self.jobs.insert(id, job);
-        if let Some(t) = self.tubes.get_mut(&tube) {
+        if let Some(t) = self.tube_mut(tube) {
             t.job_ref_ct += 1;
         }
 
         if delay > 0 {
             let deadline = now + (delay as Nanos) * NANOS_PER_SEC;
-            self.insert_delayed(&tube, id, deadline);
+            self.insert_delayed(tube, id, deadline);
         } else {
-            self.insert_ready(&tube, id);
+            self.insert_ready(tube, id);
         }
         self.process_queue(now, out);
 
         self.total_jobs_ct += 1;
-        if let Some(t) = self.tubes.get_mut(&tube) {
+        if let Some(t) = self.tube_mut(tube) {
             t.stat.total_jobs_ct += 1;
         }
         out.push((cid, Response::Inserted(id)));
@@ -867,19 +1030,18 @@ impl Engine {
 
     fn cmd_use(&mut self, cid: ConnId, tube: TubeName, out: &mut Outbox) {
         self.cmd_use += 1;
-        self.find_or_make_tube(&tube);
-        if let Some(old) = self.conns.get(&cid).map(|c| c.use_tube.clone())
-            && old != tube
-        {
-            if let Some(t) = self.tubes.get_mut(&old) {
+        let new = self.find_or_make_tube(&tube);
+        let old = self.use_tube_of(cid);
+        if old != new {
+            if let Some(t) = self.tube_mut(old) {
                 t.using_ct = t.using_ct.saturating_sub(1);
             }
-            self.gc_tube_if_orphan(&old);
-            if let Some(t) = self.tubes.get_mut(&tube) {
+            self.gc_tube_if_orphan(old);
+            if let Some(t) = self.tube_mut(new) {
                 t.using_ct += 1;
             }
             if let Some(c) = self.conns.get_mut(&cid) {
-                c.use_tube = tube.clone();
+                c.use_tube = new;
             }
         }
         out.push((cid, Response::Using(tube)));
@@ -887,17 +1049,17 @@ impl Engine {
 
     fn cmd_watch(&mut self, cid: ConnId, tube: TubeName, out: &mut Outbox) {
         self.cmd_watch += 1;
-        self.find_or_make_tube(&tube);
+        let tid = self.find_or_make_tube(&tube);
         let already = self
             .conns
             .get(&cid)
-            .map(|c| c.watch.contains(&tube))
+            .map(|c| c.watch.contains(&tid))
             .unwrap_or(true);
         if !already {
             if let Some(c) = self.conns.get_mut(&cid) {
-                c.watch.append(tube.clone());
+                c.watch.append(tid);
             }
-            if let Some(t) = self.tubes.get_mut(&tube) {
+            if let Some(t) = self.tube_mut(tid) {
                 t.watching_ct += 1;
             }
         }
@@ -907,24 +1069,24 @@ impl Engine {
 
     fn cmd_ignore(&mut self, cid: ConnId, tube: TubeName, out: &mut Outbox) {
         self.cmd_ignore += 1;
-        let watching_it = self
-            .conns
-            .get(&cid)
-            .map(|c| c.watch.contains(&tube))
-            .unwrap_or(false);
+        let tid = self.tube_ids.get(&tube).copied();
+        let watching_it = match (tid, self.conns.get(&cid)) {
+            (Some(tid), Some(c)) => c.watch.contains(&tid),
+            _ => false,
+        };
         let watch_len = self.conns.get(&cid).map(|c| c.watch.len()).unwrap_or(0);
         if watching_it && watch_len < 2 {
             out.push((cid, Response::NotIgnored));
             return;
         }
-        if watching_it {
+        if let (true, Some(tid)) = (watching_it, tid) {
             if let Some(c) = self.conns.get_mut(&cid) {
-                c.watch.remove(&tube);
+                c.watch.remove(&tid);
             }
-            if let Some(t) = self.tubes.get_mut(&tube) {
+            if let Some(t) = self.tube_mut(tid) {
                 t.watching_ct = t.watching_ct.saturating_sub(1);
             }
-            self.gc_tube_if_orphan(&tube);
+            self.gc_tube_if_orphan(tid);
         }
         let count = self.conns.get(&cid).map(|c| c.watch.len()).unwrap_or(0);
         out.push((cid, Response::Watching(count as u64)));
@@ -942,6 +1104,9 @@ impl Engine {
         }
         let wait_deadline = timeout.map(|t| now + (t as Nanos) * NANOS_PER_SEC);
         let timeout_is_zero = timeout == Some(0);
+        // A connection already inside its safety margin enters
+        // `conn_ticks` at or before `now` here, so the server's tick right
+        // after this call sends DEADLINE_SOON (docs/COMPAT.md engine item 5).
         self.enqueue_waiting_conn(cid, wait_deadline);
         self.process_queue(now, out);
         let still_waiting = self.conns.get(&cid).map(|c| c.waiting).unwrap_or(false);
@@ -964,7 +1129,7 @@ impl Engine {
     }
 
     fn cmd_reserve_job(&mut self, now: Nanos, cid: ConnId, id: JobId, out: &mut Outbox) {
-        let Some(state) = self.jobs.get(&id).map(|j| j.state) else {
+        let Some((state, tube)) = self.jobs.get(&id).map(|j| (j.state, j.tube)) else {
             out.push((cid, Response::NotFound));
             return;
         };
@@ -972,17 +1137,12 @@ impl Engine {
             out.push((cid, Response::NotFound));
             return;
         }
-        let tube = self
-            .jobs
-            .get(&id)
-            .map(|j| j.tube.clone())
-            .expect("job exists");
         if state == JobState::Ready {
-            self.remove_ready(&tube, id);
+            self.remove_ready(tube, id);
         } else if state == JobState::Buried {
-            self.remove_buried(&tube, id);
+            self.remove_buried(tube, id);
         } else {
-            self.remove_delayed(&tube, id);
+            self.remove_delayed(tube, id);
         }
         self.connsetworker(cid);
         self.do_reserve(cid, id, now);
@@ -996,16 +1156,12 @@ impl Engine {
 
     fn cmd_delete(&mut self, cid: ConnId, id: JobId, out: &mut Outbox) {
         self.cmd_delete += 1;
-        let Some(state) = self.jobs.get(&id).map(|j| j.state) else {
+        let Some((state, reserver, tube)) =
+            self.jobs.get(&id).map(|j| (j.state, j.reserver, j.tube))
+        else {
             out.push((cid, Response::NotFound));
             return;
         };
-        let reserver = self.jobs.get(&id).and_then(|j| j.reserver);
-        let tube = self
-            .jobs
-            .get(&id)
-            .map(|j| j.tube.clone())
-            .expect("job exists");
         let ok = match state {
             JobState::Reserved => {
                 if reserver == Some(cid) {
@@ -1016,15 +1172,15 @@ impl Engine {
                 }
             }
             JobState::Ready => {
-                self.remove_ready(&tube, id);
+                self.remove_ready(tube, id);
                 true
             }
             JobState::Buried => {
-                self.remove_buried(&tube, id);
+                self.remove_buried(tube, id);
                 true
             }
             JobState::Delayed => {
-                self.remove_delayed(&tube, id);
+                self.remove_delayed(tube, id);
                 true
             }
         };
@@ -1032,13 +1188,21 @@ impl Engine {
             out.push((cid, Response::NotFound));
             return;
         }
-        if let Some(t) = self.tubes.get_mut(&tube) {
+        if let Some(t) = self.tube_mut(tube) {
             t.stat.total_delete_ct += 1;
             t.job_ref_ct = t.job_ref_ct.saturating_sub(1);
         }
         self.jobs.remove(&id);
-        self.gc_tube_if_orphan(&tube);
+        self.gc_tube_if_orphan(tube);
         out.push((cid, Response::Deleted));
+    }
+
+    /// The tube of `id` if `cid` holds its reservation.
+    fn reserved_by(&self, cid: ConnId, id: JobId) -> Option<TubeId> {
+        self.jobs
+            .get(&id)
+            .filter(|j| j.reserver == Some(cid) && j.state == JobState::Reserved)
+            .map(|j| j.tube)
     }
 
     fn cmd_release(
@@ -1051,21 +1215,11 @@ impl Engine {
         out: &mut Outbox,
     ) {
         self.cmd_release += 1;
-        let reserved_by_me = self
-            .jobs
-            .get(&id)
-            .map(|j| j.reserver == Some(cid) && j.state == JobState::Reserved)
-            .unwrap_or(false);
-        if !reserved_by_me {
+        let Some(tube) = self.reserved_by(cid, id) else {
             out.push((cid, Response::NotFound));
             return;
-        }
+        };
         self.do_unreserve(cid, id);
-        let tube = self
-            .jobs
-            .get(&id)
-            .map(|j| j.tube.clone())
-            .expect("job exists");
         if let Some(j) = self.jobs.get_mut(&id) {
             j.pri = pri;
             j.delay = delay;
@@ -1073,9 +1227,9 @@ impl Engine {
         }
         if delay > 0 {
             let deadline = now + (delay as Nanos) * NANOS_PER_SEC;
-            self.insert_delayed(&tube, id, deadline);
+            self.insert_delayed(tube, id, deadline);
         } else {
-            self.insert_ready(&tube, id);
+            self.insert_ready(tube, id);
         }
         self.process_queue(now, out);
         out.push((cid, Response::Released));
@@ -1083,36 +1237,21 @@ impl Engine {
 
     fn cmd_bury(&mut self, cid: ConnId, id: JobId, pri: u32, out: &mut Outbox) {
         self.cmd_bury += 1;
-        let reserved_by_me = self
-            .jobs
-            .get(&id)
-            .map(|j| j.reserver == Some(cid) && j.state == JobState::Reserved)
-            .unwrap_or(false);
-        if !reserved_by_me {
+        let Some(tube) = self.reserved_by(cid, id) else {
             out.push((cid, Response::NotFound));
             return;
-        }
+        };
         self.do_unreserve(cid, id);
-        let tube = self
-            .jobs
-            .get(&id)
-            .map(|j| j.tube.clone())
-            .expect("job exists");
         if let Some(j) = self.jobs.get_mut(&id) {
             j.pri = pri;
         }
-        self.insert_buried(&tube, id);
+        self.insert_buried(tube, id);
         out.push((cid, Response::Buried));
     }
 
     fn cmd_touch(&mut self, now: Nanos, cid: ConnId, id: JobId, out: &mut Outbox) {
         self.cmd_touch += 1;
-        let reserved_by_me = self
-            .jobs
-            .get(&id)
-            .map(|j| j.reserver == Some(cid) && j.state == JobState::Reserved)
-            .unwrap_or(false);
-        if !reserved_by_me {
+        if self.reserved_by(cid, id).is_none() {
             out.push((cid, Response::NotFound));
             return;
         }
@@ -1126,6 +1265,7 @@ impl Engine {
             c.reserved_by_deadline.remove(&(old_deadline, id));
             c.reserved_by_deadline.insert((new_deadline, id));
         }
+        self.refresh_conn_tick(cid);
         out.push((cid, Response::Touched));
     }
 
@@ -1145,106 +1285,41 @@ impl Engine {
 
     fn cmd_peek_ready(&mut self, cid: ConnId, out: &mut Outbox) {
         self.cmd_peek_ready += 1;
-        let tube = self
-            .conns
-            .get(&cid)
-            .map(|c| c.use_tube.clone())
-            .unwrap_or_else(TubeName::default_tube);
-        let top = self
-            .tubes
-            .get(&tube)
-            .and_then(|t| t.ready.iter().next().copied());
-        match top {
-            Some((_, id)) => {
-                let body = self
-                    .jobs
-                    .get(&id)
-                    .map(|j| j.body.clone())
-                    .unwrap_or_default();
-                out.push((cid, Response::Found { id, body }));
-            }
-            None => out.push((cid, Response::NotFound)),
-        }
+        let reply = self.peek_used_tube(cid, |t| t.ready.first().map(|&(_, id)| id));
+        out.push((cid, reply));
     }
 
     fn cmd_peek_delayed(&mut self, cid: ConnId, out: &mut Outbox) {
         self.cmd_peek_delayed += 1;
-        let tube = self
-            .conns
-            .get(&cid)
-            .map(|c| c.use_tube.clone())
-            .unwrap_or_else(TubeName::default_tube);
-        let top = self
-            .tubes
-            .get(&tube)
-            .and_then(|t| t.delayed.iter().next().copied());
-        match top {
-            Some((_, id)) => {
-                let body = self
-                    .jobs
-                    .get(&id)
-                    .map(|j| j.body.clone())
-                    .unwrap_or_default();
-                out.push((cid, Response::Found { id, body }));
-            }
-            None => out.push((cid, Response::NotFound)),
-        }
+        let reply = self.peek_used_tube(cid, |t| t.delayed.first().map(|&(_, id)| id));
+        out.push((cid, reply));
     }
 
     fn cmd_peek_buried(&mut self, cid: ConnId, out: &mut Outbox) {
         self.cmd_peek_buried += 1;
-        let tube = self
-            .conns
-            .get(&cid)
-            .map(|c| c.use_tube.clone())
-            .unwrap_or_else(TubeName::default_tube);
-        let top = self
-            .tubes
-            .get(&tube)
-            .and_then(|t| t.buried.front().copied());
-        match top {
-            Some(id) => {
-                let body = self
-                    .jobs
-                    .get(&id)
-                    .map(|j| j.body.clone())
-                    .unwrap_or_default();
-                out.push((cid, Response::Found { id, body }));
-            }
-            None => out.push((cid, Response::NotFound)),
-        }
+        let reply = self.peek_used_tube(cid, |t| t.buried.front().copied());
+        out.push((cid, reply));
     }
 
     fn cmd_kick(&mut self, now: Nanos, cid: ConnId, n: u32, out: &mut Outbox) {
         self.cmd_kick += 1;
-        let tube = self
-            .conns
-            .get(&cid)
-            .map(|c| c.use_tube.clone())
-            .unwrap_or_else(TubeName::default_tube);
-        let has_buried = self
-            .tubes
-            .get(&tube)
-            .map(|t| !t.buried.is_empty())
-            .unwrap_or(false);
+        let tube = self.use_tube_of(cid);
+        let has_buried = self.tube(tube).is_some_and(|t| !t.buried.is_empty());
         let mut count: u64 = 0;
         if has_buried {
             for _ in 0..n {
-                let Some(id) = self.pop_buried_front(&tube) else {
+                let Some(id) = self.pop_buried_front(tube) else {
                     break;
                 };
-                self.kick_to_ready(&tube, id, now, out);
+                self.kick_to_ready(tube, id, now, out);
                 count += 1;
             }
         } else {
             for _ in 0..n {
-                let next = self
-                    .tubes
-                    .get(&tube)
-                    .and_then(|t| t.delayed.iter().next().copied());
+                let next = self.tube(tube).and_then(|t| t.delayed.first().copied());
                 let Some((_, id)) = next else { break };
-                self.remove_delayed(&tube, id);
-                self.kick_to_ready(&tube, id, now, out);
+                self.remove_delayed(tube, id);
+                self.kick_to_ready(tube, id, now, out);
                 count += 1;
             }
         }
@@ -1252,24 +1327,19 @@ impl Engine {
     }
 
     fn cmd_kick_job(&mut self, now: Nanos, cid: ConnId, id: JobId, out: &mut Outbox) {
-        let Some(state) = self.jobs.get(&id).map(|j| j.state) else {
+        let Some((state, tube)) = self.jobs.get(&id).map(|j| (j.state, j.tube)) else {
             out.push((cid, Response::NotFound));
             return;
         };
-        let tube = self
-            .jobs
-            .get(&id)
-            .map(|j| j.tube.clone())
-            .expect("job exists");
         match state {
             JobState::Buried => {
-                self.remove_buried(&tube, id);
-                self.kick_to_ready(&tube, id, now, out);
+                self.remove_buried(tube, id);
+                self.kick_to_ready(tube, id, now, out);
                 out.push((cid, Response::KickedJob));
             }
             JobState::Delayed => {
-                self.remove_delayed(&tube, id);
-                self.kick_to_ready(&tube, id, now, out);
+                self.remove_delayed(tube, id);
+                self.kick_to_ready(tube, id, now, out);
                 out.push((cid, Response::KickedJob));
             }
             _ => out.push((cid, Response::NotFound)),
@@ -1306,11 +1376,7 @@ impl Engine {
 
     fn cmd_list_tube_used(&mut self, cid: ConnId, out: &mut Outbox) {
         self.cmd_list_tube_used += 1;
-        let tube = self
-            .conns
-            .get(&cid)
-            .map(|c| c.use_tube.clone())
-            .unwrap_or_else(TubeName::default_tube);
+        let tube = self.tube_name(self.use_tube_of(cid));
         out.push((cid, Response::Using(tube)));
     }
 
@@ -1329,10 +1395,10 @@ impl Engine {
         out: &mut Outbox,
     ) {
         self.cmd_pause_tube += 1;
-        if !self.tubes.contains_key(&tube) {
+        let Some(&tid) = self.tube_ids.get(&tube) else {
             out.push((cid, Response::NotFound));
             return;
-        }
+        };
         // prot.c: `if (delay == 0) delay = 1;` runs on the delay already
         // converted to nanoseconds, so "pause 0" pauses for 1 ns (which
         // `stats-tube` reports as `pause: 0`), not for 1 second.
@@ -1341,11 +1407,16 @@ impl Engine {
         } else {
             (delay as Nanos) * NANOS_PER_SEC
         };
-        if let Some(t) = self.tubes.get_mut(&tube) {
-            t.pause = delay_nanos;
-            t.unpause_at = now + delay_nanos;
-            t.stat.pause_ct += 1;
+        let Some(t) = self.tubes.get_mut(tid).and_then(Option::as_mut) else {
+            return;
+        };
+        if t.pause > 0 {
+            self.pauses.remove(&(t.unpause_at, tid));
         }
+        t.pause = delay_nanos;
+        t.unpause_at = now + delay_nanos;
+        t.stat.pause_ct += 1;
+        self.pauses.insert((t.unpause_at, tid));
         out.push((cid, Response::Paused));
     }
 }
@@ -1357,13 +1428,17 @@ impl Engine {
 // ---------------------------------------------------------------------
 impl Engine {
     pub(crate) fn tube_names(&self) -> Vec<TubeName> {
-        self.tube_order.items.clone()
+        self.tube_order
+            .items
+            .iter()
+            .map(|&t| self.tube_name(t))
+            .collect()
     }
 
     pub(crate) fn watched_tube_names(&self, cid: ConnId) -> Vec<TubeName> {
         self.conns
             .get(&cid)
-            .map(|c| c.watch.items.clone())
+            .map(|c| c.watch.items.iter().map(|&t| self.tube_name(t)).collect())
             .unwrap_or_default()
     }
 
@@ -1379,7 +1454,7 @@ impl Engine {
         let age = ((now as i128 - j.created_at as i128) / NANOS_PER_SEC as i128).max(0) as u64;
         Some(StatsJob {
             id: j.id,
-            tube: j.tube.clone(),
+            tube: self.tube_name(j.tube),
             state: j.state_name(),
             pri: j.pri,
             age,
@@ -1396,7 +1471,7 @@ impl Engine {
     }
 
     pub(crate) fn build_stats_tube(&self, name: &TubeName, now: Nanos) -> Option<StatsTube> {
-        let t = self.tubes.get(name)?;
+        let t = self.tube(*self.tube_ids.get(name)?)?;
         let pause_time_left = if t.pause > 0 {
             t.unpause_at.saturating_sub(now) / NANOS_PER_SEC
         } else {
@@ -1422,12 +1497,11 @@ impl Engine {
 
     pub(crate) fn build_stats_server(&self, now: Nanos) -> StatsServer {
         let snap = self.sys.snapshot();
-        let current_jobs_delayed: u64 = self.tubes.values().map(|t| t.delayed.len() as u64).sum();
         StatsServer {
             current_jobs_urgent: self.urgent_ct,
             current_jobs_ready: self.ready_ct,
             current_jobs_reserved: self.reserved_ct,
-            current_jobs_delayed,
+            current_jobs_delayed: self.delayed_ct,
             current_jobs_buried: self.buried_ct,
             cmd_put: self.cmd_put,
             cmd_peek: self.cmd_peek,
@@ -1484,6 +1558,10 @@ impl Engine {
 // ---------------------------------------------------------------------
 #[cfg(test)]
 impl Engine {
+    fn t_tube_by_name(&self, name: &TubeName) -> Option<&TubeState> {
+        self.tube(*self.tube_ids.get(name)?)
+    }
+
     pub(crate) fn t_job_state(&self, id: JobId) -> Option<&'static str> {
         self.jobs.get(&id).map(|j| j.state_name())
     }
@@ -1517,48 +1595,45 @@ impl Engine {
     }
 
     pub(crate) fn t_tube_ready_len(&self, name: &TubeName) -> Option<usize> {
-        self.tubes.get(name).map(|t| t.ready.len())
+        self.t_tube_by_name(name).map(|t| t.ready.len())
     }
 
     pub(crate) fn t_tube_ready_ids(&self, name: &TubeName) -> Vec<JobId> {
-        self.tubes
-            .get(name)
+        self.t_tube_by_name(name)
             .map(|t| t.ready.iter().map(|&(_, id)| id).collect())
             .unwrap_or_default()
     }
 
     pub(crate) fn t_tube_delayed_ids(&self, name: &TubeName) -> Vec<JobId> {
-        self.tubes
-            .get(name)
+        self.t_tube_by_name(name)
             .map(|t| t.delayed.iter().map(|&(_, id)| id).collect())
             .unwrap_or_default()
     }
 
     pub(crate) fn t_tube_buried_ids(&self, name: &TubeName) -> Vec<JobId> {
-        self.tubes
-            .get(name)
+        self.t_tube_by_name(name)
             .map(|t| t.buried.iter().copied().collect())
             .unwrap_or_default()
     }
 
     pub(crate) fn t_tube_paused(&self, name: &TubeName) -> Option<bool> {
-        self.tubes.get(name).map(|t| t.pause > 0)
+        self.t_tube_by_name(name).map(|t| t.pause > 0)
     }
 
     pub(crate) fn t_tube_delayed_len(&self, name: &TubeName) -> Option<usize> {
-        self.tubes.get(name).map(|t| t.delayed.len())
+        self.t_tube_by_name(name).map(|t| t.delayed.len())
     }
 
     pub(crate) fn t_tube_buried_len(&self, name: &TubeName) -> Option<usize> {
-        self.tubes.get(name).map(|t| t.buried.len())
+        self.t_tube_by_name(name).map(|t| t.buried.len())
     }
 
     pub(crate) fn t_tube_waiting_conns(&self, name: &TubeName) -> Option<usize> {
-        self.tubes.get(name).map(|t| t.waiting_conns.len())
+        self.t_tube_by_name(name).map(|t| t.waiting_conns.len())
     }
 
     pub(crate) fn t_tube_exists(&self, name: &TubeName) -> bool {
-        self.tubes.contains_key(name)
+        self.t_tube_by_name(name).is_some()
     }
 
     pub(crate) fn t_conn_exists(&self, cid: ConnId) -> bool {
@@ -1581,7 +1656,7 @@ impl Engine {
     }
 
     pub(crate) fn t_all_tube_names(&self) -> Vec<TubeName> {
-        self.tubes.keys().cloned().collect()
+        self.tube_ids.keys().cloned().collect()
     }
 
     pub(crate) fn t_all_conn_ids(&self) -> Vec<ConnId> {
@@ -1590,6 +1665,101 @@ impl Engine {
 
     pub(crate) fn t_cur_conns(&self) -> u32 {
         self.cur_conns
+    }
+
+    /// The pre-index `next_deadline`: a from-scratch scan of every tube
+    /// and connection, as the engine did before T6b.
+    pub(crate) fn t_scan_next_deadline(&self) -> Option<Nanos> {
+        let mut best: Option<Nanos> = None;
+        let mut consider = |d: Nanos| best = Some(best.map_or(d, |b| b.min(d)));
+        for &tid in &self.tube_order.items {
+            if let Some(t) = self.tube(tid) {
+                if let Some(&(d, _)) = t.delayed.first() {
+                    consider(d);
+                }
+                if t.pause > 0 {
+                    consider(t.unpause_at);
+                }
+            }
+        }
+        for c in self.conns.values() {
+            if let Some(t) = conn_tickat(c) {
+                consider(t);
+            }
+        }
+        best
+    }
+
+    /// The pre-index `soonest_delayed_job`: scan tubes in `tube_order`
+    /// order, strict `<` on the deadline.
+    fn t_scan_soonest_delayed_job(&self) -> Option<(Nanos, TubeId, JobId)> {
+        let mut best: Option<(Nanos, TubeId, JobId)> = None;
+        for &tid in &self.tube_order.items {
+            if let Some(&(d, id)) = self.tube(tid).and_then(|t| t.delayed.first())
+                && best.is_none_or(|(bd, _, _)| d < bd)
+            {
+                best = Some((d, tid, id));
+            }
+        }
+        best
+    }
+
+    /// Asserts that every index equals what a from-scratch recomputation
+    /// gives, and that `next_deadline()` equals the scan.
+    pub(crate) fn t_check_indexes(&self) {
+        let conn_ticks: BTreeSet<(Nanos, ConnId)> = self
+            .conns
+            .iter()
+            .filter_map(|(&cid, c)| conn_tickat(c).map(|t| (t, cid)))
+            .collect();
+        assert_eq!(self.conn_ticks, conn_ticks, "conn_ticks index is stale");
+        for (&cid, c) in &self.conns {
+            assert_eq!(
+                c.tick_key,
+                conn_tickat(c),
+                "tick_key of conn {cid} is stale"
+            );
+        }
+
+        let mut delay_heads = BTreeSet::new();
+        let mut pauses = BTreeSet::new();
+        let mut dispatchable = BTreeSet::new();
+        let mut delayed_ct = 0;
+        let mut live = 0;
+        for (tid, t) in self.tubes.iter().enumerate() {
+            let Some(t) = t else { continue };
+            live += 1;
+            assert_eq!(
+                self.tube_order.items.get(t.pos),
+                Some(&tid),
+                "pos of tube {tid}"
+            );
+            assert_eq!(self.tube_ids.get(&t.name), Some(&tid), "name of tube {tid}");
+            if let Some(&(d, _)) = t.delayed.first() {
+                delay_heads.insert((d, tid));
+            }
+            assert_eq!(t.delay_head, t.delayed.first().map(|&(d, _)| d));
+            if t.pause > 0 {
+                pauses.insert((t.unpause_at, tid));
+            }
+            let disp = !t.waiting_conns.is_empty() && !t.ready.is_empty();
+            if disp {
+                dispatchable.insert(tid);
+            }
+            assert_eq!(t.dispatchable, disp, "dispatchable flag of tube {tid}");
+            delayed_ct += t.delayed.len() as u64;
+        }
+        assert_eq!(live, self.tube_order.len());
+        assert_eq!(live, self.tube_ids.len());
+        assert_eq!(self.delay_heads, delay_heads, "delay_heads index is stale");
+        assert_eq!(self.pauses, pauses, "pauses index is stale");
+        assert_eq!(self.dispatchable, dispatchable, "dispatchable set is stale");
+        assert_eq!(self.delayed_ct, delayed_ct, "delayed_ct");
+        assert_eq!(self.next_deadline(), self.t_scan_next_deadline());
+        assert_eq!(
+            self.soonest_delayed_job(),
+            self.t_scan_soonest_delayed_job()
+        );
     }
 }
 
@@ -3258,6 +3428,9 @@ mod proptests {
     }
 
     fn check_invariants(e: &Engine) {
+        // (0) every deadline index equals a from-scratch recomputation.
+        e.t_check_indexes();
+
         let all_ids: HashSet<JobId> = e.t_all_job_ids().into_iter().collect();
         let tubes = e.t_all_tube_names();
         let conns = e.t_all_conn_ids();

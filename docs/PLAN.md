@@ -26,6 +26,7 @@
 | T4 | `bstk-server`: networking, engine actor, CLI | subagent D | T1, T2 | 2 |
 | T5 | Run differential tests, fix mismatches, add edge cases | subagent E | T3, T4 | 3 |
 | T6 | Real-client smoke tests, concurrency stress, benchmarks | subagent F | T4 | 3 |
+| T6b | Engine timer/index performance fix (added after T6 profiling) | subagent G | T5, T6 | 3b |
 | T7 | P0 acceptance | lead | all | 4 |
 
 ### T1 bstk-proto
@@ -163,16 +164,35 @@
 - No errors or hangs during the stress run; afterwards the job count in stats is 0.
 - Numbers recorded in `docs/BENCH.md`. P0 only requires ≥ 0.8× the reference's throughput; if not met, include an analysis and defer to P4.
 
+### T6b Engine Performance Fix
+
+T6 found per-operation cost growing linearly with the number of tubes and connections: `tick` and `next_deadline` scan every tube and connection after every message, `process_queue` visits every tube, and tube names are hashed and copied on hot paths. This violates the O(log n) design (DESIGN §4.2) and misses the 0.8× bar for 100 connections on separate tubes.
+
+**Deliverables**
+- Reproducible optimized reference build for benchmarking (`scripts/build-ref.sh` option).
+- Re-baseline on the current HEAD with an otherwise idle machine.
+- Indexed deadlines (connections, delayed jobs, paused tubes) so `tick` returns immediately when nothing is due and `next_deadline` is O(log n); `process_queue` visits only tubes with waiters; further hot-path fixes (e.g. integer tube ids) only if still needed. Engine public API unchanged; semantics unchanged (tick still runs after every message).
+- A scaling scenario in `bstk-bench`: ~10,000 idle connections and ~10,000 tubes holding delayed jobs, with 10 active connections.
+
+**Tests**
+- Oracle proptest: a frozen copy of the pre-change engine and the new engine receive identical `(now, message)` sequences, including nanosecond-level advances and exact deadline ties; outboxes and stats must match at every step.
+- Invariant: the indexed `next_deadline()` equals a from-scratch scan.
+
+**Acceptance**
+- Every non-pipelined cell of the T6 matrix ≥ 0.8× the optimized reference. Pipelined cells should reach it too; any that do not must be justified with profile evidence in `docs/BENCH.md`.
+- Scaling scenario throughput ≥ 0.8× of the same scenario with no idle connections or tubes.
+- 189/189 differential cases pass in 3 consecutive runs; check.sh green; smoke tests pass; `docs/BENCH.md` updated.
+
 ## 2. P0 Acceptance Checklist (T7, run by the lead)
 
-- [ ] `scripts/check.sh` passes (fmt, clippy, build, test)
-- [ ] All 25 protocol commands implemented, covered at the proto, engine and differential levels
-- [ ] ≥ 60 differential cases, 100% passing; `docs/COMPAT.md` up to date
-- [ ] Engine invariant proptest passes with ≥ 10,000 cases
-- [ ] 1,000-connection concurrency test passes with no resource leaks
-- [ ] Real-client smoke test passes
-- [ ] `docs/BENCH.md` records performance, meeting the 0.8× bar or with an analysis
-- [ ] Code review: no unsafe; no unwrap outside tests; no clock or randomness in the engine
+- [x] `scripts/check.sh` passes (fmt, clippy, build, test): 285 tests
+- [x] All 25 protocol commands implemented, covered at the proto, engine and differential levels (line coverage: proto 96.0%, engine 98.5%)
+- [x] ≥ 60 differential cases, 100% passing; `docs/COMPAT.md` up to date: 189/189, 3 consecutive runs
+- [x] Engine invariant proptest passes with ≥ 10,000 cases, plus a 10,000-case oracle proptest against the pre-T6b engine
+- [x] 1,000-connection concurrency test passes with no resource leaks
+- [x] Real-client smoke test passes (Python greenstalk, Go go-beanstalk)
+- [x] `docs/BENCH.md` records performance, meeting the 0.8× bar or with an analysis: every cell ≥ 0.88× the -O2 reference
+- [x] Code review: no unsafe; no unwrap outside tests; no clock or randomness in the engine
 
 ## 3. Later Phases (summary; detailed when each phase starts)
 

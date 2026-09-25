@@ -18,6 +18,13 @@
 //! reading their replies (D puts, then D reserves, then D deletes). The
 //! latency of each op is measured from the batch write to its reply.
 //!
+//! Scaling load (any scenario): `--idle-conns N` opens N extra connections
+//! that stay idle for the whole run, and `--delayed-tubes M` creates M
+//! extra tubes that each hold one job delayed by an hour. Both are set up
+//! before the clock starts; the delayed jobs are deleted after the run.
+//! The soft `RLIMIT_NOFILE` is raised as far as needed (up to the hard
+//! limit).
+//!
 //! Any unexpected reply, or no reply within 10 s, fails the run (exit 1).
 //! At the end the server's `stats` must show zero ready, reserved, delayed
 //! and buried jobs. Server CPU is derived from `rusage-utime` +
@@ -85,7 +92,28 @@ struct Args {
     /// Also print a one-line JSON summary (for scripts).
     #[arg(long)]
     json: bool,
+    /// Extra connections kept open and idle during the run.
+    #[arg(long, default_value_t = 0)]
+    idle_conns: usize,
+    /// Extra tubes, each holding one job delayed by `DELAYED_JOB_SECS`.
+    #[arg(long, default_value_t = 0)]
+    delayed_tubes: usize,
 }
+
+/// Delay of the jobs created by `--delayed-tubes`: far beyond any run.
+const DELAYED_JOB_SECS: u32 = 3600;
+/// Connections used to create the `--delayed-tubes` jobs and to delete
+/// them afterwards.
+const SETUP_CONNS: usize = 8;
+/// Concurrent connection attempts while opening `--idle-conns` (the
+/// listen backlog is small on macOS).
+const CONNECT_CONCURRENCY: usize = 32;
+/// Retries per idle connection attempt.
+const CONNECT_RETRIES: u64 = 50;
+/// How long the server may take to register every idle connection.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Commands pipelined per write during setup and cleanup.
+const SETUP_BATCH: usize = 256;
 
 /// What one connection task reports back.
 #[derive(Default)]
@@ -106,6 +134,7 @@ fn main() -> ExitCode {
         eprintln!("bstk-bench: producers-consumers needs --conns >= 2");
         return ExitCode::from(2);
     }
+    raise_nofile_limit(args.conns + args.idle_conns + SETUP_CONNS + 256);
     let mut rt = tokio::runtime::Builder::new_multi_thread();
     rt.enable_all();
     if let Some(t) = args.threads {
@@ -131,6 +160,30 @@ async fn run(args: &Args) -> Result<()> {
     let body: Arc<[u8]> = vec![b'x'; args.body_size].into();
     let tag = std::process::id();
     let mut monitor = Client::connect(&args.addr).await?;
+
+    // Idle connections first: the reference's per-event work grows with
+    // the number of tubes, which slows down its accept loop.
+    let idle = open_idle(&args.addr, args.idle_conns).await?;
+    if args.idle_conns > 0 {
+        // Accepted connections reach the server's stats asynchronously.
+        let want = args.idle_conns as u64;
+        let give_up = Instant::now() + SETUP_TIMEOUT;
+        loop {
+            let s = monitor.stats().await?;
+            let conns = stats_u64(&s, "current-connections").unwrap_or(0);
+            if conns >= want {
+                break;
+            }
+            if Instant::now() >= give_up {
+                return Err(format!(
+                    "server reports {conns} connections, expected at least {want} idle ones"
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let delayed_ids = make_delayed_tubes(&args.addr, args.delayed_tubes, tag, &body).await?;
 
     // Connect and configure every client before starting the clock.
     let mut clients = Vec::with_capacity(args.conns);
@@ -208,6 +261,8 @@ async fn run(args: &Args) -> Result<()> {
         drain(&args.addr, args.conns, args.pipeline, tag).await?;
     }
     let drain_secs = start.elapsed().as_secs_f64() - finished;
+    delete_ids(&args.addr, &delayed_ids).await?;
+    drop(idle);
 
     let stats_end = monitor.stats().await?;
     let mut leftover = Vec::new();
@@ -249,6 +304,123 @@ async fn run(args: &Args) -> Result<()> {
     } else {
         Err(format!("server not empty after run: {}", leftover.join(", ")).into())
     }
+}
+
+/// Best effort: raises the soft `RLIMIT_NOFILE` to at least `want` (capped
+/// at the hard limit).
+fn raise_nofile_limit(want: usize) {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    let want = want as u64;
+    if let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE)
+        && soft < want
+        && let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, want.min(hard), hard)
+    {
+        eprintln!("bstk-bench: cannot raise RLIMIT_NOFILE from {soft} to {want}: {e}");
+    }
+}
+
+/// Opens `n` connections that are only held open (never used).
+async fn open_idle(addr: &str, n: usize) -> Result<Vec<tokio::net::TcpStream>> {
+    let mut idle = Vec::with_capacity(n);
+    let mut left = n;
+    while left > 0 {
+        let batch = left.min(CONNECT_CONCURRENCY);
+        let mut set: JoinSet<std::io::Result<tokio::net::TcpStream>> = JoinSet::new();
+        for _ in 0..batch {
+            let addr = addr.to_string();
+            set.spawn(async move {
+                let stream = connect_with_retry(&addr).await?;
+                // Close with RST, not FIN: 10,000 client sockets in
+                // TIME_WAIT would exhaust the ephemeral port range for the
+                // next run.
+                stream.set_zero_linger()?;
+                Ok(stream)
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let stream = joined
+                .map_err(|e| format!("connect task panicked: {e}"))?
+                .map_err(|e| format!("idle connection {}: {e}", idle.len()))?;
+            idle.push(stream);
+        }
+        left -= batch;
+    }
+    Ok(idle)
+}
+
+/// Connects, retrying a few times: a burst of connects can overflow the
+/// server's listen backlog, which shows up as a reset or refusal.
+async fn connect_with_retry(addr: &str) -> std::io::Result<tokio::net::TcpStream> {
+    let mut attempt = 0;
+    loop {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(s) => return Ok(s),
+            Err(_) if attempt < CONNECT_RETRIES => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis((20 * attempt).min(200))).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Creates `n` tubes named `bench-{tag}-delayed-{i}`, each holding one job
+/// delayed by `DELAYED_JOB_SECS`; returns the job ids.
+async fn make_delayed_tubes(addr: &str, n: usize, tag: u32, body: &[u8]) -> Result<Vec<u64>> {
+    let mut set: JoinSet<Result<Vec<u64>>> = JoinSet::new();
+    for k in 0..SETUP_CONNS.min(n) {
+        let addr = addr.to_string();
+        let body = body.to_vec();
+        set.spawn(async move {
+            let mut c = Client::connect(&addr).await?;
+            let mine: Vec<usize> = (k..n).step_by(SETUP_CONNS).collect();
+            let mut ids = Vec::with_capacity(mine.len());
+            for chunk in mine.chunks(SETUP_BATCH) {
+                for i in chunk {
+                    c.queue(&format!("use bench-{tag}-delayed-{i}"));
+                    c.queue_put(0, DELAYED_JOB_SECS, TTR, &body);
+                }
+                c.flush().await?;
+                for _ in chunk {
+                    match c.read_reply().await? {
+                        Reply::Using => {}
+                        r => return Err(unexpected("use", r)),
+                    }
+                    match c.read_reply().await? {
+                        Reply::Inserted(id) => ids.push(id),
+                        r => return Err(unexpected("put", r)),
+                    }
+                }
+            }
+            Ok(ids)
+        });
+    }
+    let mut ids = Vec::with_capacity(n);
+    while let Some(joined) = set.join_next().await {
+        ids.extend(joined.map_err(|e| format!("setup task panicked: {e}"))??);
+    }
+    Ok(ids)
+}
+
+/// Deletes the given jobs (pipelined, over `SETUP_CONNS` connections).
+async fn delete_ids(addr: &str, ids: &[u64]) -> Result<()> {
+    let mut set: JoinSet<Result<()>> = JoinSet::new();
+    for k in 0..SETUP_CONNS.min(ids.len()) {
+        let addr = addr.to_string();
+        let mine: Vec<u64> = ids.iter().copied().skip(k).step_by(SETUP_CONNS).collect();
+        set.spawn(async move {
+            let mut c = Client::connect(&addr).await?;
+            let mut rec = Recorder::default();
+            for chunk in mine.chunks(SETUP_BATCH) {
+                delete_batch(&mut c, &mut rec, chunk).await?;
+            }
+            Ok(())
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        joined.map_err(|e| format!("cleanup task panicked: {e}"))??;
+    }
+    Ok(())
 }
 
 /// Measured window: only ops completed before the deadline count.
@@ -444,13 +616,15 @@ fn report(
     let total = rec.total();
     let ops_per_sec = total as f64 / elapsed;
     println!(
-        "scenario={} addr={} conns={} duration={}s body={}B pipeline={}",
+        "scenario={} addr={} conns={} duration={}s body={}B pipeline={} idle-conns={} delayed-tubes={}",
         args.scenario.name(),
         args.addr,
         args.conns,
         args.duration,
         args.body_size,
-        args.pipeline
+        args.pipeline,
+        args.idle_conns,
+        args.delayed_tubes
     );
     println!("total: {total} ops in {elapsed:.2}s = {ops_per_sec:.0} ops/s");
     println!(
@@ -498,11 +672,13 @@ fn report(
     if args.json {
         let cpu = cpu_pct.map_or_else(|| "null".to_string(), |p| format!("{p:.1}"));
         println!(
-            "JSON {{\"scenario\":\"{}\",\"conns\":{},\"body_size\":{},\"pipeline\":{},\"duration_s\":{:.3},\"ops\":{},\"ops_per_sec\":{:.1},\"server_cpu_pct\":{},{}}}",
+            "JSON {{\"scenario\":\"{}\",\"conns\":{},\"body_size\":{},\"pipeline\":{},\"idle_conns\":{},\"delayed_tubes\":{},\"duration_s\":{:.3},\"ops\":{},\"ops_per_sec\":{:.1},\"server_cpu_pct\":{},{}}}",
             args.scenario.name(),
             args.conns,
             args.body_size,
             args.pipeline,
+            args.idle_conns,
+            args.delayed_tubes,
             elapsed,
             total,
             ops_per_sec,

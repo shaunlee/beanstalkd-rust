@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/engine", "crates/server", "tests/compat", "bench"]
+members = ["crates/proto", "crates/engine", "crates/engine-oracle", "crates/server", "tests/compat", "bench"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,6 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest = "1"
 bstk-proto = { path = "crates/proto" }
 bstk-engine = { path = "crates/engine" }
+bstk-engine-oracle = { path = "crates/engine-oracle" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

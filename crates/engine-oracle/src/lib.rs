@@ -1,7 +1,10 @@
-//! Deterministic beanstalkd state machine.
-//!
-//! INTERFACE CONTRACT (owned by the lead): the public API in this file must
-//! not change without lead approval.
+//! FROZEN ORACLE: a verbatim copy of `bstk-engine` as of commit 4304ef6
+//! (before the T6b performance work), used only as a dev-dependency of
+//! `bstk-engine`. Its differential proptest feeds this engine and the
+//! optimized one identical `(now, message)` sequences and requires
+//! identical outboxes, deadlines and stats. Do not change its behavior:
+//! the only edits vs. the original are removed test modules and the stats
+//! builders made `pub` for that comparison.
 //!
 //! Rules: no system clock, no randomness, no I/O. Time is always passed in as
 //! `now` (monotonic nanoseconds). Identical inputs must yield identical
@@ -12,8 +15,6 @@ use bstk_proto::Response;
 mod engine;
 mod model;
 mod ms;
-#[cfg(test)]
-mod oracle_tests;
 
 pub use engine::Engine;
 

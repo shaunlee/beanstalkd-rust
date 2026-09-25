@@ -1,17 +1,15 @@
 [package]
-name = "bstk-engine"
+name = "bstk-engine-oracle"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+publish = false
+description = "Frozen pre-T6b copy of bstk-engine, used only as a differential test oracle"
 
 [dependencies]
 bytes.workspace = true
 bstk-proto.workspace = true
-
-[dev-dependencies]
-proptest.workspace = true
-bstk-engine-oracle.workspace = true
 
 [lints]
 workspace = true

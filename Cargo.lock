@@ -93,6 +93,7 @@ name = "bstk-bench"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "nix",
  "tokio",
 ]
 
@@ -104,9 +105,18 @@ version = "0.1.0"
 name = "bstk-engine"
 version = "0.1.0"
 dependencies = [
+ "bstk-engine-oracle",
  "bstk-proto",
  "bytes",
  "proptest",
+]
+
+[[package]]
+name = "bstk-engine-oracle"
+version = "0.1.0"
+dependencies = [
+ "bstk-proto",
+ "bytes",
 ]
 
 [[package]]

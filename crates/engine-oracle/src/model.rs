@@ -12,11 +12,6 @@ use bstk_proto::{JobId, TubeName};
 use crate::ms::Ms;
 use crate::{ConnId, Nanos};
 
-/// Index of a live tube in `Engine::tubes` (a slab). Slots are reused only
-/// after the tube is destroyed, and every index entry naming a tube is
-/// removed when it is destroyed.
-pub(crate) type TubeId = usize;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JobState {
     Ready,
@@ -28,7 +23,7 @@ pub(crate) enum JobState {
 #[derive(Debug, Clone)]
 pub(crate) struct JobRec {
     pub(crate) id: JobId,
-    pub(crate) tube: TubeId,
+    pub(crate) tube: TubeName,
     pub(crate) pri: u32,
     /// Original delay in whole seconds, as last set by `put` or `release`.
     pub(crate) delay: u32,
@@ -89,21 +84,12 @@ pub(crate) struct TubeState {
     pub(crate) job_ref_ct: u64,
     pub(crate) stat: TubeStat,
     /// 0 means "not paused"; otherwise the pause duration in nanoseconds.
-    /// While non-zero, `(unpause_at, id)` is in `Engine::pauses`.
     pub(crate) pause: Nanos,
     pub(crate) unpause_at: Nanos,
-    /// Position in `Engine::tube_order` (kept in sync on swap-removal).
-    pub(crate) pos: usize,
-    /// Deadline of the head of `delayed` as currently recorded in
-    /// `Engine::delay_heads`.
-    pub(crate) delay_head: Option<Nanos>,
-    /// Whether this tube is in `Engine::dispatchable` (it has both waiting
-    /// connections and ready jobs).
-    pub(crate) dispatchable: bool,
 }
 
 impl TubeState {
-    pub(crate) fn new(name: TubeName, pos: usize) -> Self {
+    pub(crate) fn new(name: TubeName) -> Self {
         TubeState {
             name,
             ready: BTreeSet::new(),
@@ -116,9 +102,6 @@ impl TubeState {
             stat: TubeStat::default(),
             pause: 0,
             unpause_at: 0,
-            pos,
-            delay_head: None,
-            dispatchable: false,
         }
     }
 
@@ -129,8 +112,8 @@ impl TubeState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ConnState {
-    pub(crate) use_tube: TubeId,
-    pub(crate) watch: Ms<TubeId>,
+    pub(crate) use_tube: TubeName,
+    pub(crate) watch: Ms<TubeName>,
     pub(crate) is_producer: bool,
     pub(crate) is_worker: bool,
     pub(crate) waiting: bool,
@@ -146,9 +129,6 @@ pub(crate) struct ConnState {
     /// A put whose command line was accepted (`Engine::put_started`) but
     /// whose body has not completed yet: prot.c's `c->in_job`.
     pub(crate) pending_put: Option<PendingPut>,
-    /// This connection's `conntickat` as currently recorded in
-    /// `Engine::conn_ticks`.
-    pub(crate) tick_key: Option<Nanos>,
 }
 
 /// Header-time state of an in-flight put (see `ConnState::pending_put`).
@@ -162,9 +142,9 @@ pub(crate) struct PendingPut {
 }
 
 impl ConnState {
-    pub(crate) fn new(default_tube: TubeId) -> Self {
+    pub(crate) fn new(default_tube: TubeName) -> Self {
         let mut watch = Ms::new();
-        watch.append(default_tube);
+        watch.append(default_tube.clone());
         ConnState {
             use_tube: default_tube,
             watch,
@@ -175,7 +155,6 @@ impl ConnState {
             reserved_fifo: Vec::new(),
             reserved_by_deadline: BTreeSet::new(),
             pending_put: None,
-            tick_key: None,
         }
     }
 

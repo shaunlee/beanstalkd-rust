@@ -1,4 +1,244 @@
-# Benchmarks (P0, task T6)
+# Benchmarks
+
+`beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
+driven by the `bstk-bench` load generator (`bench/`). The current numbers
+are from task T6b (engine performance fix). The T6 first pass, whose
+profile motivated T6b, is kept at the end.
+
+## Summary (T6b)
+
+- **Every matrix cell now reaches at least 0.88x of the optimized (-O2)
+  reference.** The cell that failed in T6, 100 connections each on its own
+  tube, went from 0.50x/0.54x to 1.04x/1.11x. Pipelined `put-reserve-delete`
+  went from 0.93x/0.34x (10/100 conns) to 1.40x/1.60x.
+- **Scaling scenario:** 10 active connections alongside 10,000 idle
+  connections and 10,000 tubes holding delayed jobs run at **0.96x** of the
+  same load with no idle connections or tubes (116,964 vs 121,293 ops/s).
+  Before T6b the same scenario collapsed to 724 ops/s (0.007x). The reference
+  drops to 11,018 ops/s (0.09x of its own zero-idle 120,151 ops/s) because
+  its `prottick` still walks every tube on every event-loop iteration.
+- **What changed:** `Engine::tick` and `Engine::next_deadline` no longer scan
+  every tube and connection. Deadlines live in ordered indexes, so `tick`
+  returns at once when nothing is due. `process_queue` visits only tubes that
+  have both waiters and ready jobs. Tubes are slab entries with integer ids.
+  The engine actor re-arms its timer only when the deadline changes. See
+  [What changed](#what-changed-t6b). There are no observable changes: 189/189
+  differential cases pass, and a 10,000-case proptest compares the new
+  engine step by step with a frozen copy of the old one.
+
+## Environment (T6b)
+
+| | |
+|---|---|
+| Machine | Apple M6, 12 cores (2 "Super" + 4 "Performance" + 6 "Efficiency"), 32 GB RAM |
+| OS | macOS 27.0 (Darwin 27.0.0, arm64) |
+| Rust | rustc 1.98.1; `beanstalkd-rs` and `bstk-bench` built with `cargo build --release` (opt-level 3, `debug = 1`) |
+| Reference | `scripts/build-ref.sh --optimized`: a copy of `.ref/beanstalkd` built with `make CFLAGS=-O2` at `.ref/beanstalkd-opt/beanstalkd`. The Makefile appends its own flags (`override CFLAGS+=-Wall -Werror -Wformat=2 -g`), so the compile line is `cc -O2 -Wall -Werror -Wformat=2 -g`. The default debug build at `.ref/beanstalkd/beanstalkd`, used by the differential and smoke tests, is untouched. |
+| Load generator | `bstk-bench` on the same machine, tokio multi-thread runtime (12 workers), loopback TCP, `TCP_NODELAY` |
+| Servers | `-l 127.0.0.1 -p <free port>`, default `-z`; a fresh server process for every run; runs alternate ref / rs |
+| `ulimit -n` | 1048576 (soft); `kern.maxfilesperproc` 122880 |
+| Background load | **Not idle.** Nothing was compiling during the measurements, but an OrbStack VM owned by another user kept 1.5 to 5.4 cores busy throughout (`top`). 1-minute load average from the CSV `load_avg` column: before matrix 4.8 to 12.7, after matrix 7.3 to 12.3, pipelined-before 9.9 to 12.6, scaling 8.4 to 11.0. Because ref and rs runs alternate, the drift affects both servers equally. The ratios are therefore comparable, but absolute ops/s are not comparable between the "before" and "after" sessions (the reference itself moved, e.g. 161k to 121k at 100x16). |
+
+## Commands (T6b)
+
+```sh
+export CARGO_TARGET_DIR=...                 # any
+scripts/build-ref.sh --optimized            # -> .ref/beanstalkd-opt/beanstalkd
+cargo build --release -p bstk-server -p bstk-bench
+
+# Full matrix: 3 scenarios x conns {1,10,100} x body {16,4096} x 3 runs x 2 servers, 5 s each.
+# run-matrix.sh now defaults REF_BIN to .ref/beanstalkd-opt/beanstalkd.
+OUT_CSV=matrix.csv bench/run-matrix.sh
+# Pipelined cells.
+OUT_CSV=matrix.csv SCENARIOS=put-reserve-delete CONNS="10 100" BODIES=16 PIPELINES=16 bench/run-matrix.sh
+# Scaling scenario: zero-idle baseline and 10,000 idle conns + 10,000 delayed tubes, 3 runs each.
+OUT_CSV=scaling.csv SCENARIOS=put-reserve-delete CONNS=10 BODIES=16 \
+  IDLE_CONNS="0 10000" DELAYED_TUBES="0 10000" bench/run-matrix.sh
+bench/summarize.py matrix.csv
+bench/summarize.py scaling.csv
+```
+
+"Before" is the release build of commit 4304ef6 (HEAD before T6b). Its
+pipelined cells and its scaling runs were driven by the new `bstk-bench`
+binary: the old binary lacks the `--idle-conns` / `--delayed-tubes` flags
+that `run-matrix.sh` now passes. The load the bench generates is otherwise
+unchanged.
+
+Raw per-run CSVs in `bench/results/`:
+
+- `2026-09-25-t6b-before-matrix.csv`, `2026-09-25-t6b-before-pipelined.csv`
+- `2026-09-25-t6b-after-matrix.csv` (includes the pipelined cells)
+- `2026-09-25-t6b-before-scaling.csv`, `2026-09-25-t6b-after-scaling.csv`
+
+Measurement definitions (ops/s, CPU %, median of 3 runs of 5 s,
+correctness checks) are the same as in T6; see
+[What is measured](#what-is-measured).
+
+## Results (T6b): before / after
+
+Medians of 3 runs. rs/ref ratios below 0.8 are in bold.
+
+| scenario | conns | body | pipe | before: ref ops/s | before: rs ops/s | before rs/ref | after: ref ops/s | after: rs ops/s | after rs/ref | rs CPU % before | rs CPU % after | ref CPU % after |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| put-reserve-delete | 1 | 16 | 1 | 47,894 | 45,560 | 0.95 | 35,170 | 34,735 | **0.99** | 38 | 36 | 33 |
+| put-reserve-delete | 1 | 4096 | 1 | 48,172 | 46,701 | 0.97 | 32,903 | 36,920 | **1.12** | 38 | 37 | 33 |
+| put-reserve-delete | 10 | 16 | 1 | 137,938 | 139,843 | 1.01 | 101,314 | 110,347 | **1.09** | 174 | 177 | 86 |
+| put-reserve-delete | 10 | 4096 | 1 | 135,063 | 126,936 | 0.94 | 105,570 | 106,837 | **1.01** | 181 | 182 | 88 |
+| put-reserve-delete | 100 | 16 | 1 | 161,307 | 80,672 | **0.50** | 121,492 | 126,058 | **1.04** | 224 | 244 | 98 |
+| put-reserve-delete | 100 | 4096 | 1 | 132,005 | 71,824 | **0.54** | 115,506 | 128,087 | **1.11** | 232 | 252 | 99 |
+| producers-consumers | 2 | 16 | 1 | 58,802 | 59,816 | 1.02 | 47,748 | 47,857 | **1.00** | 61 | 59 | 47 |
+| producers-consumers | 2 | 4096 | 1 | 56,783 | 48,920 | 0.86 | 45,919 | 45,168 | **0.98** | 63 | 61 | 49 |
+| producers-consumers | 10 | 16 | 1 | 122,591 | 120,722 | 0.98 | 102,298 | 111,723 | **1.09** | 190 | 178 | 87 |
+| producers-consumers | 10 | 4096 | 1 | 129,906 | 128,517 | 0.99 | 102,772 | 104,847 | **1.02** | 187 | 187 | 90 |
+| producers-consumers | 100 | 16 | 1 | 165,482 | 144,679 | 0.87 | 145,215 | 127,672 | **0.88** | 320 | 245 | 99 |
+| producers-consumers | 100 | 4096 | 1 | 147,898 | 133,964 | 0.91 | 116,287 | 123,993 | **1.07** | 339 | 264 | 99 |
+| put-only | 1 | 16 | 1 | 42,761 | 41,238 | 0.96 | 35,356 | 34,519 | **0.98** | 38 | 35 | 33 |
+| put-only | 1 | 4096 | 1 | 36,824 | 36,976 | 1.00 | 33,971 | 32,616 | **0.96** | 40 | 39 | 34 |
+| put-only | 10 | 16 | 1 | 128,220 | 120,836 | 0.94 | 113,217 | 111,862 | **0.99** | 184 | 177 | 86 |
+| put-only | 10 | 4096 | 1 | 113,978 | 111,912 | 0.98 | 95,382 | 101,440 | **1.06** | 206 | 202 | 88 |
+| put-only | 100 | 16 | 1 | 151,996 | 131,882 | 0.87 | 136,112 | 126,254 | **0.93** | 320 | 244 | 99 |
+| put-only | 100 | 4096 | 1 | 123,962 | 124,071 | 1.00 | 106,795 | 120,902 | **1.13** | 353 | 280 | 98 |
+| put-reserve-delete | 10 | 16 | 16 | 242,576 | 224,970 | 0.93 | 227,565 | 319,567 | **1.40** | 304 | 371 | 96 |
+| put-reserve-delete | 100 | 16 | 16 | 214,011 | 71,958 | **0.34** | 207,574 | 332,190 | **1.60** | 176 | 418 | 96 |
+
+Full "after" table with latencies (`bench/summarize.py
+bench/results/2026-09-25-t6b-after-matrix.csv`; `*` = runs spread by more
+than 20%):
+
+| scenario | conns | body | pipe | ref ops/s | rs ops/s | rs/ref | ref CPU % | rs CPU % | ref put p99 µs | rs put p99 µs | ref reserve p99 µs | rs reserve p99 µs |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| put-reserve-delete | 1 | 16 | 1 | 35,170 | 34,735 | 0.99 | 33 | 36 | 76 | 76 | 76 | 77 |
+| put-reserve-delete | 1 | 4096 | 1 | 32,903* | 36,920* | 1.12 | 33 | 37 | 82 | 80 | 82 | 80 |
+| put-reserve-delete | 10 | 16 | 1 | 101,314* | 110,347* | 1.09 | 86 | 177 | 226 | 174 | 226 | 174 |
+| put-reserve-delete | 10 | 4096 | 1 | 105,570 | 106,837 | 1.01 | 88 | 182 | 232 | 178 | 195 | 176 |
+| put-reserve-delete | 100 | 16 | 1 | 121,492 | 126,058 | 1.04 | 98 | 244 | 1,132 | 1,065 | 1,133 | 1,068 |
+| put-reserve-delete | 100 | 4096 | 1 | 115,506 | 128,087 | 1.11 | 99 | 252 | 1,460 | 1,067 | 1,039 | 1,069 |
+| producers-consumers | 2 | 16 | 1 | 47,748* | 47,857* | 1.00 | 47 | 59 | 93 | 97 | 94 | 96 |
+| producers-consumers | 2 | 4096 | 1 | 45,919* | 45,168* | 0.98 | 49 | 61 | 102 | 104 | 95 | 104 |
+| producers-consumers | 10 | 16 | 1 | 102,298 | 111,723 | 1.09 | 87 | 178 | 222 | 170 | 223 | 171 |
+| producers-consumers | 10 | 4096 | 1 | 102,772 | 104,847 | 1.02 | 90 | 187 | 242 | 189 | 193 | 187 |
+| producers-consumers | 100 | 16 | 1 | 145,215 | 127,672 | 0.88 | 99 | 245 | 1,048 | 1,082 | 1,051 | 1,088 |
+| producers-consumers | 100 | 4096 | 1 | 116,287 | 123,993 | 1.07 | 99 | 264 | 1,393 | 1,118 | 987 | 1,119 |
+| put-only | 1 | 16 | 1 | 35,356 | 34,519 | 0.98 | 33 | 35 | 75 | 83 | - | - |
+| put-only | 1 | 4096 | 1 | 33,971 | 32,616 | 0.96 | 34 | 39 | 76 | 80 | - | - |
+| put-only | 10 | 16 | 1 | 113,217 | 111,862 | 0.99 | 86 | 177 | 193 | 168 | - | - |
+| put-only | 10 | 4096 | 1 | 95,382 | 101,440 | 1.06 | 88 | 202 | 232 | 187 | - | - |
+| put-only | 100 | 16 | 1 | 136,112 | 126,254 | 0.93 | 99 | 244 | 1,066 | 1,070 | - | - |
+| put-only | 100 | 4096 | 1 | 106,795* | 120,902* | 1.13 | 98 | 280 | 1,317 | 1,148 | - | - |
+| put-reserve-delete | 10 | 16 | 16 | 227,565 | 319,567 | 1.40 | 96 | 371 | 1,092 | 626 | 949 | 629 |
+| put-reserve-delete | 100 | 16 | 16 | 207,574 | 332,190 | 1.60 | 96 | 418 | 8,959 | 6,062 | 9,157 | 6,042 |
+
+- **Acceptance.** Every non-pipelined cell is at least 0.88x. The lowest
+  is producers-consumers 100x16 at 0.88x, where the reference run was
+  unusually fast (145k vs 116k to 136k for its neighboring 100-connection
+  cells). Both pipelined cells exceed the reference (1.40x, 1.60x).
+- **CPU.** The reference stays at one core or less. `beanstalkd-rs` still
+  uses 1.8 to 4.2 cores at 10 to 100 connections: the per-command
+  cross-thread hand-offs described in T6 remain (connection task → engine
+  actor → connection task). The engine is no longer the bottleneck. At 100
+  connections on separate tubes, throughput per CPU-second rose from about
+  36k ops (80,672 ops/s at 224%) to about 52k (126,058 at 244%), versus
+  about 124k for the reference. At 100 connections on one shared tube, CPU
+  fell from 320 to 353% to 244 to 280%. Cutting the hand-offs (T6
+  suggestion 6) is left to P4.
+
+### Scaling scenario
+
+`put-reserve-delete`, 10 active connections (each on its own tube), 16-byte
+bodies. "Scaled" adds `--idle-conns 10000 --delayed-tubes 10000`: 10,000
+connections that stay idle, plus 10,000 tubes each holding one job delayed by
+3600 s. Both are set up before the clock starts, and the delayed jobs are
+deleted afterwards. Medians of 3 runs.
+
+| server | zero-idle ops/s | scaled ops/s | scaled / zero-idle | CPU % zero-idle / scaled | put p99 µs zero-idle / scaled |
+|---|---:|---:|---:|---:|---:|
+| beanstalkd-rs after T6b | 121,293 | 116,964 | **0.96** | 170 / 172 | 160 / 166 |
+| beanstalkd-rs before T6b | 109,058 | 724 | 0.007 | 198 / 100 | 184 / 24,740 |
+| reference (-O2), after session | 120,151 | 11,018 | 0.09 | 87 / 96 | 188 / 2,352 |
+| reference (-O2), before session | 116,509 | 11,469 | 0.10 | 88 / 96 | 191 / 2,376 |
+
+Before T6b every message paid O(10,000 tubes + 10,000 connections) twice.
+The reference's `prottick` (prot.c) also calls `soonest_delayed_job()` and
+walks `tubes.items` for pauses on every event-loop iteration. That is
+O(#tubes) per event, so it slows down in this scenario too, and it accepts
+the 10,000 connections slowly once the tubes exist. The bench therefore
+opens the idle connections before it creates the tubes.
+
+## What changed (T6b)
+
+1. **Optimized reference build** (`scripts/build-ref.sh --optimized`, or
+   `REF_OPT=1`): builds an rsync'd copy of the pinned sources with
+   `CFLAGS=-O2` into `.ref/beanstalkd-opt/`. `bench/run-matrix.sh` uses it by
+   default.
+2. **Oracle first.** `crates/engine-oracle` (`bstk-engine-oracle`,
+   `publish = false`) is a frozen copy of the pre-T6b engine. Its only
+   changes are that its test modules are dropped and its stats builders are
+   made `pub`. It is only a dev-dependency of `bstk-engine`. The proptest
+   `oracle_tests::new_engine_matches_frozen_oracle` (10,000 cases, 20 to 99
+   steps each) drives both engines with identical `(now, message)`
+   sequences. The messages cover 6 connections and 4 tubes, and include
+   connect, disconnect, half-close, `put_started`, every put rejection,
+   every command, drain mode and tick (after 80% of messages, plus explicit
+   ticks). Time moves by 1 to 3 ns, by 0.5/1/2/5 s and by 1 s ± 1 ns, and
+   jumps to exactly `next_deadline()` - 1, + 0 and + 1 ns, so TTR expiry
+   (`<`), the DEADLINE_SOON margin (`>=`), delays, 1 ns pauses and reserve
+   timeouts are all hit on their boundaries. After every step the test
+   asserts identical outboxes, `next_deadline()`, server stats, stats for
+   every tube and every job id, tube order and every watch list. It also
+   asserts that each index equals a from-scratch recomputation, including
+   `next_deadline()` against the old full scan. The existing invariant
+   proptest runs the same index check. As a sanity check, four deliberately
+   planted bugs were each caught: the wrong delayed-job tie-break, a `<`
+   instead of `<=` in the tick fast path, a missing re-index after `touch`,
+   and no pause clearing in `process_queue`.
+3. **Indexed deadlines** (`crates/engine/src/engine.rs`):
+   `conn_ticks: BTreeSet<(conntickat, ConnId)>` (as in the reference's
+   connection heap), `delay_heads: BTreeSet<(deadline, TubeId)>` (one
+   entry per tube: its soonest delayed job) and
+   `pauses: BTreeSet<(unpause_at, TubeId)>`. They are updated by one helper
+   per index, called from every state change (reserve, unreserve, touch,
+   wait/unwait, delayed insert/remove, pause, tube destruction).
+   `next_deadline()` is the minimum of three `first()`s. `tick(now)` returns
+   immediately when that is after `now`. Otherwise it runs the same three
+   phases as before, in the same order. Ties between equal delayed
+   deadlines in different tubes still go to the tube earliest in the
+   `tube_order` list, which is looked up among the tied entries via each
+   tube's stored position. A reserve that starts waiting inside its safety
+   margin gets a `conntickat` at or before `now`, so the server's tick right
+   after `handle` still sends DEADLINE_SOON (COMPAT engine item 5).
+4. **`process_queue`** iterates only the `dispatchable` set: tubes that have
+   waiting connections and ready jobs, usually empty. The minimum `(pri, id)`
+   is unique, so the visiting order cannot change which job is dispatched.
+   The reference's side effect of clearing every expired pause on each
+   `process_queue` call is kept (it is visible in `stats-tube`). The expired
+   pauses are popped from `pauses` first.
+5. **Integer tube ids.** Tubes live in a slab (`Vec<Option<TubeState>>`)
+   indexed by `TubeId`. Jobs, connections (`use`, watch list), `tube_order`
+   and the indexes hold ids. Names are hashed only when a command names a
+   tube. The per-message `TubeName` clones and SipHash lookups from the T6
+   profile are gone. This was done together with item 3, whose index keys
+   need stable integer tube ids, so there is no separate measurement for it.
+   `current-jobs-delayed` is now a counter instead of a sum over all tubes.
+6. **Engine actor** (`crates/server/src/engine_actor.rs`): one pinned
+   `Sleep`, reset only when `next_deadline()` changes, instead of a new timer
+   per message. Replies are moved out of the outbox instead of cloned. It
+   still handles one message per wake-up and ticks after each one.
+7. **Not needed:** batching the connection task's flushes (step d). The
+   pipelined cells already exceed the reference.
+
+**Profile after** (`sample <pid> 5` during `put-reserve-delete --conns
+100`): the engine actor task was on-CPU for about 7% of the sample window
+(103 of 1,422 samples), versus 97% (2,592 of 2,660) in T6, so it is no
+longer saturated. Within the actor, `Engine::handle` was about 29%,
+`next_deadline` about 7% and `tick` about 4%. In T6, `tick` alone was 44%
+and `next_deadline` 21%. Most process time is now in tokio worker
+park/unpark (`__psynch_cvwait`) and socket syscalls.
+
+## T6 first pass (historical)
+
+The results and analysis below are from task T6 (commit 4304ef6, noisy
+machine, reference built by hand with `-O2`). They are superseded by the
+T6b tables above.
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`).
@@ -10,11 +250,11 @@ each on **its own tube** (`put-reserve-delete`, 100 conns) gets 0.64x to
 0.67x, and 0.39x when pipelined. Profiling shows the single engine actor is
 saturated. Every command pays for several O(#tubes + #connections) scans in
 `Engine::tick`, `Engine::next_deadline` and `process_queue`, and each scan
-SipHash-es and clones tube names (see [Hot spots](#hot-spots)). Our server
+SipHash-es and clones tube names (see Hot spots below). Our server
 also uses 2 to 3.3 cores where the reference uses 1. The fixes are
 engine-internal and are deferred to P4, as PLAN.md T6 allows.
 
-## Environment
+### Environment
 
 | | |
 |---|---|
@@ -58,7 +298,7 @@ The raw per-run CSVs are in `bench/results/`:
   producers-consumers 2x16 and 100x16) were re-run 3 more times, and those
   runs replace the first pass. All re-runs were within 20%.
 
-## What is measured
+### What is measured
 
 - **ops/s**: completed protocol operations per second (each put, reserve
   and delete counts as one) inside the measured window. The whole run fails
@@ -81,7 +321,7 @@ The raw per-run CSVs are in `bench/results/`:
 - Values are the **median of 3 runs**, 5 s each. Latencies are the median
   of the per-run p99s.
 
-## Results
+### Results
 
 | scenario | conns | body | pipe | ref ops/s | rs ops/s | rs/ref | ref CPU % | rs CPU % | ref put p99 µs | rs put p99 µs | ref reserve p99 µs | rs reserve p99 µs |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -106,7 +346,7 @@ The raw per-run CSVs are in `bench/results/`:
 | put-reserve-delete | 10 | 16 | 16 | 210,372 | 215,578 | 1.02 | 99 | 319 | 967 | 876 | 834 | 903 |
 | **put-reserve-delete** | **100** | 16 | 16 | 202,158 | 78,698 | **0.39** | 99 | 208 | 8,957 | 19,497 | 8,717 | 26,751 |
 
-### Stress run (T6 acceptance)
+#### Stress run (T6 acceptance)
 
 `put-reserve-delete`, 100 connections, 30 s, 16-byte bodies, pipeline 1,
 one run per server:
@@ -120,7 +360,7 @@ Both servers pass: no unexpected replies, no reply slower than 10 s, and
 `stats` shows `current-jobs-{ready,reserved,delayed,buried}` = 0 after the
 run. Reserve and delete latencies are within 1% of put's for both servers.
 
-## Analysis
+### Analysis
 
 - **Single tube or few connections: at parity.** With 1 or 10 connections,
   and with 100 connections sharing one tube (producers-consumers,
@@ -146,7 +386,7 @@ run. Reserve and delete latencies are within 1% of put's for both servers.
   engine work. Today that core is spent mostly on scans that do not depend
   on the command (below), not on the command itself.
 
-## Hot spots
+### Hot spots
 
 Profile: `sample <pid> 8` on `beanstalkd-rs` during
 `put-reserve-delete --conns 100` (release build with `debug = 1`).
@@ -170,7 +410,7 @@ head is examined. Tubes are walked by pointer (`tubes.items[i]`), with no
 hashing, no cloning and no allocation. Tick and next-deadline are a single
 pass, not two.
 
-### Suggestions (P4, engine and actor; not applied here)
+#### Suggestions (P4, engine and actor; items 1, 3, 4 and 5 applied in T6b, item 2 not needed)
 
 1. **Make the per-message tick nearly free.** Cache the next deadline and
    skip `tick` unless `now >= cached_deadline`. Merge `tick` and
@@ -211,7 +451,7 @@ Items 1 to 4 are local to `bstk-engine` / `engine_actor.rs` and should
 restore the many-tube case to the same level as the single-tube case
 (0.95x to 1.1x). Re-run with `bench/run-matrix.sh` to confirm.
 
-## Reproducing on a quiet machine
+### Reproducing on a quiet machine
 
 The numbers above were taken while another build was running. For
 publishable numbers, re-run the matrix on an idle machine (check `uptime`
