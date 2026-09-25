@@ -198,7 +198,67 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 
 | Phase | Main tasks | Acceptance focus |
 |---|---|---|
-| P1 | `bstk-store` WAL, engine Persist hook, `-b` `-f` `-F` `-s` flags, compaction | kill -9 at random points loses no acknowledged job (fsync=always); differential cases still pass with WAL on |
+| P1 | Write-ahead log; see §4 | see §4.5 |
 | P2 | TLS / mTLS, auth extension, HTTP metrics / healthz / admin, TOML config | differential tests 100% with default config; real clients connect over TLS |
 | P3 | openraft, Tick proposals, replicated reservations, follower proxy | on a 3-node cluster, random kills / partitions lose no acknowledged job and never double-deliver a reserved job (Jepsen-style tests) |
 | P4 | Profiling and optimization | throughput ≥ 1× reference; multi-core scaling curve |
+
+## 4. P1: Write-Ahead Log (detailed plan)
+
+### 4.1 Reference behavior (probed against `.ref` with `-b`)
+
+| Topic | Reference behavior |
+|---|---|
+| Journaled transitions | put, release **with** delay, bury, kick / kick-job, delete. **Not** journaled: reserve, touch, release with delay 0, TTR timeout, delay expiry, pause-tube, use/watch. |
+| Record content | Full job record (tube + body) the first time, short records later; the last record of a job wins on replay. |
+| Replay | Reserved → ready. Delayed with a passed deadline → ready (`delay` still reported). Jobs are replayed in first-record order, which sets buried FIFO order, ready ties and tube creation order (`list-tubes`). Tubes with no jobs are not recreated. Replaying a buried job increments `buries` again (shows 2 after one bury). |
+| Counters after restart | Per-job counters (`reserves`, `releases`, ...) come from the last journaled record. Cumulative server and tube counters (`cmd-*`, `total-jobs`) reset; recovered jobs don't count toward `total-jobs`. |
+| Time | Wall clock (`gettimeofday`): `created_at` and delay deadlines persist, so `age` and remaining delays continue across downtime. |
+| Job ids | Next id = highest id seen in the binlog + 1 (a deleted job's id is not reused while its records remain). |
+| Files | `binlog.N` plus a `lock` file (fcntl lock). A second instance on the same directory exits with status 10. Files are preallocated to `-s` rounded up to 4096; `binlog-max-size` reports `-s` unrounded. A new file is started on startup. |
+| Space reservation | Space for a job's future records is reserved at put time; if it cannot be reserved the put replies `OUT_OF_MEMORY`. A write error silently disables the WAL. |
+| Compaction | Ratio-based: while (allocated − live) / live ≥ 2, move one live job out of the oldest file. |
+| fsync | `-f MS`: at most once per MS ms (default 50), not awaited before replying. `-f0`: fsync on every write, before the reply. `-F`: never. |
+
+### 4.2 Design decisions
+
+1. **Time**: the server passes `now = wall-clock nanoseconds at startup + monotonic elapsed`, so time is monotonic but wall-anchored. Deadlines and `created_at` persist as they are, as in the reference.
+2. **Journal**: when enabled (`EngineConfig::journal`, on only with `-b`), the engine appends a `JournalEntry` to an internal buffer at exactly the reference's journaled transitions; the actor drains it after every engine call (no signature changes). Each entry is a snapshot of the job record (the body and tube only in the first entry), so the last entry wins.
+3. **Recovery**: `Engine::recover(now, cfg, sys, recovered)` takes recovered jobs in the reference's replay order, each in its final state, plus the next job id computed by the store (highest id in any surviving record + 1, including deleted jobs whose records remain), and applies the replay rules in 4.1 (including the `buries` quirk).
+3a. **Binlog stats**: the store owns `binlog-oldest-index`, `binlog-current-index`, `binlog-records-written` and `binlog-records-migrated`; the actor pushes them to the engine with `Engine::set_binlog_stats` after each write, and the engine reports them in `stats`. In the reference, compaction moves also count as records written.
+4. **Write before reply**: the actor moves to a dedicated OS thread. It writes the drained journal synchronously before releasing that call's replies; with `-f0` it also fsyncs first. This holds in every mode, so a reply is never sent for a change that has not reached the OS.
+5. **Space reservation**: before passing a completed put to the engine, the actor reserves WAL space; on failure the put completes as a new `PutRejection::OutOfMemory` (put side effects already applied, `OUT_OF_MEMORY` reply). The oracle crate is updated mechanically for the new variant.
+6. **Write errors**: fail-stop (log and exit non-zero) instead of silently disabling the WAL, so no reply is ever sent for an unpersisted change. Recorded as a COMPAT difference.
+7. **Layout**: our own file format (CRC-checked records, torn-tail truncation). File numbering and compaction moves may differ from the reference, so the following are masked in differential tests: `file`, `binlog-oldest-index`, `binlog-current-index` and `binlog-records-migrated`. `binlog-records-written` stays compared in cases that never trigger compaction (it also counts compaction moves), which checks that we journal the same transitions. Order after a compaction (buried FIFO, `list-tubes`) may differ from the reference; declared in COMPAT, and restart cases stay pre-compaction.
+
+### 4.3 Tasks
+
+| ID | Task | Owner | Depends on | Wave |
+|---|---|---|---|---|
+| P1-T0 | Contracts: `JournalEntry`, `EngineConfig::journal`, `Engine::recover`, `Engine::set_binlog_stats`, `PutRejection::OutOfMemory`, `bstk-store` API, time anchor | lead | — | 0 |
+| P1-T1 | `bstk-store`: segments, lock, records + CRC, reservation, compaction, fsync policy, recovery | subagent | T0 | 1 |
+| P1-T2 | Engine: journal at the reference's transitions, `recover`, replay quirks | subagent | T0 | 1 |
+| P1-T3 | Harness: `restart` / `crash` directives, per-server `-b` directories, `-b` mode for the whole corpus, masks, restart cases | subagent | T0 | 1 |
+| P1-T4 | Server: `-b -f -F -s`, actor on an OS thread, write-before-reply, reservation, fail-stop, lock handling | subagent | T1, T2 | 2 |
+| P1-T5 | Differential convergence with `-b`; crash, corruption and compaction tests; WAL benchmarks | subagent(s) | T3, T4 | 3 |
+| P1-T6 | P1 acceptance | lead | all | 4 |
+
+### 4.4 Tests
+
+- **Store**: unit tests; truncation of the last record at every byte offset; CRC corruption; crash in the middle of compaction (the same job in two files, last wins); a deleted job is never resurrected while its delete record survives; proptest of random operation sequences with recovery at arbitrary points.
+- **Engine**: proptest that runs random sequences, recovers from the journal, and compares with the expected post-restart state derived from the live state (reserved → ready, counters per 4.1).
+- **Differential**: the whole corpus with `-b`; new restart and crash cases covering 4.1 (orders, counters, delays across downtime, ids).
+- **Durability**: kill -9 at random points under load in every fsync mode: every acknowledged `INSERTED` job exists after restart; every acknowledged `DELETED` job is gone; acknowledged bury and release states persist. For `-f0`, an instrumented file layer proves the order write → fsync → reply.
+- **Compaction**: long churn with a small `-s`: disk usage stays bounded and the state after restart is correct.
+- **Performance**: benchmarks with `-b` against the reference with the same `-f` / `-F` settings.
+
+### 4.5 Acceptance
+
+- [ ] `scripts/check.sh` green, including the `-b` differential mode and restart cases, 3 consecutive runs
+- [ ] Recovery robustness tests pass (truncation at every offset, CRC, mid-compaction crash)
+- [ ] Durability: zero lost acknowledged changes across ≥ 100 random kill -9 runs per fsync mode
+- [ ] Compaction churn: disk usage bounded, correct state after restart
+- [ ] Real-client smoke tests pass with `-b` as well
+- [ ] Engine oracle and invariant proptests still pass; throughput without `-b` not regressed (±5%)
+- [ ] Throughput with `-b` ≥ 0.8× the reference in every fsync mode
+- [ ] `docs/COMPAT.md`, `docs/DESIGN.md` and `docs/BENCH.md` updated

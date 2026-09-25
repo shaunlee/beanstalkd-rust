@@ -181,9 +181,10 @@ pub enum Frame {
     Error(Response),
 }
 
-/// Why a `put` was rejected by the codec. Replies: `JobTooBig` →
-/// `JOB_TOO_BIG`, `TrailingGarbage` → `BAD_FORMAT`, `ExpectedCrlf` →
-/// `EXPECTED_CRLF`.
+/// Why a `put` was rejected. The first three come from the codec; replies:
+/// `JobTooBig` → `JOB_TOO_BIG`, `TrailingGarbage` → `BAD_FORMAT`,
+/// `ExpectedCrlf` → `EXPECTED_CRLF`. `OutOfMemory` comes from the server
+/// when binlog space for the job cannot be reserved (`OUT_OF_MEMORY`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PutRejection {
     /// Body size above `max_job_size`; the body has been discarded.
@@ -192,6 +193,9 @@ pub enum PutRejection {
     TrailingGarbage,
     /// The body was not followed by `\r\n`.
     ExpectedCrlf,
+    /// The body was complete but binlog space could not be reserved
+    /// (`walresvput` failing in prot.c).
+    OutOfMemory,
 }
 
 impl PutRejection {
@@ -201,6 +205,7 @@ impl PutRejection {
             PutRejection::JobTooBig => Response::JobTooBig,
             PutRejection::TrailingGarbage => Response::BadFormat,
             PutRejection::ExpectedCrlf => Response::ExpectedCrlf,
+            PutRejection::OutOfMemory => Response::OutOfMemory,
         }
     }
 }

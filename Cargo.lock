@@ -146,6 +146,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstk-store"
+version = "0.1.0"
+dependencies = [
+ "bstk-engine",
+ "bstk-proto",
+ "bytes",
+ "proptest",
+]
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

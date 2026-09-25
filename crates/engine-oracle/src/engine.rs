@@ -239,7 +239,8 @@ impl Engine {
         let started = c.pending_put.take().is_some();
         if !started {
             self.cmd_put += 1;
-            if why == PutRejection::ExpectedCrlf {
+            // Both paths run after `connsetproducer` and `make_job`.
+            if matches!(why, PutRejection::ExpectedCrlf | PutRejection::OutOfMemory) {
                 self.connsetproducer(conn);
                 self.next_job_id += 1;
             }

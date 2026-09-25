@@ -30,7 +30,10 @@ use bstk_proto::{
 
 use crate::model::{ConnState, JobRec, JobState, PendingPut, TubeId, TubeState};
 use crate::ms::Ms;
-use crate::{ConnId, EngineConfig, NANOS_PER_SEC, Nanos, Outbox, SysInfo};
+use crate::{
+    BinlogStats, ConnId, EngineConfig, JournalEntry, NANOS_PER_SEC, Nanos, Outbox, Recovery,
+    SysInfo,
+};
 
 /// `SAFETY_MARGIN` in conn.c: 1 second.
 const SAFETY_MARGIN: Nanos = NANOS_PER_SEC;
@@ -289,7 +292,8 @@ impl Engine {
         let started = c.pending_put.take().is_some();
         if !started {
             self.cmd_put += 1;
-            if why == PutRejection::ExpectedCrlf {
+            // Both paths run after `connsetproducer` and `make_job`.
+            if matches!(why, PutRejection::ExpectedCrlf | PutRejection::OutOfMemory) {
                 self.connsetproducer(conn);
                 self.next_job_id += 1;
             }
@@ -404,6 +408,26 @@ impl Engine {
 
     pub fn set_draining(&mut self, on: bool) {
         self.draining = on;
+    }
+
+    pub fn recover(
+        now: Nanos,
+        cfg: EngineConfig,
+        sys: Box<dyn SysInfo>,
+        recovery: Recovery,
+    ) -> Self {
+        let _ = (now, cfg, sys, recovery);
+        todo!("P1-T2")
+    }
+
+    pub fn take_journal(&mut self, buf: &mut Vec<JournalEntry>) {
+        let _ = buf;
+        todo!("P1-T2")
+    }
+
+    pub fn set_binlog_stats(&mut self, stats: BinlogStats) {
+        let _ = stats;
+        todo!("P1-T2")
     }
 }
 

@@ -66,6 +66,9 @@ pub struct EngineConfig {
     /// `-s`; reported as `binlog-max-size` in stats. The reference reports
     /// its default even when the binlog is disabled.
     pub binlog_max_size: u64,
+    /// Record journal entries at the reference's binlog transitions (`-b`).
+    /// When false, `take_journal` always yields nothing.
+    pub journal: bool,
 }
 
 /// Default binlog file size (`Filesizedef` in dat.h).
@@ -76,8 +79,84 @@ impl Default for EngineConfig {
         EngineConfig {
             max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
             binlog_max_size: DEFAULT_BINLOG_MAX_SIZE,
+            journal: false,
         }
     }
+}
+
+/// Persistent job state as of a journaled transition (the reference's
+/// `Jobrec`). Times are engine `Nanos`, which the server anchors to the wall
+/// clock so they stay meaningful across restarts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobRecord {
+    pub id: bstk_proto::JobId,
+    pub pri: u32,
+    /// Delay in whole seconds, as last set by put or release.
+    pub delay: u32,
+    /// TTR in whole seconds (already bumped from 0 to 1).
+    pub ttr: u32,
+    pub created_at: Nanos,
+    /// When a delayed job becomes ready; 0 for other states.
+    pub deadline_at: Nanos,
+    pub state: RecordState,
+    pub reserve_ct: u32,
+    pub timeout_ct: u32,
+    pub release_ct: u32,
+    pub bury_ct: u32,
+    pub kick_ct: u32,
+}
+
+/// Job state in a journal record. A reserved job is never journaled as
+/// such (reserve is not a journaled transition).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordState {
+    Ready,
+    Delayed,
+    Buried,
+}
+
+/// One binlog record, emitted at exactly the transitions the reference
+/// writes (see docs/PLAN.md §4.1). The last record of a job wins on replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JournalEntry {
+    /// The job's first record: full state plus tube and body.
+    Put {
+        record: JobRecord,
+        tube: bstk_proto::TubeName,
+        body: bytes::Bytes,
+    },
+    /// A later transition (release with delay, bury, kick, kick-job).
+    Update(JobRecord),
+    /// The job was deleted.
+    Delete(bstk_proto::JobId),
+}
+
+/// A job rebuilt from the binlog, in its final journaled state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveredJob {
+    pub record: JobRecord,
+    pub tube: bstk_proto::TubeName,
+    pub body: bytes::Bytes,
+}
+
+/// What the store hands to `Engine::recover`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Recovery {
+    /// Live jobs in the reference's replay order (order of each job's first
+    /// surviving record).
+    pub jobs: Vec<RecoveredJob>,
+    /// Highest job id in any surviving record (live or deleted) + 1, and at
+    /// least 1.
+    pub next_id: bstk_proto::JobId,
+}
+
+/// Binlog fields of `stats`, owned by the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BinlogStats {
+    pub oldest_index: u64,
+    pub current_index: u64,
+    pub records_written: u64,
+    pub records_migrated: u64,
 }
 
 /// Public API surface (implemented in `engine.rs`):
@@ -112,6 +191,17 @@ impl Default for EngineConfig {
 ///     pub fn tick(&mut self, now: Nanos, out: &mut Outbox);
 ///     /// Earliest time `tick` must be called, if any.
 ///     pub fn next_deadline(&self) -> Option<Nanos>;
+///     /// Rebuild state after a restart from the binlog (docs/PLAN.md §4.1):
+///     /// reserved jobs were never journaled as such; delayed jobs whose
+///     /// deadline has passed become ready; replaying a buried job counts
+///     /// one more bury; cumulative counters start at zero; recovered jobs
+///     /// don't count toward `total-jobs`. Emits no journal entries.
+///     pub fn recover(now: Nanos, cfg: EngineConfig, sys: Box<dyn SysInfo>, recovery: Recovery) -> Self;
+///     /// Move all pending journal entries into `buf` (appending, in order).
+///     pub fn take_journal(&mut self, buf: &mut Vec<JournalEntry>);
+///     /// Binlog fields reported by `stats`, pushed by the server after
+///     /// every binlog write.
+///     pub fn set_binlog_stats(&mut self, stats: BinlogStats);
 ///     /// SIGUSR1 drain mode (put -> DRAINING).
 ///     pub fn set_draining(&mut self, on: bool);
 /// }
