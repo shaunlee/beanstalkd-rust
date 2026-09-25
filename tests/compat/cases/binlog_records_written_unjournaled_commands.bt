@@ -2,7 +2,7 @@
 !binlog
 @a send "put 0 0 1 1\r\na\r\n"
 @a recv
-@a send "put 0 1 60 1\r\nb\r\n"
+@a send "put 0 2 60 1\r\nb\r\n"
 @a recv
 @a send "stats\r\n"
 @a recv
@@ -42,7 +42,7 @@
 @a recv
 @a send "stats\r\n"
 @a recv
-sleep 2500ms
+sleep 2800ms
 @a send "reserve-with-timeout 0\r\n"
 @a recv
 @a send "stats-job 1\r\n"

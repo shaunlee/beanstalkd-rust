@@ -12,6 +12,14 @@
 #   SMOKE_CLIENTS  clients to run     (default: "python go")
 #   SMOKE_TIMEOUT  per-client watchdog in seconds (default: 120)
 #   SMOKE_OUT      where transcripts are kept (default: a temp dir)
+#   SMOKE_BINLOG   1: run both servers with -b <fresh dir under SMOKE_OUT>
+#                  and mask the binlog layout fields (docs/COMPAT.md D8)
+#   SMOKE_RESTART  1 (implies SMOKE_BINLOG=1): the client leaves jobs in
+#                  known states and holds two reservations, both servers
+#                  are killed with SIGKILL and restarted on the same binlog
+#                  dir, and the client dumps the recovered state
+#   SMOKE_SERVER_ARGS  extra server arguments for both servers, e.g. "-f0"
+#                  or "-F" (split on whitespace)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,6 +30,12 @@ SMOKE_CLIENTS="${SMOKE_CLIENTS:-python go}"
 SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-120}"
 OUT="${SMOKE_OUT:-$(mktemp -d "${TMPDIR:-/tmp}/bstk-smoke.XXXXXX")}"
 mkdir -p "$OUT"
+SMOKE_RESTART="${SMOKE_RESTART:-0}"
+SMOKE_BINLOG="${SMOKE_BINLOG:-0}"
+[ "$SMOKE_RESTART" = 1 ] && SMOKE_BINLOG=1
+read -r -a SERVER_ARGS <<<"${SMOKE_SERVER_ARGS:-}"
+NORMALIZE_ARGS=()
+[ "$SMOKE_BINLOG" = 1 ] && NORMALIZE_ARGS=(--binlog)
 
 die() { echo "run-smoke: $*" >&2; exit 1; }
 
@@ -62,16 +76,21 @@ PIDS=()
 cleanup() {
   local p
   for p in "${PIDS[@]:-}"; do
-    [ -n "$p" ] && kill "$p" 2>/dev/null || true
+    [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
   done
+  # Only remove what this script created.
+  rm -rf "$OUT/binlog" "$OUT/hold.fifo"
 }
 trap cleanup EXIT
 
-# start_server NAME BIN -> sets SERVER_PORT, SERVER_PID
+# start_server NAME BIN [BINLOG_DIR] -> sets SERVER_PORT, SERVER_PID.
+# Always a fresh port: a restarted server must not depend on SO_REUSEADDR.
 start_server() {
-  local name="$1" bin="$2"
+  local name="$1" bin="$2" dir="${3:-}" args=()
+  [ -n "$dir" ] && args=(-b "$dir")
   SERVER_PORT="$(free_port)"
-  "$bin" -l 127.0.0.1 -p "$SERVER_PORT" >"$OUT/$name.server.log" 2>&1 &
+  "$bin" -l 127.0.0.1 -p "$SERVER_PORT" ${args[@]:+"${args[@]}"} \
+    ${SERVER_ARGS[@]:+"${SERVER_ARGS[@]}"} >>"$OUT/$name.server.log" 2>&1 &
   SERVER_PID=$!
   PIDS+=("$SERVER_PID")
   wait_port "$SERVER_PORT"
@@ -80,6 +99,46 @@ start_server() {
 stop_server() {
   kill "$1" 2>/dev/null || true
   wait "$1" 2>/dev/null || true
+}
+
+# SIGKILL for both servers: the reference has no SIGTERM handler anyway.
+crash_server() {
+  kill -9 "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+}
+
+# run_client NAME RAW [ARGS...]: runs the client under the watchdog,
+# appending to RAW; returns its status.
+run_client() {
+  local name="$1" raw="$2"; shift 2
+  with_timeout "$SMOKE_TIMEOUT" "${CLIENT_CMD[@]}" "$@" "127.0.0.1:$SERVER_PORT" \
+    >>"$raw" 2>>"$OUT/$name.err"
+}
+
+# run_restart NAME BIN DIR RAW: phase 1 (full flow + leftover jobs, client
+# holds its reservations), SIGKILL the server, restart it on the same binlog
+# dir, phase 2 (dump the recovered state). Returns non-zero on any failure.
+run_restart() {
+  local name="$1" bin="$2" dir="$3" raw="$4" fifo="$OUT/hold.fifo" cpid rc=0 i
+  rm -f "$fifo"; mkfifo "$fifo"
+  with_timeout "$SMOKE_TIMEOUT" "${CLIENT_CMD[@]}" --leave-jobs "127.0.0.1:$SERVER_PORT" \
+    <"$fifo" >>"$raw" 2>>"$OUT/$name.err" &
+  cpid=$!
+  exec 3>"$fifo" # opening the write end unblocks the client's stdin
+  for i in $(seq 1 $((SMOKE_TIMEOUT * 10))); do
+    grep -q '^HOLDING$' "$raw" && break
+    kill -0 "$cpid" 2>/dev/null || break
+    sleep 0.1
+  done
+  grep -q '^HOLDING$' "$raw" || rc=1
+  crash_server "$SERVER_PID"
+  exec 3>&-
+  wait "$cpid" || rc=1
+  rm -f "$fifo"
+  [ "$rc" = 0 ] || return 1
+  echo "--- server killed (SIGKILL) and restarted on the same binlog ---" >>"$raw"
+  start_server "$name" "$bin" "$dir"
+  run_client "$name" "$raw" --after-restart
 }
 
 # Client command lines (the address is appended).
@@ -111,10 +170,23 @@ for client in $SMOKE_CLIENTS; do
   status=()
   for server in ref rs; do
     if [ "$server" = ref ]; then bin="$REF_BIN"; else bin="$RS_BIN"; fi
-    # A fresh server per (client, server) so counters start from zero.
-    start_server "$client-$server" "$bin"
-    raw="$OUT/$client-$server.raw.txt"
-    if with_timeout "$SMOKE_TIMEOUT" "${CLIENT_CMD[@]}" "127.0.0.1:$SERVER_PORT" >"$raw" 2>"$OUT/$client-$server.err"; then
+    name="$client-$server"
+    raw="$OUT/$name.raw.txt"
+    : >"$raw"; : >"$OUT/$name.err"; : >"$OUT/$name.server.log"
+    dir=""
+    if [ "$SMOKE_BINLOG" = 1 ]; then
+      dir="$OUT/binlog/$name"
+      rm -rf "$dir"; mkdir -p "$dir"
+    fi
+    # A fresh server (and binlog dir) per (client, server) so counters
+    # start from zero.
+    start_server "$name" "$bin" "$dir"
+    if [ "$SMOKE_RESTART" = 1 ]; then
+      run_restart "$name" "$bin" "$dir" "$raw" && rc=0 || rc=1
+    else
+      run_client "$name" "$raw" && rc=0 || rc=1
+    fi
+    if [ "$rc" = 0 ]; then
       status+=(0)
     else
       status+=(1)
@@ -123,7 +195,9 @@ for client in $SMOKE_CLIENTS; do
       failed=1
     fi
     stop_server "$SERVER_PID"
-    python3 "$CLIENTS_DIR/normalize.py" <"$raw" >"$OUT/$client-$server.txt"
+    [ -n "$dir" ] && rm -rf "$dir"
+    python3 "$CLIENTS_DIR/normalize.py" ${NORMALIZE_ARGS[@]:+"${NORMALIZE_ARGS[@]}"} \
+      <"$raw" >"$OUT/$name.txt"
   done
 
   if diff -u "$OUT/$client-ref.txt" "$OUT/$client-rs.txt" >"$OUT/$client.diff"; then
@@ -138,5 +212,9 @@ for client in $SMOKE_CLIENTS; do
   fi
 done
 
+mode="default"
+[ "$SMOKE_BINLOG" = 1 ] && mode="binlog"
+[ "$SMOKE_RESTART" = 1 ] && mode="binlog+restart"
+echo "mode: $mode; server args: ${SMOKE_SERVER_ARGS:-(none)}"
 echo "transcripts: $OUT"
 exit "$failed"

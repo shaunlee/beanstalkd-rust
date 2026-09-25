@@ -1,7 +1,7 @@
 # a put followed immediately by close: the job is still inserted and the producer count drops.
 @c1 send "put 0 0 60 1\r\nx\r\n"
 @c1 close
-sleep 200ms
+sleep 500ms
 @p send "stats-job 1\r\n"
 @p recv
 @p send "stats\r\n"

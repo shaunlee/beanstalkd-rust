@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+mod ordering;
 mod proptests;
 mod recovery;
 mod unit;

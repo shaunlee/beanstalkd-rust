@@ -20,7 +20,7 @@
 @c2 send "list-tubes\r\n"
 @c2 recv
 @c1 close
-sleep 200ms
+sleep 500ms
 @c2 send "list-tubes\r\n"
 @c2 recv
 @c2 send "list-tubes-watched\r\n"

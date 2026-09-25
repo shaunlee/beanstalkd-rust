@@ -1,0 +1,17 @@
+# a waiter holding a reserved job half-closes: it gets TIMED_OUT, and the
+# server then reads EOF on the connection and closes it, which releases the job.
+# The job state is only checked after the server-side close: between sending
+# TIMED_OUT and handling the pending EOF, the job is still reserved, but whether
+# another client's command lands inside that window is a race inside the
+# reference (it flips under load), so it is not observed here.
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@h send "reserve\r\n"
+@h recv
+@h send "reserve\r\n"
+sleep 100ms
+@h shutdown_write
+@h recv
+@h recv_closed 500ms
+@p send "stats-job 1\r\n"
+@p recv

@@ -163,6 +163,21 @@ pub(crate) struct Inner {
     /// Jobs moved by compaction.
     #[cfg(test)]
     pub(crate) moved: std::collections::HashSet<JobId>,
+    /// Every write and fsync, in order (test instrumentation only).
+    #[cfg(test)]
+    pub(crate) file_ops: Vec<FileOp>,
+}
+
+/// A file operation recorded for the ordering tests.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileOp {
+    /// `len` bytes written to `binlog.<seg>` at `off`.
+    Write { seg: u64, off: u64, len: u64 },
+    /// fdatasync of `binlog.<seg>`.
+    Sync { seg: u64 },
+    /// fsync of the directory.
+    DirSync,
 }
 
 fn sync_fd(f: &File) -> io::Result<()> {
@@ -309,6 +324,8 @@ impl Inner {
             sync_count: 0,
             #[cfg(test)]
             moved: Default::default(),
+            #[cfg(test)]
+            file_ops: Vec::new(),
         };
         w.disk_total = w.segs.iter().map(|s| s.size).sum();
         w.allocate()?;
@@ -395,6 +412,8 @@ impl Inner {
         }
         if self.policy != SyncPolicy::Never {
             sync_dir(&self.dir_file)?;
+            #[cfg(test)]
+            self.file_ops.push(FileOp::DirSync);
         }
         self.disk_total += self.seg_size;
         self.segs.push_back(Seg {
@@ -476,6 +495,12 @@ impl Inner {
             .as_ref()
             .ok_or_else(|| io::Error::other("current binlog segment is not open"))?;
         f.write_all_at(&self.buf, self.buf_start)?;
+        #[cfg(test)]
+        self.file_ops.push(FileOp::Write {
+            seg: c.index,
+            off: self.buf_start,
+            len: self.buf.len() as u64,
+        });
         self.buf_start += self.buf.len() as u64;
         self.buf.clear();
         self.unsynced = true;
@@ -490,6 +515,8 @@ impl Inner {
         #[cfg(test)]
         {
             self.sync_count += 1;
+            let seg = self.segs[self.cur].index;
+            self.file_ops.push(FileOp::Sync { seg });
         }
         Ok(())
     }
@@ -713,6 +740,8 @@ impl Inner {
         }
         if removed && self.policy == SyncPolicy::Always {
             sync_dir(&self.dir_file)?;
+            #[cfg(test)]
+            self.file_ops.push(FileOp::DirSync);
         }
         Ok(())
     }

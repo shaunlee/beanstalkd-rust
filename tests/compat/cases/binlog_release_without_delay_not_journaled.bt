@@ -19,6 +19,6 @@ restart
 @a recv
 @a send "stats\r\n"
 @a recv
-crash 1500ms
+crash 1800ms
 @a send "stats-job 1\r\n"
 @a recv

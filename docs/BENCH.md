@@ -1,9 +1,156 @@
 # Benchmarks
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
-driven by the `bstk-bench` load generator (`bench/`). The current numbers
-are from task T6b (engine performance fix). The T6 first pass, whose
-profile motivated T6b, is kept at the end.
+driven by the `bstk-bench` load generator (`bench/`). The newest numbers
+are from task P1-T5 (write-ahead log, `-b`), first below. The T6b section
+(engine performance fix) follows, and the T6 first pass, whose profile
+motivated T6b, is kept at the end.
+
+## P1: write-ahead log (`-b`)
+
+### Summary (P1-T5)
+
+- **Every `-b` cell reaches at least 0.8x of the optimized reference, in
+  every fsync mode.** With `-F` and the default `-f 50`, beanstalkd-rs runs
+  at 1.25x to 1.73x of the reference. One noisy cell reached 2.44x: `-F`
+  10x16, where the reference's own runs spread by more than 20%. With `-f0`, the 16-byte cells run at
+  1.23x to 1.73x. The 4 KiB `-f0` cells are fsync-bound on both servers
+  (about 21k to 31k ops/s, neither server uses half a core), so they come
+  out at parity: 0.98x to 1.04x over 5 runs each. Their first 3-run pass gave
+  0.81x to 1.20x, with runs spread by more than 20%.
+- **No regression without `-b`.** In the same session the no-`-b` cells are
+  1.12x to 1.33x of the reference. In T6b they were 0.88x to 1.11x (see below).
+  Without `-b` the engine actor is still a tokio task; only `-b` moves it to
+  an OS thread.
+- Why `-b` costs us less than it costs the reference: the reference's
+  `filewrjobshort` / `filewrjobfull` (file.c) issue one `write()` per field.
+  That is 2 syscalls per update record and 4 per full put record, all on its
+  single event-loop thread. beanstalkd-rs encodes one message's records into
+  a buffer and issues one `pwrite` per engine message (wal.rs `flush`), on
+  the engine thread, while connection I/O runs on other threads.
+  Its CPU use is higher (1.6 to 3 cores vs at most 1), as without `-b`.
+
+### Environment (P1-T5)
+
+| | |
+|---|---|
+| Machine | Apple M6, 12 cores, 32 GB RAM; APFS on the internal SSD (binlog directories under `/private/tmp`) |
+| OS | macOS 27.0 (Darwin 27.0.0, arm64) |
+| Rust | rustc 1.98.1; release build (opt-level 3, `debug = 1`) |
+| Reference | `.ref/beanstalkd-opt/beanstalkd` (`scripts/build-ref.sh --optimized`, `-O2`) |
+| Load generator | `bstk-bench`, same machine, loopback, 5 s per run, a fresh server process and a fresh empty binlog directory per run, ref and rs runs alternating |
+| fsync | Both servers use plain `fsync`/`fdatasync`, not `F_FULLFSYNC` (docs/COMPAT.md, Binlog §10). On macOS this reaches the drive cache, not stable storage, so the absolute `-f0` numbers are optimistic for both servers. |
+| Background load | **Not idle.** There was no compilation or test activity during the runs. An OrbStack VM owned by another user (a Docker soak test) was running. The 1-minute load average was 6.1 at the start and 5.7 at the end, and 3.4 to 12.3 across runs (CSV `load_avg` column). Because the runs alternate, drift affects both servers alike. |
+
+### Commands (P1-T5)
+
+```sh
+scripts/build-ref.sh --optimized
+cargo build --release -p bstk-server -p bstk-bench
+# SERVER_MODES (new): none | F | default | f0, applied to both servers;
+# every run gets a fresh -b directory under BINLOG_ROOT, removed afterwards.
+OUT_CSV=p1-matrix.csv SCENARIOS="put-reserve-delete producers-consumers" \
+  CONNS="10 100" BODIES="16 4096" RUNS=3 DURATION=5 \
+  SERVER_MODES="none F default f0" bench/run-matrix.sh
+# Re-run of the noisy fsync-bound cells with 5 runs.
+OUT_CSV=p1-f0-rerun.csv SCENARIOS="put-reserve-delete producers-consumers" \
+  CONNS="10 100" BODIES=4096 RUNS=5 SERVER_MODES=f0 bench/run-matrix.sh
+bench/summarize.py p1-matrix.csv
+```
+
+The CSVs have a new `server_mode` column. `summarize.py` groups by it and
+reads old CSVs, which lack it, as mode `none`. Server arguments: `-b <dir>`
+with default `-s` (10 MiB), plus `-F` or `-f0`. Raw data:
+`bench/results/2026-09-25-p1-matrix.csv` and
+`bench/results/2026-09-25-p1-f0-rerun.csv`.
+
+### Results (P1-T5)
+
+Medians of 3 runs (`*` = runs spread by more than 20%). The 4 KiB `-f0`
+rows show the 5-run re-run; the first 3-run pass is in brackets.
+
+| mode | scenario | conns | body | ref ops/s | rs ops/s | rs/ref | ref CPU % | rs CPU % | ref put p99 µs | rs put p99 µs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| none | put-reserve-delete | 10 | 16 | 65,984* | 87,947* | 1.33 | 94 | 163 | 244 | 212 |
+| F | put-reserve-delete | 10 | 16 | 47,346* | 115,759* | 2.44 | 83 | 176 | 397 | 208 |
+| default | put-reserve-delete | 10 | 16 | 75,990* | 110,669* | 1.46 | 82 | 181 | 233 | 206 |
+| f0 | put-reserve-delete | 10 | 16 | 32,846* | 56,801* | 1.73 | 65 | 160 | 548 | 298 |
+| none | put-reserve-delete | 10 | 4096 | 135,948 | 175,792 | 1.29 | 73 | 138 | 131 | 109 |
+| F | put-reserve-delete | 10 | 4096 | 105,610 | 134,342 | 1.27 | 95 | 172 | 210 | 142 |
+| default | put-reserve-delete | 10 | 4096 | 106,388 | 132,542 | 1.25 | 95 | 170 | 202 | 144 |
+| f0 | put-reserve-delete | 10 | 4096 | 26,852* | 27,399* | 1.02 (1.04) | 35 | 52 | 395 | 306 |
+| none | put-reserve-delete | 100 | 16 | 190,102 | 219,985 | 1.16 | 99 | 180 | 709 | 617 |
+| F | put-reserve-delete | 100 | 16 | 126,124 | 200,634 | 1.59 | 98 | 242 | 1,292 | 718 |
+| default | put-reserve-delete | 100 | 16 | 128,791 | 202,455 | 1.57 | 99 | 236 | 1,207 | 729 |
+| f0 | put-reserve-delete | 100 | 16 | 50,246 | 70,486 | 1.40 | 62 | 122 | 4,456 | 2,112 |
+| none | put-reserve-delete | 100 | 4096 | 180,961 | 202,883 | 1.12 | 99 | 206 | 941 | 647 |
+| F | put-reserve-delete | 100 | 4096 | 110,235 | 175,790 | 1.59 | 99 | 273 | 8,545 | 1,865 |
+| default | put-reserve-delete | 100 | 4096 | 109,082 | 173,493 | 1.59 | 98 | 266 | 8,838 | 2,064 |
+| f0 | put-reserve-delete | 100 | 4096 | 23,087* | 24,022* | 1.04 (0.93) | 31 | 50 | 10,397 | 3,221 |
+| none | producers-consumers | 10 | 16 | 141,413 | 179,357 | 1.27 | 70 | 133 | 111 | 105 |
+| F | producers-consumers | 10 | 16 | 111,961 | 140,186 | 1.25 | 91 | 167 | 155 | 128 |
+| default | producers-consumers | 10 | 16 | 111,475 | 139,965 | 1.26 | 90 | 167 | 163 | 130 |
+| f0 | producers-consumers | 10 | 16 | 50,463 | 61,887 | 1.23 | 63 | 118 | 288 | 235 |
+| none | producers-consumers | 10 | 4096 | 128,196 | 166,333 | 1.30 | 73 | 151 | 132 | 124 |
+| F | producers-consumers | 10 | 4096 | 98,096 | 124,803 | 1.27 | 97 | 185 | 213 | 170 |
+| default | producers-consumers | 10 | 4096 | 96,175 | 124,815 | 1.30 | 96 | 181 | 236 | 174 |
+| f0 | producers-consumers | 10 | 4096 | 23,987* | 23,718* | 0.99 (1.20) | 34 | 50 | 469 | 363 |
+| none | producers-consumers | 100 | 16 | 170,879* | 199,859* | 1.17 | 94 | 207 | 751 | 688 |
+| F | producers-consumers | 100 | 16 | 106,897* | 164,339* | 1.54 | 98 | 268 | 1,468 | 983 |
+| default | producers-consumers | 100 | 16 | 105,839* | 183,411* | 1.73 | 98 | 269 | 1,489 | 774 |
+| f0 | producers-consumers | 100 | 16 | 46,453 | 60,590 | 1.30 | 59 | 116 | 2,908 | 2,148 |
+| none | producers-consumers | 100 | 4096 | 173,899 | 195,662 | 1.13 | 98 | 232 | 955 | 699 |
+| F | producers-consumers | 100 | 4096 | 101,023 | 168,223 | 1.67 | 98 | 297 | 8,483 | 1,560 |
+| default | producers-consumers | 100 | 4096 | 100,728 | 164,667 | 1.63 | 98 | 292 | 8,589 | 1,552 |
+| f0 | producers-consumers | 100 | 4096 | 26,770* | 26,306* | 0.98 (0.81) | 36 | 55 | 9,921 | 3,673 |
+
+- **Acceptance (≥ 0.8x in every `-b` cell): met.** The lowest `-b` cell is
+  `-f0` producers-consumers 100x4096: 0.98x over 5 runs, 0.81x in the first
+  3-run pass.
+- **The 4 KiB `-f0` cells are bound by the device.** Each server
+  fsyncs once per journaled write: the reference once per record from
+  `walwrite`, beanstalkd-rs once per engine message (usually one record).
+  Throughput is the same (about 21k to 31k ops/s) at 10 and 100
+  connections. The spread between identical runs is 20 to 50% on both
+  servers, and neither is CPU-bound (reference 31 to 37%, beanstalkd-rs 46
+  to 67%). The 3-run medians (0.81x to 1.20x) are within that noise. The
+  5-run re-run gives 0.98x to 1.04x, and the individual runs overlap
+  completely (reference 20.2k to 29.0k, beanstalkd-rs 21.0k to 31.4k ops/s;
+  `bench/results/2026-09-25-p1-f0-rerun.csv`). The 16-byte `-f0` cells are
+  faster (47k to 70k), and there beanstalkd-rs leads by 1.23x to 1.73x.
+- **No `-b`: no regression.** Ratios in this session are 1.12x to 1.33x for
+  these 8 cells, vs 0.88x to 1.11x in T6b. Absolute ops/s differ between
+  sessions because of background load: the reference itself moved, for
+  example 121k to 190k at 100x16 put-reserve-delete. The engine actor still
+  runs as a tokio task without `-b`, so nothing on that path changed in P1.
+
+### Durability and compaction (P1-T5)
+
+These are correctness results, recorded here with their run times. The
+tests are in `crates/server/tests/durability.rs`, and the module docs give
+the commands.
+
+- **Kill -9 torture, 100 rounds per fsync mode, release build.** 4
+  concurrent clients per round. The server is SIGKILLed at a random moment
+  (0 to 1.5 s into the round) and restarted on the same directory, with `-s`
+  alternating between 64 KiB and 256 KiB. Every model job is checked after
+  each restart (state, pri, tube, body, and the `stats` totals).
+
+  | mode | rounds | acked journaled ops | ins / del / bury / release+delay / kick | unjournaled acks | unacked at kill | lost-reply puts found on disk | max binlog | violations |
+  |---|---:|---:|---|---:|---:|---:|---:|---:|
+  | `-F` | 100 | 1,688,790 | 434,736 / 433,807 / 303,416 / 281,366 / 235,465 | 1,069,146 | 348 | 6 | 2.35 MB (33 files) | **0** |
+  | default | 100 | 1,321,708 | 340,152 / 339,343 / 237,833 / 219,679 / 184,701 | 839,437 | 356 | 10 | 2.14 MB (33 files) | **0** |
+  | `-f0` | 100 | 1,004,659 | 258,988 / 258,183 / 180,698 / 166,787 / 140,003 | 639,791 | 366 | 20 | 2.21 MB (34 files) | **0** |
+
+- **Compaction churn (`-s 65536`).** A steady set of 1,000 jobs (60%
+  ready, 20% buried, 20% delayed, 7 tubes, about 382 KB of records), one
+  steady job replaced every 500 churn pairs, and 1,000,000 put + delete
+  pairs from 4 pipelining connections (bodies 16 B to 4,000 B). Throughput
+  was about 126k ops/s. The binlog peaked at 2.10 MB (33 files) during the
+  1M churn, and 1.16M compaction moves ran. After SIGTERM the directory held
+  1.9 MB, and after a further 100k pairs and SIGKILL it held 2.0 MB. The
+  exact steady set (state, pri, tube, body and `stats` counts) was
+  recovered after both restarts.
 
 ## Summary (T6b)
 

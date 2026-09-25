@@ -3,8 +3,8 @@
 
 Usage: summarize.py results.csv [more.csv ...]
 
-For every (scenario, conns, body size, pipeline, idle conns, delayed
-tubes) cell it prints the median
+For every (server mode, scenario, conns, body size, pipeline, idle conns,
+delayed tubes) cell it prints the median
 over runs of throughput, server CPU and put/reserve p99 latency for the
 reference ("ref") and beanstalkd-rs ("rs"), and the throughput ratio
 rs / ref. Cells whose runs spread by more than 20% are flagged with "*".
@@ -41,6 +41,7 @@ def main() -> int:
         with open(path, newline="") as f:
             for r in csv.DictReader(f):
                 key = (
+                    r.get("server_mode") or "none",
                     r["scenario"],
                     int(r["conns"]),
                     int(r["body_size"]),
@@ -52,25 +53,29 @@ def main() -> int:
                     order.append(key)
                 cells[key][r["server"]].append(r)
 
-    scaling = any(k[4] or k[5] for k in order)
+    scaling = any(k[5] or k[6] for k in order)
+    modes = any(k[0] != "none" for k in order)
+    mode_head = " mode |" if modes else ""
+    mode_rule = "---|" if modes else ""
     extra_head = " idle conns | delayed tubes |" if scaling else ""
     extra_rule = "---:|---:|" if scaling else ""
     print(
-        f"| scenario | conns | body | pipe |{extra_head} ref ops/s | rs ops/s | rs/ref "
+        f"|{mode_head} scenario | conns | body | pipe |{extra_head} ref ops/s | rs ops/s | rs/ref "
         "| ref CPU % | rs CPU % | ref put p99 µs | rs put p99 µs "
         "| ref reserve p99 µs | rs reserve p99 µs |"
     )
-    print(f"|---|---:|---:|---:|{extra_rule}---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    print(f"|{mode_rule}---|---:|---:|---:|{extra_rule}---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for key in order:
         ref, rs = cells[key]["ref"], cells[key]["rs"]
         r_ops, s_ops = med(ref, "ops_per_sec"), med(rs, "ops_per_sec")
         ratio = s_ops / r_ops if r_ops and s_ops else None
         noisy = spread(ref, "ops_per_sec") > 0.2 or spread(rs, "ops_per_sec") > 0.2
         flag = "*" if noisy else ""
-        scenario, conns, body, pipe, idle, delayed = key
+        mode, scenario, conns, body, pipe, idle, delayed = key
         extra = f" {idle:,} | {delayed:,} |" if scaling else ""
+        mode_col = f" {mode} |" if modes else ""
         print(
-            f"| {scenario} | {conns} | {body} | {pipe} |{extra} {fmt(r_ops)}{flag} | {fmt(s_ops)}{flag} "
+            f"|{mode_col} {scenario} | {conns} | {body} | {pipe} |{extra} {fmt(r_ops)}{flag} | {fmt(s_ops)}{flag} "
             f"| {fmt(ratio, 2)} | {fmt(med(ref, 'server_cpu_pct'))} | {fmt(med(rs, 'server_cpu_pct'))} "
             f"| {fmt(med(ref, 'put_p99_us'))} | {fmt(med(rs, 'put_p99_us'))} "
             f"| {fmt(med(ref, 'reserve_p99_us'))} | {fmt(med(rs, 'reserve_p99_us'))} |"

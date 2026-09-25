@@ -1,6 +1,6 @@
 # beanstalkd-rust Design
 
-> Status: v0.2 (matches P0 as shipped). Reference implementation: C beanstalkd commit `25085c5` (built into `.ref/` by `scripts/build-ref.sh`). See the [changelog](#9-changelog) for what changed since v0.1 and why.
+> Status: v0.3 (matches P0 and P1 as shipped). Reference implementation: C beanstalkd commit `25085c5` (built into `.ref/` by `scripts/build-ref.sh`). See the [changelog](#10-changelog) for what changed since v0.1 and why.
 
 ## 1. Goals and Non-goals
 
@@ -28,11 +28,12 @@
 │     │  mpsc<EngineMsg> (shared, unbounded)        │
 │     ▼                     ▲ per-conn unbounded     │
 │  engine actor (sole owner of Engine)              │
-│     loop { select!(msg, timer) }                  │
-│     after every message: tick(now), re-arm timer  │
+│     tokio task, or an OS thread with -b           │
+│     per message: engine call, tick(now),          │
+│       append journal to WAL, then release replies │
 └──────────────────┬───────────────────────────────┘
-                   │ (P1) Persist trait
-            store (WAL) / raft (P3)
+                   │ JournalEntry / Recovery
+            bstk-store (WAL) / raft (P3)
 ```
 
 ### Crates
@@ -45,7 +46,8 @@
 | `bstk-server` | Binary `beanstalkd-rs`: listener, connection tasks, engine actor, CLI, system info | tokio, clap, nix, getrandom, tracing |
 | `bstk-compat` (`tests/compat`) | Differential harness and `.bt` case corpus against the reference | — |
 | `bstk-bench` (`bench/`) | Load generator and benchmark matrix | tokio |
-| `bstk-store` (P1), `bstk-raft` (P3) | WAL; openraft integration | — |
+| `bstk-store` | Write-ahead log: segments, CRC records, reservation, compaction, replay | bstk-engine (types), crc32c, nix |
+| `bstk-raft` (P3) | openraft integration | — |
 
 `clients/` holds real-client smoke tests (Python greenstalk, Go go-beanstalk).
 
@@ -56,6 +58,7 @@
 - **Command ordering**: each connection has at most one command in flight to the engine. Pipelined input stays buffered, undecoded, until the previous reply arrives. This guarantees "processed and answered in order".
 - **Tick after every message**: the reference runs `prottick` on every event-loop pass, and some replies depend on it (e.g. a reserve that starts waiting inside the DEADLINE_SOON margin, COMPAT engine item 5). The actor therefore calls `tick(now)` after every engine call. This is cheap because `tick` returns at once when nothing is due (§4.3). If the actor ever drains several messages per wake-up, it must still tick between messages.
 - **Back-pressure**: replies go out over unbounded per-connection channels and are dropped if the connection is gone, so a slow client never stalls the engine.
+- **Actor placement**: without `-b` the actor is a tokio task (no blocking I/O; a thread hop per command cost 9–17% throughput). With `-b` it runs on a dedicated OS thread fed by a std channel with `recv_timeout`, so file writes and fsync never block a tokio worker.
 - **Sharding**: not implemented. `reserve` spans multiple tubes and must pick the globally most urgent job, which sharding would break.
 
 ## 4. Engine
@@ -76,12 +79,16 @@ impl Engine {
     pub fn tick(&mut self, now: Nanos, out: &mut Outbox);
     pub fn next_deadline(&self) -> Option<Nanos>;
     pub fn set_draining(&mut self, on: bool);
+    pub fn recover(now: Nanos, cfg: EngineConfig, sys: Box<dyn SysInfo>, recovery: Recovery) -> Self;
+    pub fn take_journal(&mut self, buf: &mut Vec<JournalEntry>);
+    pub fn set_binlog_stats(&mut self, stats: BinlogStats);
 }
 // Outbox = Vec<(ConnId, Response)>: one call may answer several connections.
-// EngineConfig { max_job_size, binlog_max_size }.
+// EngineConfig { max_job_size, binlog_max_size, journal }.
 ```
 
 - The engine **never** reads the clock or uses randomness. pid, hostname, rusage etc. come from the server through `SysInfo`; uptime is `now - start`.
+- The server supplies `now` as wall-clock time at startup plus monotonic elapsed time: monotonic within a run, and comparable across restarts, so persisted deadlines and `created_at` keep their meaning (as in the reference, which uses `gettimeofday`).
 - The same `(now, message sequence)` always yields the same output. This is the prerequisite for Raft replication in P3.
 - **Put side effects happen when the command line parses**, before the body arrives (COMPAT proto item 8): `put_started` counts `cmd-put` and, unless the job is too big, marks the producer and allocates the job id. The put then completes through `handle(Command::Put)` or `put_rejected`. `ConnState::pending_put` guarantees the side effects apply exactly once. Without `put_started`, `handle(Put)` and `put_rejected` apply them themselves.
 
@@ -121,6 +128,12 @@ Tube creation and destruction follow the reference's refcounting (use + watch + 
 - **kick** acts on the used tube: buried jobs if any, else delayed.
 - **Stats** counters follow prot.c exactly, including counts taken before a command is rejected.
 
+### 4.5 Journal and recovery (P1)
+
+- With `EngineConfig::journal`, the engine records a `JournalEntry` at exactly the reference's binlog transitions: put (full record with tube and body), release with a delay, bury, kick / kick-job (updates), delete. Each update is a snapshot of the job record, so the last record wins on replay.
+- `Engine::recover` rebuilds state from `Recovery` (live jobs in first-record order, the next id and the reference's replay tube order), applying the reference's replay rules: a job returns in its last journaled state, delayed jobs past their deadline become ready, replayed buried jobs count one more bury, cumulative counters start at zero. See COMPAT "Binlog".
+- The binlog stats fields come from the store through `set_binlog_stats`.
+
 ## 5. Protocol (proto)
 
 - `Command`: one variant per protocol command (put carries its body), plus `PauseTubeBadName` for a `pause-tube` whose name fails validation after the reference has already counted it.
@@ -140,23 +153,36 @@ Tube creation and destruction follow the reference's refcounting (use + watch + 
 - EOF: finish every complete buffered frame first. Half-close is sticky: once EOF is seen, `HalfClose` is re-sent after each dispatched command, so a reserve that only now starts waiting still gets `TIMED_OUT`.
 - A drop guard sends `Disconnect` on every exit path.
 - `SysInfo` via `nix` (uname, getrusage) and `getrandom`; no unsafe code.
-- CLI: `-l addr`, `-p port`, `-z max_job_size` (parsed like the reference's `sscanf("%zu")`), `-V`, `-v`. P1 adds `-b`, `-f`, `-F`, `-s`.
+- CLI: `-l addr`, `-p port`, `-z max_job_size` (parsed like the reference's `sscanf("%zu")`), `-V`, `-v`, and for the binlog `-b DIR`, `-f MS` (`-f0` = fsync every write), `-F` (never fsync), `-s BYTES` (segment size), with the reference's defaults (fsync at most every 50 ms) and ordering rules. `-u` is rejected.
+- With `-b`, for every message the actor runs the engine call and `tick`, appends the drained journal to the WAL (fsync first with `-f0`), compacts, pushes binlog stats, and only then releases the replies, so no reply is sent for a change that has not reached the OS. A completed put first reserves WAL space; if that fails it completes as `PutRejection::OutOfMemory`. Any WAL error exits with status 20 (fail-stop). Startup replays the binlog before accepting connections; a locked directory exits with status 10.
 - SIGUSR1 enters drain mode; SIGINT / SIGTERM exit gracefully. The soft `RLIMIT_NOFILE` is raised to the hard limit at startup (best effort).
 
-## 7. Later Phases (summary)
+## 7. Write-Ahead Log (P1, `bstk-store`)
 
-- **P1 WAL**: append-only segment files, CRC32 per record; record types `Put`, `State`, `Delete`; fsync every write / every N ms / never; compaction; replay on startup through a `Persist` trait. When the engine or protocol types change, decide whether to retire or keep pinning `bstk-engine-oracle`.
+- Segment files `binlog.N`, preallocated to `-s` rounded up to 4096 (at most 4 GiB), and a `lock` file held for the process lifetime.
+- Records: length, CRC-32C, then a Put (job record, tube, body), Update (job record) or Delete (id). One positioned write per append.
+- Replay: last record wins; first-record order; next id from all surviving records; the reference's tube-list order. A bad record in the last segment holding records truncates there with a warning; earlier corruption refuses to start (COMPAT D9).
+- Space: a put reserves room for its put and delete records while one spare preallocated segment always remains for updates (COMPAT D6).
+- Compaction: while (allocated − live) / live ≥ 2, move a live job out of the oldest segment; delete segments without live records. Crash-safe at every step.
+- fsync: `fdatasync`, per the `-f` / `-F` policy.
+
+## 8. Later Phases (summary)
+
 - **P2 Operability**: TLS / mTLS via rustls; optional `auth <token>` extension; HTTP `/metrics`, `/healthz`, `/admin`; TOML config.
 - **P3 Raft (openraft)**: messages are log entries; the leader proposes `Tick{now}` for time-driven transitions; reservations are replicated; followers proxy to the leader.
 - **P4 Performance**: reduce the per-command cross-thread hop (ops per CPU-second is about 0.4× the reference), O(1) buried-job removal, profiling-driven work.
 
-## 8. Compatibility Strategy
+## 9. Compatibility Strategy
 
 - **Differential testing** (`tests/compat`): the same `.bt` script runs against the reference and `beanstalkd-rs`; replies are compared byte for byte after masking volatile fields (pid, uptime, rusage, server id, hostname, version, age, time-left, pause-time-left). 189 cases, part of `scripts/check.sh`.
 - **Real clients** (`clients/run-smoke.sh`) and an **engine oracle proptest** complement it.
 - Every known difference is recorded in `docs/COMPAT.md` with its reason.
 
-## 9. Changelog
+## 10. Changelog
+
+**v0.3 (P1 shipped)**
+- Write-ahead log (`bstk-store`), engine journal and recovery, `Recovery::tube_order` (COMPAT Binlog item 4), `PutRejection::OutOfMemory`.
+- Wall-anchored engine time; actor on an OS thread with `-b`; write-before-reply; fail-stop on WAL errors (COMPAT D5–D10).
 
 **v0.2 (P0 shipped)**
 - Put side effects moved to parse time: `Frame::PutRejected`, `Frame::PutStarted`, `Engine::put_rejected`, `Engine::put_started` (COMPAT proto item 8).

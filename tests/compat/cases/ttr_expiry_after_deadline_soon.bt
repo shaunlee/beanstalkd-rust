@@ -5,7 +5,7 @@
 @h recv
 @h send "reserve\r\n"
 @h recv
-sleep 1500ms
+sleep 1800ms
 @p send "stats-job 1\r\n"
 @p recv
 @p send "stats\r\n"

@@ -1,4 +1,11 @@
 # two jobs of one connection expire together; each is re-offered to waiters in turn.
+# Timeline (TTR 1): @h's jobs expire at ~1.0s and go to @w1 / @w2, whose
+# blocking recvs return at that point; stats is taken right after, so it
+# sees 2 timeouts / 2 reserved / 0 ready with ~1s to spare before the
+# waiters' own reservations would expire (~2.0s). The second expiry is
+# deliberately not observed: under load the reference sometimes leaves a
+# waiter's re-reserved job reserved past its deadline until that waiter's
+# connection does I/O, which is not deterministic.
 @p send "put 0 0 1 1\r\na\r\n"
 @p recv
 @p send "put 0 0 1 1\r\nb\r\n"
@@ -14,8 +21,6 @@
 @w1 send "reserve\r\n"
 sleep 50ms
 @w2 send "reserve\r\n"
-sleep 50ms
-sleep 2200ms
 @w1 recv
 @w2 recv
 @p send "stats\r\n"

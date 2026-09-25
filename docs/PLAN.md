@@ -201,7 +201,7 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 | P1 | Write-ahead log; see §4 | see §4.5 |
 | P2 | TLS / mTLS, auth extension, HTTP metrics / healthz / admin, TOML config | differential tests 100% with default config; real clients connect over TLS |
 | P3 | openraft, Tick proposals, replicated reservations, follower proxy | on a 3-node cluster, random kills / partitions lose no acknowledged job and never double-deliver a reserved job (Jepsen-style tests) |
-| P4 | Profiling and optimization | throughput ≥ 1× reference; multi-core scaling curve |
+| P4 | Profiling and optimization (incl. compaction write amplification: about one extra record per operation under churn with small `-s`) | throughput ≥ 1× reference; multi-core scaling curve |
 
 ## 4. P1: Write-Ahead Log (detailed plan)
 
@@ -254,11 +254,11 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 
 ### 4.5 Acceptance
 
-- [ ] `scripts/check.sh` green, including the `-b` differential mode and restart cases, 3 consecutive runs
-- [ ] Recovery robustness tests pass (truncation at every offset, CRC, mid-compaction crash)
-- [ ] Durability: zero lost acknowledged changes across ≥ 100 random kill -9 runs per fsync mode
-- [ ] Compaction churn: disk usage bounded, correct state after restart
-- [ ] Real-client smoke tests pass with `-b` as well
-- [ ] Engine oracle and invariant proptests still pass; throughput without `-b` not regressed (±5%)
-- [ ] Throughput with `-b` ≥ 0.8× the reference in every fsync mode
-- [ ] `docs/COMPAT.md`, `docs/DESIGN.md` and `docs/BENCH.md` updated
+- [x] `scripts/check.sh` green, including the `-b` differential mode and restart cases, 3 consecutive runs (382 tests, 148 s)
+- [x] Recovery robustness tests pass (truncation at every offset, CRC, mid-compaction crash)
+- [x] Durability: zero lost acknowledged changes across ≥ 100 random kill -9 runs per fsync mode (100 rounds each, about 4M acknowledged operations, 0 violations; `-f0` write → fsync → reply order proven)
+- [x] Compaction churn: disk usage bounded, correct state after restart (1M put/delete pairs, peak 2.1 MB)
+- [x] Real-client smoke tests pass with `-b` as well, including a kill -9 and restart
+- [x] Engine oracle and invariant proptests still pass; throughput without `-b` not regressed (±5%)
+- [x] Throughput with `-b` ≥ 0.8× the reference in every fsync mode (lowest cell 0.98×, `-f0` with 4 KiB bodies, fsync-bound on both)
+- [x] `docs/COMPAT.md`, `docs/DESIGN.md` and `docs/BENCH.md` updated

@@ -7,6 +7,10 @@ stdin and writes it to stdout with volatile values masked:
 * Stats fields that legitimately differ between two server processes
   (same list as tests/compat/src/mask.rs, plus `id` in server-wide stats)
   become `<masked>`.
+* With `--binlog` (servers run with `-b`), the binlog layout fields listed
+  in docs/COMPAT.md D8 (BINLOG_MASKED_KEYS in tests/compat/src/mask.rs)
+  are masked too. `binlog-records-written` and `binlog-max-size` stay
+  compared.
 * Job ids (`job=<n>` and `id: <n>` in stats-job) are renumbered in order of
   first appearance (`job=#1`, `job=#2`, ...). This masks the absolute value
   while still checking that the same job shows up in the same places.
@@ -38,11 +42,25 @@ MASKED_KEYS = {
 # job id, which is renumbered instead.
 SERVER_STATS_ONLY_KEYS = {"id"}
 
+# Keep in sync with BINLOG_MASKED_KEYS in tests/compat/src/mask.rs. `file`
+# appears only in stats-job, the others only in server-wide stats.
+BINLOG_MASKED_KEYS = {
+    "file",
+    "binlog-oldest-index",
+    "binlog-current-index",
+    "binlog-records-migrated",
+}
+
 STATS_LINE = re.compile(r"^\[(?P<scope>[^\]]+)\] (?P<key>[a-z0-9-]+): (?P<value>.*)$")
 JOB_REF = re.compile(r"job=(\d+)")
 
 
 def main() -> int:
+    args = sys.argv[1:]
+    if args not in ([], ["--binlog"]):
+        print("usage: normalize.py [--binlog] <raw >normalized", file=sys.stderr)
+        return 2
+    masked = MASKED_KEYS | (BINLOG_MASKED_KEYS if args else set())
     ids: dict[str, str] = {}
 
     def label(raw: str) -> str:
@@ -56,7 +74,7 @@ def main() -> int:
         if m:
             scope, key, value = m["scope"], m["key"], m["value"]
             server_stats = scope == "stats"
-            if key in MASKED_KEYS or (server_stats and key in SERVER_STATS_ONLY_KEYS):
+            if key in masked or (server_stats and key in SERVER_STATS_ONLY_KEYS):
                 value = "<masked>"
             elif key == "id" and scope.startswith("stats-job"):
                 value = label(value)

@@ -6,7 +6,7 @@
 @a recv
 @a send "release 1 7 1\r\n"
 @a recv
-sleep 1500ms
+sleep 1800ms
 @a send "reserve\r\n"
 @a recv
 @w send "reserve\r\n"

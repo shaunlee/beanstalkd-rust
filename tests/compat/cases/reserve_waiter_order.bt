@@ -1,5 +1,8 @@
 # reserve: multiple blocked waiters are served in the order they arrived.
+# The 50ms gap makes the arrival order unambiguous: with back-to-back sends on
+# two connections, which reserve the server handles first is not defined.
 @c1 send "reserve\r\n"
+sleep 50ms
 @c2 send "reserve\r\n"
 sleep 200ms
 @c3 send "put 0 0 60 5\r\nfirst\r\n"

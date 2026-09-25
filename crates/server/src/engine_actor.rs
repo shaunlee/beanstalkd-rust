@@ -688,6 +688,157 @@ mod tests {
         assert_eq!(events(&h), vec![Ev::Sync]);
     }
 
+    /// Wraps a log and records, for every `append`, whether any reply had
+    /// already been released (the connection's reply channel non-empty)
+    /// when it started and when it returned.
+    struct Probe<L> {
+        inner: L,
+        rx: Arc<Mutex<tokio_mpsc::UnboundedReceiver<Response>>>,
+        appends: Arc<Mutex<Vec<(usize, bool, bool)>>>,
+    }
+
+    impl<L: Log> Log for Probe<L> {
+        fn reserve_put(&mut self, tube_len: usize, body_len: usize) -> bool {
+            self.inner.reserve_put(tube_len, body_len)
+        }
+        fn append(&mut self, entries: &[JournalEntry]) -> Result<(), WalError> {
+            let before = !self.rx.lock().unwrap().is_empty();
+            let res = self.inner.append(entries);
+            let after = !self.rx.lock().unwrap().is_empty();
+            self.appends
+                .lock()
+                .unwrap()
+                .push((entries.len(), before, after));
+            res
+        }
+        fn sync_if_due(&mut self, now: Instant) -> Result<(), WalError> {
+            self.inner.sync_if_due(now)
+        }
+        fn maintain(&mut self) -> Result<(), WalError> {
+            self.inner.maintain()
+        }
+        fn stats(&self) -> BinlogStats {
+            self.inner.stats()
+        }
+    }
+
+    /// With the real WAL and `-f0` (`SyncPolicy::Always`, whose `append`
+    /// writes and fsyncs before returning; see bstk-store's
+    /// `tests::ordering`), every acknowledged journaled change is appended
+    /// before its reply is released: write -> fsync -> reply.
+    #[test]
+    fn replies_are_released_only_after_append_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wal, _) = Wal::open(bstk_store::WalOptions {
+            dir: dir.path().to_path_buf(),
+            file_size: 8192,
+            sync: SyncPolicy::Always,
+        })
+        .unwrap();
+        let clock = Clock::start();
+        let cfg = EngineConfig {
+            journal: true,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::new(clock.now(), cfg, Box::new(StaticSysInfo::default()));
+        let (reply_tx, rx) = tokio_mpsc::unbounded_channel();
+        let rx = Arc::new(Mutex::new(rx));
+        let appends = Arc::new(Mutex::new(Vec::new()));
+        let probe = Probe {
+            inner: wal,
+            rx: rx.clone(),
+            appends: appends.clone(),
+        };
+        let mut actor = Actor::new(clock, engine, Some((probe, SyncPolicy::Always)));
+        actor
+            .on_message(EngineMsg::Connect { conn: 1, reply_tx })
+            .unwrap();
+
+        let cmd = |cmd: Command| EngineMsg::Command { conn: 1, cmd };
+        let mut script = Vec::new();
+        for n in 0..12u64 {
+            let body = Bytes::from(vec![b'j'; [5, 900, 3000][(n % 3) as usize]]);
+            script.push(cmd(Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 60,
+                body,
+            }));
+        }
+        for id in 1..=12u64 {
+            script.push(cmd(Command::ReserveJob(id)));
+            match id % 4 {
+                0 => script.push(cmd(Command::Delete(id))),
+                1 => {
+                    script.push(cmd(Command::Bury { id, pri: 7 }));
+                    script.push(cmd(Command::KickJob(id)));
+                }
+                2 => {
+                    script.push(cmd(Command::Release {
+                        id,
+                        pri: 3,
+                        delay: 100,
+                    }));
+                    script.push(cmd(Command::KickJob(id)));
+                    script.push(cmd(Command::Delete(id)));
+                }
+                _ => script.push(cmd(Command::Release {
+                    id,
+                    pri: 3,
+                    delay: 0,
+                })),
+            }
+        }
+
+        // Records the engine journaled (compaction moves excluded).
+        let journaled_records = |a: &Actor<Probe<Wal>>| {
+            let s = a.binlog.as_ref().unwrap().log.stats();
+            s.records_written - s.records_migrated
+        };
+        let mut acked = 0;
+        for msg in script {
+            let written = journaled_records(&actor);
+            appends.lock().unwrap().clear();
+            actor.on_message(msg).unwrap();
+            let reply = rx.lock().unwrap().try_recv().unwrap();
+            let new_records = journaled_records(&actor) - written;
+            let seen = std::mem::take(&mut *appends.lock().unwrap());
+            if new_records > 0 {
+                acked += 1;
+                assert!(
+                    matches!(
+                        reply,
+                        Response::Inserted(_)
+                            | Response::Buried
+                            | Response::KickedJob
+                            | Response::Deleted
+                            | Response::Released
+                    ),
+                    "{reply:?}"
+                );
+                assert_eq!(seen.len(), 1, "{reply:?}: {seen:?}");
+                let (entries, before, after) = seen[0];
+                assert_eq!(entries as u64, new_records, "{reply:?}");
+                assert!(!before && !after, "{reply:?} released during append");
+            } else {
+                assert!(
+                    !matches!(
+                        reply,
+                        Response::Inserted(_)
+                            | Response::Buried
+                            | Response::KickedJob
+                            | Response::Deleted
+                    ),
+                    "{reply:?} acknowledged without a record"
+                );
+                assert!(seen.iter().all(|&(n, _, _)| n == 0), "{reply:?}: {seen:?}");
+            }
+        }
+        // 12 puts, 3 bury + 3 kick, 3 delayed releases + 3 kicks + 3
+        // deletes, 3 deletes.
+        assert_eq!(acked, 30);
+    }
+
     #[test]
     fn huge_deadlines_do_not_overflow_the_wait() {
         let mut h = harness(FakeLog::default(), true, SyncPolicy::Never);

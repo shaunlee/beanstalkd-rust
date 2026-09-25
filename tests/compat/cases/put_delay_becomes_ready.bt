@@ -5,7 +5,7 @@
 @c1 recv
 @c1 send "peek-delayed\r\n"
 @c1 recv
-sleep 2500ms
+sleep 2800ms
 @c1 send "peek-ready\r\n"
 @c1 recv
 @c1 send "peek-delayed\r\n"

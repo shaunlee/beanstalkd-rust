@@ -2,7 +2,7 @@
 @c1 send "put 0 0 60 5\r\nhe"
 sleep 100ms
 @c1 close
-sleep 200ms
+sleep 500ms
 @c2 send "put 0 0 60 1\r\nx\r\n"
 @c2 recv
 @c2 send "stats\r\n"

@@ -4,7 +4,7 @@ sleep 100ms
 @p send "stats-tube default\r\n"
 @p recv
 @c1 close
-sleep 200ms
+sleep 500ms
 @p send "stats-tube default\r\n"
 @p recv
 @p send "stats\r\n"

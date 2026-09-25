@@ -11,7 +11,7 @@
 @p recv
 @p send "stats-tube default\r\n"
 @p recv
-sleep 1500ms
+sleep 1800ms
 @p send "stats-job 1\r\n"
 @p recv
 @p send "peek-ready\r\n"

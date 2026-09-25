@@ -21,6 +21,15 @@
 #   IDLE_CONNS     ["0"]  values for --idle-conns (scaling scenario)
 #   DELAYED_TUBES  ["0"]  --delayed-tubes, paired with each IDLE_CONNS value
 #                  by position (e.g. IDLE_CONNS="0 10000" DELAYED_TUBES="0 10000")
+#   SERVER_MODES   ["none"]  server persistence modes, applied to both servers:
+#                  none     no binlog
+#                  F        -b <fresh dir> -F      (never fsync)
+#                  default  -b <fresh dir>         (fsync at most every 50 ms)
+#                  f0       -b <fresh dir> -f0     (fsync every write)
+#                  Every run gets a fresh, empty binlog directory under
+#                  BINLOG_ROOT, removed after the run.
+#   BINLOG_ROOT    parent of the per-run binlog directories [a mktemp -d dir]
+#   SERVER_ARGS    extra arguments for both servers (e.g. "-s 1048576")
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,6 +47,13 @@ OUT_CSV="${OUT_CSV:-bench-results.csv}"
 BENCH_ARGS="${BENCH_ARGS:-}"
 IDLE_CONNS="${IDLE_CONNS:-0}"
 DELAYED_TUBES="${DELAYED_TUBES:-0}"
+SERVER_MODES="${SERVER_MODES:-none}"
+SERVER_ARGS="${SERVER_ARGS:-}"
+for m in $SERVER_MODES; do
+  case "$m" in none|F|default|f0) ;; *) echo "run-matrix: unknown server mode $m" >&2; exit 1 ;; esac
+done
+BINLOG_ROOT="${BINLOG_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/bstk-bench-binlog.XXXXXX")}"
+mkdir -p "$BINLOG_ROOT"
 read -r -a idle_list <<<"$IDLE_CONNS"
 read -r -a delayed_list <<<"$DELAYED_TUBES"
 [ "${#idle_list[@]}" -eq "${#delayed_list[@]}" ] || {
@@ -62,9 +78,27 @@ wait_port() {
 }
 
 SERVER_PID=""
-trap '[ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true' EXIT
+BINLOG_DIR=""
+cleanup() {
+  [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
+  [ -n "$BINLOG_DIR" ] && rm -rf "$BINLOG_DIR" || true
+}
+trap cleanup EXIT
 
-[ -s "$OUT_CSV" ] || echo "server,scenario,conns,body_size,pipeline,run,ops_per_sec,server_cpu_pct,put_p50_us,put_p99_us,put_p999_us,reserve_p50_us,reserve_p99_us,reserve_p999_us,delete_p50_us,delete_p99_us,delete_p999_us,load_avg,idle_conns,delayed_tubes" >"$OUT_CSV"
+# Server arguments for a mode; creates a fresh binlog directory (BINLOG_DIR).
+mode_args() {
+  MODE_ARGS=()
+  BINLOG_DIR=""
+  [ "$1" = none ] && return 0
+  BINLOG_DIR="$(mktemp -d "$BINLOG_ROOT/run.XXXXXX")"
+  MODE_ARGS=(-b "$BINLOG_DIR")
+  case "$1" in
+    F) MODE_ARGS+=(-F) ;;
+    f0) MODE_ARGS+=(-f0) ;;
+  esac
+}
+
+[ -s "$OUT_CSV" ] || echo "server,scenario,conns,body_size,pipeline,run,ops_per_sec,server_cpu_pct,put_p50_us,put_p99_us,put_p999_us,reserve_p50_us,reserve_p99_us,reserve_p999_us,delete_p50_us,delete_p99_us,delete_p999_us,load_avg,idle_conns,delayed_tubes,server_mode" >"$OUT_CSV"
 
 # Extracts a numeric field from the bench's JSON line ("" if absent).
 field() {
@@ -81,10 +115,13 @@ for scenario in $SCENARIOS; do
         idle="${idle_list[$li]}"
         delayed="${delayed_list[$li]}"
         for run in $(seq 1 "$RUNS"); do
+         for mode in $SERVER_MODES; do
           for server in ref rs; do
             if [ "$server" = ref ]; then bin="$REF_BIN"; else bin="$RS_BIN"; fi
             port="$(free_port)"
-            "$bin" -l 127.0.0.1 -p "$port" >/dev/null 2>&1 &
+            mode_args "$mode"
+            # shellcheck disable=SC2086
+            "$bin" -l 127.0.0.1 -p "$port" ${MODE_ARGS[@]+"${MODE_ARGS[@]}"} $SERVER_ARGS >/dev/null 2>&1 &
             SERVER_PID=$!
             wait_port "$port"
             load="$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}' || echo "")"
@@ -98,24 +135,28 @@ for scenario in $SCENARIOS; do
                        reserve_p50_us reserve_p99_us reserve_p999_us delete_p50_us delete_p99_us delete_p999_us; do
                 row="$row,$(field "$json" "$f")"
               done
-              echo "$row,$load,$idle,$delayed" >>"$OUT_CSV"
-              printf '%-4s %-20s conns=%-3s body=%-5s pipe=%-3s idle=%-5s delayed=%-5s run=%s  %s ops/s  cpu=%s%%\n' \
-                "$server" "$scenario" "$conns" "$body" "$pipeline" "$idle" "$delayed" "$run" \
+              echo "$row,$load,$idle,$delayed,$mode" >>"$OUT_CSV"
+              printf '%-4s %-7s %-20s conns=%-3s body=%-5s pipe=%-3s idle=%-5s delayed=%-5s run=%s  %s ops/s  cpu=%s%%\n' \
+                "$server" "$mode" "$scenario" "$conns" "$body" "$pipeline" "$idle" "$delayed" "$run" \
                 "$(field "$json" ops_per_sec)" "$(field "$json" server_cpu_pct)"
             else
-              echo "FAILED: $server $scenario conns=$conns body=$body pipeline=$pipeline idle=$idle delayed=$delayed run=$run" >&2
+              echo "FAILED: $server mode=$mode $scenario conns=$conns body=$body pipeline=$pipeline idle=$idle delayed=$delayed run=$run" >&2
               printf '%s\n' "$out" >&2
               failures=$((failures + 1))
             fi
             kill "$SERVER_PID" 2>/dev/null || true
             wait "$SERVER_PID" 2>/dev/null || true
             SERVER_PID=""
+            [ -n "$BINLOG_DIR" ] && rm -rf "$BINLOG_DIR"
+            BINLOG_DIR=""
           done
+         done
         done
        done
       done
     done
   done
 done
+rmdir "$BINLOG_ROOT" 2>/dev/null || true
 echo "results: $OUT_CSV (failures: $failures)"
 [ "$failures" -eq 0 ]

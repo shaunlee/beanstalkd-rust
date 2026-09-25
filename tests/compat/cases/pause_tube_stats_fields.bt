@@ -11,7 +11,7 @@
 @c1 recv
 @c1 send "stats-tube other\r\n"
 @c1 recv
-sleep 1500ms
+sleep 1800ms
 @c1 send "stats-tube default\r\n"
 @c1 recv
 @c1 send "stats\r\n"

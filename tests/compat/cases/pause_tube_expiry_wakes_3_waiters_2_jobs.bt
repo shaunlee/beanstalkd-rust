@@ -19,7 +19,7 @@ sleep 50ms
 sleep 50ms
 @w3 send "reserve\r\n"
 sleep 50ms
-sleep 1500ms
+sleep 1800ms
 @w1 recv_none 50ms
 @w2 recv_none 50ms
 @w3 recv_none 50ms

@@ -1,17 +1,21 @@
 // Command smoke is a real-client smoke test using github.com/beanstalkd/go-beanstalk.
 //
-// Usage: go run . HOST:PORT
+// Usage: go run . [--leave-jobs | --after-restart] HOST:PORT
 //
 // It runs a full protocol flow against a (fresh) beanstalkd-compatible
 // server, asserting on every result, and prints a transcript to stdout in
 // the same line formats as clients/python/smoke.py (see that file), so the
 // same normalizer (clients/normalize.py) applies. go-beanstalk returns stats
 // as maps, so stats fields are printed in sorted key order.
+//
+// --leave-jobs and --after-restart drive the binlog restart test exactly
+// like the Python client (see clients/python/smoke.py).
 package main
 
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"reflect"
@@ -22,8 +26,9 @@ import (
 )
 
 const (
-	tubeA = "smoke-go-a"
-	tubeB = "smoke-go-b"
+	tubeA    = "smoke-go-a"
+	tubeB    = "smoke-go-b"
+	tubeKeep = "smoke-go-keep"
 )
 
 func out(format string, args ...any) { fmt.Printf(format+"\n", args...) }
@@ -93,11 +98,20 @@ func dial(addr string) *beanstalk.Conn {
 }
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: smoke HOST:PORT")
+	args := os.Args[1:]
+	mode := ""
+	if len(args) == 2 {
+		mode, args = args[0], args[1:]
+	}
+	if len(args) != 1 || (mode != "" && mode != "--leave-jobs" && mode != "--after-restart") {
+		fmt.Fprintln(os.Stderr, "usage: smoke [--leave-jobs | --after-restart] HOST:PORT")
 		os.Exit(2)
 	}
-	addr := os.Args[1]
+	addr := args[0]
+	if mode == "--after-restart" {
+		afterRestart(addr)
+		return
+	}
 	prod := dial(addr)
 	defer prod.Close()
 	work := dial(addr)
@@ -246,5 +260,141 @@ func main() {
 		expect(k, st[k], "0")
 	}
 	expect("total-jobs", st["total-jobs"], "6")
+	if mode == "--leave-jobs" {
+		leaveJobsAndHold(addr, prod)
+		return
+	}
+	out("DONE")
+}
+
+// leaveJobsAndHold leaves jobs in known journaled states, then holds two
+// reservations until stdin is closed (the runner kills the server
+// meanwhile). Mirrors leave_jobs_and_hold in clients/python/smoke.py.
+func leaveJobsAndHold(addr string, prod *beanstalk.Conn) {
+	tk := beanstalk.NewTube(prod, tubeKeep)
+	hold := dial(addr)
+	put := func(body string, pri uint32, delay time.Duration) uint64 {
+		id, err := tk.Put([]byte(body), pri, delay, time.Minute)
+		must(err, "put "+body)
+		out("put %s pri=%d delay=%d: job=%d", body, pri, int(delay.Seconds()), id)
+		return id
+	}
+	reserveJob := func(id uint64) {
+		_, err := hold.ReserveJob(id)
+		must(err, "reserve-job")
+	}
+
+	put("keep-ready", 100, 0)
+	put("keep-delayed", 200, 3600*time.Second)
+	// Put a before b but bury b first: live FIFO order is b, a; after a
+	// restart buried jobs are replayed in order of their first record.
+	a := put("keep-buried-a", 300, 0)
+	b := put("keep-buried-b", 300, 0)
+	for _, x := range []struct {
+		id  uint64
+		pri uint32
+	}{{b, 41}, {a, 42}} {
+		reserveJob(x.id)
+		must(hold.Bury(x.id, x.pri), "bury")
+		out("reserve-job + bury job=%d pri=%d: ok", x.id, x.pri)
+	}
+	id, body, err := tk.PeekBuried()
+	must(err, "peek-buried")
+	out("peek-buried: job=%d body=%s", id, body)
+	expect("live buried fifo", id, b)
+	id = put("keep-kicked", 400, 0)
+	reserveJob(id)
+	must(hold.Bury(id, 400), "bury")
+	must(prod.KickJob(id), "kick-job")
+	out("reserve-job + bury + kick-job job=%d: ok", id)
+	id = put("keep-released", 500, 0)
+	reserveJob(id)
+	must(hold.Release(id, 501, 7200*time.Second), "release")
+	out("reserve-job + release job=%d pri=501 delay=7200: ok", id)
+	// Reserved at crash; the last journaled record is the put.
+	id = put("keep-reserved", 600, 0)
+	reserveJob(id)
+	out("reserve-job job=%d (held): ok", id)
+	// Reserved at crash; the last journaled record is a release with a 1s
+	// delay, which will have expired by the time the server restarts.
+	id = put("keep-reserved-expired", 700, 0)
+	reserveJob(id)
+	must(hold.Release(id, 701, time.Second), "release")
+	reserveJob(id)
+	out("reserve-job + release delay=1 + reserve-job job=%d (held): ok", id)
+	// Deleted: leaves only a delete record, but its id still counts.
+	id = put("keep-deleted", 800, 0)
+	must(prod.Delete(id), "delete")
+	out("delete job=%d: ok", id)
+	dump("stats-tube " + tubeKeep)(tk.Stats())
+	time.Sleep(1200 * time.Millisecond) // let the 1s release delay expire
+	out("HOLDING")
+	// Keep both connections (and the reservations) open until the runner has
+	// killed the server and closes our stdin.
+	_, _ = io.ReadAll(os.Stdin)
+}
+
+// afterRestart dumps and checks the state recovered from the binlog, then
+// drains it. Mirrors after_restart in clients/python/smoke.py.
+func afterRestart(addr string) {
+	out("--- after restart ---")
+	c := dial(addr)
+	defer c.Close()
+	tk := beanstalk.NewTube(c, tubeKeep)
+	st := dump("stats")(c.Stats())
+	for k, want := range map[string]string{
+		"current-jobs-ready": "4", "current-jobs-reserved": "0",
+		"current-jobs-delayed": "2", "current-jobs-buried": "2", "total-jobs": "0",
+	} {
+		expect(k, st[k], want)
+	}
+	tubes, err := c.ListTubes()
+	must(err, "list-tubes")
+	out("list-tubes: %v", tubes)
+	sorted := append([]string(nil), tubes...)
+	sort.Strings(sorted)
+	expect("list-tubes", sorted, []string{"default", tubeKeep})
+	dump("stats-tube " + tubeKeep)(tk.Stats())
+
+	var maxID uint64
+	for _, s := range []struct {
+		state string
+		peek  func() (uint64, []byte, error)
+		want  []string
+	}{
+		{"ready", tk.PeekReady, []string{"keep-ready", "keep-kicked", "keep-reserved", "keep-reserved-expired"}},
+		{"buried", tk.PeekBuried, []string{"keep-buried-a", "keep-buried-b"}},
+		{"delayed", tk.PeekDelayed, []string{"keep-delayed", "keep-released"}},
+	} {
+		var got []string
+		for {
+			id, body, err := s.peek()
+			if errors.Is(err, beanstalk.ErrNotFound) {
+				out("peek-%s: NOT_FOUND", s.state)
+				break
+			}
+			must(err, "peek-"+s.state)
+			out("peek-%s: job=%d body=%s", s.state, id, body)
+			dump("stats-job " + string(body))(c.StatsJob(id))
+			must(c.Delete(id), "delete")
+			out("delete job=%d: ok", id)
+			got = append(got, string(body))
+			if id > maxID {
+				maxID = id
+			}
+		}
+		expect("recovered "+s.state+" jobs", got, s.want)
+	}
+
+	// Ids continue after the highest id in any record (the deleted job's).
+	id, err := tk.Put([]byte("after-restart"), 0, 0, time.Minute)
+	must(err, "put")
+	out("put after-restart: job=%d", id)
+	out("next-id minus highest recovered id: %d", id-maxID)
+	expect("next id", id-maxID, uint64(2))
+	must(c.Delete(id), "delete")
+	out("delete job=%d: ok", id)
+	st = dump("stats")(c.Stats())
+	expect("total-jobs", st["total-jobs"], "1")
 	out("DONE")
 }

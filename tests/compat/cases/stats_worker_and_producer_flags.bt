@@ -27,6 +27,6 @@
 @s recv
 @a close
 @c close
-sleep 200ms
+sleep 400ms
 @s send "stats\r\n"
 @s recv

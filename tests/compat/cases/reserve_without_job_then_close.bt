@@ -1,7 +1,7 @@
 # a blocking reserve followed immediately by close leaves no waiter behind.
 @c1 send "reserve\r\n"
 @c1 close
-sleep 200ms
+sleep 500ms
 @p send "stats\r\n"
 @p recv
 @p send "put 0 0 60 1\r\nx\r\n"

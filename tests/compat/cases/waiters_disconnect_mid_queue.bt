@@ -18,7 +18,7 @@ sleep 50ms
 @w4 send "reserve\r\n"
 sleep 50ms
 @w2 close
-sleep 100ms
+sleep 500ms
 @p send "stats\r\n"
 @p recv
 @p send "put 0 0 60 2\r\nj1\r\n"

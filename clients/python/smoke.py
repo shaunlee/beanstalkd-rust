@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """Real-client smoke test using the greenstalk client library.
 
-Usage: smoke.py HOST:PORT
+Usage: smoke.py [--leave-jobs | --after-restart] HOST:PORT
 
 Runs a full protocol flow against a (fresh) beanstalkd-compatible server,
-asserting on every result, and prints a transcript to stdout. The raw
+asserting on every result, and prints a transcript to stdout.
+
+Binlog restart test (driven by clients/run-smoke.sh with SMOKE_RESTART=1):
+    --leave-jobs      after the full flow, leaves jobs in known states in
+                      tube smoke-keep (ready, delayed, buried, kicked, and
+                      two jobs held reserved), prints HOLDING and then
+                      blocks until stdin is closed, so the runner can kill
+                      the server while the jobs are still reserved.
+    --after-restart   run against the restarted server (same binlog dir):
+                      dumps and checks the recovered state, then drains it. The raw
 transcript contains volatile values (pids, job ids, uptime, ...); the
 runner (clients/run-smoke.sh) pipes it through clients/normalize.py
 before diffing the reference against beanstalkd-rs.
@@ -31,6 +40,7 @@ socket.setdefaulttimeout(10)
 TUBE_A = "smoke-a"
 TUBE_B = "smoke-b"
 TUBE_C = "smoke-c"
+TUBE_KEEP = "smoke-keep"
 
 
 def out(line: str) -> None:
@@ -65,12 +75,19 @@ def expect(label: str, got: Any, want: Any) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or ":" not in sys.argv[1]:
+    args = sys.argv[1:]
+    mode = args.pop(0) if args and args[0].startswith("--") else ""
+    if mode not in ("", "--leave-jobs", "--after-restart") or len(args) != 1 or ":" not in args[0]:
         print(__doc__, file=sys.stderr)
         return 2
-    host, port_s = sys.argv[1].rsplit(":", 1)
+    host, port_s = args[0].rsplit(":", 1)
     addr = (host, int(port_s))
+    if mode == "--after-restart":
+        return after_restart(addr)
+    return full_flow(addr, leave_jobs=mode == "--leave-jobs")
 
+
+def full_flow(addr: tuple[str, int], leave_jobs: bool) -> int:
     # --- tubes: use / watch / ignore / list -----------------------------
     prod = greenstalk.Client(addr, use=TUBE_A, watch=TUBE_A)
     work = greenstalk.Client(addr, use="default", watch=[TUBE_A, TUBE_B])
@@ -251,8 +268,119 @@ def main() -> int:
         expect(k, st[k], 0)
     expect("total-jobs", st["total-jobs"], 7)
 
+    if leave_jobs:
+        return leave_jobs_and_hold(addr, prod)
+
     work.close()
     prod.close()
+    out("DONE")
+    return 0
+
+
+def leave_jobs_and_hold(addr: tuple[str, int], prod: greenstalk.Client) -> int:
+    """Leaves jobs in known journaled states, then holds two reservations
+    until stdin is closed (the runner kills the server meanwhile)."""
+    prod.use(TUBE_KEEP)
+    hold = greenstalk.Client(addr, use=TUBE_KEEP, watch=TUBE_KEEP)
+
+    def put(body: str, pri: int, delay: int = 0) -> int:
+        i = prod.put(body, priority=pri, delay=delay, ttr=60)
+        out(f"put {body} pri={pri} delay={delay}: {job(i)}")
+        return i
+
+    put("keep-ready", 100)
+    put("keep-delayed", 200, delay=3600)
+    # Put a before b but bury b first: live FIFO order is b, a; after a
+    # restart buried jobs are replayed in order of their first record.
+    a = put("keep-buried-a", 300)
+    b = put("keep-buried-b", 300)
+    for i, pri in [(b, 41), (a, 42)]:
+        hold.bury(hold.reserve_job(i), priority=pri)
+        out(f"reserve-job + bury {job(i)} pri={pri}: ok")
+    j = prod.peek_buried()
+    out(f"peek-buried: {jb(j)}")
+    expect("live buried fifo", j.id, b)
+    i = put("keep-kicked", 400)
+    hold.bury(hold.reserve_job(i), priority=400)
+    prod.kick_job(i)
+    out(f"reserve-job + bury + kick-job {job(i)}: ok")
+    i = put("keep-released", 500)
+    hold.release(hold.reserve_job(i), priority=501, delay=7200)
+    out(f"reserve-job + release {job(i)} pri=501 delay=7200: ok")
+    # Reserved at crash; the last journaled record is the put.
+    i = put("keep-reserved", 600)
+    hold.reserve_job(i)
+    out(f"reserve-job {job(i)} (held): ok")
+    # Reserved at crash; the last journaled record is a release with a 1s
+    # delay, which will have expired by the time the server restarts.
+    i = put("keep-reserved-expired", 700)
+    hold.release(hold.reserve_job(i), priority=701, delay=1)
+    hold.reserve_job(i)
+    out(f"reserve-job + release delay=1 + reserve-job {job(i)} (held): ok")
+    # Deleted: leaves only a delete record, but its id still counts.
+    i = put("keep-deleted", 800)
+    prod.delete(i)
+    out(f"delete {job(i)}: ok")
+    dump(f"stats-tube {TUBE_KEEP}", prod.stats_tube(TUBE_KEEP))
+    time.sleep(1.2)  # let the 1s release delay expire
+    out("HOLDING")
+    # Keep both connections (and the reservations) open until the runner
+    # has killed the server and closes our stdin. No `quit`: the server is
+    # gone by then.
+    sys.stdin.read()
+    return 0
+
+
+def after_restart(addr: tuple[str, int]) -> int:
+    """Dumps and checks the state recovered from the binlog, then drains it."""
+    out("--- after restart ---")
+    c = greenstalk.Client(addr, use=TUBE_KEEP, watch=TUBE_KEEP)
+    st = c.stats()
+    dump("stats", st)
+    for k, want in [
+        ("current-jobs-ready", 4),
+        ("current-jobs-reserved", 0),
+        ("current-jobs-delayed", 2),
+        ("current-jobs-buried", 2),
+        ("total-jobs", 0),
+    ]:
+        expect(k, st[k], want)
+    out(f"list-tubes: {c.tubes()}")
+    expect("list-tubes", sorted(c.tubes()), ["default", TUBE_KEEP])
+    dump(f"stats-tube {TUBE_KEEP}", c.stats_tube(TUBE_KEEP))
+
+    seen: list[int] = []
+    for state, peek, want in [
+        ("ready", c.peek_ready, ["keep-ready", "keep-kicked", "keep-reserved", "keep-reserved-expired"]),
+        ("buried", c.peek_buried, ["keep-buried-a", "keep-buried-b"]),
+        ("delayed", c.peek_delayed, ["keep-delayed", "keep-released"]),
+    ]:
+        got = []
+        while True:
+            try:
+                j = peek()
+            except greenstalk.NotFoundError:
+                out(f"peek-{state}: NotFoundError")
+                break
+            out(f"peek-{state}: {jb(j)}")
+            dump(f"stats-job {j.body}", c.stats_job(j))
+            c.delete(j)
+            out(f"delete {job(j)}: ok")
+            got.append(j.body)
+            seen.append(j.id)
+        expect(f"recovered {state} jobs", got, want)
+
+    # Ids continue after the highest id in any record (the deleted job's).
+    i = c.put("after-restart", ttr=60)
+    out(f"put after-restart: {job(i)}")
+    out(f"next-id minus highest recovered id: {i - max(seen)}")
+    expect("next id", i - max(seen), 2)
+    c.delete(i)
+    out(f"delete {job(i)}: ok")
+    st = c.stats()
+    dump("stats", st)
+    expect("total-jobs", st["total-jobs"], 1)
+    c.close()
     out("DONE")
     return 0
 
