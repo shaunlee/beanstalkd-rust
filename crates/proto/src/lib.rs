@@ -155,8 +155,37 @@ pub enum Response {
 pub enum Frame {
     /// A well-formed command ready for the engine.
     Command(Command),
-    /// A protocol-level error the connection must reply with directly
-    /// (BAD_FORMAT, UNKNOWN_COMMAND, JOB_TOO_BIG, EXPECTED_CRLF, ...).
-    /// The connection stays open.
+    /// A `put` whose numeric fields parsed but which was rejected during
+    /// framing. It must still go to the engine: the reference counts it in
+    /// `cmd-put` (and, for `ExpectedCrlf`, marks the connection as a producer
+    /// and consumes a job id) before rejecting it. The engine emits the reply.
+    PutRejected(PutRejection),
+    /// A protocol-level error with no engine side effects (BAD_FORMAT,
+    /// UNKNOWN_COMMAND, ...). The connection replies with it directly and
+    /// stays open.
     Error(Response),
+}
+
+/// Why a `put` was rejected by the codec. Replies: `JobTooBig` →
+/// `JOB_TOO_BIG`, `TrailingGarbage` → `BAD_FORMAT`, `ExpectedCrlf` →
+/// `EXPECTED_CRLF`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutRejection {
+    /// Body size above `max_job_size`; the body has been discarded.
+    JobTooBig,
+    /// Garbage after the size field; no body bytes were consumed.
+    TrailingGarbage,
+    /// The body was not followed by `\r\n`.
+    ExpectedCrlf,
+}
+
+impl PutRejection {
+    /// The reply the client receives for this rejection.
+    pub fn response(self) -> Response {
+        match self {
+            PutRejection::JobTooBig => Response::JobTooBig,
+            PutRejection::TrailingGarbage => Response::BadFormat,
+            PutRejection::ExpectedCrlf => Response::ExpectedCrlf,
+        }
+    }
 }

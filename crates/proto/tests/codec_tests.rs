@@ -4,7 +4,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use bstk_proto::{Command, Frame, Response, ServerCodec};
+use bstk_proto::{Command, Frame, PutRejection, Response, ServerCodec};
 use bytes::{Buf, BytesMut};
 use tokio_util::codec::Decoder;
 
@@ -134,7 +134,7 @@ fn job_too_big_then_next_command_ok() {
     assert_eq!(
         frames,
         vec![
-            Frame::Error(Response::JobTooBig),
+            Frame::PutRejected(PutRejection::JobTooBig),
             Frame::Command(Command::ListTubes),
         ]
     );
@@ -152,7 +152,7 @@ fn job_too_big_discard_is_incremental_not_double_buffered() {
     buf.extend_from_slice(b"6789\r\n");
     assert_eq!(
         codec.decode(&mut buf).unwrap(),
-        Some(Frame::Error(Response::JobTooBig))
+        Some(Frame::PutRejected(PutRejection::JobTooBig))
     );
     // Next command still works normally.
     buf.extend_from_slice(b"list-tubes\r\n");
@@ -173,7 +173,7 @@ fn put_trailing_garbage_after_size_bad_format() {
     assert_eq!(
         frames,
         vec![
-            Frame::Error(Response::BadFormat),
+            Frame::PutRejected(PutRejection::TrailingGarbage),
             Frame::Error(Response::UnknownCommand),
         ]
     );
@@ -187,7 +187,7 @@ fn job_too_big_ignores_trailing_garbage_on_put_line() {
     assert_eq!(
         frames,
         vec![
-            Frame::Error(Response::JobTooBig),
+            Frame::PutRejected(PutRejection::JobTooBig),
             Frame::Command(Command::Stats)
         ]
     );
@@ -202,7 +202,7 @@ fn expected_crlf_then_next_command_ok() {
     assert_eq!(
         frames,
         vec![
-            Frame::Error(Response::ExpectedCrlf),
+            Frame::PutRejected(PutRejection::ExpectedCrlf),
             Frame::Command(Command::ListTubes),
         ]
     );

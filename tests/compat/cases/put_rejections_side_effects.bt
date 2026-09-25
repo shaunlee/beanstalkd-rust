@@ -1,0 +1,33 @@
+# Every way a put can be rejected, followed by a normal put and stats: job
+# ids, cmd-put, current-producers and total-jobs must reflect the side
+# effects the reference applies before each rejection.
+!args -z 10
+# Producer flag is per connection, so each rejection uses a fresh one.
+# JOB_TOO_BIG: counts cmd-put only.
+@c1 send "put 0 0 60 20\r\n01234567890123456789\r\n"
+@c1 recv
+@c9 send "stats\r\n"
+@c9 recv
+# Trailing garbage after the size: BAD_FORMAT, counts cmd-put, body re-parsed.
+@c2 send "put 0 0 60 1 junk\r\nx\r\n"
+@c2 recv
+@c2 recv
+@c9 send "stats\r\n"
+@c9 recv
+# Unparsable numbers: BAD_FORMAT with no side effects.
+@c3 send "put a 0 60 1\r\n"
+@c3 recv
+@c9 send "stats\r\n"
+@c9 recv
+# EXPECTED_CRLF: counts cmd-put, marks producer, consumes a job id.
+@c4 send "put 0 0 60 1\r\nabc"
+@c4 recv
+@c9 send "stats\r\n"
+@c9 recv
+# A normal put now: its id shows whether ids were consumed above.
+@c5 send "put 0 0 60 1\r\nx\r\n"
+@c5 recv
+@c5 send "stats-job 2\r\n"
+@c5 recv
+@c9 send "stats\r\n"
+@c9 recv

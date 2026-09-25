@@ -4,9 +4,8 @@
 //!
 //! See docs/DESIGN.md section 8.
 
-/// YAML keys whose values are masked before comparison. The three formats
-/// (stats, stats-job, stats-tube) never share a key name, so a single flat
-/// list is safe to apply to any `OK` response body.
+/// YAML keys whose values are masked in any `OK` response body. None of
+/// these names appears in more than one of the stats formats.
 const MASKED_KEYS: &[&str] = &[
     // stats (server-wide)
     "pid",
@@ -14,7 +13,6 @@ const MASKED_KEYS: &[&str] = &[
     "rusage-utime",
     "rusage-stime",
     "uptime",
-    "id",
     "hostname",
     "os",
     "platform",
@@ -24,6 +22,14 @@ const MASKED_KEYS: &[&str] = &[
     // stats-tube
     "pause-time-left",
 ];
+
+/// Keys masked only in server-wide `stats`. `id` is the random server id
+/// there, but the (deterministic) job id in `stats-job`, which must be
+/// compared.
+const SERVER_STATS_ONLY_KEYS: &[&str] = &["id"];
+
+/// A key that only appears in server-wide `stats` output.
+const SERVER_STATS_MARKER: &[u8] = b"\ntotal-connections: ";
 
 const MASKED_VALUE: &str = "<masked>";
 
@@ -65,24 +71,26 @@ pub fn mask_response(resp: &[u8]) -> Vec<u8> {
 }
 
 fn mask_yaml_body(body: &[u8]) -> Vec<u8> {
+    let server_stats = find(body, SERVER_STATS_MARKER).is_some();
     let mut out = Vec::with_capacity(body.len());
     let mut rest = body;
     while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
-        out.extend_from_slice(&mask_line(&rest[..nl]));
+        out.extend_from_slice(&mask_line(&rest[..nl], server_stats));
         out.push(b'\n');
         rest = &rest[nl + 1..];
     }
     if !rest.is_empty() {
-        out.extend_from_slice(&mask_line(rest));
+        out.extend_from_slice(&mask_line(rest, server_stats));
     }
     out
 }
 
-fn mask_line(line: &[u8]) -> Vec<u8> {
+fn mask_line(line: &[u8], server_stats: bool) -> Vec<u8> {
     if let Some(colon) = line.iter().position(|&b| b == b':') {
         let key = &line[..colon];
         if let Ok(key_str) = std::str::from_utf8(key)
-            && MASKED_KEYS.contains(&key_str)
+            && (MASKED_KEYS.contains(&key_str)
+                || (server_stats && SERVER_STATS_ONLY_KEYS.contains(&key_str)))
         {
             let mut out = Vec::with_capacity(key.len() + 2 + MASKED_VALUE.len());
             out.extend_from_slice(key);
@@ -121,7 +129,7 @@ mod tests {
 
     #[test]
     fn masks_stats_fields_and_recomputes_length() {
-        let body = "---\ncurrent-jobs-ready: 0\npid: 12345\nversion: \"1.13\"\nrusage-utime: 0.000000\nrusage-stime: 0.000000\nuptime: 42\nid: abcdef0123456789\nhostname: \"myhost\"\nos: \"Darwin\"\nplatform: \"arm64\"\n";
+        let body = "---\ncurrent-jobs-ready: 0\npid: 12345\nversion: \"1.13\"\nrusage-utime: 0.000000\nrusage-stime: 0.000000\nuptime: 42\ntotal-connections: 1\nid: abcdef0123456789\nhostname: \"myhost\"\nos: \"Darwin\"\nplatform: \"arm64\"\n";
         let resp = ok_response(body);
         let masked = mask_response(&resp);
         let masked_str = String::from_utf8(masked.clone()).expect("utf8");
@@ -155,6 +163,8 @@ mod tests {
         assert!(masked.contains("age: <masked>"));
         assert!(masked.contains("time-left: <masked>"));
         assert!(masked.contains("state: reserved"));
+        // The job id is deterministic and must still be compared.
+        assert!(masked.contains("---\nid: 1\n"));
     }
 
     #[test]

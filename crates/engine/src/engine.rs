@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use bytes::Bytes;
 
 use bstk_proto::{
-    Command, JobId, Response, StatsJob, StatsServer, StatsTube, TubeName, URGENT_THRESHOLD,
+    Command, JobId, PutRejection, Response, StatsJob, StatsServer, StatsTube, TubeName,
+    URGENT_THRESHOLD,
 };
 
 use crate::model::{ConnState, JobRec, JobState, TubeState};
@@ -192,6 +193,22 @@ impl Engine {
             self.do_remove_waiting_conn(conn);
             out.push((conn, Response::TimedOut));
         }
+    }
+
+    /// A `put` rejected by the codec. Mirrors the side effects prot.c
+    /// performs before each rejection: `op_ct[OP_PUT]++` happens right after
+    /// the numeric fields parse, and the EXPECTED_CRLF path has already run
+    /// `connsetproducer` and `make_job` (which consumes a job id).
+    pub fn put_rejected(&mut self, _now: Nanos, conn: ConnId, why: PutRejection, out: &mut Outbox) {
+        if !self.conns.contains_key(&conn) {
+            return;
+        }
+        self.cmd_put += 1;
+        if why == PutRejection::ExpectedCrlf {
+            self.connsetproducer(conn);
+            self.next_job_id += 1;
+        }
+        out.push((conn, why.response()));
     }
 
     pub fn handle(&mut self, now: Nanos, conn: ConnId, cmd: Command, out: &mut Outbox) {
@@ -1528,6 +1545,31 @@ mod tests {
 
     fn tube(name: &str) -> TubeName {
         TubeName::new(name).unwrap()
+    }
+
+    // Verified against the reference: a rejected put still bumps cmd-put;
+    // EXPECTED_CRLF also consumes a job id and marks the conn a producer.
+    #[test]
+    fn put_rejected_side_effects_match_reference() {
+        use bstk_proto::PutRejection;
+        let mut e = engine_at(0);
+        e.connect(0, 1);
+        let mut out = Outbox::new();
+        e.put_rejected(0, 1, PutRejection::JobTooBig, &mut out);
+        e.put_rejected(0, 1, PutRejection::TrailingGarbage, &mut out);
+        assert_eq!(
+            out,
+            vec![(1, Response::JobTooBig), (1, Response::BadFormat)]
+        );
+        let s = e.build_stats_server(0);
+        assert_eq!((s.cmd_put, s.current_producers, s.total_jobs), (2, 0, 0));
+
+        out.clear();
+        e.put_rejected(0, 1, PutRejection::ExpectedCrlf, &mut out);
+        assert_eq!(out, vec![(1, Response::ExpectedCrlf)]);
+        let s = e.build_stats_server(0);
+        assert_eq!((s.cmd_put, s.current_producers, s.total_jobs), (3, 1, 0));
+        assert_eq!(put(&mut e, 0, 1, 0, 0, 10, "x"), 2);
     }
 
     fn put(

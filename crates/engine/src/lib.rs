@@ -85,6 +85,9 @@ impl Default for EngineConfig {
 ///     /// Client half-closed its socket: if `conn` is waiting on reserve,
 ///     /// reply TIMED_OUT (see STATE_WAIT / halfclosed in prot.c).
 ///     pub fn half_close(&mut self, now: Nanos, conn: ConnId, out: &mut Outbox);
+///     /// A `put` rejected by the codec (`Frame::PutRejected`): applies the
+///     /// reference's pre-rejection side effects and emits the reply.
+///     pub fn put_rejected(&mut self, now: Nanos, conn: ConnId, why: PutRejection, out: &mut Outbox);
 ///     /// Execute one command. `Command::Quit` is handled by the server and
 ///     /// must not be passed here. A reserve that must wait produces no reply
 ///     /// now; the reply is emitted by a later call (handle/tick/disconnect).

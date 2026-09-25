@@ -9,7 +9,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::parse::{ParsedLine, parse_line_raw};
-use crate::{Command, Frame, LINE_BUF_SIZE, Response};
+use crate::{Command, Frame, LINE_BUF_SIZE, PutRejection, Response};
 
 /// Internal decoder state, mirroring the relevant `Conn` states in prot.c.
 #[derive(Debug)]
@@ -27,9 +27,9 @@ enum State {
         ttr: u32,
         body_size: u32,
     },
-    /// `STATE_BITBUCKET`: discarding `remaining` bytes before sending
-    /// `reply` (used for `JOB_TOO_BIG`).
-    Discard { remaining: u64, reply: Response },
+    /// `STATE_BITBUCKET`: discarding `remaining` bytes of an oversized
+    /// `put` body before emitting `PutRejected(JobTooBig)`.
+    Discard { remaining: u64 },
 }
 
 /// Server-side codec. Decodes client bytes into `Frame`s and encodes
@@ -128,11 +128,12 @@ impl Decoder for ServerCodec {
                                     // prot.c's check ordering.
                                     self.state = State::Discard {
                                         remaining: u64::from(header.body_size) + 2,
-                                        reply: Response::JobTooBig,
                                     };
                                 } else if header.trailing_garbage {
                                     self.state = State::Line { overflowed: false };
-                                    return Ok(Some(Frame::Error(Response::BadFormat)));
+                                    return Ok(Some(Frame::PutRejected(
+                                        PutRejection::TrailingGarbage,
+                                    )));
                                 } else {
                                     self.state = State::PutBody {
                                         pri: header.pri,
@@ -168,7 +169,7 @@ impl Decoder for ServerCodec {
                     let crlf_ok =
                         body_with_crlf[need - 2] == b'\r' && body_with_crlf[need - 1] == b'\n';
                     if !crlf_ok {
-                        return Ok(Some(Frame::Error(Response::ExpectedCrlf)));
+                        return Ok(Some(Frame::PutRejected(PutRejection::ExpectedCrlf)));
                     }
                     let body: Bytes = body_with_crlf.slice(0..need - 2);
                     return Ok(Some(Frame::Command(Command::Put {
@@ -178,7 +179,7 @@ impl Decoder for ServerCodec {
                         body,
                     })));
                 }
-                State::Discard { remaining, reply } => {
+                State::Discard { remaining } => {
                     if src.is_empty() {
                         return Ok(None);
                     }
@@ -188,9 +189,8 @@ impl Decoder for ServerCodec {
                     if *remaining > 0 {
                         return Ok(None);
                     }
-                    let reply = reply.clone();
                     self.state = State::Line { overflowed: false };
-                    return Ok(Some(Frame::Error(reply)));
+                    return Ok(Some(Frame::PutRejected(PutRejection::JobTooBig)));
                 }
             }
         }
