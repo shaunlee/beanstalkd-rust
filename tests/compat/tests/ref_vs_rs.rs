@@ -42,17 +42,12 @@ fn run_and_check(cases: &[PathBuf], ref_bin: &Path, rs_bin: &Path, what: &str) {
 #[test]
 fn ref_vs_rs_all_cases_pass() {
     let (ref_bin, rs_bin) = bins();
-    let mut cases = discover_cases().expect("failed to list tests/compat/cases");
-    // TODO(P1-T4): remove this filter once beanstalkd-rs supports `-b`; the
-    // `!binlog` cases are covered by `ref_vs_rs_binlog_cases_pass` below
-    // until then.
-    cases.retain(|p| !case_declares_binlog(p));
-    run_and_check(&cases, &ref_bin, &rs_bin, "non-binlog");
+    let cases = discover_cases().expect("failed to list tests/compat/cases");
+    run_and_check(&cases, &ref_bin, &rs_bin, "all");
 }
 
 /// The cases that declare `!binlog` (restart / crash recovery).
 #[test]
-#[ignore = "enabled at P1-T4"]
 fn ref_vs_rs_binlog_cases_pass() {
     let (ref_bin, rs_bin) = bins();
     let mut cases = discover_cases().expect("failed to list tests/compat/cases");

@@ -99,6 +99,12 @@ use crate::{SyncPolicy, WalError, WalOptions};
 
 const BLOCK: u64 = 4096;
 
+/// Largest accepted segment size (4 GiB): room for the largest allowed job
+/// (1 GiB) with margin. Segments are preallocated in full, so an absurd
+/// `-s` (e.g. a wrapped `-1`) must be rejected up front rather than
+/// overflow or start filling the disk.
+const MAX_SEGMENT_SIZE: u64 = 1 << 32;
+
 #[derive(Debug)]
 struct Seg {
     index: u64,
@@ -194,6 +200,7 @@ impl Inner {
         opts: WalOptions,
         limit: Option<u64>,
     ) -> Result<(Inner, Recovery), WalError> {
+        let seg_size = segment_size(opts.file_size)?;
         std::fs::create_dir_all(&opts.dir)?;
         let lock = lock_dir(&opts.dir)?;
         let dir_file = File::open(&opts.dir)?;
@@ -276,7 +283,6 @@ impl Inner {
             }
         }
 
-        let seg_size = opts.file_size.max(1).div_ceil(BLOCK) * BLOCK;
         let mut w = Inner {
             dir: opts.dir,
             dir_file,
@@ -772,5 +778,18 @@ impl Inner {
             assert!(self.segs[p].puts.contains(&(j.record.id, j.off)));
         }
         assert!(self.buf.is_empty());
+    }
+}
+
+/// `file_size` rounded up to a whole number of blocks (at least one block),
+/// or an error if it exceeds `MAX_SEGMENT_SIZE`.
+fn segment_size(file_size: u64) -> Result<u64, WalError> {
+    let size = file_size.max(1).div_ceil(BLOCK).checked_mul(BLOCK);
+    match size {
+        Some(size) if size <= MAX_SEGMENT_SIZE => Ok(size),
+        _ => Err(WalError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("binlog file size {file_size} is too large (max {MAX_SEGMENT_SIZE})"),
+        ))),
     }
 }

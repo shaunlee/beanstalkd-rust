@@ -10,6 +10,12 @@ Reference: beanstalkd commit `25085c5`. Each entry states the observed behavior,
 | D2 | engine / proto | `time-left` (stats-job) and `pause-time-left` (stats-tube) are signed in the reference and can be briefly negative (job overdue but not yet ticked). We clamp them to 0. | Stats types are unsigned; the window is sub-tick. Revisit if differential tests observe it. | Yes | — |
 | D3 | server | A connection blocked awaiting a reply (e.g. `reserve`) stops reading once 64 KiB of pipelined input is buffered. The reference does not read at all while waiting but detects hangup via EPOLLRDHUP, so it notices a half-close even with unread data. We notice it only while under the cap. | Bounded memory per connection; only matters for a client that pipelines > 64 KiB behind a blocking reserve and then half-closes. | Yes | `large_pipeline_behind_blocked_reserve_is_processed_in_order` |
 | D4 | server CLI | A `-z` value the reference's `sscanf("%zu")` cannot parse exits with status 2 (clap) instead of 5. `-l` accepts IP literals only, not hostnames. | Standard CLI tooling; hostnames rarely used. | Yes | — |
+| D5 | binlog | On a binlog write, fsync or compaction error the server logs it and exits non-zero (fail-stop). The reference silently disables its binlog and keeps serving. | Never acknowledge a change that was not persisted. | Yes | P1-T4 server tests |
+| D6 | binlog | bury, release with delay and kick never reply `OUT_OF_MEMORY`. The reference reserves binlog space for every update and can reply `OUT_OF_MEMORY` when the disk is full. The store keeps one spare preallocated segment for updates; only new puts are refused (`OUT_OF_MEMORY`) when a new spare cannot be allocated. | Deciding whether a command will write a record would need engine logic before the engine runs. | Yes | store reservation tests |
+| D7 | binlog | A put whose records don't fit in one segment (`-z` larger than `-s`) replies `OUT_OF_MEMORY`. The reference lets the file grow. | Records never straddle segments. | Yes | store unit tests |
+| D8 | binlog | On-disk format and file layout are our own. Differential tests mask `file` (stats-job), `binlog-oldest-index`, `binlog-current-index` and `binlog-records-migrated`. Compaction timing differs, so after compaction `binlog-records-written`, buried FIFO order and `list-tubes` order after a restart may differ from the reference. | Format compatibility is a non-goal (DESIGN §1). | Yes | binlog cases stay pre-compaction |
+| D9 | binlog | Replay: a bad record in the last segment holding records truncates the log there with a warning; corruption in an earlier segment (followed by valid records in a later one), a bad header or an undecodable record refuses to start. | Unsynced tails may be torn after power loss; earlier corruption means real data loss. | Yes | store recovery tests |
+| D10 | server CLI | `-s` above 4 GiB (including a wrapped `-1`) makes startup with `-b` fail with status 1. `-u USER` is rejected with status 5 instead of switching user. A binlog error while serving exits with status 20 (see D5). | Segments are preallocated in full; privilege dropping is left to the service manager. | Yes | server binlog tests, store unit tests |
 
 ## Reference behaviors that differ from protocol.txt (we follow the implementation)
 
@@ -46,3 +52,16 @@ Reference: beanstalkd commit `25085c5`. Each entry states the observed behavior,
 ### Server CLI
 
 1. `-z` is parsed with `sscanf("%zu")`: leading whitespace is skipped, `-1` wraps, values beyond u64 saturate, and the result is clamped to 1 GiB with a warning.
+
+### Binlog (`-b`)
+
+1. Journaled transitions: put, release with a delay > 0, bury, kick / kick-job (one record per job), delete. Not journaled: reserve, reserve-job, touch, release with delay 0, TTR timeout, delay expiry, pause-tube, use / watch, and jobs released by a disconnect.
+2. Replay rebuilds each job from its last record: a job reserved at crash time comes back in that state (ready, delayed or buried) with that record's counters. A delayed job whose deadline passed during downtime comes back ready and still reports its `delay`.
+3. Replaying a buried job adds one to its `buries` (on top of the last journaled value, so it does not accumulate across restarts).
+4. Jobs are replayed in the order of their first record; this sets buried FIFO order after a restart. The tube list order results from replaying every record: a tube is appended at a job's full record and swap-removed when a delete record frees its last job.
+5. After a restart the next job id is the highest id in any surviving record + 1. Cumulative server and tube counters (`cmd-*`, `total-jobs`, `cmd-pause-tube`) start at 0; tubes that were only used or watched are gone; pause and drain mode are not persisted.
+6. Times are wall-clock based, so `age` and remaining delays continue across downtime.
+7. The reference compacts only after a journaled write and only once there are 3 or more files; compaction moves count in `binlog-records-written`.
+8. The reference has no SIGTERM handler (unless it is pid 1), so SIGTERM is an abrupt exit. beanstalkd-rs shuts down gracefully and fsyncs the binlog unless `-F`.
+9. A second instance on the same binlog directory exits with status 10. `-s` is reported unrounded in `binlog-max-size`; files are preallocated to a multiple of 4096.
+10. fsync uses `fdatasync`, like the reference; on macOS this is weaker than `F_FULLFSYNC`.

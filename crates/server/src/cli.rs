@@ -1,16 +1,68 @@
-//! Command-line interface, mirroring the reference's `-l`, `-p`, `-z`, `-V`,
-//! `-v`, `-h` flags (see `util.c: optparse` / `usage`).
+//! Command-line interface, mirroring the reference's `-b`, `-f`, `-F`,
+//! `-l`, `-p`, `-s`, `-u`, `-z`, `-V`, `-v`, `-h` flags (see
+//! `util.c: optparse` / `usage` and the defaults in `serv.c`).
+//!
+//! Like `optparse`, a repeated flag overrides the earlier occurrence, and
+//! `-f` / `-F` interact in argument order: `-f MS` sets the fsync rate and
+//! turns fsync on, `-F` turns it off (keeping the rate), so the last of the
+//! two wins (`-f 10 -F` never fsyncs, `-F -f 10` fsyncs every 10 ms).
 
 use std::net::IpAddr;
+use std::path::PathBuf;
+use std::time::Duration;
 
-use clap::{ArgAction, Parser};
+use clap::parser::ValueSource;
+use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
 
+use bstk_engine::DEFAULT_BINLOG_MAX_SIZE;
 use bstk_proto::{DEFAULT_MAX_JOB_SIZE, MAX_JOB_SIZE_LIMIT};
+use bstk_store::SyncPolicy;
+
+/// `DEFAULT_FSYNC_MS` in dat.h: the fsync rate when `-b` is given without
+/// `-f` or `-F` (`serv.c` starts with `wantsync = 1`).
+pub const DEFAULT_FSYNC_MS: u64 = 50;
 
 /// beanstalkd-rs: a byte-for-byte compatible reimplementation of beanstalkd.
 #[derive(Parser, Debug)]
-#[command(name = "beanstalkd-rs", disable_version_flag = true)]
+#[command(
+    name = "beanstalkd-rs",
+    disable_version_flag = true,
+    args_override_self = true
+)]
 pub struct Cli {
+    /// Write-ahead log directory
+    #[arg(short = 'b', value_name = "DIR")]
+    pub binlog_dir: Option<PathBuf>,
+
+    /// fsync at most once every MS milliseconds (default is 50ms); use -f0
+    /// for "always fsync"
+    #[arg(
+        short = 'f',
+        value_name = "MS",
+        value_parser = parse_size_arg,
+        allow_hyphen_values = true,
+    )]
+    pub fsync_ms: Option<u64>,
+
+    /// Never fsync
+    #[arg(short = 'F', action = ArgAction::SetTrue)]
+    pub never_fsync: bool,
+
+    /// Set the size of each write-ahead log file (rounded up to a multiple
+    /// of 4096 bytes)
+    #[arg(
+        short = 's',
+        value_name = "BYTES",
+        default_value_t = DEFAULT_BINLOG_MAX_SIZE,
+        value_parser = parse_size_arg,
+        allow_hyphen_values = true,
+    )]
+    pub binlog_file_size: u64,
+
+    /// Become user and group (not supported by beanstalkd-rs)
+    #[arg(short = 'u', value_name = "USER")]
+    pub user: Option<String>,
+
     /// Listen on address
     #[arg(short = 'l', value_name = "ADDR", default_value = "0.0.0.0")]
     pub listen_addr: IpAddr,
@@ -36,6 +88,58 @@ pub struct Cli {
     /// Show version information and exit
     #[arg(short = 'v', action = ArgAction::SetTrue)]
     pub version: bool,
+
+    /// Resolved fsync policy (from `-f` / `-F` in argument order); only
+    /// meaningful with `-b`.
+    #[arg(skip = SyncPolicy::Interval(Duration::from_millis(DEFAULT_FSYNC_MS)))]
+    pub sync: SyncPolicy,
+}
+
+impl Cli {
+    /// Parses the process arguments (exiting on error, like
+    /// `Parser::parse`) and resolves the fsync policy.
+    pub fn from_env() -> Cli {
+        let matches = Cli::command().get_matches();
+        Cli::from_matches(&matches).unwrap_or_else(|e| e.exit())
+    }
+
+    fn from_matches(matches: &ArgMatches) -> Result<Cli, clap::Error> {
+        let mut cli = Cli::from_arg_matches(matches)?;
+        // Defaults (e.g. `-F`'s implicit `false`) have indices too; only
+        // occurrences on the command line count.
+        let last = |id: &str| {
+            (matches.value_source(id) == Some(ValueSource::CommandLine))
+                .then(|| matches.indices_of(id).and_then(|mut i| i.next_back()))
+                .flatten()
+        };
+        let never = match (last("never_fsync"), last("fsync_ms")) {
+            (Some(big_f), Some(f)) => big_f > f,
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        cli.sync = sync_policy(cli.fsync_ms.unwrap_or(DEFAULT_FSYNC_MS), never);
+        Ok(cli)
+    }
+}
+
+/// `wal.syncrate = (int64) ms * 1000000` with `wantsync = !never`.
+/// `walsync` fsyncs when `now >= lastsync + syncrate`, so a rate of 0 (or
+/// one that wrapped negative) means fsync on every write.
+fn sync_policy(ms: u64, never: bool) -> SyncPolicy {
+    if never {
+        return SyncPolicy::Never;
+    }
+    // Two's-complement reinterpretation, as the C cast does.
+    let rate = i64::from_ne_bytes(ms.to_ne_bytes()).wrapping_mul(1_000_000);
+    match u64::try_from(rate) {
+        Ok(nanos) if nanos > 0 => SyncPolicy::Interval(Duration::from_nanos(nanos)),
+        _ => SyncPolicy::Always,
+    }
+}
+
+/// `-s` and `-f` arguments: the reference's `parse_size_t`.
+fn parse_size_arg(s: &str) -> Result<u64, String> {
+    scan_size_t(s).ok_or_else(|| format!("invalid size: {s}"))
 }
 
 /// Parses `-z`'s argument the way the reference's `parse_size_t` does, then
@@ -111,6 +215,54 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn binlog_defaults_mirror_serv_c() {
+        let cli = parse(&[]).expect("no args");
+        assert_eq!(cli.binlog_dir, None);
+        assert_eq!(cli.binlog_file_size, 10 << 20);
+        assert_eq!(cli.sync, SyncPolicy::Interval(Duration::from_millis(50)));
+        let cli = parse(&["-b", "/x", "-s", "1000"]).expect("-b -s");
+        assert_eq!(cli.binlog_dir, Some(PathBuf::from("/x")));
+        assert_eq!(cli.binlog_file_size, 1000);
+    }
+
+    #[test]
+    fn fsync_flags_follow_argument_order() {
+        let sync = |args: &[&str]| parse(args).expect("parses").sync;
+        let ms = |n| SyncPolicy::Interval(Duration::from_millis(n));
+        assert_eq!(sync(&["-f0"]), SyncPolicy::Always);
+        assert_eq!(sync(&["-f", "0"]), SyncPolicy::Always);
+        assert_eq!(sync(&["-f", "10"]), ms(10));
+        assert_eq!(sync(&["-F"]), SyncPolicy::Never);
+        assert_eq!(sync(&["-f", "10", "-F"]), SyncPolicy::Never);
+        assert_eq!(sync(&["-F", "-f", "10"]), ms(10));
+        assert_eq!(sync(&["-F", "-f", "10", "-F"]), SyncPolicy::Never);
+        assert_eq!(sync(&["-f", "10", "-F", "-f", "20"]), ms(20));
+        assert_eq!(sync(&["-f", "10", "-f", "20"]), ms(20));
+        // -F keeps the rate: fsync is off, whatever -f said before.
+        assert_eq!(sync(&["-f0", "-F"]), SyncPolicy::Never);
+        // (int64) SIZE_MAX * 1000000 wraps negative: always fsync.
+        assert_eq!(sync(&["-f", "-1"]), SyncPolicy::Always);
+        assert!(parse(&["-f", "x"]).is_err());
+        assert!(parse(&["-s", "10k"]).is_err());
+    }
+
+    #[test]
+    fn size_flag_is_parse_size_t() {
+        assert_eq!(
+            parse(&["-s", "-1"]).expect("-s -1").binlog_file_size,
+            u64::MAX
+        );
+        assert_eq!(parse(&["-s", " 4097"]).expect("-s").binlog_file_size, 4097);
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let mut argv = vec!["beanstalkd-rs"];
+        argv.extend_from_slice(args);
+        let matches = Cli::command().try_get_matches_from(argv)?;
+        Cli::from_matches(&matches)
     }
 
     #[test]

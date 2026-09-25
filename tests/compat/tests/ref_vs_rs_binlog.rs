@@ -9,7 +9,6 @@ use bstk_compat::runner::{
 use bstk_compat::summarize;
 
 #[test]
-#[ignore = "enabled at P1-T4"]
 fn ref_vs_rs_binlog_all_cases_pass() {
     let ref_bin = default_ref_bin();
     let rs_bin = default_rs_bin();

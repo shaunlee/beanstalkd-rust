@@ -134,11 +134,13 @@ version = "0.1.0"
 dependencies = [
  "bstk-engine",
  "bstk-proto",
+ "bstk-store",
  "bytes",
  "clap",
  "futures",
  "getrandom 0.2.17",
  "nix",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

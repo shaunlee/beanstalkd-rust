@@ -450,3 +450,18 @@ fn incomplete_segments_are_removed() {
         "{idx:?}"
     );
 }
+
+/// A wrapped `-s -1` (or anything past the cap) is rejected before any
+/// file is created, instead of overflowing or preallocating a huge segment.
+#[test]
+fn absurd_segment_size_is_rejected() {
+    let t = tmp();
+    let dir = t.path().join("wal");
+    for size in [u64::MAX, u64::MAX - 4095, (1 << 32) + 1] {
+        match Wal::open(opts(&dir, size)) {
+            Err(WalError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+            other => panic!("expected InvalidInput for {size}, got {other:?}"),
+        }
+    }
+    assert!(!dir.exists(), "no directory should be created");
+}
