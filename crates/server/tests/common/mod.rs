@@ -5,6 +5,8 @@
 // Each test binary uses a different subset of these helpers.
 #![allow(dead_code)]
 
+pub mod p2;
+
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};

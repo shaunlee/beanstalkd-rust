@@ -95,14 +95,10 @@ pub struct Cli {
 
     /// Read settings from a TOML configuration file (command-line flags
     /// override its values)
-    // Read by `config.rs`; wired into startup in P2-T4.
-    #[allow(dead_code)]
     #[arg(long = "config", value_name = "PATH")]
     pub config: Option<PathBuf>,
 
     /// Validate the configuration, print a summary and exit
-    // Read by `config.rs`; wired into startup in P2-T4.
-    #[allow(dead_code)]
     #[arg(long = "check-config", action = ArgAction::SetTrue)]
     pub check_config: bool,
 
@@ -121,8 +117,6 @@ pub struct Cli {
 /// `sync`) was given on the command line. Filled in by `from_matches`;
 /// all `false` for a `Cli` built any other way.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-// Read by `config.rs`; wired into startup in P2-T4.
-#[allow(dead_code)]
 pub struct Given {
     /// `-l`
     pub listen_addr: bool,
@@ -239,7 +233,11 @@ fn scan_size_t(s: &str) -> Option<u64> {
 }
 
 /// Maps `-V` repeat count to a tracing level, matching the reference's
-/// `verbose++` behavior (more `-V` = more output).
+/// `verbose++` behavior (more `-V` = more output). The server now takes
+/// its level from `config::LogLevel::from_verbosity` (which also applies
+/// `[log] level`); this stays as the reference the config tests check it
+/// against.
+#[cfg(test)]
 pub fn tracing_level(verbose: u8) -> tracing::Level {
     match verbose {
         0 => tracing::Level::WARN,

@@ -38,7 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
-use bstk_engine::{BinlogStats, ConnId, Engine, JournalEntry, Nanos, Outbox};
+use bstk_engine::{BinlogStats, ConnId, Engine, JournalEntry, Nanos, Outbox, Snapshot};
 use bstk_proto::{Command, MAX_TUBE_NAME_LEN, PutRejection, Response};
 use bstk_store::{SyncPolicy, Wal, WalError};
 
@@ -77,6 +77,10 @@ pub enum EngineMsg {
     Disconnect { conn: ConnId },
     /// SIGUSR1: enter (or, in principle, leave) drain mode.
     SetDraining(bool),
+    /// The HTTP listener wants a monitoring snapshot (`Engine::snapshot`,
+    /// which changes no state). Like every message it is followed by a
+    /// tick, which is harmless: `tick` only does what is already due.
+    Snapshot { reply: oneshot::Sender<Snapshot> },
     /// SIGINT / SIGTERM: sync the WAL (unless `-F`), acknowledge on `done`
     /// and stop. Messages queued behind it are never processed.
     Shutdown { done: oneshot::Sender<()> },
@@ -367,6 +371,10 @@ impl<L: Log> Actor<L> {
                 self.draining = on;
                 self.engine.set_draining(on);
             }
+            EngineMsg::Snapshot { reply } => {
+                // The requester may have given up (timeout); that's fine.
+                let _ = reply.send(self.engine.snapshot(now));
+            }
             // Handled by `run`; kept total so a stray one is harmless.
             EngineMsg::Shutdown { done } => {
                 let _ = done.send(());
@@ -636,6 +644,34 @@ mod tests {
         h.actor.on_message(put(b"x")).unwrap();
         assert_eq!(events(&h), vec![]);
         assert_eq!(h.rx.try_recv().unwrap(), Response::Draining);
+    }
+
+    #[test]
+    fn snapshot_is_read_only_and_touches_neither_log_nor_replies() {
+        let mut h = harness(FakeLog::default(), true, SyncPolicy::Never);
+        h.actor.on_message(put(b"hello")).unwrap();
+        let _ = events(&h);
+        let _ = h.rx.try_recv();
+        let (reply, mut rx) = oneshot::channel();
+        h.actor.on_message(EngineMsg::Snapshot { reply }).unwrap();
+        let snap = rx.try_recv().unwrap();
+        assert_eq!(snap.server.current_jobs_ready, 1);
+        assert_eq!(snap.server.cmd_put, 1);
+        assert_eq!(snap.server.cmd_stats, 0);
+        assert_eq!(snap.server.current_connections, 1);
+        assert_eq!(snap.tubes.len(), 1);
+        assert_eq!(events(&h), vec![]);
+        assert!(h.rx.try_recv().is_err(), "a snapshot sends no reply");
+        // A second snapshot sees exactly the same counters.
+        let (reply, mut rx) = oneshot::channel();
+        h.actor.on_message(EngineMsg::Snapshot { reply }).unwrap();
+        let again = rx.try_recv().unwrap();
+        assert_eq!(again.server.cmd_stats, 0);
+        assert_eq!(again.tubes, snap.tubes);
+        // A requester that gave up is harmless.
+        let (reply, rx) = oneshot::channel();
+        drop(rx);
+        h.actor.on_message(EngineMsg::Snapshot { reply }).unwrap();
     }
 
     #[test]

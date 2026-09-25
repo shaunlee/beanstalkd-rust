@@ -1,8 +1,7 @@
 //! TLS differential mode against `beanstalkd-rs`: every case in `cases/`
 //! runs with the reference as server A over plaintext and `beanstalkd-rs`
 //! as server B over TLS (B started with a generated `--config` file
-//! declaring one TLS listener, throwaway certificate). Enabled once
-//! `beanstalkd-rs` has TLS listeners (task P2-T4): remove the `#[ignore]`.
+//! declaring one TLS listener, throwaway certificate).
 
 use bstk_compat::runner::{
     RunOptions, default_parallelism, default_ref_bin, default_rs_bin, discover_cases, run_all_with,
@@ -10,7 +9,6 @@ use bstk_compat::runner::{
 use bstk_compat::summarize;
 
 #[test]
-#[ignore = "enabled at P2-T4"]
 fn ref_vs_rs_tls_all_cases_pass() {
     let ref_bin = default_ref_bin();
     let rs_bin = default_rs_bin();
