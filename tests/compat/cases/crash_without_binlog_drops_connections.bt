@@ -1,0 +1,17 @@
+# without -b a crash drops all connections and the new process starts empty (the reserved job is gone); connection names reconnect lazily.
+@w send "reserve\r\n"
+@w recv_none 200ms
+@p send "put 0 0 60 1\r\na\r\n"
+@p recv
+@w recv
+@w send "stats-job 1\r\n"
+@w recv
+crash 500ms
+@w send "stats-job 1\r\n"
+@w recv
+@p send "stats\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nb\r\n"
+@p recv
+@w send "reserve-with-timeout 0\r\n"
+@w recv

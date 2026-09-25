@@ -5,10 +5,38 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::compare::{Mismatch, compare};
+use crate::compare::{Mismatch, compare_with, format_outcome};
 use crate::conn::execute;
 use crate::dsl::{CaseFile, parse_case_file};
-use crate::server::spawn_server;
+use crate::mask::MaskMode;
+use crate::server::{ServerConfig, spawn};
+
+/// Environment variable enabling the global binlog mode in the `compat`
+/// CLI (any value other than empty or `0`).
+pub const BINLOG_ENV: &str = "BSTK_COMPAT_BINLOG";
+
+/// Options that apply to every case of a run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    /// Global binlog mode: give every server its own fresh `-b <dir>`, as if
+    /// every case declared `!binlog` (cases that already do are unchanged).
+    pub force_binlog: bool,
+    /// Keep server A's (masked) transcript in [`CaseResult::transcript`].
+    pub keep_transcript: bool,
+}
+
+impl RunOptions {
+    /// Default options, with `force_binlog` taken from [`BINLOG_ENV`].
+    pub fn from_env() -> Self {
+        let force_binlog = std::env::var(BINLOG_ENV)
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        RunOptions {
+            force_binlog,
+            ..RunOptions::default()
+        }
+    }
+}
 
 /// Repository root, computed at compile time from this crate's manifest
 /// directory (`tests/compat`).
@@ -69,6 +97,9 @@ pub struct CaseResult {
     /// failure.
     pub harness_error: Option<String>,
     pub mismatches: Vec<Mismatch>,
+    /// Server A's transcript as `(line, step, outcome)`, masked; only
+    /// filled when [`RunOptions::keep_transcript`] is set.
+    pub transcript: Vec<(u32, String, String)>,
 }
 
 impl CaseResult {
@@ -86,6 +117,7 @@ fn error_result(path: &Path, message: String) -> CaseResult {
         path: path.to_path_buf(),
         harness_error: Some(message),
         mismatches: Vec::new(),
+        transcript: Vec::new(),
     }
 }
 
@@ -95,6 +127,16 @@ fn error_result(path: &Path, message: String) -> CaseResult {
 /// binary in particular must always be present (built by
 /// `scripts/build-ref.sh`).
 pub fn run_case_pair(case_path: &Path, bin_a: &Path, bin_b: &Path) -> CaseResult {
+    run_case_pair_with(case_path, bin_a, bin_b, RunOptions::default())
+}
+
+/// Like [`run_case_pair`], with explicit [`RunOptions`].
+pub fn run_case_pair_with(
+    case_path: &Path,
+    bin_a: &Path,
+    bin_b: &Path,
+    opts: RunOptions,
+) -> CaseResult {
     let case: CaseFile = match parse_case_file(case_path) {
         Ok(c) => c,
         Err(e) => return error_result(case_path, format!("parse error: {e}")),
@@ -113,38 +155,54 @@ pub fn run_case_pair(case_path: &Path, bin_a: &Path, bin_b: &Path) -> CaseResult
         );
     }
 
-    let server_a = match spawn_server(bin_a, &case.extra_args) {
+    let binlog = case.binlog || opts.force_binlog;
+    let mode = MaskMode { binlog };
+    let cfg = |bin| ServerConfig {
+        bin,
+        extra_args: &case.extra_args,
+        binlog,
+    };
+    let mut server_a = match spawn(&cfg(bin_a)) {
         Ok(s) => s,
         Err(e) => return error_result(case_path, format!("failed to start server A: {e}")),
     };
-    let server_b = match spawn_server(bin_b, &case.extra_args) {
+    let mut server_b = match spawn(&cfg(bin_b)) {
         Ok(s) => s,
         Err(e) => return error_result(case_path, format!("failed to start server B: {e}")),
     };
 
-    let (addr_a, pid_a) = (server_a.addr(), server_a.pid());
-    let (addr_b, pid_b) = (server_b.addr(), server_b.pid());
     let steps = &case.steps;
 
     let (outcomes_a, outcomes_b) = thread::scope(|scope| {
-        let handle_a = scope.spawn(|| execute(steps, addr_a, pid_a));
-        let handle_b = scope.spawn(|| execute(steps, addr_b, pid_b));
+        let handle_a = scope.spawn(|| execute(steps, &mut server_a));
+        let handle_b = scope.spawn(|| execute(steps, &mut server_b));
         (
             handle_a.join().expect("server A execution thread panicked"),
             handle_b.join().expect("server B execution thread panicked"),
         )
     });
 
-    // Servers are killed here (end of scope), before we finish comparing.
+    // Servers are killed (and binlog directories removed) here, before we
+    // finish comparing.
     drop(server_a);
     drop(server_b);
 
-    let mismatches = compare(steps, &outcomes_a, &outcomes_b);
+    let mismatches = compare_with(steps, &outcomes_a, &outcomes_b, mode);
+    let transcript = if opts.keep_transcript {
+        steps
+            .iter()
+            .zip(&outcomes_a)
+            .map(|(step, o)| (step.line, step.kind.describe(), format_outcome(o, mode)))
+            .collect()
+    } else {
+        Vec::new()
+    };
     CaseResult {
         name: case.name(),
         path: case_path.to_path_buf(),
         harness_error: None,
         mismatches,
+        transcript,
     }
 }
 
@@ -156,6 +214,23 @@ pub fn run_all(
     bin_a: &Path,
     bin_b: &Path,
     max_parallel: usize,
+) -> Vec<CaseResult> {
+    run_all_with(
+        case_paths,
+        bin_a,
+        bin_b,
+        max_parallel,
+        RunOptions::default(),
+    )
+}
+
+/// Like [`run_all`], with explicit [`RunOptions`].
+pub fn run_all_with(
+    case_paths: &[PathBuf],
+    bin_a: &Path,
+    bin_b: &Path,
+    max_parallel: usize,
+    opts: RunOptions,
 ) -> Vec<CaseResult> {
     let max_parallel = max_parallel.max(1);
     let queue: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(case_paths.to_vec()));
@@ -169,7 +244,7 @@ pub fn run_all(
                 loop {
                     let next = { queue.lock().expect("case queue lock poisoned").pop() };
                     let Some(path) = next else { break };
-                    let result = run_case_pair(&path, bin_a, bin_b);
+                    let result = run_case_pair_with(&path, bin_a, bin_b, opts);
                     results.lock().expect("results lock poisoned").push(result);
                 }
             });
@@ -182,6 +257,12 @@ pub fn run_all(
         .expect("results lock poisoned");
     results.sort_by(|a, b| a.path.cmp(&b.path));
     results
+}
+
+/// Whether the case file at `path` declares `!binlog`. A case that fails to
+/// parse counts as not declaring it (running it reports the parse error).
+pub fn case_declares_binlog(path: &Path) -> bool {
+    parse_case_file(path).map(|c| c.binlog).unwrap_or(false)
 }
 
 /// A reasonable default worker count: enough to keep several case pairs

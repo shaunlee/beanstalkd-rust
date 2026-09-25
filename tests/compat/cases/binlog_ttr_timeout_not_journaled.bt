@@ -1,0 +1,14 @@
+# a TTR timeout is not journaled: timeouts goes back to the last record's value after restart.
+!binlog
+@a send "put 0 0 1 1\r\nx\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+sleep 2500ms
+@a send "stats-job 1\r\n"
+@a recv
+restart
+@a send "stats-job 1\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv

@@ -1,0 +1,38 @@
+# binlog-records-written deltas for the journaled commands: put, release with delay, bury, kick, kick-job, delete (one record each).
+!binlog
+@a send "stats\r\n"
+@a recv
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nb\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nc\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "release 1 0 30\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "bury 2 0\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv
+@a send "kick 1\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv
+@a send "kick-job 1\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv
+@a send "delete 2\r\n"
+@a recv
+@a send "delete 3\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv

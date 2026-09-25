@@ -1,0 +1,17 @@
+# the next job id after restart is the highest id in the binlog + 1, even when that job was deleted.
+!binlog
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nb\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nc\r\n"
+@a recv
+@a send "delete 3\r\n"
+@a recv
+restart
+@a send "peek 3\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nd\r\n"
+@a recv
+@a send "stats-job 4\r\n"
+@a recv

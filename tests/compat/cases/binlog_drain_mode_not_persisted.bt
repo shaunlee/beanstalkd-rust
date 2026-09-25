@@ -1,0 +1,15 @@
+# drain mode (SIGUSR1) is not persisted: after a restart puts are accepted again and stats shows draining false.
+!binlog
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+signal USR1
+sleep 300ms
+@a send "put 0 0 60 1\r\nb\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv
+restart
+@a send "stats\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nc\r\n"
+@a recv

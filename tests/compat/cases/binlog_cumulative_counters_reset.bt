@@ -1,0 +1,33 @@
+# cumulative server and tube counters (cmd-*, total-jobs, job-timeouts, total-connections) reset on restart; recovered jobs don't count toward total-jobs.
+!binlog
+@a send "use t\r\n"
+@a recv
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nb\r\n"
+@a recv
+@a send "put 0 5 60 1\r\nc\r\n"
+@a recv
+@b send "watch t\r\n"
+@b recv
+@b send "reserve\r\n"
+@b recv
+@b send "bury 1 0\r\n"
+@b recv
+@b send "reserve\r\n"
+@b recv
+@b send "stats-tube t\r\n"
+@b recv
+@b send "stats\r\n"
+@b recv
+restart
+@a send "stats-tube t\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv
+@a send "use t\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nd\r\n"
+@a recv
+@a send "stats-tube t\r\n"
+@a recv

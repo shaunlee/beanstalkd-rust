@@ -1,0 +1,16 @@
+# without -b a restart loses every job and tube; ids restart at 1 and a fresh connection is opened for the next reference.
+@a send "use foo\r\n"
+@a recv
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nb\r\n"
+@a recv
+restart
+@a send "stats\r\n"
+@a recv
+@a send "list-tubes\r\n"
+@a recv
+@a send "peek 1\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nc\r\n"
+@a recv

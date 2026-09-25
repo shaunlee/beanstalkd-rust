@@ -1,0 +1,35 @@
+# tubes that were only used/watched, or whose jobs were all deleted, are not recreated after restart; a tube with a buried job is.
+!binlog
+@a send "use onlyused\r\n"
+@a recv
+@b send "watch onlywatched\r\n"
+@b recv
+@c send "use emptied\r\n"
+@c recv
+@c send "put 0 0 60 1\r\ne\r\n"
+@c recv
+@c send "delete 1\r\n"
+@c recv
+@c send "use keep\r\n"
+@c recv
+@c send "put 0 0 60 1\r\nk\r\n"
+@c recv
+@b send "watch keep\r\n"
+@b recv
+@b send "reserve\r\n"
+@b recv
+@b send "bury 2 0\r\n"
+@b recv
+@a send "list-tubes\r\n"
+@a recv
+crash
+@a send "list-tubes\r\n"
+@a recv
+@a send "list-tube-used\r\n"
+@a recv
+@a send "stats-tube onlyused\r\n"
+@a recv
+@a send "stats-tube keep\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv

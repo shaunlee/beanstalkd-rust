@@ -14,6 +14,8 @@ mod model;
 mod ms;
 #[cfg(test)]
 mod oracle_tests;
+#[cfg(test)]
+mod recovery_tests;
 
 pub use engine::Engine;
 
@@ -148,6 +150,13 @@ pub struct Recovery {
     /// Highest job id in any surviving record (live or deleted) + 1, and at
     /// least 1.
     pub next_id: bstk_proto::JobId,
+    /// Tube list order the reference ends up with after replaying every
+    /// surviving record in file order, excluding `default` (always first):
+    /// a tube is appended when a job's full record first needs it, and
+    /// swap-removed (`ms_remove`) when a delete record frees its last job.
+    /// Tubes without live jobs are ignored; tubes of live jobs missing here
+    /// are appended in first-appearance order.
+    pub tube_order: Vec<bstk_proto::TubeName>,
 }
 
 /// Binlog fields of `stats`, owned by the store.

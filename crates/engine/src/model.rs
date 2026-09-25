@@ -46,6 +46,10 @@ pub(crate) struct JobRec {
     pub(crate) release_ct: u32,
     pub(crate) bury_ct: u32,
     pub(crate) kick_ct: u32,
+    /// Reported as `file` by stats-job: the binlog `current_index` known to
+    /// the engine when the job's first journal record was produced (0 when
+    /// journaling is off, and for recovered jobs). See `Engine::cmd_put`.
+    pub(crate) file: u64,
 }
 
 impl JobRec {

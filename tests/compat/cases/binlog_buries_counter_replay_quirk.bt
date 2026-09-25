@@ -1,0 +1,27 @@
+# replaying a buried job increments buries again (1 -> 2), but only from the last record: a second restart still shows 2, and a kick record snapshots buries 2.
+!binlog
+@a send "put 0 0 60 1\r\nx\r\n"
+@a recv
+@a send "put 0 0 60 1\r\ny\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "bury 1 0\r\n"
+@a recv
+@a send "stats-job 1\r\n"
+@a recv
+restart
+@a send "stats-job 1\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv
+restart
+@a send "stats-job 1\r\n"
+@a recv
+@a send "kick-job 1\r\n"
+@a recv
+restart
+@a send "stats-job 1\r\n"
+@a recv
+@a send "stats-job 2\r\n"
+@a recv

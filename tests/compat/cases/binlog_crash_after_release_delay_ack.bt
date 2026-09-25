@@ -1,0 +1,18 @@
+# a release with delay acknowledged before a SIGKILL persists: the job is still delayed after restart, then becomes ready at its original deadline.
+!binlog
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "release 1 2 3\r\n"
+@a recv
+crash
+@a send "stats-job 1\r\n"
+@a recv
+@a send "reserve-with-timeout 0\r\n"
+@a recv
+sleep 4600ms
+@a send "reserve-with-timeout 0\r\n"
+@a recv
+@a send "stats-job 1\r\n"
+@a recv

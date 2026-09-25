@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 
-use crate::conn::{Outcome, outcomes_equal};
+use crate::conn::{Outcome, outcomes_equal_with};
 use crate::dsl::Step;
 use crate::escape::escape_bytes;
-use crate::mask::mask_response;
+use crate::mask::{MaskMode, mask_response_with};
 
 /// A single point of disagreement between the two servers' transcripts.
 #[derive(Debug, Clone)]
@@ -21,6 +21,11 @@ pub struct Mismatch {
 /// Compare two transcripts (produced by [`crate::conn::execute`] from the
 /// same step list) and report every step where they disagree.
 pub fn compare(steps: &[Step], a: &[Outcome], b: &[Outcome]) -> Vec<Mismatch> {
+    compare_with(steps, a, b, MaskMode::default())
+}
+
+/// Like [`compare`], masking responses according to `mode`.
+pub fn compare_with(steps: &[Step], a: &[Outcome], b: &[Outcome], mode: MaskMode) -> Vec<Mismatch> {
     assert_eq!(
         steps.len(),
         a.len(),
@@ -40,25 +45,29 @@ pub fn compare(steps: &[Step], a: &[Outcome], b: &[Outcome]) -> Vec<Mismatch> {
             last_send.insert(conn.as_str(), (step.line, escape_bytes(data)));
         }
 
-        if !outcomes_equal(&a[i], &b[i]) {
+        if !outcomes_equal_with(&a[i], &b[i], mode) {
             let conn = step.kind.conn();
             let last_send = conn.and_then(|c| last_send.get(c).cloned());
             mismatches.push(Mismatch {
                 line: step.line,
                 step_desc: step.kind.describe(),
                 last_send,
-                expected: format_outcome(&a[i]),
-                actual: format_outcome(&b[i]),
+                expected: format_outcome(&a[i], mode),
+                actual: format_outcome(&b[i], mode),
             });
         }
     }
     mismatches
 }
 
-fn format_outcome(o: &Outcome) -> String {
+/// Render an outcome for reports and transcripts (responses masked per
+/// `mode`).
+pub fn format_outcome(o: &Outcome, mode: MaskMode) -> String {
     match o {
         Outcome::Sent(n) => format!("sent({n} bytes)"),
-        Outcome::Received(bytes) => format!("\"{}\"", escape_bytes(&mask_response(bytes))),
+        Outcome::Received(bytes) => {
+            format!("\"{}\"", escape_bytes(&mask_response_with(bytes, mode)))
+        }
         Outcome::Timeout => "<timeout>".to_string(),
         Outcome::NoBytes => "<no bytes arrived>".to_string(),
         Outcome::SomeBytes(bytes) => format!("<bytes arrived: \"{}\">", escape_bytes(bytes)),
@@ -68,6 +77,8 @@ fn format_outcome(o: &Outcome) -> String {
         Outcome::Signaled => "<signaled>".to_string(),
         Outcome::ShutdownDone => "<shutdown_write done>".to_string(),
         Outcome::ClosedDone => "<close done>".to_string(),
+        Outcome::Restarted(how) => format!("<{} done>", how.directive()),
+        Outcome::HarnessError(msg) => format!("<HARNESS ERROR: {msg}>"),
         Outcome::IoError(msg) => format!("<io error: {msg}>"),
     }
 }

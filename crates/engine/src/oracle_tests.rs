@@ -9,6 +9,10 @@
 //! `next_deadline() - 1 ns`, `+ 0` and `+ 1 ns`, so TTR expiry (`<`), the
 //! DEADLINE_SOON margin (`>=`), delays, `pause-tube 0` (1 ns) and reserve
 //! timeouts are all hit on their exact boundaries.
+//!
+//! The new engine runs both with journaling off and on (the oracle has no
+//! journal): journaling must not change any reply or statistic. With it off,
+//! `take_journal` must always yield nothing.
 
 #![allow(clippy::unwrap_used)]
 
@@ -20,7 +24,9 @@ use proptest::prelude::*;
 use bstk_engine_oracle as oracle;
 use bstk_proto::{Command, JobId, PutRejection, TubeName};
 
-use crate::{ConnId, Engine, EngineConfig, NANOS_PER_SEC, Nanos, Outbox, StaticSysInfo};
+use crate::{
+    ConnId, Engine, EngineConfig, JournalEntry, NANOS_PER_SEC, Nanos, Outbox, StaticSysInfo,
+};
 
 const SEC: Nanos = NANOS_PER_SEC;
 const TUBES: [&str; 4] = ["default", "a", "b", "c"];
@@ -28,7 +34,7 @@ const TUBES: [&str; 4] = ["default", "a", "b", "c"];
 const CONNS: ConnId = 6;
 const PRECONNECTED: ConnId = 3;
 /// Commands address job ids `0..MAX_JOB` (0 never exists).
-const MAX_JOB: JobId = 24;
+pub(crate) const MAX_JOB: JobId = 24;
 
 fn tube_name(i: usize) -> TubeName {
     TubeName::new(TUBES[i % TUBES.len()]).unwrap()
@@ -36,7 +42,7 @@ fn tube_name(i: usize) -> TubeName {
 
 /// How a put completes (see `Frame::PutStarted` / `Frame::PutRejected`).
 #[derive(Debug, Clone, Copy)]
-enum PutEnd {
+pub(crate) enum PutEnd {
     Body,
     ExpectedCrlf,
     TrailingGarbage,
@@ -44,7 +50,7 @@ enum PutEnd {
 }
 
 #[derive(Debug, Clone)]
-enum Msg {
+pub(crate) enum Msg {
     Connect(ConnId),
     Disconnect(ConnId),
     HalfClose(ConnId),
@@ -141,14 +147,17 @@ fn msg() -> impl Strategy<Value = Msg> {
 /// A message plus whether the caller ticks right after it (the server
 /// always does; skipping it covers a message that arrives before an
 /// overdue timer has fired).
-fn step() -> impl Strategy<Value = (Msg, bool)> {
+pub(crate) fn step() -> impl Strategy<Value = (Msg, bool)> {
     (msg(), prop::bool::weighted(0.8))
 }
 
-struct Pair {
-    new: Engine,
+pub(crate) struct Pair {
+    pub(crate) new: Engine,
+    journal: bool,
+    /// The entries the last `run` drained from `new`.
+    pub(crate) journal_buf: Vec<JournalEntry>,
     old: oracle::Engine,
-    now: Nanos,
+    pub(crate) now: Nanos,
     connected: HashSet<ConnId>,
     ever_connected: HashSet<ConnId>,
     waiting: HashSet<ConnId>,
@@ -157,13 +166,18 @@ struct Pair {
 }
 
 impl Pair {
-    fn new() -> Self {
+    pub(crate) fn new(journal: bool) -> Self {
         let mut p = Pair {
             new: Engine::new(
                 0,
-                EngineConfig::default(),
+                EngineConfig {
+                    journal,
+                    ..EngineConfig::default()
+                },
                 Box::new(StaticSysInfo::default()),
             ),
+            journal,
+            journal_buf: Vec::new(),
             old: oracle::Engine::new(
                 0,
                 oracle::EngineConfig::default(),
@@ -195,7 +209,7 @@ impl Pair {
         !self.waiting.contains(&c) && !self.pending_put.contains_key(&c)
     }
 
-    fn run(&mut self, msg: Msg, tick_after: bool) {
+    pub(crate) fn run(&mut self, msg: Msg, tick_after: bool) {
         let mut out_new = Outbox::new();
         let mut out_old = Outbox::new();
         let now = self.now;
@@ -295,6 +309,13 @@ impl Pair {
         }
         assert_eq!(out_new, out_old, "outbox differs at now={}", self.now);
 
+        // Drain like the server does after every call.
+        self.journal_buf.clear();
+        self.new.take_journal(&mut self.journal_buf);
+        if !self.journal {
+            assert!(self.journal_buf.is_empty(), "journal off but entries");
+        }
+
         for (c, _) in &out_new {
             self.waiting.remove(c);
         }
@@ -346,8 +367,8 @@ impl Pair {
     }
 }
 
-fn run_steps(steps: Vec<(Msg, bool)>) {
-    let mut p = Pair::new();
+fn run_steps(steps: Vec<(Msg, bool)>, journal: bool) {
+    let mut p = Pair::new(journal);
     p.compare();
     for (msg, tick_after) in steps {
         p.run(msg, tick_after);
@@ -359,6 +380,15 @@ proptest! {
 
     #[test]
     fn new_engine_matches_frozen_oracle(steps in prop::collection::vec(step(), 20..100)) {
-        run_steps(steps);
+        run_steps(steps, false);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 4_000, ..ProptestConfig::default() })]
+
+    #[test]
+    fn journaling_engine_matches_frozen_oracle(steps in prop::collection::vec(step(), 20..100)) {
+        run_steps(steps, true);
     }
 }

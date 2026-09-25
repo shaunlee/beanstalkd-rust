@@ -31,13 +31,40 @@ const SERVER_STATS_ONLY_KEYS: &[&str] = &["id"];
 /// A key that only appears in server-wide `stats` output.
 const SERVER_STATS_MARKER: &[u8] = b"\ntotal-connections: ";
 
+/// Keys masked only when the case runs with a binlog directory (see
+/// docs/PLAN.md section 4.2, decision 7): file numbering and compaction
+/// moves are layout details that may legitimately differ. `file` appears
+/// only in `stats-job`; the `binlog-*` keys appear only in `stats`.
+/// `binlog-records-written` and `binlog-max-size` stay compared.
+const BINLOG_MASKED_KEYS: &[&str] = &[
+    // stats-job
+    "file",
+    // stats
+    "binlog-oldest-index",
+    "binlog-current-index",
+    "binlog-records-migrated",
+];
+
 const MASKED_VALUE: &str = "<masked>";
+
+/// Which optional masks apply to a case.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaskMode {
+    /// The servers run with a binlog directory: also mask
+    /// [`BINLOG_MASKED_KEYS`].
+    pub binlog: bool,
+}
 
 /// Mask volatile fields in a full response (as captured by the harness: the
 /// status line plus any trailing body). Only `OK <n>\r\n...` responses are
 /// touched; anything else (RESERVED/FOUND job bodies, plain word replies,
 /// list-tubes YAML lists, ...) is returned unchanged.
 pub fn mask_response(resp: &[u8]) -> Vec<u8> {
+    mask_response_with(resp, MaskMode::default())
+}
+
+/// Like [`mask_response`], additionally applying the masks enabled by `mode`.
+pub fn mask_response_with(resp: &[u8], mode: MaskMode) -> Vec<u8> {
     let Some(line_end) = find(resp, b"\r\n") else {
         return resp.to_vec();
     };
@@ -59,7 +86,7 @@ pub fn mask_response(resp: &[u8]) -> Vec<u8> {
     let body = &resp[body_start..body_end];
     let trailer = &resp[body_end..body_end + 2];
 
-    let masked_body = mask_yaml_body(body);
+    let masked_body = mask_yaml_body(body, mode);
 
     let mut out = Vec::with_capacity(masked_body.len() + trailer.len() + 16);
     out.extend_from_slice(b"OK ");
@@ -70,27 +97,28 @@ pub fn mask_response(resp: &[u8]) -> Vec<u8> {
     out
 }
 
-fn mask_yaml_body(body: &[u8]) -> Vec<u8> {
+fn mask_yaml_body(body: &[u8], mode: MaskMode) -> Vec<u8> {
     let server_stats = find(body, SERVER_STATS_MARKER).is_some();
     let mut out = Vec::with_capacity(body.len());
     let mut rest = body;
     while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
-        out.extend_from_slice(&mask_line(&rest[..nl], server_stats));
+        out.extend_from_slice(&mask_line(&rest[..nl], server_stats, mode));
         out.push(b'\n');
         rest = &rest[nl + 1..];
     }
     if !rest.is_empty() {
-        out.extend_from_slice(&mask_line(rest, server_stats));
+        out.extend_from_slice(&mask_line(rest, server_stats, mode));
     }
     out
 }
 
-fn mask_line(line: &[u8], server_stats: bool) -> Vec<u8> {
+fn mask_line(line: &[u8], server_stats: bool, mode: MaskMode) -> Vec<u8> {
     if let Some(colon) = line.iter().position(|&b| b == b':') {
         let key = &line[..colon];
         if let Ok(key_str) = std::str::from_utf8(key)
             && (MASKED_KEYS.contains(&key_str)
-                || (server_stats && SERVER_STATS_ONLY_KEYS.contains(&key_str)))
+                || (server_stats && SERVER_STATS_ONLY_KEYS.contains(&key_str))
+                || (mode.binlog && BINLOG_MASKED_KEYS.contains(&key_str)))
         {
             let mut out = Vec::with_capacity(key.len() + 2 + MASKED_VALUE.len());
             out.extend_from_slice(key);
@@ -183,6 +211,58 @@ mod tests {
         assert_eq!(
             mask_response(&ok_response(body_a)),
             mask_response(&ok_response(body_b))
+        );
+    }
+
+    const BINLOG: MaskMode = MaskMode { binlog: true };
+
+    #[test]
+    fn binlog_fields_are_compared_without_binlog_mode() {
+        let body = "---\nbinlog-oldest-index: 1\nbinlog-current-index: 2\nbinlog-records-migrated: 3\nbinlog-records-written: 4\nbinlog-max-size: 10485760\ntotal-connections: 1\n";
+        let resp = ok_response(body);
+        assert_eq!(mask_response(&resp), resp);
+        let job = ok_response("---\nid: 1\nfile: 3\nreserves: 0\n");
+        assert_eq!(mask_response(&job), job);
+    }
+
+    #[test]
+    fn binlog_mode_masks_layout_fields_in_stats() {
+        let body = "---\ncurrent-jobs-ready: 1\nbinlog-oldest-index: 1\nbinlog-current-index: 2\nbinlog-records-migrated: 3\nbinlog-records-written: 4\nbinlog-max-size: 10485760\ntotal-connections: 1\nid: abc\n";
+        let masked =
+            String::from_utf8(mask_response_with(&ok_response(body), BINLOG)).expect("utf8");
+        assert!(masked.contains("binlog-oldest-index: <masked>\n"));
+        assert!(masked.contains("binlog-current-index: <masked>\n"));
+        assert!(masked.contains("binlog-records-migrated: <masked>\n"));
+        assert!(masked.contains("binlog-records-written: 4\n"));
+        assert!(masked.contains("binlog-max-size: 10485760\n"));
+        assert!(masked.contains("current-jobs-ready: 1\n"));
+        assert!(masked.contains("id: <masked>\n"));
+    }
+
+    #[test]
+    fn binlog_mode_masks_file_in_stats_job_only() {
+        let body = "---\nid: 7\ntube: \"default\"\nstate: ready\nfile: 3\nreserves: 2\n";
+        let masked =
+            String::from_utf8(mask_response_with(&ok_response(body), BINLOG)).expect("utf8");
+        assert!(masked.contains("file: <masked>\n"));
+        assert!(masked.contains("---\nid: 7\n"));
+        assert!(masked.contains("reserves: 2\n"));
+        // A differing file number compares equal only in binlog mode.
+        let other = ok_response(&body.replace("file: 3", "file: 9"));
+        assert_eq!(
+            mask_response_with(&ok_response(body), BINLOG),
+            mask_response_with(&other, BINLOG)
+        );
+        assert_ne!(mask_response(&ok_response(body)), mask_response(&other));
+    }
+
+    #[test]
+    fn binlog_mode_keeps_records_written_compared() {
+        let a = ok_response("---\nbinlog-records-written: 4\ntotal-connections: 1\n");
+        let b = ok_response("---\nbinlog-records-written: 5\ntotal-connections: 1\n");
+        assert_ne!(
+            mask_response_with(&a, BINLOG),
+            mask_response_with(&b, BINLOG)
         );
     }
 

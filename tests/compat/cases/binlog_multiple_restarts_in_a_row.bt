@@ -1,0 +1,35 @@
+# state survives several restarts and crashes in a row with no writes in between: ready, delayed, buried jobs, tubes and the next id.
+!binlog
+@a send "use t1\r\n"
+@a recv
+@a send "put 5 0 60 1\r\na\r\n"
+@a recv
+@a send "put 6 60 60 1\r\nb\r\n"
+@a recv
+@a send "put 7 0 60 1\r\nc\r\n"
+@a recv
+@a send "watch t1\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "bury 1 1\r\n"
+@a recv
+restart
+crash
+restart
+@a send "list-tubes\r\n"
+@a recv
+@a send "stats-job 1\r\n"
+@a recv
+@a send "stats-job 2\r\n"
+@a recv
+@a send "stats-job 3\r\n"
+@a recv
+@a send "stats-tube t1\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv
+@a send "use t1\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nd\r\n"
+@a recv

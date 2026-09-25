@@ -18,6 +18,16 @@
 //!   the spare. Only if even the spare is exhausted does `append` fail.
 //! - Compaction (`maintain`): while (allocated - live) / live >= 2, move a
 //!   live job out of the oldest segment; delete segments with no live jobs.
+//!
+//! Implementation notes: the file format is documented in `format.rs`, the
+//! replay and corruption rules in `replay.rs`, and space accounting,
+//! compaction, crash safety and memory use in `wal.rs`.
+
+mod format;
+mod replay;
+#[cfg(test)]
+mod tests;
+mod wal;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -73,7 +83,7 @@ impl From<std::io::Error> for WalError {
 /// An open binlog. Not thread-safe; owned by the engine actor thread.
 #[derive(Debug)]
 pub struct Wal {
-    _private: (),
+    inner: wal::Inner,
 }
 
 impl Wal {
@@ -81,38 +91,46 @@ impl Wal {
     /// start a new current segment. Returns the recovered jobs in replay
     /// order and the next job id.
     pub fn open(opts: WalOptions) -> Result<(Wal, Recovery), WalError> {
-        let _ = opts;
-        todo!("P1-T1")
+        let (inner, rec) = wal::Inner::open(opts, None)?;
+        Ok((Wal { inner }, rec))
+    }
+
+    /// Like `open`, but allocating a segment fails once the segment files
+    /// would exceed `max_total_bytes` (simulates a full disk).
+    #[cfg(test)]
+    pub(crate) fn open_with_limit(
+        opts: WalOptions,
+        max_total_bytes: u64,
+    ) -> Result<(Wal, Recovery), WalError> {
+        let (inner, rec) = wal::Inner::open(opts, Some(max_total_bytes))?;
+        Ok((Wal { inner }, rec))
     }
 
     /// Reserve space for a new job's put and delete records. `false` means
     /// the put must be rejected with OUT_OF_MEMORY.
     pub fn reserve_put(&mut self, tube_len: usize, body_len: usize) -> bool {
-        let _ = (tube_len, body_len);
-        todo!("P1-T1")
+        self.inner.reserve_put(tube_len, body_len)
     }
 
     /// Write entries in order. Returns after the bytes reached the OS (and,
     /// with `SyncPolicy::Always`, after fsync). An error is fatal to the
     /// server (fail-stop).
     pub fn append(&mut self, entries: &[JournalEntry]) -> Result<(), WalError> {
-        let _ = entries;
-        todo!("P1-T1")
+        self.inner.append(entries)
     }
 
     /// With `SyncPolicy::Interval`, fsync if at least one interval has
     /// passed since the last fsync and there are unsynced writes.
     pub fn sync_if_due(&mut self, now: std::time::Instant) -> Result<(), WalError> {
-        let _ = now;
-        todo!("P1-T1")
+        self.inner.sync_if_due(now)
     }
 
     /// Compaction and removal of dead segments; call after `append`.
     pub fn maintain(&mut self) -> Result<(), WalError> {
-        todo!("P1-T1")
+        self.inner.maintain()
     }
 
     pub fn stats(&self) -> BinlogStats {
-        todo!("P1-T1")
+        self.inner.stats()
     }
 }

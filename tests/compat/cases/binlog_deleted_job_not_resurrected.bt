@@ -1,0 +1,19 @@
+# a job put before one restart and deleted after it (its put record is in an older file) stays deleted across two more restarts.
+!binlog
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nb\r\n"
+@a recv
+restart
+@a send "delete 1\r\n"
+@a recv
+restart
+@a send "peek 1\r\n"
+@a recv
+crash
+@a send "peek 1\r\n"
+@a recv
+@a send "peek-ready\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nc\r\n"
+@a recv

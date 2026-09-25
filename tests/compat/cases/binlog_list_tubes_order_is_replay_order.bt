@@ -1,0 +1,27 @@
+# list-tubes after restart follows the order of each tube's first job record (xx, zz, yy), not the original creation order (zz, yy, xx).
+!binlog
+@k send "watch zz\r\n"
+@k recv
+@k send "watch yy\r\n"
+@k recv
+@k send "watch xx\r\n"
+@k recv
+@a send "use xx\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nx\r\n"
+@a recv
+@a send "use zz\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nz\r\n"
+@a recv
+@a send "use yy\r\n"
+@a recv
+@a send "put 0 0 60 1\r\ny\r\n"
+@a recv
+@a send "list-tubes\r\n"
+@a recv
+restart
+@a send "list-tubes\r\n"
+@a recv
+@a send "stats-tube zz\r\n"
+@a recv

@@ -1,0 +1,21 @@
+# pause-tube is not journaled: after a crash the tube is no longer paused and its job can be reserved immediately.
+!binlog
+@a send "use p\r\n"
+@a recv
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@a send "pause-tube p 60\r\n"
+@a recv
+@a send "watch p\r\n"
+@a recv
+@a send "reserve-with-timeout 0\r\n"
+@a recv
+@a send "stats-tube p\r\n"
+@a recv
+crash
+@a send "stats-tube p\r\n"
+@a recv
+@a send "watch p\r\n"
+@a recv
+@a send "reserve-with-timeout 0\r\n"
+@a recv

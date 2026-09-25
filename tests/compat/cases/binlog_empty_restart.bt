@@ -1,0 +1,9 @@
+# restart with an empty binlog: nothing recovered, the first put gets id 1, and a fresh connection is used.
+!binlog
+@a send "stats\r\n"
+@a recv
+restart
+@a send "stats\r\n"
+@a recv
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv

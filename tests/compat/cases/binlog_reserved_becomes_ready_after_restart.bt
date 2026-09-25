@@ -1,0 +1,17 @@
+# a reserved job is ready after restart; reserve is not journaled, so reserves goes back to the value in the last record (0).
+!binlog
+@a send "put 3 0 60 5\r\nhello\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "stats-job 1\r\n"
+@a recv
+restart
+@a send "stats-job 1\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv
+@b send "reserve-with-timeout 0\r\n"
+@b recv
+@b send "stats-job 1\r\n"
+@b recv

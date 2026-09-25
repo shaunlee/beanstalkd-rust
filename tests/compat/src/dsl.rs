@@ -13,10 +13,29 @@
 //! @c1 close                       # close and forget the connection
 //! sleep 1100ms                    # sleep the whole harness for a duration
 //! signal USR1                     # send SIGUSR1 to the server process under test
+//! !binlog                         # give each server its own fresh `-b <dir>`
+//! restart                         # SIGTERM the server, wait, start it again
+//! crash 2s                        # SIGKILL the server, stay down 2s, start again
 //! ```
 //!
 //! Connections are named `@c1`, `@c2`, ... and are opened lazily the first
 //! time they are referenced.
+//!
+//! `!binlog` (a header, like `!args`, allowed anywhere in the file) makes the
+//! harness create a fresh temporary directory per server process and pass
+//! it as `-b <dir>` after the `!args` arguments. The directory is kept
+//! across `restart` / `crash` within the case and removed when the case
+//! ends. It also enables the binlog masks (see [`crate::mask::MaskMode`]).
+//!
+//! `restart [DOWNTIME]` sends SIGTERM and `crash [DOWNTIME]` sends SIGKILL to
+//! the server under test, waits for it to exit, optionally stays down for
+//! `DOWNTIME` (default 0), then starts the same binary again with the same
+//! arguments and binlog directory (on the same port when possible) and
+//! waits until it accepts connections. Every open connection is dropped;
+//! the next reference to a connection name opens a fresh connection. Note
+//! that the reference installs a SIGTERM handler only when running as pid
+//! 1, so for it both directives are an abrupt death; `beanstalkd-rs` may
+//! handle SIGTERM gracefully.
 
 use std::fmt;
 use std::fs;
@@ -56,6 +75,32 @@ pub enum StepKind {
     Close {
         conn: String,
     },
+    /// Stop the server under test (SIGTERM for `restart`, SIGKILL for
+    /// `crash`), wait for it to exit, stay down for `downtime`, then start
+    /// it again with the same arguments and binlog directory.
+    Restart {
+        how: StopMode,
+        downtime: Duration,
+    },
+}
+
+/// How a `restart` / `crash` step stops the server process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopMode {
+    /// `restart`: SIGTERM, then wait for the process to exit.
+    Term,
+    /// `crash`: SIGKILL, then wait for the process to exit.
+    Kill,
+}
+
+impl StopMode {
+    /// The directive keyword used in case files.
+    pub fn directive(self) -> &'static str {
+        match self {
+            StopMode::Term => "restart",
+            StopMode::Kill => "crash",
+        }
+    }
 }
 
 impl StepKind {
@@ -68,7 +113,7 @@ impl StepKind {
             | StepKind::RecvClosed { conn, .. }
             | StepKind::ShutdownWrite { conn }
             | StepKind::Close { conn } => Some(conn.as_str()),
-            StepKind::Sleep(_) | StepKind::Signal(_) => None,
+            StepKind::Sleep(_) | StepKind::Signal(_) | StepKind::Restart { .. } => None,
         }
     }
 
@@ -85,6 +130,13 @@ impl StepKind {
             StepKind::Signal(sig) => format!("signal {}", sig.name()),
             StepKind::ShutdownWrite { conn } => format!("@{conn} shutdown_write"),
             StepKind::Close { conn } => format!("@{conn} close"),
+            StepKind::Restart { how, downtime } => {
+                if downtime.is_zero() {
+                    how.directive().to_string()
+                } else {
+                    format!("{} {downtime:?}", how.directive())
+                }
+            }
         }
     }
 }
@@ -121,6 +173,8 @@ pub struct CaseFile {
     pub path: PathBuf,
     /// Extra CLI arguments to pass to both server binaries (from `!args`).
     pub extra_args: Vec<String>,
+    /// `!binlog`: run each server with its own fresh `-b <dir>`.
+    pub binlog: bool,
     pub steps: Vec<Step>,
 }
 
@@ -161,6 +215,7 @@ pub fn parse_case_file(path: &Path) -> Result<CaseFile, ParseError> {
 /// Parse case source text already loaded into memory (used by unit tests).
 pub fn parse_case_str(path: &Path, text: &str) -> Result<CaseFile, ParseError> {
     let mut extra_args = Vec::new();
+    let mut binlog = false;
     let mut steps = Vec::new();
 
     for (idx, raw_line) in text.lines().enumerate() {
@@ -183,6 +238,37 @@ pub fn parse_case_str(path: &Path, text: &str) -> Result<CaseFile, ParseError> {
                 return Err(err("!args requires at least one argument".to_string()));
             }
             extra_args.extend(rest.split_whitespace().map(str::to_string));
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("!binlog") {
+            if !rest.trim().is_empty() {
+                return Err(err("!binlog takes no arguments".to_string()));
+            }
+            if binlog {
+                return Err(err("duplicate !binlog header".to_string()));
+            }
+            binlog = true;
+            continue;
+        }
+
+        let (word, rest) = split_first_word(line);
+        let stop_mode = match word {
+            "restart" => Some(StopMode::Term),
+            "crash" => Some(StopMode::Kill),
+            _ => None,
+        };
+        if let Some(how) = stop_mode {
+            let rest = rest.trim();
+            let downtime = if rest.is_empty() {
+                Duration::ZERO
+            } else {
+                parse_duration(rest).map_err(&err)?
+            };
+            steps.push(Step {
+                line: line_no,
+                kind: StepKind::Restart { how, downtime },
+            });
             continue;
         }
 
@@ -274,6 +360,7 @@ pub fn parse_case_str(path: &Path, text: &str) -> Result<CaseFile, ParseError> {
     Ok(CaseFile {
         path: path.to_path_buf(),
         extra_args,
+        binlog,
         steps,
     })
 }
@@ -556,6 +643,67 @@ mod tests {
         assert!(err.message.contains("unknown directive"));
         let err = parse_case_str(&path(), "signalUSR1\n").expect_err("should fail");
         assert!(err.message.contains("unknown directive"));
+    }
+
+    #[test]
+    fn parses_binlog_header() {
+        let case = parse_case_str(&path(), "!binlog\n@c1 recv\n").expect("should parse");
+        assert!(case.binlog);
+        let case = parse_case_str(&path(), "@c1 recv\n").expect("should parse");
+        assert!(!case.binlog);
+        let case = parse_case_str(&path(), "!args -s 4096\n!binlog   # comment\n").expect("parse");
+        assert!(case.binlog);
+        assert_eq!(case.extra_args, vec!["-s".to_string(), "4096".to_string()]);
+    }
+
+    #[test]
+    fn error_on_binlog_with_arguments_or_duplicate() {
+        let err = parse_case_str(&path(), "!binlog /tmp/x\n").expect_err("should fail");
+        assert!(err.message.contains("takes no arguments"));
+        let err = parse_case_str(&path(), "!binlog\n!binlog\n").expect_err("should fail");
+        assert_eq!(err.line, 2);
+        assert!(err.message.contains("duplicate"));
+    }
+
+    #[test]
+    fn parses_restart_and_crash() {
+        let src = "restart\ncrash\nrestart 2s   # comment\ncrash 1500ms\n";
+        let case = parse_case_str(&path(), src).expect("should parse");
+        let got: Vec<(StopMode, Duration)> = case
+            .steps
+            .iter()
+            .map(|s| match s.kind {
+                StepKind::Restart { how, downtime } => (how, downtime),
+                ref other => panic!("unexpected step: {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (StopMode::Term, Duration::ZERO),
+                (StopMode::Kill, Duration::ZERO),
+                (StopMode::Term, Duration::from_secs(2)),
+                (StopMode::Kill, Duration::from_millis(1500)),
+            ]
+        );
+        assert_eq!(case.steps[0].kind.conn(), None);
+        assert_eq!(case.steps[0].kind.describe(), "restart");
+        assert_eq!(case.steps[1].kind.describe(), "crash");
+        assert_eq!(case.steps[2].kind.describe(), "restart 2s");
+        assert_eq!(case.steps[3].kind.describe(), "crash 1.5s");
+        assert_eq!(case.steps[2].line, 3);
+    }
+
+    #[test]
+    fn error_on_bad_restart_arguments() {
+        let err = parse_case_str(&path(), "restart now\n").expect_err("should fail");
+        assert!(err.message.contains("duration must end with"));
+        let err = parse_case_str(&path(), "crash 2\n").expect_err("should fail");
+        assert!(err.message.contains("duration must end with"));
+        let err = parse_case_str(&path(), "restarting\n").expect_err("should fail");
+        assert!(err.message.contains("unrecognized directive"));
+        let err = parse_case_str(&path(), "@c1 restart\n").expect_err("should fail");
+        assert!(err.message.contains("unknown connection action"));
     }
 
     #[test]

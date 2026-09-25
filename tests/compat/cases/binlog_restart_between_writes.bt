@@ -1,0 +1,31 @@
+# alternating writes and restarts: each restart replays the latest state of every job (checked per job id only: after a second restart the next write may trigger compaction moves, which count in binlog-records-written and can change replay order).
+!binlog
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nb\r\n"
+@a recv
+restart
+@a send "reserve\r\n"
+@a recv
+@a send "release 1 3 30\r\n"
+@a recv
+restart
+@a send "stats-job 1\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nc\r\n"
+@a recv
+@a send "delete 2\r\n"
+@a recv
+@a send "peek-ready\r\n"
+@a recv
+crash
+@a send "peek 2\r\n"
+@a recv
+@a send "stats-job 1\r\n"
+@a recv
+@a send "stats-job 3\r\n"
+@a recv
+@a send "kick 5\r\n"
+@a recv
+@a send "stats-job 1\r\n"
+@a recv

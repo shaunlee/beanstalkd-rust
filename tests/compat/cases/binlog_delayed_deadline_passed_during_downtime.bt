@@ -1,0 +1,15 @@
+# a delayed job whose deadline passes while the server is down is ready after restart, and stats-job still reports its delay.
+!binlog
+@a send "put 0 1 60 1\r\nd\r\n"
+@a recv
+@a send "stats-job 1\r\n"
+@a recv
+crash 2500ms
+@a send "stats-job 1\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv
+@a send "peek-ready\r\n"
+@a recv
+@a send "reserve-with-timeout 0\r\n"
+@a recv

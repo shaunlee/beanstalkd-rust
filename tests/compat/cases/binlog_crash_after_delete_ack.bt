@@ -1,0 +1,39 @@
+# jobs acknowledged DELETED before a SIGKILL (ready, reserved, buried and delayed ones) stay gone; the undeleted one survives.
+!binlog
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nb\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nc\r\n"
+@a recv
+@a send "put 0 30 60 1\r\nd\r\n"
+@a recv
+@a send "put 0 0 60 1\r\ne\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "bury 2 0\r\n"
+@a recv
+@a send "delete 1\r\n"
+@a recv
+@a send "delete 2\r\n"
+@a recv
+@a send "delete 3\r\n"
+@a recv
+@a send "delete 4\r\n"
+@a recv
+crash
+@a send "peek 1\r\n"
+@a recv
+@a send "peek 2\r\n"
+@a recv
+@a send "peek 3\r\n"
+@a recv
+@a send "peek 4\r\n"
+@a recv
+@a send "peek 5\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv

@@ -1,0 +1,19 @@
+# connections are dropped by a restart: a waiting reserve gets nothing, and the reconnected client is back on the default tube with default watch list.
+!binlog
+@a send "use foo\r\n"
+@a recv
+@a send "watch foo\r\n"
+@a recv
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@w send "reserve\r\n"
+@w recv_none 200ms
+restart
+@a send "list-tube-used\r\n"
+@a recv
+@a send "list-tubes-watched\r\n"
+@a recv
+@w send "reserve-with-timeout 0\r\n"
+@w recv
+@a send "stats\r\n"
+@a recv

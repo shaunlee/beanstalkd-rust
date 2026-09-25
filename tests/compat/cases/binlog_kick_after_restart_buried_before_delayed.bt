@@ -1,0 +1,27 @@
+# after a restart kick still prefers buried jobs over delayed ones, and kicks buried jobs in replay order.
+!binlog
+@a send "put 0 60 60 1\r\nd\r\n"
+@a recv
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nb\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "bury 3 0\r\n"
+@a recv
+@a send "bury 2 0\r\n"
+@a recv
+crash
+@a send "kick 1\r\n"
+@a recv
+@a send "peek-ready\r\n"
+@a recv
+@a send "kick 5\r\n"
+@a recv
+@a send "kick 5\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv

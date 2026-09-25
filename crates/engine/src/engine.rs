@@ -31,8 +31,8 @@ use bstk_proto::{
 use crate::model::{ConnState, JobRec, JobState, PendingPut, TubeId, TubeState};
 use crate::ms::Ms;
 use crate::{
-    BinlogStats, ConnId, EngineConfig, JournalEntry, NANOS_PER_SEC, Nanos, Outbox, Recovery,
-    SysInfo,
+    BinlogStats, ConnId, EngineConfig, JobRecord, JournalEntry, NANOS_PER_SEC, Nanos, Outbox,
+    RecordState, Recovery, SysInfo,
 };
 
 /// `SAFETY_MARGIN` in conn.c: 1 second.
@@ -110,6 +110,11 @@ pub struct Engine {
     cmd_list_tube_used: u64,
     cmd_list_tubes_watched: u64,
     cmd_pause_tube: u64,
+
+    /// Pending binlog records (only ever non-empty when `cfg.journal`).
+    journal: Vec<JournalEntry>,
+    /// Binlog fields of `stats`, pushed by the server.
+    binlog: BinlogStats,
 }
 
 impl Engine {
@@ -164,6 +169,8 @@ impl Engine {
             cmd_list_tube_used: 0,
             cmd_list_tubes_watched: 0,
             cmd_pause_tube: 0,
+            journal: Vec::new(),
+            binlog: BinlogStats::default(),
         };
         // The "default" tube is immortal (see TubeState::refs / gc_tube_if_orphan).
         let default = e.find_or_make_tube(&TubeName::default_tube());
@@ -410,24 +417,107 @@ impl Engine {
         self.draining = on;
     }
 
+    /// Rebuilds the state after a restart, as `prot_replay` in prot.c does
+    /// for the job list `walinit` read (docs/PLAN.md §4.1):
+    ///
+    /// * jobs are created in the given (first-record) order, so tubes are
+    ///   created in order of first appearance after "default", and buried
+    ///   jobs enter each tube's buried FIFO in that order;
+    /// * a buried job goes through `bury_job` again, which counts one more
+    ///   bury (the reference's replay quirk);
+    /// * a delayed job whose deadline has passed (`deadline_at <= now`)
+    ///   becomes ready and keeps its `delay`; otherwise it stays delayed
+    ///   until its original deadline;
+    /// * cumulative counters (`cmd-*`, `total-jobs`, per-tube `total-jobs`
+    ///   and `cmd-delete`, ...) start at zero, and recovered jobs don't count
+    ///   toward `total-jobs`;
+    /// * no journal entries are produced.
+    ///
+    /// A job reserved at crash time was never journaled as reserved, so it
+    /// arrives here in its last journaled state, with that record's
+    /// counters. (A reserved state never appears in a record; in the
+    /// reference only compaction writes one, and `readrec` maps it to
+    /// ready.)
+    ///
+    /// Known difference: while replaying, the reference also creates the
+    /// tube of a deleted job at its put record and destroys it (swap-remove)
+    /// at its delete record, which can reorder `list-tubes`. `Recovery` only
+    /// carries live jobs, so we cannot reproduce that (docs/COMPAT.md).
     pub fn recover(
         now: Nanos,
         cfg: EngineConfig,
         sys: Box<dyn SysInfo>,
         recovery: Recovery,
     ) -> Self {
-        let _ = (now, cfg, sys, recovery);
-        todo!("P1-T2")
+        let mut e = Engine::new(now, cfg, sys);
+        // Create tubes in the reference's post-replay list order first
+        // (`Recovery::tube_order`), but only tubes that will hold a job, so
+        // no unreferenced tube is left behind.
+        let live_tubes: std::collections::HashSet<&TubeName> =
+            recovery.jobs.iter().map(|rj| &rj.tube).collect();
+        for name in &recovery.tube_order {
+            if live_tubes.contains(name) {
+                e.find_or_make_tube(name);
+            }
+        }
+        let mut max_id: JobId = 0;
+        for rj in recovery.jobs {
+            let r = rj.record;
+            // Ids are unique in a well-formed recovery; keep the first.
+            if e.jobs.contains_key(&r.id) {
+                continue;
+            }
+            max_id = max_id.max(r.id);
+            let tube = e.find_or_make_tube(&rj.tube);
+            e.jobs.insert(
+                r.id,
+                JobRec {
+                    id: r.id,
+                    tube,
+                    pri: r.pri,
+                    delay: r.delay,
+                    ttr: r.ttr.max(1),
+                    body: rj.body,
+                    created_at: r.created_at,
+                    deadline_at: 0,
+                    state: JobState::Ready,
+                    reserver: None,
+                    reserve_ct: r.reserve_ct,
+                    timeout_ct: r.timeout_ct,
+                    release_ct: r.release_ct,
+                    bury_ct: r.bury_ct,
+                    kick_ct: r.kick_ct,
+                    // The reference reports the file holding the job's full
+                    // record; that is the store's business and the field is
+                    // masked in differential tests.
+                    file: 0,
+                },
+            );
+            if let Some(t) = e.tube_mut(tube) {
+                t.job_ref_ct += 1;
+            }
+            match r.state {
+                // `bury_job(s, j, 0)`: increments bury_ct once more.
+                RecordState::Buried => e.insert_buried(tube, r.id),
+                RecordState::Delayed if r.deadline_at > now => {
+                    e.insert_delayed(tube, r.id, r.deadline_at);
+                }
+                RecordState::Delayed | RecordState::Ready => e.insert_ready(tube, r.id),
+            }
+        }
+        // `recovery.next_id` is authoritative (it also covers deleted jobs
+        // whose records survive); never go below 1 or reuse a live id.
+        e.next_job_id = recovery.next_id.max(max_id + 1).max(1);
+        e
     }
 
+    /// Moves every pending journal entry into `buf`, in order.
     pub fn take_journal(&mut self, buf: &mut Vec<JournalEntry>) {
-        let _ = buf;
-        todo!("P1-T2")
+        buf.append(&mut self.journal);
     }
 
     pub fn set_binlog_stats(&mut self, stats: BinlogStats) {
-        let _ = stats;
-        todo!("P1-T2")
+        self.binlog = stats;
     }
 }
 
@@ -435,6 +525,68 @@ impl Engine {
 // Internal helpers
 // ---------------------------------------------------------------------
 impl Engine {
+    /// The persistent record of `j` as it is now (`j->r` in the
+    /// reference), for a journal entry.
+    fn job_record(j: &JobRec) -> JobRecord {
+        let (state, deadline_at) = match j.state {
+            JobState::Delayed => (RecordState::Delayed, j.deadline_at),
+            JobState::Buried => (RecordState::Buried, 0),
+            // Reserved is never journaled; map it the way readrec does.
+            JobState::Ready | JobState::Reserved => (RecordState::Ready, 0),
+        };
+        JobRecord {
+            id: j.id,
+            pri: j.pri,
+            delay: j.delay,
+            ttr: j.ttr,
+            created_at: j.created_at,
+            deadline_at,
+            state,
+            reserve_ct: j.reserve_ct,
+            timeout_ct: j.timeout_ct,
+            release_ct: j.release_ct,
+            bury_ct: j.bury_ct,
+            kick_ct: j.kick_ct,
+        }
+    }
+
+    /// Journals a new job (the reference's full record, `filewrjobfull`).
+    /// Called from `cmd_put` right after the job is queued and before
+    /// `process_queue`, where `enqueue_job` calls `walwrite`.
+    fn journal_put(&mut self, id: JobId) {
+        if !self.cfg.journal {
+            return;
+        }
+        let Some(j) = self.jobs.get(&id) else {
+            return;
+        };
+        let entry = JournalEntry::Put {
+            record: Self::job_record(j),
+            tube: self.tube_name(j.tube),
+            body: j.body.clone(),
+        };
+        self.journal.push(entry);
+    }
+
+    /// Journals a later transition of job `id` (a short record): release
+    /// with delay, bury, kick and kick-job.
+    fn journal_update(&mut self, id: JobId) {
+        if !self.cfg.journal {
+            return;
+        }
+        if let Some(j) = self.jobs.get(&id) {
+            let record = Self::job_record(j);
+            self.journal.push(JournalEntry::Update(record));
+        }
+    }
+
+    /// Journals a deletion (`j->r.state = Invalid; walwrite(...)`).
+    fn journal_delete(&mut self, id: JobId) {
+        if self.cfg.journal {
+            self.journal.push(JournalEntry::Delete(id));
+        }
+    }
+
     fn tube(&self, id: TubeId) -> Option<&TubeState> {
         self.tubes.get(id).and_then(Option::as_ref)
     }
@@ -926,6 +1078,9 @@ impl Engine {
             j.kick_ct += 1;
         }
         self.insert_ready(tube, id);
+        // kick_buried_job / kick_delayed_job: `enqueue_job(s, j, 0, 1)`
+        // writes the (now ready) record before `process_queue`.
+        self.journal_update(id);
         self.process_queue(now, out);
     }
 
@@ -1031,6 +1186,17 @@ impl Engine {
             release_ct: 0,
             bury_ct: 0,
             kick_ct: 0,
+            // Approximation: the index of the binlog file the server last
+            // reported, not necessarily the one this job's first record
+            // lands in (the store may start a new file for it). The
+            // reference reports `j->file->seq`, which also changes when
+            // compaction moves the job; the field is masked in differential
+            // tests.
+            file: if self.cfg.journal {
+                self.binlog.current_index
+            } else {
+                0
+            },
         };
         self.jobs.insert(id, job);
         if let Some(t) = self.tube_mut(tube) {
@@ -1043,6 +1209,9 @@ impl Engine {
         } else {
             self.insert_ready(tube, id);
         }
+        // `enqueue_job(c->srv, j, j->r.delay, 1)` writes the record before
+        // `process_queue` can hand the job to a waiting connection.
+        self.journal_put(id);
         self.process_queue(now, out);
 
         self.total_jobs_ct += 1;
@@ -1217,6 +1386,7 @@ impl Engine {
             t.job_ref_ct = t.job_ref_ct.saturating_sub(1);
         }
         self.jobs.remove(&id);
+        self.journal_delete(id);
         self.gc_tube_if_orphan(tube);
         out.push((cid, Response::Deleted));
     }
@@ -1252,6 +1422,9 @@ impl Engine {
         if delay > 0 {
             let deadline = now + (delay as Nanos) * NANOS_PER_SEC;
             self.insert_delayed(tube, id, deadline);
+            // `enqueue_job(c->srv, j, delay, !!delay)`: only a release with
+            // a delay is written.
+            self.journal_update(id);
         } else {
             self.insert_ready(tube, id);
         }
@@ -1270,6 +1443,8 @@ impl Engine {
             j.pri = pri;
         }
         self.insert_buried(tube, id);
+        // `bury_job(c->srv, j, 1)`.
+        self.journal_update(id);
         out.push((cid, Response::Buried));
     }
 
@@ -1485,7 +1660,7 @@ impl Engine {
             delay: j.delay as u64,
             ttr: j.ttr as u64,
             time_left,
-            file: 0,
+            file: j.file,
             reserves: j.reserve_ct as u64,
             timeouts: j.timeout_ct as u64,
             releases: j.release_ct as u64,
@@ -1563,10 +1738,10 @@ impl Engine {
             rusage_utime: snap.rusage_utime,
             rusage_stime: snap.rusage_stime,
             uptime: now.saturating_sub(self.start) / NANOS_PER_SEC,
-            binlog_oldest_index: 0,
-            binlog_current_index: 0,
-            binlog_records_migrated: 0,
-            binlog_records_written: 0,
+            binlog_oldest_index: self.binlog.oldest_index,
+            binlog_current_index: self.binlog.current_index,
+            binlog_records_migrated: self.binlog.records_migrated,
+            binlog_records_written: self.binlog.records_written,
             binlog_max_size: self.cfg.binlog_max_size,
             draining: self.draining,
             id: snap.id,
@@ -1584,6 +1759,21 @@ impl Engine {
 impl Engine {
     fn t_tube_by_name(&self, name: &TubeName) -> Option<&TubeState> {
         self.tube(*self.tube_ids.get(name)?)
+    }
+
+    pub(crate) fn t_journal_capacity(&self) -> usize {
+        self.journal.capacity()
+    }
+
+    pub(crate) fn t_next_job_id(&self) -> JobId {
+        self.next_job_id
+    }
+
+    /// A copy of job `id`'s internal record and its tube's name.
+    pub(crate) fn t_job_raw(&self, id: JobId) -> Option<(JobRec, TubeName)> {
+        self.jobs
+            .get(&id)
+            .map(|j| (j.clone(), self.tube_name(j.tube)))
     }
 
     pub(crate) fn t_job_state(&self, id: JobId) -> Option<&'static str> {
@@ -3308,7 +3498,7 @@ mod tests {
 // -----------------------------------------------------------------------
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod proptests {
+pub(crate) mod proptests {
     use std::collections::HashSet;
 
     use bytes::Bytes;
@@ -3451,7 +3641,7 @@ mod proptests {
         Bytes::from_static(b"x")
     }
 
-    fn check_invariants(e: &Engine) {
+    pub(crate) fn check_invariants(e: &Engine) {
         // (0) every deadline index equals a from-scratch recomputation.
         e.t_check_indexes();
 
@@ -3535,12 +3725,16 @@ mod proptests {
         }
     }
 
-    fn run_actions(actions: Vec<Action>) {
+    fn run_actions(actions: Vec<Action>, journal: bool) {
         let mut e = Engine::new(
             0,
-            EngineConfig::default(),
+            EngineConfig {
+                journal,
+                ..EngineConfig::default()
+            },
             Box::new(StaticSysInfo::default()),
         );
+        let mut journal_buf = Vec::new();
         let mut now: Nanos = 0;
         let mut ever_connected: HashSet<ConnId> = HashSet::new();
         let mut out = Outbox::new();
@@ -3619,6 +3813,9 @@ mod proptests {
             {
                 e.handle(now, conn, cmd, &mut out);
             }
+            journal_buf.clear();
+            e.take_journal(&mut journal_buf);
+            assert!(journal || journal_buf.is_empty());
             check_invariants(&e);
         }
     }
@@ -3628,7 +3825,16 @@ mod proptests {
 
         #[test]
         fn state_machine_invariants_hold(actions in prop::collection::vec(action_strategy(), 15..35)) {
-            run_actions(actions);
+            run_actions(actions, false);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 4_000, ..ProptestConfig::default() })]
+
+        #[test]
+        fn state_machine_invariants_hold_with_journal(actions in prop::collection::vec(action_strategy(), 15..35)) {
+            run_actions(actions, true);
         }
     }
 }

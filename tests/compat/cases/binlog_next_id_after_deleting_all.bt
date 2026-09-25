@@ -1,0 +1,15 @@
+# all jobs deleted before a crash: nothing is recovered, but ids are not reused (next id follows the deleted jobs).
+!binlog
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nb\r\n"
+@a recv
+@a send "delete 1\r\n"
+@a recv
+@a send "delete 2\r\n"
+@a recv
+crash
+@a send "stats\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nc\r\n"
+@a recv

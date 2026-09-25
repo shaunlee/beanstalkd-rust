@@ -1,0 +1,16 @@
+# a delayed job's deadline is wall-clock and persists: put delay 4, down 2s, still delayed at ~2s, ready at ~5.6s (not restarted from the restart time).
+!binlog
+@a send "put 0 4 60 1\r\nd\r\n"
+@a recv
+crash 2s
+@a send "stats-job 1\r\n"
+@a recv
+@a send "reserve-with-timeout 0\r\n"
+@a recv
+@a send "peek-delayed\r\n"
+@a recv
+sleep 3500ms
+@a send "reserve-with-timeout 0\r\n"
+@a recv
+@a send "stats-job 1\r\n"
+@a recv

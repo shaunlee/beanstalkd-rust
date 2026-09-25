@@ -6,7 +6,9 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use crate::dsl::{Signal, Step, StepKind};
+use crate::dsl::{Signal, Step, StepKind, StopMode};
+use crate::mask::{MaskMode, mask_response_with};
+use crate::server::ServerProcess;
 
 /// The observable result of executing one DSL step against one server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +35,13 @@ pub enum Outcome {
     ShutdownDone,
     /// `close` completed.
     ClosedDone,
+    /// `restart` / `crash` completed: the server was stopped and is
+    /// accepting connections again; all connections were dropped.
+    Restarted(StopMode),
+    /// The harness itself failed to perform a step (e.g. the server could
+    /// not be restarted). Never equal to anything, so it always surfaces
+    /// as a mismatch.
+    HarnessError(String),
     /// An unexpected I/O error occurred while performing the step (e.g. the
     /// connection could not be opened, or a write failed). Compared only by
     /// category, not by the OS-specific message text, to avoid flakiness.
@@ -203,15 +212,26 @@ fn extra_body_len(line: &[u8]) -> Option<usize> {
     Some(n + 2)
 }
 
-/// Execute a whole case's steps against one server (listening on `addr`,
-/// running as process `pid`), returning one [`Outcome`] per step (same
-/// length and order as `steps`).
-pub fn execute(steps: &[Step], addr: SocketAddr, pid: u32) -> Vec<Outcome> {
+/// Execute a whole case's steps against one server, returning one
+/// [`Outcome`] per step (same length and order as `steps`). `restart` /
+/// `crash` steps restart `server` in place.
+pub fn execute(steps: &[Step], server: &mut ServerProcess) -> Vec<Outcome> {
     let mut conns: HashMap<String, ConnHandle> = HashMap::new();
     let mut out = Vec::with_capacity(steps.len());
 
     for step in steps {
-        let outcome = run_step(&mut conns, addr, pid, &step.kind);
+        let outcome = match &step.kind {
+            StepKind::Restart { how, downtime } => {
+                // Every connection is invalidated; later references to a
+                // connection name open a fresh one.
+                conns.clear();
+                match server.restart(*how, *downtime) {
+                    Ok(()) => Outcome::Restarted(*how),
+                    Err(e) => Outcome::HarnessError(format!("{} failed: {e}", how.directive())),
+                }
+            }
+            kind => run_step(&mut conns, server.addr(), server.pid(), kind),
+        };
         out.push(outcome);
     }
     out
@@ -285,6 +305,10 @@ fn run_step(
             conns.remove(conn);
             Outcome::ClosedDone
         }
+        StepKind::Restart { how, .. } => Outcome::HarnessError(format!(
+            "internal error: {} must be handled by execute()",
+            how.directive()
+        )),
     }
 }
 
@@ -292,12 +316,20 @@ fn run_step(
 /// processes: bodies of `Received`/`SomeBytes` responses are masked first,
 /// and `IoError` is compared only by category (not by exact message) since
 /// OS-level error text can vary in irrelevant ways between processes.
+/// `HarnessError` never compares equal. Uses the default mask mode; see
+/// [`outcomes_equal_with`].
 pub fn outcomes_equal(a: &Outcome, b: &Outcome) -> bool {
+    outcomes_equal_with(a, b, MaskMode::default())
+}
+
+/// Like [`outcomes_equal`], masking responses according to `mode`.
+pub fn outcomes_equal_with(a: &Outcome, b: &Outcome, mode: MaskMode) -> bool {
     match (a, b) {
         (Outcome::Received(x), Outcome::Received(y)) => {
-            crate::mask::mask_response(x) == crate::mask::mask_response(y)
+            mask_response_with(x, mode) == mask_response_with(y, mode)
         }
         (Outcome::IoError(_), Outcome::IoError(_)) => true,
+        (Outcome::HarnessError(_), _) | (_, Outcome::HarnessError(_)) => false,
         _ => a == b,
     }
 }
@@ -348,6 +380,25 @@ mod tests {
         let a = Outcome::IoError("connection refused".to_string());
         let b = Outcome::IoError("broken pipe".to_string());
         assert!(outcomes_equal(&a, &b));
+    }
+
+    #[test]
+    fn harness_errors_never_compare_equal() {
+        let e = Outcome::HarnessError("restart failed".to_string());
+        assert!(!outcomes_equal(&e, &e.clone()));
+        assert!(!outcomes_equal(&e, &Outcome::Restarted(StopMode::Term)));
+        assert!(outcomes_equal(
+            &Outcome::Restarted(StopMode::Kill),
+            &Outcome::Restarted(StopMode::Kill)
+        ));
+    }
+
+    #[test]
+    fn binlog_mode_masks_file_field() {
+        let a = Outcome::Received(b"OK 18\r\n---\nid: 1\nfile: 2\n\r\n".to_vec());
+        let b = Outcome::Received(b"OK 18\r\n---\nid: 1\nfile: 5\n\r\n".to_vec());
+        assert!(!outcomes_equal(&a, &b));
+        assert!(outcomes_equal_with(&a, &b, MaskMode { binlog: true }));
     }
 
     #[test]

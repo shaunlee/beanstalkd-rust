@@ -1,0 +1,37 @@
+# kick (buried), kick (delayed) and kick-job acknowledged before a SIGKILL all persist as ready jobs with their kicks counters.
+!binlog
+@a send "put 0 0 60 1\r\na\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nb\r\n"
+@a recv
+@a send "put 0 60 60 1\r\nc\r\n"
+@a recv
+@a send "put 0 60 60 1\r\nd\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "bury 1 0\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "bury 2 0\r\n"
+@a recv
+@a send "kick 1\r\n"
+@a recv
+@a send "kick-job 2\r\n"
+@a recv
+@a send "kick 1\r\n"
+@a recv
+@a send "kick-job 4\r\n"
+@a recv
+crash
+@a send "stats-job 1\r\n"
+@a recv
+@a send "stats-job 2\r\n"
+@a recv
+@a send "stats-job 3\r\n"
+@a recv
+@a send "stats-job 4\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv

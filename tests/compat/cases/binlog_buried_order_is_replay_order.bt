@@ -1,0 +1,25 @@
+# buried jobs are replayed in first-record order: bury B then A, restart, and kick 1 kicks A (id 1), not B.
+!binlog
+@a send "put 1 0 60 1\r\nA\r\n"
+@a recv
+@a send "put 2 0 60 1\r\nB\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "bury 2 5\r\n"
+@a recv
+@a send "bury 1 5\r\n"
+@a recv
+@a send "peek-buried\r\n"
+@a recv
+restart
+@a send "peek-buried\r\n"
+@a recv
+@a send "kick 1\r\n"
+@a recv
+@a send "peek-ready\r\n"
+@a recv
+@a send "peek-buried\r\n"
+@a recv

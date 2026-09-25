@@ -1,0 +1,23 @@
+# every put acknowledged with INSERTED before a SIGKILL exists afterwards, with its tube, priority, ttr and body (including binary bytes).
+!binlog
+@a send "use bin\r\n"
+@a recv
+@a send "put 7 0 42 6\r\n\x00\xff\r\nab\r\n"
+@a recv
+@a send "use default\r\n"
+@a recv
+@a send "put 4294967295 0 1 0\r\n\r\n"
+@a recv
+crash
+@a send "stats-job 1\r\n"
+@a recv
+@a send "stats-job 2\r\n"
+@a recv
+@a send "peek 1\r\n"
+@a recv
+@a send "watch bin\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
+@a send "reserve\r\n"
+@a recv
