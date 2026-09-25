@@ -1398,7 +1398,7 @@ impl Engine {
             binlog_current_index: 0,
             binlog_records_migrated: 0,
             binlog_records_written: 0,
-            binlog_max_size: 0,
+            binlog_max_size: self.cfg.binlog_max_size,
             draining: self.draining,
             id: snap.id,
             hostname: snap.hostname,

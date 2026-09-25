@@ -61,12 +61,19 @@ pub struct EngineConfig {
     /// `-z`; reported as `max-job-size` in stats. (Size enforcement happens in
     /// the codec.)
     pub max_job_size: u32,
+    /// `-s`; reported as `binlog-max-size` in stats. The reference reports
+    /// its default even when the binlog is disabled.
+    pub binlog_max_size: u64,
 }
+
+/// Default binlog file size (`Filesizedef` in dat.h).
+pub const DEFAULT_BINLOG_MAX_SIZE: u64 = 10 << 20;
 
 impl Default for EngineConfig {
     fn default() -> Self {
         EngineConfig {
             max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
+            binlog_max_size: DEFAULT_BINLOG_MAX_SIZE,
         }
     }
 }
