@@ -1,0 +1,184 @@
+# Development, Test and Acceptance Plan
+
+> Companion to `docs/DESIGN.md`. Roles: the lead (architecture owner) owns planning, interface contracts, integration and acceptance; subagents implement and test.
+
+## 0. Common Rules (every task)
+
+- **Toolchain**: Rust ≥ 1.98, edition 2024, workspace `resolver = "3"`.
+- **Quality gate** `scripts/check.sh` must pass before hand-off:
+  - `cargo fmt --all --check`
+  - `cargo clippy --workspace --all-targets -- -D warnings`
+  - `cargo build --workspace`
+  - `cargo test --workspace`
+- **Interface contracts are frozen**: `Command`, `Response`, `Frame` in `bstk-proto` and the public API of `bstk-engine` are defined by the lead. Any change must be justified in the hand-off report; the lead decides.
+- **The reference code is authoritative**: `.ref/beanstalkd/*.c` (run `scripts/build-ref.sh` first). When in doubt read the source — never guess. If the reference has a bug, or protocol.txt disagrees with it, follow the reference and record it in `docs/COMPAT.md`.
+- **Parallel builds**: each subagent uses its own `CARGO_TARGET_DIR` to avoid cargo lock contention.
+- **Forbidden**: `unsafe`; `unwrap()` outside tests (use `expect("reason")` where failure is impossible); reading the clock or using randomness inside the engine.
+
+## 1. P0 Task Breakdown
+
+| ID | Task | Owner | Depends on | Wave |
+|---|---|---|---|---|
+| T0 | Workspace skeleton, interface contracts, check script | lead | — | 0 |
+| T1 | `bstk-proto`: parsing, encoding, codec, stats YAML | subagent A | T0 | 1 |
+| T2 | `bstk-engine`: full state machine | subagent B | T0 | 1 |
+| T3 | `tests/compat`: differential harness and case corpus | subagent C | T0 | 1 |
+| T4 | `bstk-server`: networking, engine actor, CLI | subagent D | T1, T2 | 2 |
+| T5 | Run differential tests, fix mismatches, add edge cases | subagent E | T3, T4 | 3 |
+| T6 | Real-client smoke tests, concurrency stress, benchmarks | subagent F | T4 | 3 |
+| T7 | P0 acceptance | lead | all | 4 |
+
+### T1 bstk-proto
+
+**Deliverables**
+- `parse_line(&[u8]) -> Result<Command, Response>` for command lines (without the put body).
+- `ServerCodec`:
+  - Put body reading, discarding the body on JOB_TOO_BIG, EXPECTED_CRLF.
+  - Handling of command lines longer than 224 bytes.
+  - Behavior matches `scan_line_end`, `_skip` and `fill_extra_data` in prot.c.
+- `Response::encode` byte-identical to the reference.
+- YAML output of `StatsJob`, `StatsTube`, `StatsServer` and tube lists byte-identical to `STATS_FMT` and friends.
+
+**Tests**
+- Valid cases for all 25 commands, plus error cases:
+  - wrong argument count
+  - non-numeric values
+  - minus sign
+  - u32 / u64 overflow
+  - leading or extra whitespace
+  - invalid tube names; length exactly 200 and 201
+  - unknown commands; wrong case
+- Codec tests:
+  - correct decoding under arbitrary fragmentation (1 byte at a time, random splits)
+  - pipelining (several commands in one write)
+  - the next command still decodes correctly after a JOB_TOO_BIG body is discarded
+- proptest: for random valid commands, `encode_command → parse` round-trips (needs a test-only client-side encoder).
+- A cargo-fuzz target under `fuzz/` (nightly; not part of check.sh).
+
+**Acceptance**: check passes; `cargo llvm-cov -p bstk-proto` line coverage ≥ 90% (manual spot check if the tool is unavailable); every listed case has a test.
+
+### T2 bstk-engine
+
+**Deliverables**
+- The full semantics of `docs/DESIGN.md` §4, including:
+  - reserve / reserve-with-timeout waiting and wake-up
+  - reserve-job
+  - DEADLINE_SOON
+  - TTR expiry
+  - delay expiry
+  - pause-tube
+  - kick and kick-job
+  - tube creation and garbage collection
+  - releasing a connection's jobs on disconnect
+  - half-close
+  - drain mode
+  - all stats counters
+
+**Tests** (all with simulated time)
+- At least one case for each command's success path and for each of its error replies.
+- Every state transition: ready, reserved, delayed, buried, deleted.
+- Time-related:
+  - TTR expiry (check the timeouts counter and that the job returns to ready)
+  - both DEADLINE_SOON triggers
+  - reserve-with-timeout with 0 and with > 0
+  - pause expiry waking waiters
+- Multi-connection:
+  - waiters are woken in arrival order
+  - watching several tubes picks the globally most urgent job
+- proptest state-machine test: random sequences of commands and time advances; after every step check the invariants:
+  - (a) every job is in exactly one container
+  - (b) counters match container sizes
+  - (c) every reserved job belongs to a live connection
+  - (d) no tube has both ready jobs and an unpaused waiter
+
+**Acceptance**: check passes; all of the above tests exist and pass; the invariant test runs ≥ 10,000 cases.
+
+### T3 tests/compat Differential Harness
+
+**Deliverables**
+- A runner that starts the reference and `beanstalkd-rs` on random ports, runs the same case script against both, records replies, masks volatile fields and compares byte for byte. On mismatch it prints a clear diff.
+- A case DSL in `tests/compat/cases/*.bt`:
+
+  ```
+  # comment
+  @c1 send "put 0 0 5\r\nhello\r\n"    # escapes: \r \n \\ \" \xNN
+  @c1 recv                            # read one complete reply (incl. body), up to 3 s
+  @c1 recv_none 200ms                 # nothing must arrive within this time
+  @c2 send "reserve\r\n"
+  sleep 1100ms
+  @c1 shutdown_write                  # half-close
+  @c1 close
+  ```
+
+  Connections open automatically on first reference.
+- Both server binary paths can be overridden via environment variables. A missing reference binary must **fail loudly**, never skip.
+- A corpus of ≥ 60 cases covering:
+  - all 25 commands and their error replies
+  - protocol-level errors such as overlong lines and JOB_TOO_BIG
+  - time-dependent behavior
+  - multiple connections
+  - stats contents
+
+**Acceptance**: the runner has self-tests (DSL parsing, masking); running reference-vs-reference passes fully, proving the harness itself is stable.
+
+### T4 bstk-server
+
+**Deliverables**
+- Binary `beanstalkd-rs`.
+- Connection tasks: at most one command in flight per connection; EOF and half-close are still detected while blocked in reserve.
+- Engine actor: `select!` between `recv` and `sleep_until(next_deadline)`.
+- `SysInfo`: pid, hostname, uname, rusage, uptime, random server id.
+- CLI flags `-l`, `-p`, `-z`, `-V`, `-v`; SIGUSR1 enters drain mode.
+- Graceful shutdown on SIGINT / SIGTERM.
+
+**Tests**: integration tests start the server and drive it over raw TCP:
+- basic flow
+- a blocked reserve woken by another connection's put
+- jobs released on disconnect
+- half-close → TIMED_OUT
+- pipelining
+
+**Acceptance**: check passes; integration tests pass; after 1,000 connections open and then close, no tasks are left behind and the connection count returns to zero (verified via stats).
+
+### T5 Compatibility Convergence
+
+- Run every T3 case; classify each mismatch as a proto, engine or server issue; fix and re-run.
+- Add new edge cases discovered along the way.
+
+**Acceptance**: 100% of differential cases pass; any intentional difference is recorded in `docs/COMPAT.md` with its reason (target: zero).
+
+### T6 Real Clients and Stress
+
+**Real-client smoke tests**
+- At least one real client, Python greenstalk preferred; a second one if feasible.
+- Run the full flow — put, reserve, delete, release, bury, kick, stats, tubes — and get identical results from both servers.
+
+**Stress test**
+- A Rust load generator under `bench/`.
+- Scenario: N connections (100) doing a put/reserve/delete loop for 30 s.
+- Record ops/s and p99 latency for both servers.
+
+**Acceptance**:
+- Client tests pass.
+- No errors or hangs during the stress run; afterwards the job count in stats is 0.
+- Numbers recorded in `docs/BENCH.md`. P0 only requires ≥ 0.8× the reference's throughput; if not met, include an analysis and defer to P4.
+
+## 2. P0 Acceptance Checklist (T7, run by the lead)
+
+- [ ] `scripts/check.sh` passes (fmt, clippy, build, test)
+- [ ] All 25 protocol commands implemented, covered at the proto, engine and differential levels
+- [ ] ≥ 60 differential cases, 100% passing; `docs/COMPAT.md` up to date
+- [ ] Engine invariant proptest passes with ≥ 10,000 cases
+- [ ] 1,000-connection concurrency test passes with no resource leaks
+- [ ] Real-client smoke test passes
+- [ ] `docs/BENCH.md` records performance, meeting the 0.8× bar or with an analysis
+- [ ] Code review: no unsafe; no unwrap outside tests; no clock or randomness in the engine
+
+## 3. Later Phases (summary; detailed when each phase starts)
+
+| Phase | Main tasks | Acceptance focus |
+|---|---|---|
+| P1 | `bstk-store` WAL, engine Persist hook, `-b` `-f` `-F` `-s` flags, compaction | kill -9 at random points loses no acknowledged job (fsync=always); differential cases still pass with WAL on |
+| P2 | TLS / mTLS, auth extension, HTTP metrics / healthz / admin, TOML config | differential tests 100% with default config; real clients connect over TLS |
+| P3 | openraft, Tick proposals, replicated reservations, follower proxy | on a 3-node cluster, random kills / partitions lose no acknowledged job and never double-deliver a reserved job (Jepsen-style tests) |
+| P4 | Profiling and optimization | throughput ≥ 1× reference; multi-core scaling curve |
