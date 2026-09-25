@@ -437,6 +437,7 @@ struct RawCluster {
     heartbeat: Option<String>,
     election_timeout: Option<Vec<String>>,
     insecure_plaintext: Option<bool>,
+    insecure_plaintext_allow_remote: Option<bool>,
     tls: Option<RawClusterTls>,
     #[serde(default, rename = "peer")]
     peers: Vec<RawPeer>,

@@ -37,6 +37,17 @@
 #                  and `stats-tube`, on a beanstalkd-rs with [http] and the
 #                  listener of the current mode (plaintext, TLS or mTLS;
 #                  with -b in binlog modes)
+#   SMOKE_CLUSTER  1: beanstalkd-rs is a 3-node Raft cluster (plaintext
+#                  cluster traffic, fresh data dirs under SMOKE_OUT) and
+#                  the clients connect to a follower; combines with
+#                  SMOKE_TLS / SMOKE_MTLS for the client listeners
+#   SMOKE_CLUSTER_KILL  1 (implies SMOKE_CLUSTER=1): the clients run with
+#                  --kill-point; while a worker holds a reservation and a
+#                  second worker waits in reserve-with-timeout, the runner
+#                  kill -9s the cluster leader, waits for a new leader,
+#                  lets the client continue on its (surviving) follower
+#                  connection, then restarts the killed node; the
+#                  reference just continues
 #   SMOKE_CLIENTS=""   skips the client transcript comparison (e.g. to run
 #                  only the SMOKE_TOKEN / SMOKE_HTTP checks)
 set -euo pipefail
@@ -57,12 +68,23 @@ SMOKE_TLS="${SMOKE_TLS:-0}"
 [ "$SMOKE_MTLS" = 1 ] && SMOKE_TLS=1
 SMOKE_TOKEN="${SMOKE_TOKEN:-0}"
 SMOKE_HTTP="${SMOKE_HTTP:-0}"
+SMOKE_CLUSTER_KILL="${SMOKE_CLUSTER_KILL:-0}"
+SMOKE_CLUSTER="${SMOKE_CLUSTER:-0}"
+[ "$SMOKE_CLUSTER_KILL" = 1 ] && SMOKE_CLUSTER=1
 CERTS="$OUT/certs"
 read -r -a SERVER_ARGS <<<"${SMOKE_SERVER_ARGS:-}"
 NORMALIZE_ARGS=()
 [ "$SMOKE_BINLOG" = 1 ] && NORMALIZE_ARGS=(--binlog)
 
 die() { echo "run-smoke: $*" >&2; exit 1; }
+
+if [ "$SMOKE_CLUSTER" = 1 ]; then
+  # The Raft log replaces the binlog (-b with [cluster] is a configuration
+  # error), and the token / HTTP checks target a standalone server.
+  for v in SMOKE_BINLOG SMOKE_RESTART SMOKE_TOKEN SMOKE_HTTP; do
+    [ "${!v}" = 1 ] && die "SMOKE_CLUSTER=1 cannot be combined with $v=1"
+  done
+fi
 
 if [ ! -x "$REF_BIN" ]; then
   die "reference binary not found at $REF_BIN (run scripts/build-ref.sh or set BSTK_REF_BIN)"
@@ -121,7 +143,7 @@ cleanup() {
     [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
   done
   # Only remove what this script created.
-  rm -rf "$OUT/binlog" "$OUT/hold.fifo" "$CERTS" "$OUT"/*.toml
+  rm -rf "$OUT/binlog" "$OUT/cluster" "$OUT/hold.fifo" "$CERTS" "$OUT"/*.toml
 }
 trap cleanup EXIT
 
@@ -227,6 +249,163 @@ run_restart() {
   run_client "$name" "$raw" --after-restart
 }
 
+# --- Cluster mode ----------------------------------------------------------
+# Node i (1..3) of the current cluster: client port CL_CLIENT[i], HTTP port
+# CL_HTTP[i], cluster port CL_PEER[i], pid CL_PID[i], config CL_CONF[i].
+CL_CLIENT=(); CL_HTTP=(); CL_PEER=(); CL_PID=(); CL_CONF=(); CL_LOG=""
+
+# http_status PORT PATH: the HTTP status of GET PATH (0 if unreachable).
+http_status() {
+  python3 - "$1" "$2" <<'PY'
+import sys, urllib.error, urllib.request
+try:
+    print(urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}{sys.argv[2]}", timeout=1).status)
+except urllib.error.HTTPError as e:
+    print(e.code)
+except Exception:
+    print(0)
+PY
+}
+
+# is_leader PORT: whether /admin on PORT reports a ready leader.
+is_leader() {
+  python3 - "$1" <<'PY'
+import json, sys, urllib.request
+try:
+    c = json.load(urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/admin", timeout=1))["cluster"]
+    sys.exit(0 if c["role"] == "leader" and c["ready"] else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+# start_node I [ARGS...]: starts node I of the current cluster.
+start_node() {
+  local i="$1"; shift
+  "$RS_BIN" --config "${CL_CONF[$i]}" "$@" ${SERVER_ARGS[@]:+"${SERVER_ARGS[@]}"} >>"$CL_LOG" 2>&1 &
+  CL_PID[$i]=$!
+  PIDS+=("${CL_PID[$i]}")
+}
+
+# wait_node_ready I: waits until node I answers /readyz with 200.
+wait_node_ready() {
+  local i="$1" n
+  for n in $(seq 1 300); do
+    [ "$(http_status "${CL_HTTP[$i]}" /readyz)" = 200 ] && return 0
+    kill -0 "${CL_PID[$i]}" 2>/dev/null || die "cluster node $i exited (see $CL_LOG)"
+    sleep 0.1
+  done
+  die "cluster node $i not ready after 30s (see $CL_LOG)"
+}
+
+# find_leader [SKIP]: prints the index of the node that reports a ready
+# leader (ignoring node SKIP), waiting up to 15s; fails if there is none.
+find_leader() {
+  local skip="${1:-0}" n i
+  for n in $(seq 1 150); do
+    for i in 1 2 3; do
+      [ "$i" = "$skip" ] && continue
+      if is_leader "${CL_HTTP[$i]}"; then echo "$i"; return 0; fi
+    done
+    sleep 0.1
+  done
+  return 1
+}
+
+# start_cluster NAME -> SERVER_PORT / SERVER_PID of a follower (the client
+# node), CLUSTER_FOLLOWER. Three nodes on fresh ports with fresh data dirs,
+# every node bootstraps with --cluster-init; each node gets the listener of the
+# current mode (plaintext, TLS or mTLS) and [http] (to find the leader).
+start_cluster() {
+  local name="$1" i tls=false auth=none probe=() peers="" leader
+  if [ "$SMOKE_TLS" = 1 ]; then tls=true; auth="$LISTENER_AUTH"; fi
+  case "$auth" in
+    none) [ "$tls" = true ] && probe=("$CERTS/ca.pem") ;;
+    mtls) probe=("$CERTS/ca.pem" "$CERTS/client.pem" "$CERTS/client.key") ;;
+  esac
+  CL_LOG="$OUT/$name.server.log"
+  for i in 1 2 3; do
+    CL_CLIENT[$i]="$(free_port)"; CL_HTTP[$i]="$(free_port)"; CL_PEER[$i]="$(free_port)"
+    peers+="$(printf '[[cluster.peer]]\nid = %s\naddr = "127.0.0.1:%s"\n' "$i" "${CL_PEER[$i]}")"$'\n'
+  done
+  for i in 1 2 3; do
+    CL_CONF[$i]="$OUT/$name-node$i.toml"
+    rm -rf "$OUT/cluster/$name/data$i"; mkdir -p "$OUT/cluster/$name"
+    write_config "${CL_CONF[$i]}" "${CL_CLIENT[$i]}" "$auth" "$tls" "${CL_HTTP[$i]}"
+    printf '[cluster]\nnode_id = %s\nlisten = "127.0.0.1:%s"\ndata_dir = "%s"\ninsecure_plaintext = true\n%s' \
+      "$i" "${CL_PEER[$i]}" "$OUT/cluster/$name/data$i" "$peers" >>"${CL_CONF[$i]}"
+    "$RS_BIN" --config "${CL_CONF[$i]}" --check-config >/dev/null 2>>"$CL_LOG" ||
+      die "invalid generated config ${CL_CONF[$i]} (see $CL_LOG)"
+  done
+  start_node 1 --cluster-init
+  start_node 2 --cluster-init
+  start_node 3 --cluster-init
+  for i in 1 2 3; do wait_node_ready "$i"; done
+  leader="$(find_leader)" || die "cluster $name elected no leader (see $CL_LOG)"
+  for i in 1 2 3; do
+    if [ "$i" != "$leader" ]; then CLUSTER_FOLLOWER="$i"; break; fi
+  done
+  SERVER_PORT="${CL_CLIENT[$CLUSTER_FOLLOWER]}"
+  SERVER_PID="${CL_PID[$CLUSTER_FOLLOWER]}"
+  echo "run-smoke: cluster $name: leader node $leader, client on follower node $CLUSTER_FOLLOWER" >&2
+  wait_port "$SERVER_PORT" ${probe[@]:+"${probe[@]}"}
+}
+
+stop_cluster() {
+  local i
+  for i in 1 2 3; do kill "${CL_PID[$i]}" 2>/dev/null || true; done
+  for i in 1 2 3; do wait "${CL_PID[$i]}" 2>/dev/null || true; done
+}
+
+# kill_leader: kill -9 the leader (never the client's follower) and wait
+# for a new leader among the survivors; sets KILLED.
+kill_leader() {
+  local leader new t0 t1
+  leader="$(find_leader)" || { echo "run-smoke: no leader to kill" >&2; return 1; }
+  if [ "$leader" = "$CLUSTER_FOLLOWER" ]; then
+    echo "run-smoke: the client's node $leader became the leader; not killing it" >&2
+    return 1
+  fi
+  t0="$(python3 -c 'import time; print(time.time())')"
+  kill -9 "${CL_PID[$leader]}"
+  wait "${CL_PID[$leader]}" 2>/dev/null || true
+  KILLED="$leader"
+  new="$(find_leader "$leader")" || { echo "run-smoke: no new leader after killing node $leader" >&2; return 1; }
+  t1="$(python3 -c 'import time; print(time.time())')"
+  echo "run-smoke: killed leader node $leader (kill -9); node $new leads after $(python3 -c "print(round(($t1-$t0)*1000))") ms" >&2
+}
+
+# run_kill NAME SERVER RAW: the client runs with --kill-point; at
+# KILL_POINT, against the cluster the leader is killed (and a new one
+# awaited) before the client continues, then the killed node is restarted.
+run_kill() {
+  local name="$1" server="$2" raw="$3" fifo="$OUT/hold.fifo" cpid rc=0 i
+  KILLED=""
+  rm -f "$fifo"; mkfifo "$fifo"
+  with_timeout "$SMOKE_TIMEOUT" "${CLIENT_ENV[@]}" "${CLIENT_CMD[@]}" --kill-point "127.0.0.1:$SERVER_PORT" \
+    <"$fifo" >>"$raw" 2>>"$OUT/$name.err" &
+  cpid=$!
+  exec 3>"$fifo" # opening the write end unblocks the client's stdin
+  for i in $(seq 1 $((SMOKE_TIMEOUT * 10))); do
+    grep -q '^KILL_POINT$' "$raw" && break
+    kill -0 "$cpid" 2>/dev/null || break
+    sleep 0.1
+  done
+  grep -q '^KILL_POINT$' "$raw" || rc=1
+  if [ "$rc" = 0 ] && [ "$server" = rs ]; then
+    kill_leader || rc=1
+  fi
+  exec 3>&-
+  wait "$cpid" || rc=1
+  rm -f "$fifo"
+  if [ -n "$KILLED" ]; then
+    start_node "$KILLED"
+    wait_node_ready "$KILLED"
+    echo "run-smoke: restarted node $KILLED; it is ready again" >&2
+  fi
+  return "$rc"
+}
+
 # Client command lines (the address is appended).
 prepare_python() {
   if [ ! -x "$SMOKE_VENV/bin/python" ]; then
@@ -282,9 +461,15 @@ for client in $SMOKE_CLIENTS; do
     fi
     # A fresh server (and binlog dir) per (client, server) so counters
     # start from zero.
-    start_server "$name" "$bin" "$dir"
+    if [ "$SMOKE_CLUSTER" = 1 ] && [ "$server" = rs ]; then
+      start_cluster "$name"
+    else
+      start_server "$name" "$bin" "$dir"
+    fi
     if [ "$SMOKE_RESTART" = 1 ]; then
       run_restart "$name" "$bin" "$dir" "$raw" && rc=0 || rc=1
+    elif [ "$SMOKE_CLUSTER_KILL" = 1 ]; then
+      run_kill "$name" "$server" "$raw" && rc=0 || rc=1
     else
       run_client "$name" "$raw" && rc=0 || rc=1
     fi
@@ -296,7 +481,12 @@ for client in $SMOKE_CLIENTS; do
       tail -n 5 "$OUT/$client-$server.err" >&2 || true
       failed=1
     fi
-    stop_server "$SERVER_PID"
+    if [ "$SMOKE_CLUSTER" = 1 ] && [ "$server" = rs ]; then
+      stop_cluster
+      rm -rf "$OUT/cluster/$name"
+    else
+      stop_server "$SERVER_PID"
+    fi
     [ -n "$dir" ] && rm -rf "$dir"
     python3 "$CLIENTS_DIR/normalize.py" ${NORMALIZE_ARGS[@]:+"${NORMALIZE_ARGS[@]}"} \
       <"$raw" >"$OUT/$name.txt"
@@ -341,7 +531,12 @@ PY="python3"
 [ -x "$SMOKE_VENV/bin/python" ] && PY="$SMOKE_VENV/bin/python"
 CHECKS="$CLIENTS_DIR/python/checks.py"
 
-if [ "$SMOKE_MTLS" = 1 ]; then
+if [ "$SMOKE_MTLS" = 1 ] && [ "$SMOKE_CLUSTER" = 1 ]; then
+  start_cluster mtls-reject
+  check mtls-reject "$PY" "$CHECKS" mtls-reject --ca "$CERTS/ca.pem" \
+    --rogue-cert "$CERTS/rogue-client.pem" --rogue-key "$CERTS/rogue-client.key" "127.0.0.1:$SERVER_PORT"
+  stop_cluster
+elif [ "$SMOKE_MTLS" = 1 ]; then
   extra_server mtls-reject
   check mtls-reject "$PY" "$CHECKS" mtls-reject --ca "$CERTS/ca.pem" \
     --rogue-cert "$CERTS/rogue-client.pem" --rogue-key "$CERTS/rogue-client.key" "127.0.0.1:$SERVER_PORT"
@@ -374,6 +569,8 @@ mode="default"
 [ "$SMOKE_MTLS" = 1 ] && mode="$mode+mtls"
 [ "$SMOKE_TOKEN" = 1 ] && mode="$mode+token"
 [ "$SMOKE_HTTP" = 1 ] && mode="$mode+http"
+[ "$SMOKE_CLUSTER" = 1 ] && mode="$mode+cluster(follower)"
+[ "$SMOKE_CLUSTER_KILL" = 1 ] && mode="$mode+leader-kill"
 echo "mode: $mode; server args: ${SMOKE_SERVER_ARGS:-(none)}"
 echo "transcripts: $OUT"
 exit "$failed"

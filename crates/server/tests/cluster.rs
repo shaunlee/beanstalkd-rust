@@ -11,16 +11,18 @@
 
 mod common;
 
-use std::net::{SocketAddr, TcpStream};
+use std::collections::BTreeMap;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
 use serde_json::Value;
 
-use common::p2::{BIN, Proto, claim_port, http, release, run, stat_of};
+use common::p2::{BIN, End, Proto, claim_port, http, release, run, stat_of};
 
 static SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -55,6 +57,9 @@ struct Opts {
     /// Extra `[cluster]` lines (e.g. `[cluster.tls]`); `insecure_plaintext`
     /// is set unless this contains `[cluster.tls]`.
     extra: String,
+    /// Route every directed cluster link `a -> b` (connections node `a`
+    /// dials to node `b`) through its own [`Proxy`].
+    proxied: bool,
 }
 
 impl Default for Opts {
@@ -63,7 +68,69 @@ impl Default for Opts {
             node_timeout: "5s",
             snapshot_every: 100_000,
             extra: String::new(),
+            proxied: false,
         }
+    }
+}
+
+/// A TCP proxy for one directed cluster link that can be cut: while cut,
+/// its connections are closed and new ones are closed at accept, so
+/// nothing the dialing node sends on this link (requests, and the answers
+/// to them) gets through. The opposite direction is a separate link.
+struct Proxy {
+    addr: SocketAddr,
+    cut: Arc<AtomicBool>,
+    conns: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl Proxy {
+    fn start(target: SocketAddr) -> Proxy {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cut = Arc::new(AtomicBool::new(false));
+        let conns: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let (cut2, conns2) = (cut.clone(), conns.clone());
+        // Threads of a proxy end with the test process.
+        std::thread::spawn(move || {
+            for down in listener.incoming() {
+                let Ok(down) = down else { continue };
+                if cut2.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let Ok(up) = TcpStream::connect(target) else {
+                    continue;
+                };
+                let _ = down.set_nodelay(true);
+                let _ = up.set_nodelay(true);
+                {
+                    let mut cs = conns2.lock().unwrap();
+                    cs.push(down.try_clone().unwrap());
+                    cs.push(up.try_clone().unwrap());
+                }
+                for (mut from, mut to) in [
+                    (down.try_clone().unwrap(), up.try_clone().unwrap()),
+                    (up, down),
+                ] {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(Shutdown::Both);
+                        let _ = from.shutdown(Shutdown::Both);
+                    });
+                }
+            }
+        });
+        Proxy { addr, cut, conns }
+    }
+
+    fn cut(&self) {
+        self.cut.store(true, Ordering::SeqCst);
+        for c in self.conns.lock().unwrap().drain(..) {
+            let _ = c.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn heal(&self) {
+        self.cut.store(false, Ordering::SeqCst);
     }
 }
 
@@ -190,6 +257,8 @@ impl Node {
 struct Cluster {
     _dir: tempfile::TempDir,
     nodes: Vec<Node>,
+    /// `(from, to)` node ids -> the proxy of that link (`Opts::proxied`).
+    proxies: BTreeMap<(u64, u64), Proxy>,
     _serial: MutexGuard<'static, ()>,
 }
 
@@ -222,17 +291,31 @@ impl Cluster {
         let ports: Vec<(u16, u16, u16)> = (0..n)
             .map(|_| (claim_port(), claim_port(), claim_port()))
             .collect();
-        let peers: String = ports
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                format!(
-                    "[[cluster.peer]]\nid = {}\naddr = \"127.0.0.1:{}\"\n",
-                    i + 1,
-                    p.2
-                )
-            })
-            .collect();
+        let mut proxies = BTreeMap::new();
+        if opts.proxied {
+            for a in 1..=n {
+                for (j, p) in ports.iter().enumerate() {
+                    let b = j as u64 + 1;
+                    if a != b {
+                        proxies.insert((a, b), Proxy::start(([127, 0, 0, 1], p.2).into()));
+                    }
+                }
+            }
+        }
+        // The peer list as node `a` sees it.
+        let peers = |a: u64| -> String {
+            ports
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let b = i as u64 + 1;
+                    let addr = proxies
+                        .get(&(a, b))
+                        .map_or_else(|| format!("127.0.0.1:{}", p.2), |x| x.addr.to_string());
+                    format!("[[cluster.peer]]\nid = {b}\naddr = \"{addr}\"\n")
+                })
+                .collect()
+        };
         let security = if opts.extra.contains("[cluster.tls]") {
             ""
         } else {
@@ -252,6 +335,7 @@ impl Cluster {
                 opts.node_timeout,
                 opts.snapshot_every,
                 opts.extra.replace("{id}", &id.to_string()),
+                peers = peers(id),
             );
             std::fs::write(&config, text).unwrap();
             nodes.push(Node {
@@ -269,17 +353,17 @@ impl Cluster {
         Cluster {
             _dir: dir,
             nodes,
+            proxies,
             _serial: guard,
         }
     }
 
-    /// Starts `n` nodes, bootstraps from node 1 and waits until all are
-    /// ready.
+    /// Starts `n` nodes, bootstrapping every one with `--cluster-init`,
+    /// and waits until all are ready.
     fn start(n: u64, opts: &Opts) -> Cluster {
         let mut c = Cluster::configure(n, opts);
-        c.nodes[0].start(&["--cluster-init"]);
-        for node in &mut c.nodes[1..] {
-            node.start(&[]);
+        for node in &mut c.nodes {
+            node.start(&["--cluster-init"]);
         }
         c.wait_all_ready();
         c
@@ -699,17 +783,17 @@ fn sigusr1_on_a_follower_drains_the_cluster() {
 #[test]
 fn readyz_follows_leader_and_catch_up() {
     let mut c = Cluster::configure(3, &Opts::default());
-    // Nodes without state wait to be contacted: not ready.
-    c.nodes[1].start(&[]);
-    c.nodes[2].start(&[]);
+    // One bootstrapped node alone has no leader: not ready.
+    c.nodes[1].start(&["--cluster-init"]);
     wait_for(Duration::from_secs(10), || {
-        (c.nodes[1].readyz() == 503 && c.nodes[2].readyz() == 503).then_some(())
+        (c.nodes[1].readyz() == 503).then_some(())
     })
     .expect("HTTP never answered");
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(c.nodes[1].readyz(), 503);
-    // Bootstrapping makes every node ready.
+    // Bootstrapping the others makes every node ready.
     c.nodes[0].start(&["--cluster-init"]);
+    c.nodes[2].start(&["--cluster-init"]);
     c.wait_all_ready();
     let l = c.leader();
     let fs = c.followers(l);
@@ -734,8 +818,8 @@ fn readyz_follows_leader_and_catch_up() {
 fn mismatched_max_job_size_is_rejected() {
     let mut c = Cluster::configure(3, &Opts::default());
     c.nodes[0].start(&["--cluster-init"]);
-    c.nodes[1].start(&[]);
-    c.nodes[2].start(&["-z", "1000"]);
+    c.nodes[1].start(&["--cluster-init"]);
+    c.nodes[2].start(&["--cluster-init", "-z", "1000"]);
     assert!(c.nodes[0].wait_ready(Duration::from_secs(20)));
     assert!(c.nodes[1].wait_ready(Duration::from_secs(20)));
     std::thread::sleep(Duration::from_secs(2));
@@ -767,6 +851,283 @@ fn graceful_shutdown_disconnects_clients() {
         "ready"
     );
     assert_eq!(on_leader.stat("stats", "current-connections"), "1");
+}
+
+/// Chaos finding 3: a node that lost its data and rejoined as a voter
+/// could elect a leader lacking an entry it had acknowledged. Now it
+/// rejoins without voting until it has caught up, and stays in rejoin mode
+/// across a crash.
+#[test]
+fn wiped_node_does_not_vote_until_it_has_caught_up() {
+    let mut c = Cluster::start(3, &Opts::default());
+    let l = c.leader();
+    let fs = c.followers(l);
+    let (behind, acker) = (fs[0], fs[1]);
+    let mut on_leader = c.nodes[l].connect();
+    inserted(&on_leader.put(b"before"));
+
+    // Committed on the leader and `acker` only.
+    c.nodes[behind].signal(Signal::SIGSTOP);
+    let job = inserted(&on_leader.put(b"acknowledged by two"));
+    drop(on_leader);
+    c.nodes[acker].kill9();
+    c.nodes[acker].wipe();
+    c.nodes[l].kill9();
+    c.nodes[acker].start(&[]);
+    let marker = c.nodes[acker].data_dir.join("rejoin");
+    wait_for(Duration::from_secs(10), || marker.exists().then_some(())).expect("no rejoin marker");
+    c.nodes[behind].signal(Signal::SIGCONT);
+
+    // `behind` lacks the job and `acker` refuses to vote: no leader.
+    // (`/admin` is served only once a node accepts clients.)
+    std::thread::sleep(Duration::from_secs(3));
+    let a = c.nodes[behind].admin().unwrap();
+    assert_ne!(a["cluster"]["role"], "leader", "{a}");
+    assert_eq!(c.nodes[acker].readyz(), 503);
+    assert!(c.nodes[acker].admin().is_none());
+    assert!(c.nodes[acker].log_text().contains("rejoin mode"));
+
+    // A crash during rejoin keeps the marker: still rejoining, and
+    // --cluster-init is refused.
+    c.nodes[acker].kill9();
+    assert!(marker.exists());
+    let (st, _, err) = run(&[
+        "--config",
+        c.nodes[acker].config.to_str().unwrap(),
+        "--cluster-init",
+    ]);
+    assert_eq!(st.code(), Some(1), "{err}");
+    assert!(err.contains("rejoin marker"), "{err}");
+    c.nodes[acker].start(&[]);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(c.nodes[acker].readyz(), 503);
+    assert_eq!(c.nodes[acker].log_text().matches("rejoin mode:").count(), 2);
+    assert_ne!(
+        c.nodes[behind].admin().unwrap()["cluster"]["role"],
+        "leader"
+    );
+
+    // The old leader comes back: it wins (its log has the job), `acker`
+    // catches up and leaves rejoin mode.
+    c.nodes[l].start(&[]);
+    c.wait_all_ready();
+    assert!(!marker.exists());
+    let a = c.nodes[acker].admin().unwrap();
+    assert_eq!(a["cluster"]["rejoining"], false, "{a}");
+    // `behind` asked it for votes while it was rejoining.
+    assert!(a["cluster"]["votes_refused"].as_u64().unwrap() > 0, "{a}");
+    assert!(c.nodes[acker].log_text().contains("rejoin complete"));
+    for n in &c.nodes {
+        let mut cl = n.connect();
+        let (hdr, body) = cl.body_reply(&format!("peek {job}"));
+        assert_eq!(hdr, format!("FOUND {job} 19"), "node {}", n.id);
+        assert_eq!(body, b"acknowledged by two");
+    }
+
+    // A wiped node started with --cluster-init by mistake finds a peer of
+    // a running cluster and rejoins instead of bootstrapping.
+    let nl = c.leader();
+    let f = c.followers(nl)[0];
+    c.nodes[f].kill9();
+    c.nodes[f].wipe();
+    c.nodes[f].start(&["--cluster-init"]);
+    assert!(c.nodes[f].wait_ready(Duration::from_secs(20)));
+    let log = c.nodes[f].log_text();
+    assert!(
+        log.contains("already belongs to a running cluster"),
+        "{log}"
+    );
+    assert!(log.contains("rejoin complete"), "{log}");
+    let mut cl = c.nodes[f].connect();
+    assert_eq!(cl.stat("stats", "current-jobs-ready"), "2");
+}
+
+/// Chaos finding 5: connection ids of a process whose `Connect`s never
+/// reached the log were handed out again after a restart. Numbers now come
+/// from durably reserved blocks.
+#[test]
+fn connection_ids_are_fresh_after_a_restart_without_committed_connects() {
+    let mut c = Cluster::start(3, &Opts::default());
+    let l = c.leader();
+    let f = c.followers(l)[0];
+    let next = |n: &Node| {
+        n.admin().unwrap()["cluster"]["next_local_conn"]
+            .as_u64()
+            .unwrap()
+    };
+    let first = next(&c.nodes[f]);
+    // No quorum: the `Connect`s of these connections are never committed.
+    let others: Vec<usize> = (0..3).filter(|&i| i != f).collect();
+    for &i in &others {
+        c.nodes[i].signal(Signal::SIGSTOP);
+    }
+    let mut held = Vec::new();
+    for _ in 0..3 {
+        let mut cl = c.nodes[f].connect();
+        cl.send(b"use t\r\n");
+        held.push(cl);
+    }
+    let used = next(&c.nodes[f]);
+    assert_eq!(used, first + 3);
+    c.nodes[f].kill9();
+    drop(held);
+    for &i in &others {
+        c.nodes[i].signal(Signal::SIGCONT);
+    }
+    c.nodes[f].start(&[]);
+    assert!(c.nodes[f].wait_ready(Duration::from_secs(20)));
+    let restarted = next(&c.nodes[f]);
+    assert!(
+        restarted >= used,
+        "connection numbers reused: {restarted} after {used}"
+    );
+    // The reserved block, not a 2^20 gap.
+    assert!(restarted < 1 << 20, "{restarted}");
+    let mut cl = c.nodes[f].connect();
+    assert_eq!(cl.cmd("use t"), "USING t");
+    assert_eq!(next(&c.nodes[f]), restarted + 1);
+}
+
+/// Security M4: a follower whose link to the leader is cut in one
+/// direction only (the leader's replication still reaches it) closes its
+/// clients after `node_timeout`, refuses new ones without queueing
+/// anything, and the leader drops its connections after
+/// `2 × node_timeout`.
+#[test]
+fn one_way_partition_isolates_the_follower_and_the_leader_drops_it() {
+    let opts = Opts {
+        node_timeout: "1s",
+        proxied: true,
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(3, &opts);
+    let l = c.leader();
+    let f = c.followers(l)[0];
+    let (lid, fid) = (c.nodes[l].id, c.nodes[f].id);
+
+    let mut on_leader = c.nodes[l].connect();
+    let job = inserted(&on_leader.put(b"x"));
+    let mut worker = c.nodes[f].connect();
+    assert_eq!(reserve(&mut worker, "reserve-with-timeout 5"), job);
+    let mut waiter = c.nodes[l].connect();
+    waiter.send(b"reserve-with-timeout 30\r\n");
+
+    let cut = Instant::now();
+    c.proxies[&(fid, lid)].cut();
+    // The follower closes its client connections.
+    worker
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let (_, end) = worker.read_to_end(Duration::from_secs(10));
+    assert!(
+        matches!(end, End::Closed | End::Error(_)),
+        "the follower's client was not closed: {end:?}"
+    );
+    let mut buf = [0u8; 16];
+    let took = cut.elapsed();
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    // The leader dropped it: the job returns to ready and goes to the
+    // waiting reserve.
+    let (id, _) = read_reserved(&mut waiter);
+    assert_eq!(id, job);
+    let took = cut.elapsed();
+    assert!(took >= Duration::from_millis(1900), "{took:?}");
+    let a = c.nodes[l].admin().unwrap();
+    assert!(
+        a["cluster"]["drop_node_proposals"].as_u64().unwrap() >= 1,
+        "{a}"
+    );
+    // Replication to the follower still works (the other direction).
+    let a = c.nodes[f].admin().unwrap();
+    assert_eq!(a["cluster"]["leader_id"], lid, "{a}");
+    assert_eq!(a["cluster"]["isolated"], true, "{a}");
+
+    // Reconnecting to the isolated node creates no state: refused at
+    // accept, nothing queued.
+    for _ in 0..50 {
+        if let Ok(s) = TcpStream::connect(c.nodes[f].client_addr()) {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = std::io::Read::read(&mut &s, &mut buf);
+        }
+    }
+    let a = c.nodes[f].admin().unwrap();
+    assert!(
+        a["cluster"]["refused_connections"].as_u64().unwrap() >= 50,
+        "{a}"
+    );
+    assert!(a["cluster"]["forward_queue"].as_u64().unwrap() <= 4, "{a}");
+
+    // Healed: the follower serves again.
+    c.proxies[&(fid, lid)].heal();
+    wait_for(Duration::from_secs(10), || {
+        (c.nodes[f].admin()?["cluster"]["isolated"] == false).then_some(())
+    })
+    .expect("the follower stayed isolated");
+    let mut again = c.nodes[f].connect();
+    let second = inserted(&again.put(b"y"));
+    assert_eq!(
+        on_leader.stat(&format!("stats-job {second}"), "state"),
+        "ready"
+    );
+}
+
+/// Security M3: under sustained load through a follower, inputs are not
+/// resent (a stall resend only follows a leader change, an error, or proof
+/// that something was dropped).
+#[test]
+fn sustained_load_through_a_follower_resends_nothing() {
+    let mut c = Cluster::start(3, &Opts::default());
+    let l = c.leader();
+    let f = c.followers(l)[0];
+    let addr = c.nodes[f].client_addr();
+    let term0 = c.nodes[f].admin().unwrap()["cluster"]["term"].clone();
+    let workers: Vec<_> = (0..16)
+        .map(|w| {
+            std::thread::spawn(move || {
+                let s = TcpStream::connect(addr).unwrap();
+                s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+                let mut cl = Proto::new(s);
+                assert_eq!(cl.cmd(&format!("use t{w}")), format!("USING t{w}"));
+                for i in 0..150 {
+                    let id = inserted(&cl.put(format!("{w}-{i}").as_bytes()));
+                    if i % 3 == 0 {
+                        assert_eq!(cl.cmd(&format!("delete {id}")), "DELETED");
+                    }
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().unwrap();
+    }
+    // The workers' `Disconnect`s drain.
+    let a = wait_for(Duration::from_secs(10), || {
+        let a = c.nodes[f].admin()?;
+        (a["cluster"]["forward_queue"] == 0).then_some(a)
+    })
+    .expect("the forward queue never drained");
+    let cl = &a["cluster"];
+    // An election during the run (possible on a loaded machine) is a
+    // legitimate reason to resend; overload alone is not.
+    let causes: &[&str] = if cl["term"] == term0 {
+        assert_eq!(cl["resent_inputs"], 0, "{a}");
+        &["stall", "dropped", "error", "view"]
+    } else {
+        &["stall", "dropped"]
+    };
+    for cause in causes {
+        assert_eq!(cl["forward_rewinds"][cause], 0, "{cause}: {a}");
+    }
+    let m = c.nodes[f].metrics();
+    assert!(
+        m.contains("beanstalkd_cluster_resent_inputs_total 0"),
+        "{m}"
+    );
+    assert!(
+        m.contains("beanstalkd_cluster_forward_rewinds_total{cause=\"stall\"} 0"),
+        "{m}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -824,9 +1185,9 @@ fn mtls_cluster_replicates() {
     ]);
     assert_eq!(status.code(), Some(0), "{err}");
     assert!(out.contains("cluster tls: cert"), "{out}");
-    c.nodes[0].start(&["--cluster-init"]);
-    c.nodes[1].start(&[]);
-    c.nodes[2].start(&[]);
+    for n in &mut c.nodes {
+        n.start(&["--cluster-init"]);
+    }
     c.wait_all_ready();
     let l = c.leader();
     let f = c.followers(l)[0];

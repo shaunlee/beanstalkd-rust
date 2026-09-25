@@ -1,6 +1,6 @@
 // Command smoke is a real-client smoke test using github.com/beanstalkd/go-beanstalk.
 //
-// Usage: go run . [--leave-jobs | --after-restart] HOST:PORT
+// Usage: go run . [--leave-jobs | --after-restart | --kill-point] HOST:PORT
 //
 // It runs a full protocol flow against a (fresh) beanstalkd-compatible
 // server, asserting on every result, and prints a transcript to stdout in
@@ -9,7 +9,8 @@
 // as maps, so stats fields are printed in sorted key order.
 //
 // --leave-jobs and --after-restart drive the binlog restart test exactly
-// like the Python client (see clients/python/smoke.py).
+// like the Python client (see clients/python/smoke.py), and so does
+// --kill-point (the cluster leader-kill test).
 //
 // TLS: when SMOKE_TLS_CA is set, every connection is a crypto/tls
 // connection verifying the server against that CA bundle (server name: the
@@ -37,6 +38,7 @@ const (
 	tubeA    = "smoke-go-a"
 	tubeB    = "smoke-go-b"
 	tubeKeep = "smoke-go-keep"
+	tubeKill = "smoke-go-kill"
 )
 
 func out(format string, args ...any) { fmt.Printf(format+"\n", args...) }
@@ -141,8 +143,8 @@ func main() {
 	if len(args) == 2 {
 		mode, args = args[0], args[1:]
 	}
-	if len(args) != 1 || (mode != "" && mode != "--leave-jobs" && mode != "--after-restart") {
-		fmt.Fprintln(os.Stderr, "usage: smoke [--leave-jobs | --after-restart] HOST:PORT")
+	if len(args) != 1 || (mode != "" && mode != "--leave-jobs" && mode != "--after-restart" && mode != "--kill-point") {
+		fmt.Fprintln(os.Stderr, "usage: smoke [--leave-jobs | --after-restart | --kill-point] HOST:PORT")
 		os.Exit(2)
 	}
 	addr := args[0]
@@ -302,7 +304,73 @@ func main() {
 		leaveJobsAndHold(addr, prod)
 		return
 	}
+	if mode == "--kill-point" {
+		holdAcrossKill(addr, prod, work)
+	}
 	out("DONE")
+}
+
+// holdAcrossKill holds a reservation and a waiting reserve across the
+// point where the runner kills the cluster leader (KILL_POINT, until stdin
+// is closed), then checks both survived. Mirrors hold_across_kill in
+// clients/python/smoke.py.
+func holdAcrossKill(addr string, prod, work *beanstalk.Conn) {
+	tk := beanstalk.NewTube(prod, tubeKill)
+	wk := beanstalk.NewTubeSet(work, tubeKill)
+	held, err := tk.Put([]byte("held"), 5, 0, 120*time.Second)
+	must(err, "put held")
+	out("put held into %s: job=%d", tubeKill, held)
+	rid, body, err := wk.Reserve(time.Second)
+	must(err, "reserve held")
+	out("reserve: job=%d body=%q", rid, body)
+	expect("reserve held", rid, held)
+
+	// The waiter blocks in reserve-with-timeout on the (now empty) tube,
+	// across the kill (its connection deadline is 60s after dialing).
+	waiter := dial(addr)
+	defer waiter.Close()
+	ww := beanstalk.NewTubeSet(waiter, tubeKill)
+	type result struct {
+		id   uint64
+		body []byte
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		id, body, err := ww.Reserve(50 * time.Second)
+		done <- result{id, body, err}
+	}()
+	// Make sure the reserve is actually waiting before the kill. A fixed
+	// pause and one check, not a poll: the number of stats-tube calls
+	// shows in cmd-stats-tube.
+	time.Sleep(500 * time.Millisecond)
+	st := dump("stats-tube " + tubeKill)(tk.Stats())
+	expect("waiting before the kill", st["current-waiting"], "1")
+	out("KILL_POINT")
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	out("resumed")
+
+	// Same connections, same reservation.
+	dump("stats-job held")(work.StatsJob(held))
+	must(work.Touch(held), "touch held")
+	out("touch job=%d: ok", held)
+	dump("stats-tube " + tubeKill)(tk.Stats())
+	must(work.Release(held, 6, 0), "release held")
+	out("release job=%d: ok", held)
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(55 * time.Second):
+		fail("waiter never returned")
+	}
+	must(r.err, "waiter reserve")
+	out("waiter reserved: job=%d body=%q", r.id, r.body)
+	expect("waiter job", r.id, held)
+	dump("stats-job held")(waiter.StatsJob(held))
+	must(waiter.Delete(r.id), "delete held")
+	out("delete job=%d: ok", r.id)
+	st = dump("stats")(prod.Stats())
+	expect("total-jobs", st["total-jobs"], "7")
 }
 
 // leaveJobsAndHold leaves jobs in known journaled states, then holds two

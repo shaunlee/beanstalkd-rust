@@ -28,7 +28,7 @@ use crate::client::{Network, NetworkConfig, PeerClient};
 use crate::forward::{
     ControlRequest, ControlResponse, ForwardError, ForwardHandler, ForwardTransport,
 };
-use crate::listener::{ClusterListener, ListenerConfig};
+use crate::listener::{ClusterListener, ListenerConfig, VoteGate};
 use crate::test_store::{MemLog, MemSm};
 use crate::tls::{ClusterTls, cluster_tls_from_pem, node_dns_name};
 use crate::wire::{self, ClientMsg, Hello, PROTOCOL_VERSION, ServerHello, ServerMsg};
@@ -497,7 +497,7 @@ async fn hello_from_unknown_or_misaddressed_node_is_rejected() {
         .await
         .expect_err("rejected");
     assert!(
-        matches!(e, ForwardError::Unreachable(ref m) if m.contains("not a configured peer")),
+        matches!(e, ForwardError::Unreachable(ref m) if m.contains("rejected: hello rejected")),
         "{e:?}"
     );
     // Node 2 believes node 5 listens there.
@@ -507,7 +507,7 @@ async fn hello_from_unknown_or_misaddressed_node_is_rejected() {
         .await
         .expect_err("rejected");
     assert!(
-        matches!(e, ForwardError::Unreachable(ref m) if m.contains("this is node 1")),
+        matches!(e, ForwardError::Unreachable(ref m) if m.contains("rejected: hello rejected")),
         "{e:?}"
     );
     // Unknown target address.
@@ -688,8 +688,128 @@ async fn request_timeouts() {
     let e = net.forward(1, forward_from(2)).await.expect_err("timeout");
     assert_eq!(e, ForwardError::Timeout);
 
-    // Each timeout closed the connection; every request re-dialed.
-    assert_eq!(accepts.load(Ordering::SeqCst), 3);
+    // A timeout fails only its own request: the connection stays up until
+    // it has been stalled for the stall bound (1 s here).
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_connection_is_closed_after_the_stall_bound() {
+    let (addr, accepts) = silent_server(true).await;
+    let mut cfg = net_config(2, [(1, addr.clone())].into(), None);
+    cfg.vote_timeout = Duration::from_millis(50);
+    cfg.stall_timeout = Duration::from_millis(100);
+    let net = Network::new(cfg);
+    let mut c = client_to(&net, 1, &addr).await;
+    // The bound is max(100 ms, 3 × 50 ms) = 150 ms of no answer at all.
+    let t0 = tokio::time::Instant::now();
+    let mut timeouts = 0;
+    while accepts.load(Ordering::SeqCst) < 2 {
+        let e = c.vote(vote_req(1, 2), option()).await.expect_err("timeout");
+        assert!(matches!(e, RPCError::Timeout(_)), "{e:?}");
+        timeouts += 1;
+        assert!(t0.elapsed() < Duration::from_secs(5), "never re-dialed");
+    }
+    assert!(timeouts >= 4, "re-dialed after {timeouts} timeouts");
+    assert!(t0.elapsed() >= Duration::from_millis(150));
+}
+
+/// A fake listener that answers every request, in order, `delay` after
+/// reading it.
+async fn slow_server(delay: Duration) -> (String, Arc<AtomicUsize>) {
+    use crate::wire::{RpcRequest, RpcResponse};
+    let tcp = bind().await;
+    let addr = tcp.local_addr().expect("addr").to_string();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let count = accepts.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = tcp.accept().await else {
+                return;
+            };
+            count.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let max = wire::DEFAULT_MAX_FRAME;
+                let Ok(Some(ClientMsg::Hello(_))) =
+                    wire::read_frame::<_, ClientMsg>(&mut s, max).await
+                else {
+                    return;
+                };
+                let hello = ServerMsg::Hello(ServerHello::Accepted {
+                    version: PROTOCOL_VERSION,
+                    node_id: 1,
+                    max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
+                });
+                let f = wire::encode(&hello, max).expect("encode");
+                if wire::write_frame(&mut s, &f).await.is_err() {
+                    return;
+                }
+                while let Ok(Some(ClientMsg::Request { id, body })) =
+                    wire::read_frame::<_, ClientMsg>(&mut s, max).await
+                {
+                    tokio::time::sleep(delay).await;
+                    let body = match body {
+                        RpcRequest::AppendEntries(_) => {
+                            RpcResponse::AppendEntries(Ok(AppendEntriesResponse::Success))
+                        }
+                        RpcRequest::Forward(_) => {
+                            RpcResponse::Forward(Ok(ForwardResponse::NotLeader { leader: None }))
+                        }
+                        _ => return,
+                    };
+                    let f = wire::encode(&ServerMsg::Response { id, body }, max).expect("encode");
+                    if wire::write_frame(&mut s, &f).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, accepts)
+}
+
+fn heartbeat() -> AppendEntriesRequest<TypeConfig> {
+    AppendEntriesRequest {
+        vote: Vote::new_committed(1, 2),
+        prev_log_id: None,
+        entries: vec![],
+        leader_commit: None,
+    }
+}
+
+/// H2: an AppendEntries that outlives openraft's heartbeat-interval
+/// timeout (which drops the call) or our own timeout fails alone; the
+/// forward sharing the connection is answered, and nothing re-dials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_append_does_not_fail_forwards_on_the_same_connection() {
+    let (addr, accepts) = slow_server(Duration::from_millis(80)).await;
+    let mut cfg = net_config(2, [(1, addr.clone())].into(), None);
+    cfg.append_timeout = Duration::from_millis(50);
+    cfg.forward_timeout = Duration::from_secs(2);
+    let net = Network::new(cfg);
+    let mut c = client_to(&net, 1, &addr).await;
+
+    // Our own timeout.
+    let e = c
+        .append_entries(heartbeat(), option())
+        .await
+        .expect_err("timeout");
+    assert!(matches!(e, RPCError::Timeout(_)), "{e:?}");
+    // openraft's outer timeout dropping the call (as replication does
+    // with `heartbeat_interval`).
+    let mut c2 = client_to(&net, 1, &addr).await;
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(30),
+        c2.append_entries(heartbeat(), option()),
+    )
+    .await;
+    assert!(dropped.is_err());
+    assert_eq!(net.pending_len(1), 0, "the dropped call left its slot");
+
+    // A forward behind them is answered on the same connection.
+    let r = net.forward(1, forward_from(2)).await.expect("forward");
+    assert_eq!(r, ForwardResponse::NotLeader { leader: None });
+    assert_eq!(accepts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -739,9 +859,64 @@ async fn oversized_append_asks_openraft_to_split() {
         .await
         .expect_err("too large");
     match e {
-        RPCError::PayloadTooLarge(p) => assert_eq!(p.entries_hint(), 20),
+        RPCError::PayloadTooLarge(p) => {
+            let h = p.entries_hint();
+            assert!((1..40).contains(&h), "{h}");
+        }
         other => panic!("unexpected {other:?}"),
     }
+}
+
+fn put_entry(i: u64, body: usize) -> Entry<TypeConfig> {
+    Entry {
+        log_id: LogId::new(CommittedLeaderId::new(1, 2), i),
+        payload: EntryPayload::Normal(Request {
+            now: i,
+            op: Op::Conn {
+                seq: 2,
+                input: EngineInput::Command {
+                    conn: conn_id(2, 1),
+                    cmd: bstk_proto::Command::Put {
+                        pri: 0,
+                        delay: 0,
+                        ttr: 1,
+                        body: bytes::Bytes::from(vec![b'x'; body]),
+                    },
+                },
+            },
+        }),
+    }
+}
+
+/// H2 (a): batches are bounded by bytes, not only by the frame size; a
+/// single entry larger than the budget is still sent.
+#[tokio::test]
+async fn append_batches_are_split_by_the_byte_budget() {
+    let mut cfg = net_config(2, [(1, "127.0.0.1:1".into())].into(), None);
+    cfg.append_budget = 10_000;
+    let net = Network::new(cfg);
+    let mut c = client_to(&net, 1, "127.0.0.1:1").await;
+    let mut req = heartbeat();
+    req.entries = (1..=100).map(|i| put_entry(i, 1000)).collect();
+    let e = c
+        .append_entries(req, option())
+        .await
+        .expect_err("too large");
+    match e {
+        RPCError::PayloadTooLarge(p) => {
+            let h = p.entries_hint();
+            assert!((5..=10).contains(&h), "{h}");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    // One entry of 50 kB goes (and fails only because nobody listens).
+    let mut req = heartbeat();
+    req.entries = vec![put_entry(1, 50_000)];
+    let e = c
+        .append_entries(req, option())
+        .await
+        .expect_err("no server");
+    assert!(matches!(e, RPCError::Unreachable(_)), "{e:?}");
 }
 
 async fn raw_hello(addr: SocketAddr, from: NodeId) -> tokio::net::TcpStream {
@@ -827,8 +1002,31 @@ async fn listener_closes_on_bad_frames() {
     shutdown(vec![node]).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn listener_limits_connections_and_handshake_time() {
+/// Sends a forward on a raw authenticated connection; true if answered.
+async fn raw_forward(s: &mut tokio::net::TcpStream, from: NodeId) -> bool {
+    let f = wire::encode(
+        &ClientMsg::Request {
+            id: 1,
+            body: wire::RpcRequest::Forward(forward_from(from)),
+        },
+        wire::DEFAULT_MAX_FRAME,
+    )
+    .expect("encode");
+    if s.write_all(&f).await.is_err() {
+        return false;
+    }
+    let r = tokio::time::timeout(
+        Duration::from_secs(2),
+        wire::read_frame::<_, ServerMsg>(s, wire::DEFAULT_MAX_FRAME),
+    )
+    .await;
+    matches!(r, Ok(Ok(Some(ServerMsg::Response { id: 1, .. }))))
+}
+
+/// A lone node 1 (peers 2 and 3) with listener settings from `edit`.
+async fn lone_listener(
+    edit: impl FnOnce(&mut ListenerConfig),
+) -> (ClusterListener, Raft<TypeConfig>, SocketAddr) {
     let tcp = bind().await;
     let addr = tcp.local_addr().expect("addr");
     let addrs: BTreeMap<NodeId, String> = [(1, addr.to_string()), (2, "127.0.0.1:1".into())].into();
@@ -836,25 +1034,87 @@ async fn listener_limits_connections_and_handshake_time() {
     let raft = Raft::new(1, raft_config(), net, MemLog::default(), MemSm::default())
         .await
         .expect("raft");
-    let mut cfg = listener_config(1, &[1, 2], None);
-    cfg.max_connections = 1;
-    cfg.handshake_timeout = Duration::from_millis(300);
+    let mut cfg = listener_config(1, &[1, 2, 3], None);
+    edit(&mut cfg);
     let handler = Arc::new(CountingHandler::default());
     let l = ClusterListener::spawn(tcp, cfg, raft.clone(), handler).expect("listener");
+    (l, raft, addr)
+}
 
-    // The first connection occupies the only slot (no hello yet).
-    let mut first = tokio::net::TcpStream::connect(addr).await.expect("connect");
+/// H1: connections that never finish the handshake use their own budget
+/// (global and per source address) and time out; they cannot take the
+/// slots of authenticated peers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_limits_handshakes_separately_from_peers() {
+    let (l, raft, addr) = lone_listener(|c| {
+        c.max_handshakes = 1;
+        c.max_handshakes_per_ip = 1;
+        c.handshake_timeout = Duration::from_millis(300);
+    })
+    .await;
+
+    // Node 2 is connected and authenticated.
+    let mut peer2 = raw_hello(addr, 2).await;
+    // A connection that never says hello takes the only handshake slot.
+    let mut idle = tokio::net::TcpStream::connect(addr).await.expect("connect");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // The second is closed at accept.
+    // Another one is closed at accept.
     let mut second = tokio::net::TcpStream::connect(addr).await.expect("connect");
     assert!(closes(&mut second).await);
-    // The first is closed when the handshake time runs out.
-    assert!(closes(&mut first).await);
-    // Then the slot is free again.
+    // The authenticated peer is still served.
+    assert!(raw_forward(&mut peer2, 2).await);
+    // The idle one is closed when the handshake time runs out.
+    assert!(closes(&mut idle).await);
+    // Then the slot is free again: node 3 gets in, node 2 stays.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let _ok = raw_hello(addr, 2).await;
+    let mut peer3 = raw_hello(addr, 3).await;
+    assert!(raw_forward(&mut peer3, 3).await);
+    assert!(raw_forward(&mut peer2, 2).await);
     l.shutdown().await;
     let _ = raft.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_limits_handshakes_per_source_address() {
+    let (l, raft, addr) = lone_listener(|c| {
+        c.max_handshakes = 8;
+        c.max_handshakes_per_ip = 2;
+        c.handshake_timeout = Duration::from_millis(500);
+    })
+    .await;
+    let _a = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let _b = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The global budget has room, but this address is at its limit.
+    let mut c = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    assert!(closes(&mut c).await);
+    l.shutdown().await;
+    let _ = raft.shutdown().await;
+}
+
+/// H1: a new authenticated connection of a peer replaces its older one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn newer_peer_connection_replaces_the_older_one() {
+    let (l, raft, addr) = lone_listener(|_| {}).await;
+    let mut old = raw_hello(addr, 2).await;
+    assert!(raw_forward(&mut old, 2).await);
+    let mut other = raw_hello(addr, 3).await;
+    let mut new = raw_hello(addr, 2).await;
+    assert!(closes(&mut old).await);
+    assert!(raw_forward(&mut new, 2).await);
+    // Node 3's connection is untouched.
+    assert!(raw_forward(&mut other, 3).await);
+    l.shutdown().await;
+    let _ = raft.shutdown().await;
+}
+
+#[test]
+fn listener_defaults() {
+    let c = ListenerConfig::new(1, [1, 2, 3].into(), None);
+    assert_eq!(c.handshake_timeout, Duration::from_secs(2));
+    assert_eq!(c.max_handshakes_per_ip, 6);
+    assert!(c.max_handshakes >= c.max_handshakes_per_ip);
+    assert!(c.vote_gate.is_none());
 }
 
 // -------------------------------------------------------------------- TLS
@@ -937,7 +1197,7 @@ async fn mtls_certificate_for_another_node_is_rejected() {
     assert_rejected(
         pki.node(1),
         tls_with_cert_for(&pki, &pki, 3),
-        "certificate is not valid for bstk-node-2",
+        "rejected: hello rejected",
     )
     .await;
     // The listener at node 1's address presents node 3's certificate: the
@@ -1231,7 +1491,7 @@ async fn old_protocol_version_is_rejected() {
         .await
         .expect("answer");
     assert!(
-        matches!(a, Some(ServerMsg::Hello(ServerHello::Rejected { ref reason })) if reason.contains("version")),
+        matches!(a, Some(ServerMsg::Hello(ServerHello::Rejected { ref reason })) if reason == crate::listener::REJECT_VERSION),
         "{a:?}"
     );
     shutdown(vec![node]).await;
@@ -1246,5 +1506,130 @@ async fn last_response_tracks_answers() {
     let at = net.last_response(1).expect("a response arrived");
     assert!(at >= before);
     assert_eq!(net.last_response(3), None);
+    shutdown(vec![node]).await;
+}
+
+// ------------------------------------------------------------- P3-FA fixes
+
+/// Like [`single_target`], with `edit` applied to the listener config.
+async fn single_target_with(edit: impl FnOnce(&mut ListenerConfig)) -> (Node, Network) {
+    let tcp = bind().await;
+    let addr = tcp.local_addr().expect("addr");
+    let addrs: BTreeMap<NodeId, String> = [
+        (1, addr.to_string()),
+        (2, "127.0.0.1:1".into()),
+        (3, "127.0.0.1:1".into()),
+    ]
+    .into();
+    let net = Network::new(net_config(1, addrs.clone(), None));
+    let sm = MemSm::default();
+    let raft = Raft::new(1, raft_config(), net, MemLog::default(), sm.clone())
+        .await
+        .expect("raft");
+    let handler = Arc::new(CountingHandler::default());
+    let mut cfg = listener_config(1, &[1, 2, 3], None);
+    edit(&mut cfg);
+    let listener =
+        ClusterListener::spawn(tcp, cfg, raft.clone(), handler.clone()).expect("listener");
+    let client = Network::new(net_config(2, [(1, addr.to_string())].into(), None));
+    let node = Node {
+        id: 1,
+        raft,
+        sm,
+        handler,
+        listener: Some(listener),
+        addr,
+    };
+    (node, client)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_vote_gate_refuses_votes_without_touching_raft() {
+    let gate = Arc::new(VoteGate::new(false));
+    let g = gate.clone();
+    let (node, net) = single_target_with(move |c| c.vote_gate = Some(g)).await;
+    let mut c = client_to(&net, 1, &node.addr.to_string()).await;
+
+    let e = c.vote(vote_req(5, 2), option()).await.expect_err("refused");
+    assert!(matches!(e, RPCError::Network(_)), "{e:?}");
+    assert_eq!(gate.refused(), 1);
+    // Raft never saw the candidate's term.
+    assert_eq!(node.raft.metrics().borrow().current_term, 0);
+    // Other requests on the same connection are served.
+    let r = net.forward(1, forward_from(2)).await.expect("forward");
+    assert_eq!(r, ForwardResponse::NotLeader { leader: Some(3) });
+
+    gate.open();
+    let v = c.vote(vote_req(5, 2), option()).await.expect("vote");
+    assert!(v.vote_granted);
+    assert_eq!(gate.refused(), 1);
+    gate.close();
+    assert!(c.vote(vote_req(6, 3), option()).await.is_err());
+    assert_eq!(gate.refused(), 2);
+    shutdown(vec![node]).await;
+}
+
+/// H3: chunk offsets over the wire. A retransmitted chunk and a restart
+/// from offset 0 (same snapshot id) are accepted; a chunk that would
+/// leave a gap is refused (as a remote storage error) without disturbing
+/// the node, and the snapshot then completes normally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_chunks_cannot_leave_gaps() {
+    let (node, net) = single_target(None, None).await;
+    let addr = node.addr.to_string();
+    let mut c = client_to(&net, 1, &addr).await;
+    let leader = CommittedLeaderId::new(1, 2);
+    let members: BTreeMap<NodeId, BasicNode> =
+        [(2, BasicNode::new("x")), (1, BasicNode::new(addr.clone()))].into();
+    let membership = Membership::new(vec![members.keys().copied().collect()], members);
+    let meta = SnapshotMeta {
+        last_log_id: Some(LogId::new(leader, 5)),
+        last_membership: StoredMembership::new(Some(LogId::new(leader, 0)), membership),
+        snapshot_id: "snap-gap".into(),
+    };
+    let data = postcard::to_stdvec(&vec![req(1), req(2), req(3)]).expect("encode");
+    let (a, b) = data.split_at(data.len() / 2);
+    let chunk = |offset: u64, bytes: &[u8], done: bool| InstallSnapshotRequest {
+        vote: Vote::new_committed(1, 2),
+        meta: meta.clone(),
+        offset,
+        data: bytes.to_vec(),
+        done,
+    };
+    let alen = a.len() as u64;
+    c.install_snapshot(chunk(0, a, false), option())
+        .await
+        .expect("first chunk");
+    // Retransmit of the first chunk.
+    c.install_snapshot(chunk(0, a, false), option())
+        .await
+        .expect("retransmit");
+    // A chunk far beyond the received bytes.
+    let e = c
+        .install_snapshot(chunk(1 << 40, b, false), option())
+        .await
+        .expect_err("gap");
+    assert!(
+        matches!(e, RPCError::RemoteError(ref r) if matches!(r.source, RaftError::Fatal(_))),
+        "{e:?}"
+    );
+    let e = c
+        .install_snapshot(chunk(alen + 1, b, false), option())
+        .await
+        .expect_err("gap of one byte");
+    assert!(matches!(e, RPCError::RemoteError(_)), "{e:?}");
+    // The node is fine; the sender restarts from 0 with the same id.
+    c.install_snapshot(chunk(0, a, false), option())
+        .await
+        .expect("restart");
+    c.install_snapshot(chunk(alen, b, true), option())
+        .await
+        .expect("last chunk");
+    node.raft
+        .wait(Some(Duration::from_secs(5)))
+        .applied_index_at_least(Some(5), "snapshot installed")
+        .await
+        .expect("installed");
+    assert_eq!(node.sm.applied(), vec![req(1), req(2), req(3)]);
     shutdown(vec![node]).await;
 }

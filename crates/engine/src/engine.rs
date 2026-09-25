@@ -38,6 +38,14 @@ use crate::{
 /// `SAFETY_MARGIN` in conn.c: 1 second.
 const SAFETY_MARGIN: Nanos = NANOS_PER_SEC;
 
+/// Largest tube slab (`tubes.len()`, live tubes plus free slots) accepted
+/// by `import_state`. The slab never shrinks (freed slots are reused, not
+/// dropped), so free slots cannot be bounded by the live tubes; but a slab
+/// this large means some 16 million tubes existed at once, gigabytes of
+/// tube state in the running engine, which no healthy node produces. The
+/// check runs before the per-tube arrays of `validate` are allocated.
+const MAX_TUBE_SLOTS: usize = if cfg!(test) { 1 << 12 } else { 1 << 24 };
+
 /// "default" is created first and never destroyed, so it always has id 0.
 const DEFAULT_TUBE: TubeId = 0;
 
@@ -1149,7 +1157,7 @@ impl Engine {
             return;
         };
         let tube = j.tube;
-        let deadline = now + (j.ttr as Nanos) * NANOS_PER_SEC;
+        let deadline = now.saturating_add((j.ttr as Nanos) * NANOS_PER_SEC);
         j.state = JobState::Reserved;
         j.reserver = Some(cid);
         j.deadline_at = deadline;
@@ -1450,6 +1458,10 @@ impl Engine {
             };
         }
         let n_tubes = self.tubes.len();
+        ensure!(
+            n_tubes <= MAX_TUBE_SLOTS,
+            "tube slab of {n_tubes} slots exceeds the maximum of {MAX_TUBE_SLOTS}"
+        );
 
         // --- Tube slab, names, list order, free list -------------------
         let default = self
@@ -1966,7 +1978,7 @@ impl Engine {
         }
 
         if delay > 0 {
-            let deadline = now + (delay as Nanos) * NANOS_PER_SEC;
+            let deadline = now.saturating_add((delay as Nanos) * NANOS_PER_SEC);
             self.insert_delayed(tube, id, deadline);
         } else {
             self.insert_ready(tube, id);
@@ -2057,7 +2069,7 @@ impl Engine {
             out.push((cid, Response::DeadlineSoon));
             return;
         }
-        let wait_deadline = timeout.map(|t| now + (t as Nanos) * NANOS_PER_SEC);
+        let wait_deadline = timeout.map(|t| now.saturating_add((t as Nanos) * NANOS_PER_SEC));
         let timeout_is_zero = timeout == Some(0);
         // A connection already inside its safety margin enters
         // `conn_ticks` at or before `now` here, so the server's tick right
@@ -2182,7 +2194,7 @@ impl Engine {
             j.release_ct += 1;
         }
         if delay > 0 {
-            let deadline = now + (delay as Nanos) * NANOS_PER_SEC;
+            let deadline = now.saturating_add((delay as Nanos) * NANOS_PER_SEC);
             self.insert_delayed(tube, id, deadline);
             // `enqueue_job(c->srv, j, delay, !!delay)`: only a release with
             // a delay is written.
@@ -2218,7 +2230,7 @@ impl Engine {
         }
         let ttr = self.jobs.get(&id).map(|j| j.ttr).unwrap_or(1);
         let old_deadline = self.jobs.get(&id).map(|j| j.deadline_at).unwrap_or(0);
-        let new_deadline = now + (ttr as Nanos) * NANOS_PER_SEC;
+        let new_deadline = now.saturating_add((ttr as Nanos) * NANOS_PER_SEC);
         if let Some(j) = self.jobs.get_mut(&id) {
             j.deadline_at = new_deadline;
         }
@@ -2375,7 +2387,7 @@ impl Engine {
             self.pauses.remove(&(t.unpause_at, tid));
         }
         t.pause = delay_nanos;
-        t.unpause_at = now + delay_nanos;
+        t.unpause_at = now.saturating_add(delay_nanos);
         t.stat.pause_ct += 1;
         self.pauses.insert((t.unpause_at, tid));
         out.push((cid, Response::Paused));
@@ -2779,6 +2791,46 @@ mod tests {
 
     fn tube(name: &str) -> TubeName {
         TubeName::new(name).unwrap()
+    }
+
+    /// L3: deadlines computed from a far-future `now` (a snapshot or log
+    /// entry from a faulty peer) saturate instead of overflowing.
+    #[test]
+    fn far_future_now_saturates_deadlines() {
+        let now = u64::MAX - 5;
+        let mut e = engine_at(now);
+        e.connect(now, 1);
+        e.connect(now, 2);
+        let delayed = put(&mut e, now, 1, 0, u32::MAX, u32::MAX, "d");
+        let ready = put(&mut e, now, 1, 0, 0, u32::MAX, "r");
+        let out = handle(&mut e, now, 1, Command::Reserve);
+        assert!(matches!(only(&out, 1), Response::Reserved { id, .. } if id == ready));
+        let _ = handle(&mut e, now, 1, Command::Touch(ready));
+        let _ = handle(
+            &mut e,
+            now,
+            1,
+            Command::Release {
+                id: ready,
+                pri: 0,
+                delay: u32::MAX,
+            },
+        );
+        let _ = handle(&mut e, now, 2, Command::ReserveWithTimeout(u32::MAX));
+        let _ = handle(
+            &mut e,
+            now,
+            1,
+            Command::PauseTube {
+                tube: tube("default"),
+                delay: u32::MAX,
+            },
+        );
+        let mut out = Outbox::new();
+        e.tick(u64::MAX, &mut out);
+        assert!(e.next_deadline().is_some());
+        e.validate().unwrap();
+        let _ = delayed;
     }
 
     // Verified against the reference: a rejected put still bumps cmd-put;

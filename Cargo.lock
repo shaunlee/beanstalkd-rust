@@ -193,11 +193,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstk-chaos"
+version = "0.1.0"
+dependencies = [
+ "bstk-engine",
+ "bstk-proto",
+ "bstk-raft",
+ "bytes",
+ "nix",
+ "openraft",
+ "postcard",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "bstk-compat"
 version = "0.1.0"
 dependencies = [
  "rcgen",
  "rustls",
+ "serde_json",
 ]
 
 [[package]]

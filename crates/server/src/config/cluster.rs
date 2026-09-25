@@ -10,7 +10,10 @@
 //! - 1, 3 or 5 peers (1 only makes sense for tests), with unique ids and
 //!   unique addresses;
 //! - `[cluster.tls]` (`cert`, `key`, `ca`) is required unless
-//!   `insecure_plaintext = true`;
+//!   `insecure_plaintext = true`, and the two exclude each other;
+//! - `insecure_plaintext = true` requires `listen` and every peer address to
+//!   be loopback (`127.0.0.0/8`, `::1` or `localhost`), unless
+//!   `insecure_plaintext_allow_remote = true` as well;
 //! - `-b` / `binlog.dir` together with `[cluster]` is an error (the Raft log
 //!   replaces the binlog);
 //! - `heartbeat` < `election_timeout[0]` <= `election_timeout[1]`;
@@ -287,13 +290,39 @@ fn resolve_cluster(
         }
         None => None,
     };
+    let allow_remote = raw.insecure_plaintext_allow_remote.unwrap_or(false);
     if tls.is_none() && !insecure_plaintext {
         return Err(invalid(
             "[cluster.tls] (cert, key, ca) is required: cluster traffic uses mutual TLS \
              (set cluster.insecure_plaintext = true only for tests)",
         ));
     }
-    let tls = if insecure_plaintext { None } else { tls };
+    if tls.is_some() && insecure_plaintext {
+        return Err(invalid(
+            "[cluster.tls] and cluster.insecure_plaintext = true exclude each other: remove \
+             one of them",
+        ));
+    }
+    if allow_remote && !insecure_plaintext {
+        return Err(invalid(
+            "cluster.insecure_plaintext_allow_remote = true requires \
+             cluster.insecure_plaintext = true",
+        ));
+    }
+    if insecure_plaintext && !allow_remote {
+        let remote = std::iter::once(listen.to_string())
+            .chain(peers.values().cloned())
+            .find(|a| !is_loopback(a));
+        if let Some(addr) = remote {
+            return Err(invalid(format!(
+                "cluster.insecure_plaintext = true sends unauthenticated, unencrypted cluster \
+                 traffic, so it is allowed only when cluster.listen and every peer address are \
+                 loopback; {addr:?} is not (use [cluster.tls], or set \
+                 cluster.insecure_plaintext_allow_remote = true on a network you trust \
+                 completely)"
+            )));
+        }
+    }
 
     // Interaction with the rest of the configuration.
     if let Some(dir) = &config.binlog.dir {
@@ -346,6 +375,15 @@ fn resolve_cluster(
     })
 }
 
+/// Whether a cluster address (`IP:port` or `host:port`) is loopback.
+fn is_loopback(addr: &str) -> bool {
+    if let Ok(a) = addr.parse::<SocketAddr>() {
+        return a.ip().is_loopback();
+    }
+    addr.rsplit_once(':')
+        .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost"))
+}
+
 /// `--check-config` lines for `[cluster]`.
 pub fn cluster_summary(c: &ClusterSettings) -> String {
     let mut s = String::new();
@@ -368,7 +406,11 @@ pub fn cluster_summary(c: &ClusterSettings) -> String {
             t.key.display(),
             t.ca.display()
         ),
-        None => writeln!(s, "cluster tls: disabled (insecure_plaintext)"),
+        None => writeln!(
+            s,
+            "cluster tls: DISABLED (insecure_plaintext: cluster traffic is neither \
+             authenticated nor encrypted)"
+        ),
     };
     let _ = writeln!(
         s,
@@ -460,7 +502,8 @@ mod tests {
             &[],
             &config(
                 "node_timeout = \"2s\"\nsnapshot_every = 7\nheartbeat = \"20ms\"\n\
-                 election_timeout = [\"100ms\", \"100ms\"]\ninsecure_plaintext = true",
+                 election_timeout = [\"100ms\", \"100ms\"]\ninsecure_plaintext = true\n\
+                 insecure_plaintext_allow_remote = true",
                 PEERS3,
             ),
         )
@@ -473,14 +516,6 @@ mod tests {
             c.election_timeout,
             (Duration::from_millis(100), Duration::from_millis(100))
         );
-        assert_eq!(c.tls, None);
-        // insecure_plaintext wins over a [cluster.tls] section.
-        let c = resolve(
-            &[],
-            &config(&format!("insecure_plaintext = true\n{TLS}"), PEERS3),
-        )
-        .unwrap()
-        .unwrap();
         assert_eq!(c.tls, None);
     }
 
@@ -552,6 +587,59 @@ mod tests {
             &config("[cluster.tls]\ncert = \"a\"\nca = \"b\"\nx = 1\n", PEERS3),
         );
         assert!(e.contains("unknown field"), "{e}");
+        // [cluster.tls] and insecure_plaintext exclude each other.
+        let e = error(
+            &[],
+            &config(&format!("insecure_plaintext = true\n{TLS}"), PEERS3),
+        );
+        assert!(e.contains("exclude each other"), "{e}");
+    }
+
+    #[test]
+    fn plaintext_is_loopback_only_unless_explicitly_allowed() {
+        let loopback = "[[cluster.peer]]\nid = 1\naddr = \"127.0.0.1:1\"\n\
+                        [[cluster.peer]]\nid = 2\naddr = \"[::1]:2\"\n\
+                        [[cluster.peer]]\nid = 3\naddr = \"localhost:3\"\n";
+        let local = |extra: &str, peers: &str| {
+            config(&format!("insecure_plaintext = true\n{extra}"), peers)
+                .replace("0.0.0.0:11400", "127.0.0.2:11400")
+        };
+        let c = resolve(&[], &local("", loopback)).unwrap().unwrap();
+        assert_eq!(c.tls, None);
+        assert!(cluster_summary(&c).contains("DISABLED"));
+        // A remote peer, or a listen address on every interface.
+        let e = error(&[], &local("", PEERS3));
+        assert!(
+            e.contains("\"10.0.0.1:11400\" is not") && e.contains("allow_remote"),
+            "{e}"
+        );
+        let e = error(&[], &config("insecure_plaintext = true", loopback));
+        assert!(e.contains("\"0.0.0.0:11400\" is not"), "{e}");
+        let e = error(
+            &[],
+            &local("", &loopback.replace("localhost:3", "node3.example:3")),
+        );
+        assert!(e.contains("node3.example:3"), "{e}");
+        // The second opt-in allows it.
+        let c = resolve(
+            &[],
+            &local("insecure_plaintext_allow_remote = true", PEERS3),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(c.tls, None);
+        // ... but only together with insecure_plaintext.
+        let e = error(
+            &[],
+            &config(
+                &format!("insecure_plaintext_allow_remote = true\n{TLS}"),
+                PEERS3,
+            ),
+        );
+        assert!(
+            e.contains("requires cluster.insecure_plaintext = true"),
+            "{e}"
+        );
     }
 
     #[test]

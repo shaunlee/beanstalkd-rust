@@ -40,7 +40,10 @@ pub enum ControlResponse {
 /// served one at a time, in arrival order, and Raft RPCs on the same
 /// connection wait behind it: the implementation must return once the
 /// inputs are proposed (for example with `client_write_ff`), never wait for
-/// their commit.
+/// their commit. A call may be dropped at any await point (the connection
+/// closed, or replaced by a newer connection of the same peer), so an
+/// implementation must not leave shared state inconsistent across an
+/// await.
 pub trait ForwardHandler: Send + Sync + 'static {
     fn forward(&self, req: ForwardRequest) -> impl Future<Output = ForwardResponse> + Send;
 

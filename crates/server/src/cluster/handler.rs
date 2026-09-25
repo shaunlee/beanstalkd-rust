@@ -7,10 +7,22 @@
 //!   peer connection are served one at a time, and Raft RPCs on it wait
 //!   behind them). Elsewhere the answer is `NotLeader` with the leader this
 //!   node knows of.
+//! - A forward without items is a *ping* (an owner checking that the
+//!   leader hears it, see [`super::actor`]) or a *probe* (a node started
+//!   with `--cluster-init` asking whether this node already belongs to a
+//!   running cluster, see [`super::start`]). The answer is `Accepted` on
+//!   the leader; elsewhere `NotLeader { leader: Some(l) }` if this node
+//!   belongs to a running cluster (`l` is the leader it knows, or its own
+//!   id when it knows none), and `NotLeader { leader: None }` if it has no
+//!   cluster state beyond the bootstrap membership. (An owner ignores a
+//!   `NotLeader` hint that names the node it asked.)
 //! - A control request (`SetDraining`, or `DropNode` of the sender, checked
 //!   by the listener): on the leader it is proposed and the answer waits,
 //!   at most one second, for it to be applied, so that the requester knows
-//!   its index. These are rare (SIGUSR1, a node's startup).
+//!   its index. These are rare (SIGUSR1, a node's startup and rejoin).
+//!
+//! Every forward, ping and control request records that its sender was
+//! heard from (the leader's node liveness, [`super::duties`]).
 
 use std::sync::Arc;
 
@@ -35,6 +47,18 @@ impl Handler {
 
 impl ForwardHandler for Handler {
     async fn forward(&self, req: ForwardRequest) -> ForwardResponse {
+        self.core.heard_from(req.from);
+        if req.items.is_empty() {
+            return if self.core.is_leader() {
+                ForwardResponse::Accepted
+            } else if self.core.established().await {
+                ForwardResponse::NotLeader {
+                    leader: Some(self.core.leader().unwrap_or(self.core.id)),
+                }
+            } else {
+                ForwardResponse::NotLeader { leader: None }
+            };
+        }
         if !self.core.is_leader() {
             return ForwardResponse::NotLeader {
                 leader: self.not_leader(),
@@ -49,6 +73,7 @@ impl ForwardHandler for Handler {
     }
 
     async fn control(&self, req: ControlRequest) -> ControlResponse {
+        self.core.heard_from(req.from);
         if !self.core.is_leader() {
             return ControlResponse::NotLeader {
                 leader: self.not_leader(),

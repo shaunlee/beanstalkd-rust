@@ -1069,3 +1069,36 @@ fn duplicate_free_slot_is_rejected() {
     s.free_tube_ids[1] = s.free_tube_ids[0];
     assert!(Engine::import_state(s, sys()).is_err());
 }
+
+/// L1: an absurd tube slab is rejected before the per-tube arrays of the
+/// validation are allocated; a large legitimate one (many freed tubes) is
+/// accepted. (Unit tests use a cap of 4096 slots; the real one is 2^24.)
+#[test]
+fn absurd_tube_slab_is_rejected() {
+    let mut e = new_engine(false);
+    let mut out = Outbox::new();
+    e.apply_input(0, EngineInput::Connect(1), &mut out);
+    // 1000 tubes created and freed again: a legitimate state with far more
+    // free slots than live tubes.
+    let names: Vec<TubeName> = (0..1000)
+        .map(|i| TubeName::new(&format!("t{i}")).unwrap())
+        .collect();
+    for cmd in names.iter().cloned().map(Command::Watch) {
+        e.apply_input(0, EngineInput::Command { conn: 1, cmd }, &mut out);
+    }
+    for cmd in names.into_iter().map(Command::Ignore) {
+        e.apply_input(0, EngineInput::Command { conn: 1, cmd }, &mut out);
+    }
+    let s = e.export_state();
+    assert_eq!(s.free_tube_ids.len(), 1000);
+    assert!(Engine::import_state(s.clone(), sys()).is_ok());
+    let mut big = s.clone();
+    for _ in 0..3 {
+        // Grow the slab with consistent free slots.
+        let n = big.tubes.len();
+        big.tubes.extend((0..2000).map(|_| None));
+        big.free_tube_ids.extend(n..n + 2000);
+    }
+    let err = Engine::import_state(big, sys()).map(|_| ()).unwrap_err();
+    assert!(err.to_string().contains("tube slab"), "{err}");
+}

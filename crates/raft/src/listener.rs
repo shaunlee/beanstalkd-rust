@@ -16,21 +16,38 @@
 //! `max_frame` bytes) plus one response. It also preserves the order of
 //! forwards from one owner.
 //!
-//! Inbound connections (including those still in the handshake) are
-//! limited to `max_connections`; beyond it new connections are closed at
-//! accept.
+//! # Connection budgets
+//!
+//! Unauthenticated and authenticated connections use separate budgets, so
+//! that connections that never complete the handshake cannot keep the
+//! peers out:
+//! - connections still in the TLS handshake or hello are limited to
+//!   `max_handshakes` in total and `max_handshakes_per_ip` per source
+//!   address; beyond either, new connections are closed at accept. Each has
+//!   `handshake_timeout` to finish.
+//! - an authenticated connection holds the slot of its peer: each
+//!   configured peer has exactly one, and an accepted hello from a peer
+//!   closes that peer's older connection (the dialer keeps one connection
+//!   per target and only dials again once it gave the old one up).
+//!
+//! Rejections (at accept, failed handshakes and hellos) are logged at most
+//! about once a second, with a count of the ones not logged. A rejected
+//! hello is answered with a generic reason ([`REJECT_HELLO`],
+//! [`REJECT_VERSION`], [`REJECT_MAX_JOB_SIZE`]); the details are only
+//! logged locally.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use openraft::Raft;
 use rustls::ServerConfig;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
@@ -40,6 +57,66 @@ use crate::wire::{
     WireError,
 };
 use crate::{NodeId, TypeConfig};
+
+/// A switch that keeps this node out of elections (see
+/// [`ListenerConfig::vote_gate`]).
+///
+/// While the gate is closed, every inbound Vote RPC is answered with
+/// [`WireError::Rejected`] without reaching Raft, so this node grants no
+/// vote (and does not update its term from the candidate); each refusal is
+/// counted. A node that rejoins with an empty data directory keeps the gate
+/// closed until it has caught up with the cluster, so that it cannot help
+/// elect a leader that lacks entries it had acknowledged before it lost
+/// them. AppendEntries, InstallSnapshot, forwards and control requests are
+/// not affected. The gate starts in the state given to [`VoteGate::new`]
+/// (`VoteGate::default()` is closed) and may be flipped any number of
+/// times.
+#[derive(Debug, Default)]
+pub struct VoteGate {
+    open: AtomicBool,
+    refused: AtomicU64,
+}
+
+impl VoteGate {
+    /// A gate that is initially open (`true`) or closed (`false`).
+    pub fn new(open: bool) -> Self {
+        VoteGate {
+            open: AtomicBool::new(open),
+            refused: AtomicU64::new(0),
+        }
+    }
+
+    /// Lets Vote RPCs through again.
+    pub fn open(&self) {
+        self.open.store(true, Ordering::Release);
+    }
+
+    /// Refuses Vote RPCs from now on.
+    pub fn close(&self) {
+        self.open.store(false, Ordering::Release);
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
+    /// Vote RPCs refused so far.
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    /// Whether a vote may go to Raft; counts a refusal if not.
+    pub(crate) fn admit(&self) -> bool {
+        if self.is_open() {
+            return true;
+        }
+        self.refused.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+}
+
+/// The reason sent with a refused Vote RPC.
+pub const VOTE_GATE_CLOSED: &str = "this node does not vote yet";
 
 /// Settings of the cluster listener.
 #[derive(Clone)]
@@ -53,26 +130,36 @@ pub struct ListenerConfig {
     pub tls: Option<Arc<ServerConfig>>,
     /// Maximum frame payload, both directions.
     pub max_frame: usize,
-    /// Inbound connections at once, including handshakes in progress.
-    pub max_connections: usize,
+    /// Inbound connections in the TLS handshake or hello at once.
+    pub max_handshakes: usize,
+    /// Of those, from one source IP address.
+    pub max_handshakes_per_ip: usize,
     /// TLS handshake plus hello.
     pub handshake_timeout: Duration,
     /// This node's `-z`; hellos with another value are rejected.
     pub max_job_size: u32,
+    /// When present and closed, inbound Vote RPCs are refused (see
+    /// [`VoteGate`]). `None` (the default) serves every vote.
+    pub vote_gate: Option<Arc<VoteGate>>,
 }
 
 impl ListenerConfig {
-    /// Defaults: 64 connections, 5 s handshake, 32 MiB frames, the default
-    /// `-z`.
+    /// Defaults: 16 handshakes at once, `max(4, 2 × peers)` of them per
+    /// source address (every peer may share one address, as on a test
+    /// machine or behind NAT), 2 s handshake, 32 MiB frames, the default
+    /// `-z`, no vote gate.
     pub fn new(node_id: NodeId, peers: BTreeSet<NodeId>, tls: Option<Arc<ServerConfig>>) -> Self {
+        let per_ip = peers.len().saturating_mul(2).max(4);
         ListenerConfig {
             node_id,
             peers,
             tls,
             max_frame: wire::DEFAULT_MAX_FRAME,
-            max_connections: 64,
-            handshake_timeout: Duration::from_secs(5),
+            max_handshakes: 16,
+            max_handshakes_per_ip: per_ip,
+            handshake_timeout: Duration::from_secs(2),
             max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
+            vote_gate: None,
         }
     }
 }
@@ -95,7 +182,7 @@ impl ClusterListener {
         handler: Arc<H>,
     ) -> io::Result<Self> {
         let local_addr = listener.local_addr()?;
-        let task = tokio::spawn(accept_loop(listener, Arc::new(cfg), raft, handler));
+        let task = tokio::spawn(accept_loop(listener, cfg, raft, handler));
         Ok(ClusterListener {
             local_addr,
             task: Some(task),
@@ -124,13 +211,140 @@ impl Drop for ClusterListener {
     }
 }
 
+/// Generic reason sent for a rejected hello (wrong target, unknown peer,
+/// certificate not valid for the claimed id).
+pub const REJECT_HELLO: &str = "hello rejected";
+/// Reason sent for a hello with another protocol version.
+pub const REJECT_VERSION: &str = "unsupported protocol version";
+/// Reason sent for a hello with another `-z` (the dialer logs it as a
+/// configuration error).
+pub const REJECT_MAX_JOB_SIZE: &str = "max_job_size mismatch (every node must use the same -z)";
+
+/// Logs at most about once per interval; counts what it suppressed.
+struct RateLimit {
+    state: StdMutex<(Option<std::time::Instant>, u64)>,
+}
+
+impl RateLimit {
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    fn new() -> Self {
+        RateLimit {
+            state: StdMutex::new((None, 0)),
+        }
+    }
+
+    /// `Some(suppressed since the last logged one)` if this one may be
+    /// logged.
+    fn allow(&self) -> Option<u64> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if st.0.is_some_and(|t| now.duration_since(t) < Self::INTERVAL) {
+            st.1 = st.1.saturating_add(1);
+            return None;
+        }
+        let suppressed = st.1;
+        *st = (Some(now), 0);
+        Some(suppressed)
+    }
+}
+
+/// State shared by the accept loop and the connections.
+struct Shared {
+    cfg: ListenerConfig,
+    handshakes: Arc<Semaphore>,
+    per_ip: StdMutex<HashMap<IpAddr, usize>>,
+    /// The authenticated connection of each peer: generation and closer.
+    peers: StdMutex<HashMap<NodeId, (u64, Arc<Notify>)>>,
+    next_gen: AtomicU64,
+    rejects: RateLimit,
+}
+
+fn lock<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Shared {
+    fn log_reject(&self, addr: SocketAddr, what: &str) {
+        if let Some(suppressed) = self.rejects.allow() {
+            tracing::warn!(%addr, suppressed, "cluster connection rejected: {what}");
+        }
+    }
+
+    /// Makes `peer`'s new connection the current one, closing the older
+    /// one; returns its generation and the notification that closes it.
+    fn register(&self, peer: NodeId) -> (u64, Arc<Notify>) {
+        let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
+        let close = Arc::new(Notify::new());
+        let old = lock(&self.peers).insert(peer, (generation, close.clone()));
+        if let Some((_, old)) = old {
+            old.notify_one();
+        }
+        (generation, close)
+    }
+
+    fn unregister(&self, peer: NodeId, generation: u64) {
+        let mut peers = lock(&self.peers);
+        if peers.get(&peer).is_some_and(|(g, _)| *g == generation) {
+            peers.remove(&peer);
+        }
+    }
+}
+
+/// A handshake slot: a global permit plus the per-address count.
+struct HandshakeSlot {
+    shared: Arc<Shared>,
+    ip: IpAddr,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl HandshakeSlot {
+    fn acquire(shared: &Arc<Shared>, ip: IpAddr) -> Result<Self, &'static str> {
+        let permit = shared
+            .handshakes
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "too many handshakes in progress")?;
+        let mut per_ip = lock(&shared.per_ip);
+        let n = per_ip.entry(ip).or_insert(0);
+        if *n >= shared.cfg.max_handshakes_per_ip {
+            return Err("too many handshakes in progress from this address");
+        }
+        *n += 1;
+        Ok(HandshakeSlot {
+            shared: shared.clone(),
+            ip,
+            _permit: permit,
+        })
+    }
+}
+
+impl Drop for HandshakeSlot {
+    fn drop(&mut self) {
+        let mut per_ip = lock(&self.shared.per_ip);
+        if let Some(n) = per_ip.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                per_ip.remove(&self.ip);
+            }
+        }
+    }
+}
+
 async fn accept_loop<H: ForwardHandler>(
     listener: TcpListener,
-    cfg: Arc<ListenerConfig>,
+    cfg: ListenerConfig,
     raft: Raft<TypeConfig>,
     handler: Arc<H>,
 ) {
-    let limit = Arc::new(Semaphore::new(cfg.max_connections));
+    let shared = Arc::new(Shared {
+        handshakes: Arc::new(Semaphore::new(cfg.max_handshakes)),
+        cfg,
+        per_ip: StdMutex::new(HashMap::new()),
+        peers: StdMutex::new(HashMap::new()),
+        next_gen: AtomicU64::new(1),
+        rejects: RateLimit::new(),
+    });
     // Owned here so that aborting this task aborts every connection.
     let mut conns = JoinSet::new();
     loop {
@@ -146,37 +360,50 @@ async fn accept_loop<H: ForwardHandler>(
                 continue;
             }
         };
-        let Ok(permit) = limit.clone().try_acquire_owned() else {
-            tracing::warn!(%addr, "cluster connection limit reached; closing");
-            drop(tcp);
-            continue;
+        let slot = match HandshakeSlot::acquire(&shared, addr.ip()) {
+            Ok(slot) => slot,
+            Err(why) => {
+                shared.log_reject(addr, why);
+                drop(tcp);
+                continue;
+            }
         };
-        let cfg = cfg.clone();
+        let shared = shared.clone();
         let raft = raft.clone();
         let handler = handler.clone();
         conns.spawn(async move {
-            if let Err(e) = serve_tcp(tcp, &cfg, &raft, &*handler).await {
-                tracing::debug!(%addr, error = %e, "cluster connection closed");
-            }
-            drop(permit);
+            serve_tcp(tcp, addr, slot, &shared, &raft, &*handler).await;
         });
     }
 }
 
+/// Handshake (TLS and hello) within the timeout, holding `slot`; then the
+/// peer's connection slot until the connection ends or is replaced.
 async fn serve_tcp<H: ForwardHandler>(
     tcp: TcpStream,
-    cfg: &ListenerConfig,
+    addr: SocketAddr,
+    slot: HandshakeSlot,
+    shared: &Shared,
     raft: &Raft<TypeConfig>,
     handler: &H,
-) -> Result<(), String> {
+) {
+    let cfg = &shared.cfg;
     let _ = tcp.set_nodelay(true);
-    match &cfg.tls {
+    let result = match &cfg.tls {
         None => {
-            let mut io = tcp;
-            let peer = tokio::time::timeout(cfg.handshake_timeout, hello(&mut io, cfg, |_| Ok(())))
-                .await
-                .map_err(|_| "hello timed out".to_string())??;
-            serve(io, peer, cfg, raft, handler).await
+            let handshake = async {
+                let mut io = tcp;
+                let peer = hello(&mut io, shared, addr, |_| Ok(())).await?;
+                Ok::<_, String>((io, peer))
+            };
+            match tokio::time::timeout(cfg.handshake_timeout, handshake).await {
+                Ok(Ok((io, peer))) => {
+                    drop(slot);
+                    serve_peer(io, peer, shared, raft, handler).await
+                }
+                Ok(Err(e)) => Err(Phase::Handshake(e)),
+                Err(_) => Err(Phase::Handshake("handshake timed out".into())),
+            }
         }
         Some(tls) => {
             let acceptor = TlsAcceptor::from(tls.clone());
@@ -186,48 +413,102 @@ async fn serve_tcp<H: ForwardHandler>(
                     .await
                     .map_err(|e| format!("TLS handshake: {e}"))?;
                 let certs = io.get_ref().1.peer_certificates().map(<[_]>::to_vec);
-                let peer = hello(&mut io, cfg, |id| {
+                let peer = hello(&mut io, shared, addr, |id| {
                     crate::tls::verify_peer_identity(certs.as_deref(), id)
                 })
                 .await?;
                 Ok::<_, String>((io, peer))
             };
-            let (io, peer) = tokio::time::timeout(cfg.handshake_timeout, handshake)
-                .await
-                .map_err(|_| "handshake timed out".to_string())??;
-            serve(io, peer, cfg, raft, handler).await
+            match tokio::time::timeout(cfg.handshake_timeout, handshake).await {
+                Ok(Ok((io, peer))) => {
+                    drop(slot);
+                    serve_peer(io, peer, shared, raft, handler).await
+                }
+                Ok(Err(e)) => Err(Phase::Handshake(e)),
+                Err(_) => Err(Phase::Handshake("handshake timed out".into())),
+            }
         }
+    };
+    match result {
+        Ok(()) => {}
+        Err(Phase::Handshake(e)) => shared.log_reject(addr, &e),
+        Err(Phase::Serve(e)) => tracing::debug!(%addr, error = %e, "cluster connection closed"),
     }
 }
 
-/// Reads and checks the hello; answers it. Returns the peer's id.
-async fn hello<S, F>(io: &mut S, cfg: &ListenerConfig, identity: F) -> Result<NodeId, String>
+enum Phase {
+    Handshake(String),
+    Serve(String),
+}
+
+/// Serves an authenticated connection of `peer` as that peer's current
+/// one, until it ends or a newer connection of the same peer replaces it.
+async fn serve_peer<S, H>(
+    io: S,
+    peer: NodeId,
+    shared: &Shared,
+    raft: &Raft<TypeConfig>,
+    handler: &H,
+) -> Result<(), Phase>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    H: ForwardHandler,
+{
+    let (generation, close) = shared.register(peer);
+    let r = tokio::select! {
+        r = serve(io, peer, &shared.cfg, raft, handler) => r,
+        () = close.notified() => Err("replaced by a newer connection of the same peer".into()),
+    };
+    shared.unregister(peer, generation);
+    r.map_err(Phase::Serve)
+}
+
+/// Reads and checks the hello; answers it. Returns the peer's id. The
+/// answer to a rejected hello carries a generic reason; the details are
+/// returned (and logged by the caller).
+async fn hello<S, F>(
+    io: &mut S,
+    shared: &Shared,
+    addr: SocketAddr,
+    identity: F,
+) -> Result<NodeId, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     F: FnOnce(NodeId) -> Result<(), String>,
 {
+    let cfg = &shared.cfg;
     let h = match wire::read_frame::<_, ClientMsg>(io, cfg.max_frame).await {
         Ok(Some(ClientMsg::Hello(h))) => h,
         Ok(Some(ClientMsg::Request { .. })) => return Err("request before hello".into()),
         Ok(None) => return Err("closed before hello".into()),
         Err(e) => return Err(format!("hello: {e}")),
     };
-    let verdict = if h.version != PROTOCOL_VERSION {
-        Err(format!("unsupported protocol version {}", h.version))
+    // (details for the local log, generic reason for the peer)
+    let verdict: Result<(), (String, &str)> = if h.version != PROTOCOL_VERSION {
+        Err((
+            format!("unsupported protocol version {}", h.version),
+            REJECT_VERSION,
+        ))
     } else if h.to != cfg.node_id {
-        Err(format!("this is node {}, not {}", cfg.node_id, h.to))
+        Err((
+            format!("hello for node {}, this is node {}", h.to, cfg.node_id),
+            REJECT_HELLO,
+        ))
     } else if h.from == cfg.node_id || !cfg.peers.contains(&h.from) {
-        Err(format!("node {} is not a configured peer", h.from))
+        Err((
+            format!("node {} is not a configured peer", h.from),
+            REJECT_HELLO,
+        ))
     } else if h.max_job_size != cfg.max_job_size {
         let reason = format!(
             "max_job_size mismatch: node {} uses {}, node {} uses {} \
              (every node must use the same -z)",
             h.from, h.max_job_size, cfg.node_id, cfg.max_job_size
         );
-        tracing::error!(from = h.from, "cluster hello rejected: {reason}");
-        Err(reason)
+        tracing::error!(from = h.from, %addr, "cluster hello rejected: {reason}");
+        Err((reason, REJECT_MAX_JOB_SIZE))
     } else {
-        identity(h.from)
+        identity(h.from).map_err(|e| (e, REJECT_HELLO))
     };
     let answer = match &verdict {
         Ok(()) => ServerHello::Accepted {
@@ -235,19 +516,18 @@ where
             node_id: cfg.node_id,
             max_job_size: cfg.max_job_size,
         },
-        Err(reason) => {
-            tracing::warn!(from = h.from, %reason, "cluster hello rejected");
-            ServerHello::Rejected {
-                reason: reason.clone(),
-            }
-        }
+        Err((_, generic)) => ServerHello::Rejected {
+            reason: (*generic).to_string(),
+        },
     };
     let frame =
         wire::encode(&ServerMsg::Hello(answer), cfg.max_frame).map_err(|e| e.to_string())?;
     wire::write_frame(io, &frame)
         .await
         .map_err(|e| e.to_string())?;
-    verdict.map(|()| h.from)
+    verdict
+        .map(|()| h.from)
+        .map_err(|(detail, _)| format!("hello from node {} rejected: {detail}", h.from))
 }
 
 async fn serve<S, H>(
@@ -268,7 +548,7 @@ where
             Ok(None) => return Ok(()),
             Err(e) => return Err(e.to_string()),
         };
-        let resp = dispatch(peer, body, raft, handler).await;
+        let resp = dispatch(peer, body, raft, handler, cfg.vote_gate.as_deref()).await;
         let frame = match wire::encode(&ServerMsg::Response { id, body: resp }, cfg.max_frame) {
             Ok(f) => f,
             Err(FrameError::TooLarge { len, max }) => {
@@ -288,6 +568,7 @@ pub(crate) async fn dispatch<H: ForwardHandler>(
     body: RpcRequest,
     raft: &Raft<TypeConfig>,
     handler: &H,
+    vote_gate: Option<&VoteGate>,
 ) -> RpcResponse {
     match body {
         RpcRequest::AppendEntries(r) => RpcResponse::AppendEntries(
@@ -296,6 +577,10 @@ pub(crate) async fn dispatch<H: ForwardHandler>(
                 .map_err(|e| WireError::from_raft(&e)),
         ),
         RpcRequest::Vote(r) => {
+            if vote_gate.is_some_and(|g| !g.admit()) {
+                tracing::debug!(from = peer, "vote refused: the vote gate is closed");
+                return RpcResponse::Vote(Err(WireError::Rejected(VOTE_GATE_CLOSED.into())));
+            }
             RpcResponse::Vote(raft.vote(r).await.map_err(|e| WireError::from_raft(&e)))
         }
         RpcRequest::InstallSnapshot(r) => RpcResponse::InstallSnapshot(

@@ -39,7 +39,7 @@
 //! local connection of the old and the new state.
 
 use std::collections::BTreeMap;
-use std::io::{self, Cursor};
+use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -55,7 +55,8 @@ use tokio::sync::watch;
 
 use super::OpenError;
 use super::snapshot::SnapshotStore;
-use crate::{Applied, CONN_SEQ_BITS, NodeId, Op, Request, TypeConfig, owner_of};
+use crate::snapshot_buf::DEFAULT_MAX_SNAPSHOT_BYTES;
+use crate::{Applied, CONN_SEQ_BITS, NodeId, Op, Request, SnapshotBuf, TypeConfig, owner_of};
 
 type Sid = LogId<NodeId>;
 type SResult<T> = Result<T, StorageError<NodeId>>;
@@ -204,8 +205,12 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 }
 
 /// Decode a snapshot payload and rebuild the engine, checking that the
-/// metadata agrees with the engine state.
-fn restore(payload: &[u8], sys: &SysFactory) -> io::Result<(Engine, SmMeta)> {
+/// metadata agrees with the engine state and that the snapshot's engine
+/// configuration agrees with the local one (`cfg`): the snapshot must not
+/// change this node's `-z` (the engine answers `JOB_TOO_BIG` by it, so a
+/// difference would make nodes diverge), and it must not turn the journal
+/// on (cluster mode has no binlog).
+fn restore(payload: &[u8], cfg: &EngineConfig, sys: &SysFactory) -> io::Result<(Engine, SmMeta)> {
     let p: SnapshotPayload =
         postcard::from_bytes(payload).map_err(|e| invalid(format!("snapshot payload: {e}")))?;
     if p.version != PAYLOAD_VERSION {
@@ -215,6 +220,17 @@ fn restore(payload: &[u8], sys: &SysFactory) -> io::Result<(Engine, SmMeta)> {
         )));
     }
     let engine = Engine::import_state(p.engine, sys()).map_err(|e| invalid(e.to_string()))?;
+    let theirs = engine.config();
+    if theirs.max_job_size != cfg.max_job_size {
+        return Err(invalid(format!(
+            "snapshot max_job_size {} differs from this node's {} \
+             (every node must use the same -z)",
+            theirs.max_job_size, cfg.max_job_size
+        )));
+    }
+    if theirs.journal {
+        return Err(invalid("snapshot engine has the journal enabled"));
+    }
     let conns = engine.conn_ids();
     if !conns.iter().copied().eq(p.meta.next_seq.keys().copied()) {
         return Err(invalid(
@@ -250,6 +266,8 @@ pub struct ClusterStateMachine {
     shared: Arc<Shared>,
     sink: Arc<dyn ReplySink>,
     snaps: Arc<Mutex<SnapshotStore>>,
+    /// Largest snapshot accepted from the leader.
+    max_snapshot_bytes: u64,
 }
 
 /// Cheap, cloneable read access to the applied state for the server.
@@ -267,7 +285,7 @@ impl ClusterStateMachine {
         cfg.journal = false;
         let core = match snaps.load_current()? {
             Some((meta, payload)) => {
-                let (engine, sm_meta) = restore(&payload, &opts.sys).map_err(|e| {
+                let (engine, sm_meta) = restore(&payload, &cfg, &opts.sys).map_err(|e| {
                     OpenError::Corrupt(format!("snapshot {}: {e}", meta.snapshot_id))
                 })?;
                 Core {
@@ -295,7 +313,15 @@ impl ClusterStateMachine {
             }),
             sink: opts.sink,
             snaps: Arc::new(Mutex::new(snaps)),
+            max_snapshot_bytes: DEFAULT_MAX_SNAPSHOT_BYTES,
         })
+    }
+
+    /// Sets the largest snapshot this node accepts from a leader (default
+    /// [`DEFAULT_MAX_SNAPSHOT_BYTES`]); a longer one fails to install. Call
+    /// before handing the state machine to openraft.
+    pub fn set_max_snapshot_bytes(&mut self, max: u64) {
+        self.max_snapshot_bytes = max;
     }
 
     /// A read handle for the server.
@@ -509,7 +535,7 @@ impl RaftSnapshotBuilder<TypeConfig> for ClusterStateMachine {
             .map_err(|e| snap_err(Some(&meta), ErrorVerb::Write, e))?;
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(payload)),
+            snapshot: Box::new(SnapshotBuf::from_vec(payload)),
         })
     }
 }
@@ -559,17 +585,17 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> SResult<Box<Cursor<Vec<u8>>>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    async fn begin_receiving_snapshot(&mut self) -> SResult<Box<SnapshotBuf>> {
+        Ok(Box::new(SnapshotBuf::receiver(self.max_snapshot_bytes)))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<NodeId, BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: Box<SnapshotBuf>,
     ) -> SResult<()> {
         let payload = snapshot.into_inner();
-        let (engine, sm_meta) = restore(&payload, &self.shared.sys)
+        let (engine, sm_meta) = restore(&payload, &self.shared.cfg, &self.shared.sys)
             .map_err(|e| snap_err(Some(meta), ErrorVerb::Read, e))?;
         self.snaps()?
             .save(meta, &payload, true)
@@ -606,7 +632,7 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
             Ok(None) => Ok(None),
             Ok(Some((meta, payload))) => Ok(Some(Snapshot {
                 meta,
-                snapshot: Box::new(Cursor::new(payload)),
+                snapshot: Box::new(SnapshotBuf::from_vec(payload)),
             })),
             Err(e) => Err(snap_err(snaps.current_meta(), ErrorVerb::Read, e)),
         }

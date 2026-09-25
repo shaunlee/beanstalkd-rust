@@ -2,9 +2,9 @@
 //! tests (test code only; the real storage is `crate::storage`, P3-T2).
 //! The state machine records every applied `Request` in order.
 
+use crate::SnapshotBuf;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -154,7 +154,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSm {
         d.snapshot = Some((meta.clone(), data.clone()));
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(data)),
+            snapshot: Box::new(SnapshotBuf::from_vec(data)),
         })
     }
 }
@@ -200,16 +200,16 @@ impl RaftStateMachine<TypeConfig> for MemSm {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    async fn begin_receiving_snapshot(&mut self) -> Result<Box<SnapshotBuf>, StorageError<NodeId>> {
+        Ok(Box::new(SnapshotBuf::receiver(
+            crate::snapshot_buf::DEFAULT_MAX_SNAPSHOT_BYTES,
+        )))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: Box<SnapshotBuf>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
         let applied: Vec<Request> = postcard::from_bytes(&data)
@@ -227,7 +227,7 @@ impl RaftStateMachine<TypeConfig> for MemSm {
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
         Ok(lock(&self.inner).snapshot.as_ref().map(|(m, d)| Snapshot {
             meta: m.clone(),
-            snapshot: Box::new(Cursor::new(d.clone())),
+            snapshot: Box::new(SnapshotBuf::from_vec(d.clone())),
         }))
     }
 }

@@ -563,7 +563,7 @@ fn snapshot_install_continue_equals_uninterrupted() {
     assert_eq!(snap.meta.last_log_id, Some(lid(1, k as u64)));
     let cur = block_on(a.sm.get_current_snapshot()).unwrap().unwrap();
     assert_eq!(cur.meta, snap.meta);
-    assert_eq!(cur.snapshot.get_ref(), snap.snapshot.get_ref());
+    assert_eq!(cur.snapshot.as_slice(), snap.snapshot.as_slice());
 
     // Reference node that never snapshots.
     let mut c = node(2);
@@ -579,7 +579,7 @@ fn snapshot_install_continue_equals_uninterrupted() {
     // Fresh node installs.
     let mut b = node(2);
     let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
-    rx.get_mut().extend_from_slice(snap.snapshot.get_ref());
+    *rx = crate::SnapshotBuf::from_vec(snap.snapshot.as_slice().to_vec());
     block_on(b.sm.install_snapshot(&snap.meta, rx)).unwrap();
     assert_eq!(state_bytes(&b.sm), state_bytes(&a.sm));
     assert_eq!(
@@ -626,7 +626,7 @@ fn snapshot_install_continue_equals_uninterrupted() {
     assert_eq!(state_bytes(&re), {
         let mut fresh = node(2);
         let mut rx = block_on(fresh.sm.begin_receiving_snapshot()).unwrap();
-        rx.get_mut().extend_from_slice(snap.snapshot.get_ref());
+        *rx = crate::SnapshotBuf::from_vec(snap.snapshot.as_slice().to_vec());
         block_on(fresh.sm.install_snapshot(&snap.meta, rx)).unwrap();
         state_bytes(&fresh.sm)
     });
@@ -744,14 +744,14 @@ fn install_rejects_invalid_snapshots() {
     let mut a = node(1);
     apply(&mut a.sm, entries(1, &reqs));
     let snap = build(&mut a.sm).unwrap();
-    let good = snap.snapshot.get_ref().clone();
+    let good = snap.snapshot.as_slice().to_vec();
 
     let mut b = node(1);
     apply(&mut b.sm, entries(1, &reqs[..10]));
     let before = state_bytes(&b.sm);
     let install = |b: &mut Node, bytes: Vec<u8>| {
         let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
-        *rx.get_mut() = bytes;
+        *rx = crate::SnapshotBuf::from_vec(bytes);
         block_on(b.sm.install_snapshot(&snap.meta, rx))
     };
 
@@ -910,4 +910,60 @@ fn stale_drop_node_after_restart_spares_new_connections() {
             .any(|e| matches!(e, Ev::Closed(c) if *c == new)),
         "{delivered:?}"
     );
+}
+
+/// L2: a snapshot must not change this node's `-z` or turn the journal on.
+#[test]
+fn snapshot_engine_config_must_match_the_local_one() {
+    let mut b = node(1);
+    let install = |b: &mut Node, cfg: bstk_engine::EngineConfig| {
+        let engine = Engine::new(0, cfg, Box::new(bstk_engine::StaticSysInfo::default()));
+        let p = SnapshotPayload {
+            version: 1,
+            meta: crate::storage::state_machine::SmMeta::default(),
+            engine: engine.export_state(),
+        };
+        let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
+        *rx = crate::SnapshotBuf::from_vec(postcard::to_allocvec(&p).unwrap());
+        let meta = openraft::SnapshotMeta {
+            last_log_id: Some(lid(1, 5)),
+            last_membership: StoredMembership::default(),
+            snapshot_id: "x".into(),
+        };
+        block_on(b.sm.install_snapshot(&meta, rx))
+    };
+    let local = bstk_engine::EngineConfig::default();
+    let e = install(
+        &mut b,
+        bstk_engine::EngineConfig {
+            max_job_size: local.max_job_size + 1,
+            ..local.clone()
+        },
+    )
+    .expect_err("other -z");
+    assert!(e.to_string().contains("max_job_size"), "{e}");
+    let e = install(
+        &mut b,
+        bstk_engine::EngineConfig {
+            journal: true,
+            ..local.clone()
+        },
+    )
+    .expect_err("journal");
+    assert!(e.to_string().contains("journal"), "{e}");
+    assert_eq!(block_on(b.sm.applied_state()).unwrap().0, None);
+    install(&mut b, local).expect("matching config");
+    assert_eq!(block_on(b.sm.applied_state()).unwrap().0, Some(lid(1, 5)));
+}
+
+/// H3: a received snapshot is bounded by the configured maximum.
+#[test]
+fn received_snapshot_is_bounded() {
+    use tokio::io::AsyncWriteExt;
+    let mut b = node(1);
+    b.sm.set_max_snapshot_bytes(16);
+    let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
+    block_on(rx.write_all(&[7; 16])).expect("up to the maximum");
+    assert!(block_on(rx.write_all(&[7])).is_err());
+    assert_eq!(rx.len(), 16);
 }

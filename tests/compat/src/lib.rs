@@ -17,7 +17,13 @@
 //! `stunnel` (used to validate the TLS path with the reference on both
 //! sides). See [`server`] and [`conn`] for how each DSL action maps onto
 //! TLS.
+//!
+//! Cluster mode ([`runner::RunOptions::cluster_b`], `BSTK_COMPAT_CLUSTER=
+//! leader|follower`) runs server B as a 3-node `beanstalkd-rs` Raft cluster
+//! and connects every client to its leader or to one follower; see
+//! [`cluster`] for the startup and restart semantics.
 
+pub mod cluster;
 pub mod compare;
 pub mod conn;
 pub mod dsl;

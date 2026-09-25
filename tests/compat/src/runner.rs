@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use crate::cluster::{ClusterProcess, ClusterTarget};
 use crate::compare::{Mismatch, compare_with, format_outcome};
-use crate::conn::execute;
-use crate::dsl::{CaseFile, parse_case_file};
+use crate::conn::{DisconnectOnRestart, Outcome, Target, execute};
+use crate::dsl::{CaseFile, Step, parse_case_file};
 use crate::mask::MaskMode;
 use crate::server::{ServerConfig, ServerTransport, spawn};
 use crate::tls::TlsMaterial;
@@ -19,6 +20,10 @@ pub const BINLOG_ENV: &str = "BSTK_COMPAT_BINLOG";
 /// Environment variable enabling TLS mode for server B in the `compat` CLI
 /// (any value other than empty or `0`); see [`RunOptions::tls_b`].
 pub const TLS_ENV: &str = "BSTK_COMPAT_TLS";
+
+/// Environment variable enabling cluster mode for server B in the `compat`
+/// CLI: `leader` or `follower` (see [`RunOptions::cluster_b`]).
+pub const CLUSTER_ENV: &str = "BSTK_COMPAT_CLUSTER";
 
 /// Environment variable overriding the path of the `stunnel` binary used by
 /// [`RunOptions::stunnel_b`].
@@ -46,6 +51,14 @@ pub struct RunOptions {
     /// connection (and none for the readiness check), so even the
     /// connection counts in `stats` match.
     pub stunnel_b: bool,
+    /// Cluster mode: server B is a fresh 3-node `beanstalkd-rs` cluster
+    /// (see [`crate::cluster`]) and every client connection goes to the
+    /// given node. Server A (the reference) keeps running through
+    /// `restart` / `crash` steps, which only close its connections in
+    /// opening order ([`DisconnectOnRestart`]), the model of a cluster
+    /// restart. Adds the cluster masks ([`MaskMode::cluster`]). Takes
+    /// precedence over `tls_b` / `stunnel_b`.
+    pub cluster_b: Option<ClusterTarget>,
 }
 
 impl RunOptions {
@@ -55,6 +68,11 @@ impl RunOptions {
         RunOptions {
             force_binlog: env_flag(BINLOG_ENV),
             tls_b: env_flag(TLS_ENV),
+            cluster_b: match std::env::var(CLUSTER_ENV).as_deref() {
+                Ok("leader") => Some(ClusterTarget::Leader),
+                Ok("follower") => Some(ClusterTarget::Follower),
+                _ => None,
+            },
             ..RunOptions::default()
         }
     }
@@ -254,7 +272,10 @@ fn run_case_pair_ctx(case_path: &Path, bin_a: &Path, bin_b: &Path, ctx: &RunCont
     let binlog = case.binlog || opts.force_binlog;
     // No transport-specific masks: TLS (and stunnel) must be invisible in
     // every response, including the connection counts in `stats`.
-    let mode = MaskMode { binlog };
+    let mode = MaskMode {
+        binlog,
+        cluster: opts.cluster_b.is_some(),
+    };
     let cfg = |bin, transport| ServerConfig {
         bin,
         extra_args: &case.extra_args,
@@ -265,26 +286,27 @@ fn run_case_pair_ctx(case_path: &Path, bin_a: &Path, bin_b: &Path, ctx: &RunCont
         Ok(s) => s,
         Err(e) => return error_result(case_path, format!("failed to start server A: {e}")),
     };
-    let mut server_b = match spawn(&cfg(bin_b, transport_b)) {
-        Ok(s) => s,
-        Err(e) => return error_result(case_path, format!("failed to start server B: {e}")),
-    };
 
     let steps = &case.steps;
-
-    let (outcomes_a, outcomes_b) = thread::scope(|scope| {
-        let handle_a = scope.spawn(|| execute(steps, &mut server_a));
-        let handle_b = scope.spawn(|| execute(steps, &mut server_b));
-        (
-            handle_a.join().expect("server A execution thread panicked"),
-            handle_b.join().expect("server B execution thread panicked"),
-        )
-    });
+    let (outcomes_a, outcomes_b) = if let Some(target) = opts.cluster_b {
+        let mut cluster = match ClusterProcess::spawn(bin_b, &case.extra_args, target) {
+            Ok(c) => c,
+            Err(e) => {
+                return error_result(case_path, format!("failed to start cluster B: {e}"));
+            }
+        };
+        run_both(steps, &mut DisconnectOnRestart(&mut server_a), &mut cluster)
+    } else {
+        let mut server_b = match spawn(&cfg(bin_b, transport_b)) {
+            Ok(s) => s,
+            Err(e) => return error_result(case_path, format!("failed to start server B: {e}")),
+        };
+        run_both(steps, &mut server_a, &mut server_b)
+    };
 
     // Servers are killed (and binlog directories removed) here, before we
     // finish comparing.
     drop(server_a);
-    drop(server_b);
 
     let mismatches = compare_with(steps, &outcomes_a, &outcomes_b, mode);
     let transcript = if opts.keep_transcript {
@@ -303,6 +325,22 @@ fn run_case_pair_ctx(case_path: &Path, bin_a: &Path, bin_b: &Path, ctx: &RunCont
         mismatches,
         transcript,
     }
+}
+
+/// Execute `steps` against `a` and `b` concurrently.
+fn run_both<A: Target + Send, B: Target + Send>(
+    steps: &[Step],
+    a: &mut A,
+    b: &mut B,
+) -> (Vec<Outcome>, Vec<Outcome>) {
+    thread::scope(|scope| {
+        let handle_a = scope.spawn(|| execute(steps, a));
+        let handle_b = scope.spawn(|| execute(steps, b));
+        (
+            handle_a.join().expect("server A execution thread panicked"),
+            handle_b.join().expect("server B execution thread panicked"),
+        )
+    })
 }
 
 /// Run every case in `case_paths` against `bin_a`/`bin_b`, using up to

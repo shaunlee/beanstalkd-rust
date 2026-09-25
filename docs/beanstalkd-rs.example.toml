@@ -133,13 +133,17 @@ format = "text"
 #
 # Rules: node_id must be listed in [[cluster.peer]]; 3 or 5 peers (1 for
 # tests), with unique ids and addresses; [cluster.tls] is required unless
-# insecure_plaintext = true; -b / binlog.dir cannot be combined with
-# [cluster] (the Raft log replaces the binlog); every node must use the same
-# max job size (-z / server.max_job_size), at most 33488896 in cluster mode.
+# insecure_plaintext = true (not both); -b / binlog.dir cannot be combined
+# with [cluster] (the Raft log replaces the binlog); every node must use the
+# same max job size (-z / server.max_job_size), at most 33488896 in cluster
+# mode.
 #
-# Bootstrap a new cluster once: start one node with --cluster-init (refused
-# if its data_dir already holds state) and the others without it; they wait
-# until the leader contacts them. Restart nodes without --cluster-init.
+# Bootstrap a new cluster once: start every initial node with --cluster-init
+# (all with the same [[cluster.peer]] list; refused if data_dir already holds
+# state). Restart nodes without --cluster-init. A node whose data_dir is
+# empty (new, or wiped after a disk loss) and that is started without
+# --cluster-init rejoins: it does not vote or serve clients until it has
+# caught up with a leader (docs/DESIGN.md §8).
 #
 # [cluster]
 # # This node's id, 1..=65535.
@@ -158,8 +162,12 @@ format = "text"
 # # heartbeat < minimum <= maximum). Defaults: "50ms", ["150ms", "300ms"].
 # heartbeat = "50ms"
 # election_timeout = ["150ms", "300ms"]
-# # true only for tests: cluster traffic in clear text, without [cluster.tls].
+# # true only for tests: cluster traffic in clear text, without
+# # [cluster.tls]. Allowed only when listen and every peer address are
+# # loopback, unless insecure_plaintext_allow_remote = true as well (anyone
+# # who can reach the cluster port can then join the cluster).
 # insecure_plaintext = false
+# insecure_plaintext_allow_remote = false
 #
 # [cluster.tls]
 # # One certificate per node, used as the cluster listener's server

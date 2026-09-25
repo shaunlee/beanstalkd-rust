@@ -198,6 +198,8 @@ struct SimInner {
     cfg: SimConfig,
     state: Mutex<SimState>,
     endpoints: RwLock<HashMap<NodeId, Endpoint>>,
+    /// Vote gates by node (kept across re-registration and restarts).
+    vote_gates: RwLock<HashMap<NodeId, Arc<crate::listener::VoteGate>>>,
     /// Woken whenever a node is resumed.
     resumed: Notify,
 }
@@ -254,6 +256,7 @@ impl SimNetwork {
                     log: Vec::new(),
                 }),
                 endpoints: RwLock::new(HashMap::new()),
+                vote_gates: RwLock::new(HashMap::new()),
                 resumed: Notify::new(),
             }),
         }
@@ -291,6 +294,30 @@ impl SimNetwork {
                     handler: Arc::new(handler),
                 },
             );
+    }
+
+    /// Gives node `id` a vote gate, as [`crate::listener::ListenerConfig`]
+    /// does on TCP (`None` removes it). It stays in place across
+    /// restarts of the node until changed.
+    pub fn set_vote_gate(&self, id: NodeId, gate: Option<Arc<crate::listener::VoteGate>>) {
+        let mut gates = self
+            .inner
+            .vote_gates
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        match gate {
+            Some(g) => gates.insert(id, g),
+            None => gates.remove(&id),
+        };
+    }
+
+    fn vote_gate(&self, id: NodeId) -> Option<Arc<crate::listener::VoteGate>> {
+        self.inner
+            .vote_gates
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
     }
 
     /// Makes node `id` unreachable (for example before restarting it).
@@ -481,14 +508,25 @@ impl SimNetwork {
             let Some(ep) = self.endpoint(to) else {
                 return Err(SimError::Unreachable(format!("node {to} is not running")));
             };
+            let gate = self.vote_gate(to);
             if d.duplicate {
                 let (ep2, body2, delay) = (ep.clone(), body.clone(), d.dup_delay);
+                let gate2 = gate.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let _ = crate::listener::dispatch(from, body2, &ep2.raft, &*ep2.handler).await;
+                    let _ = crate::listener::dispatch(
+                        from,
+                        body2,
+                        &ep2.raft,
+                        &*ep2.handler,
+                        gate2.as_deref(),
+                    )
+                    .await;
                 });
             }
-            let resp = crate::listener::dispatch(from, body, &ep.raft, &*ep.handler).await;
+            let resp =
+                crate::listener::dispatch(from, body, &ep.raft, &*ep.handler, gate.as_deref())
+                    .await;
             if d.drop_response || self.is_blocked(to, from) {
                 std::future::pending::<()>().await;
             }

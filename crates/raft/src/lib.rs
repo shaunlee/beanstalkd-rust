@@ -26,9 +26,10 @@ pub mod tls;
 pub mod wire;
 
 // Storage: log store, state machine, snapshots (P3-T2).
+pub mod snapshot_buf;
 pub mod storage;
 
-use std::io::Cursor;
+pub use snapshot_buf::SnapshotBuf;
 
 use bstk_engine::{ConnId, EngineInput, Nanos};
 use serde::{Deserialize, Serialize};
@@ -105,7 +106,8 @@ openraft::declare_raft_types!(
         R = Applied,
         NodeId = NodeId,
         Node = openraft::BasicNode,
-        SnapshotData = Cursor<Vec<u8>>,
+        // Bounded, gap-free receive buffer (see `snapshot_buf`).
+        SnapshotData = SnapshotBuf,
 );
 
 /// Owner → leader: inputs of the owner's connections, in order.

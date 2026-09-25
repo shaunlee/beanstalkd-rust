@@ -599,8 +599,10 @@ impl Inner {
                 None => true,
                 Some(s) => {
                     // A segment left over below the purge marker cannot be
-                    // continued at a different index.
-                    s.next() != idx
+                    // continued at a different index. The records of this
+                    // batch buffered for the segment (`offs`) are not in
+                    // `s.offsets` until `flush`, so they count here.
+                    s.next() + offs.len() as u64 != idx
                         || ((!s.offsets.is_empty() || pending > 0)
                             && s.end + pending + rec_len > self.opts.segment_size)
                 }

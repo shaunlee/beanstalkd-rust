@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real-client smoke test using the greenstalk client library.
 
-Usage: smoke.py [--leave-jobs | --after-restart] HOST:PORT
+Usage: smoke.py [--leave-jobs | --after-restart | --kill-point] HOST:PORT
 
 Runs a full protocol flow against a (fresh) beanstalkd-compatible server,
 asserting on every result, and prints a transcript to stdout.
@@ -13,7 +13,18 @@ Binlog restart test (driven by clients/run-smoke.sh with SMOKE_RESTART=1):
                       blocks until stdin is closed, so the runner can kill
                       the server while the jobs are still reserved.
     --after-restart   run against the restarted server (same binlog dir):
-                      dumps and checks the recovered state, then drains it. The raw
+                      dumps and checks the recovered state, then drains it.
+
+Cluster leader-kill test (driven by clients/run-smoke.sh with
+SMOKE_CLUSTER_KILL=1):
+    --kill-point      after the full flow, a worker holds a reservation and
+                      a second worker waits in reserve-with-timeout; the
+                      client prints KILL_POINT and blocks until stdin is
+                      closed (the runner kills the cluster leader
+                      meanwhile), then checks that both connections and the
+                      reservation survived and that the waiter is served.
+
+The raw
 transcript contains volatile values (pids, job ids, uptime, ...); the
 runner (clients/run-smoke.sh) pipes it through clients/normalize.py
 before diffing the reference against beanstalkd-rs.
@@ -50,6 +61,7 @@ TUBE_A = "smoke-a"
 TUBE_B = "smoke-b"
 TUBE_C = "smoke-c"
 TUBE_KEEP = "smoke-keep"
+TUBE_KILL = "smoke-kill"
 
 
 def tls_context() -> ssl.SSLContext | None:
@@ -108,17 +120,17 @@ def expect(label: str, got: Any, want: Any) -> None:
 def main() -> int:
     args = sys.argv[1:]
     mode = args.pop(0) if args and args[0].startswith("--") else ""
-    if mode not in ("", "--leave-jobs", "--after-restart") or len(args) != 1 or ":" not in args[0]:
+    if mode not in ("", "--leave-jobs", "--after-restart", "--kill-point") or len(args) != 1 or ":" not in args[0]:
         print(__doc__, file=sys.stderr)
         return 2
     host, port_s = args[0].rsplit(":", 1)
     addr = (host, int(port_s))
     if mode == "--after-restart":
         return after_restart(addr)
-    return full_flow(addr, leave_jobs=mode == "--leave-jobs")
+    return full_flow(addr, leave_jobs=mode == "--leave-jobs", kill_point=mode == "--kill-point")
 
 
-def full_flow(addr: tuple[str, int], leave_jobs: bool) -> int:
+def full_flow(addr: tuple[str, int], leave_jobs: bool, kill_point: bool = False) -> int:
     # --- tubes: use / watch / ignore / list -----------------------------
     prod = connect(addr, use=TUBE_A, watch=TUBE_A)
     work = connect(addr, use="default", watch=[TUBE_A, TUBE_B])
@@ -301,6 +313,8 @@ def full_flow(addr: tuple[str, int], leave_jobs: bool) -> int:
 
     if leave_jobs:
         return leave_jobs_and_hold(addr, prod)
+    if kill_point:
+        hold_across_kill(addr, prod, work)
 
     work.close()
     prod.close()
@@ -360,6 +374,69 @@ def leave_jobs_and_hold(addr: tuple[str, int], prod: greenstalk.Client) -> int:
     # gone by then.
     sys.stdin.read()
     return 0
+
+
+def hold_across_kill(addr: tuple[str, int], prod: greenstalk.Client, work: greenstalk.Client) -> None:
+    """Holds a reservation and a waiting reserve across the point where the
+    runner kills the cluster leader (KILL_POINT, until stdin is closed),
+    then checks both survived."""
+    import threading
+
+    prod.use(TUBE_KILL)
+    n = work.watch(TUBE_KILL)
+    out(f"worker watch {TUBE_KILL}: {n}")
+    held = prod.put("held", priority=5, ttr=120)
+    out(f"put held into {TUBE_KILL}: {job(held)}")
+    j = work.reserve(timeout=1)
+    out(f"reserve: {jb(j)}")
+    expect("reserve held", j.id, held)
+
+    # The waiter blocks in reserve-with-timeout on the (now empty) tube,
+    # across the kill; its socket timeout must outlast that.
+    socket.setdefaulttimeout(90)
+    waiter = connect(addr, use=TUBE_KILL, watch=TUBE_KILL)
+    socket.setdefaulttimeout(10)
+    got: dict[str, Any] = {}
+
+    def wait() -> None:
+        try:
+            got["job"] = waiter.reserve(timeout=60)
+        except Exception as e:  # reported by the main thread
+            got["err"] = e
+
+    t = threading.Thread(target=wait)
+    t.start()
+    # Make sure the reserve is actually waiting before the kill. A fixed
+    # pause and one check, not a poll: the number of stats-tube calls
+    # shows in cmd-stats-tube.
+    time.sleep(0.5)
+    st = prod.stats_tube(TUBE_KILL)
+    dump(f"stats-tube {TUBE_KILL}", st)
+    expect("waiting before the kill", st["current-waiting"], 1)
+    out("KILL_POINT")
+    sys.stdin.read()
+    out("resumed")
+
+    # Same connections, same reservation.
+    dump("stats-job held", work.stats_job(held))
+    work.touch(j)
+    out(f"touch {job(held)}: ok")
+    dump(f"stats-tube {TUBE_KILL}", prod.stats_tube(TUBE_KILL))
+    work.release(j, priority=6)
+    out(f"release {job(held)}: ok")
+    t.join(70)
+    if "err" in got or "job" not in got:
+        raise AssertionError(f"waiter: {got.get('err', 'no job')!r}")
+    j = got["job"]
+    out(f"waiter reserved: {jb(j)}")
+    expect("waiter job", j.id, held)
+    dump("stats-job held", waiter.stats_job(held))
+    waiter.delete(j)
+    out(f"delete {job(j)}: ok")
+    waiter.close()
+    st = prod.stats()
+    dump("stats", st)
+    expect("total-jobs", st["total-jobs"], 8)
 
 
 def after_restart(addr: tuple[str, int]) -> int:

@@ -18,6 +18,10 @@
 //! | `close` | close the socket | consume already-arrived TLS records, send a `close_notify` (best effort, unless already sent by `shutdown_write`), then close the socket |
 //! | `restart` / `crash` | drop every connection | drop every connection without `close_notify` (the server process is gone) |
 //!
+//! (What `restart` / `crash` do to the connections depends on the
+//! [`Target`]: a single server drops them, then restarts; see also
+//! [`DisconnectOnRestart`] and `crate::cluster`.)
+//!
 //! Errors other than an end of stream (e.g. a connection reset) are treated
 //! the same way on both transports.
 //!
@@ -30,7 +34,6 @@
 //! responses is a FIN over TLS but a RST over plaintext; cases should read
 //! what they provoke before closing (a race over plaintext anyway).
 
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::Arc;
@@ -545,12 +548,134 @@ fn extra_body_len(line: &[u8]) -> Option<usize> {
     Some(n + 2)
 }
 
+/// A server under test, as seen by [`execute`]: where clients connect,
+/// which process receives `signal` steps, and what `restart` / `crash`
+/// do.
+pub trait Target {
+    /// The address clients connect to.
+    fn addr(&self) -> SocketAddr;
+    /// How clients connect.
+    fn client_transport(&self) -> ClientTransport;
+    /// The process that receives `signal` steps.
+    fn pid(&self) -> u32;
+    /// Perform a `restart` / `crash` step. `open` holds every open
+    /// connection of the case, in the order they were opened; none of
+    /// them is used afterwards (later references open fresh connections).
+    fn restart(
+        &mut self,
+        how: StopMode,
+        downtime: Duration,
+        open: Vec<ConnHandle>,
+    ) -> Result<(), String>;
+}
+
+impl Target for ServerProcess {
+    fn addr(&self) -> SocketAddr {
+        ServerProcess::addr(self)
+    }
+
+    fn client_transport(&self) -> ClientTransport {
+        ServerProcess::client_transport(self)
+    }
+
+    fn pid(&self) -> u32 {
+        ServerProcess::pid(self)
+    }
+
+    /// Drop every connection, then stop and start the process again.
+    fn restart(
+        &mut self,
+        how: StopMode,
+        downtime: Duration,
+        open: Vec<ConnHandle>,
+    ) -> Result<(), String> {
+        drop(open);
+        ServerProcess::restart(self, how, downtime).map_err(|e| e.to_string())
+    }
+}
+
+/// Gap between two closes in [`DisconnectOnRestart`], so that the server
+/// handles them one at a time, in order.
+pub const ORDERED_CLOSE_GAP: Duration = Duration::from_millis(20);
+
+/// A server that keeps running through `restart` / `crash` steps: the
+/// step instead closes every open connection in the order they were
+/// opened ([`ORDERED_CLOSE_GAP`] apart), then waits `downtime`. This is
+/// the reference model of a full cluster restart (see `crate::cluster`).
+pub struct DisconnectOnRestart<'a>(pub &'a mut ServerProcess);
+
+impl Target for DisconnectOnRestart<'_> {
+    fn addr(&self) -> SocketAddr {
+        self.0.addr()
+    }
+
+    fn client_transport(&self) -> ClientTransport {
+        self.0.client_transport()
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.pid()
+    }
+
+    fn restart(
+        &mut self,
+        _how: StopMode,
+        downtime: Duration,
+        open: Vec<ConnHandle>,
+    ) -> Result<(), String> {
+        close_in_order(open);
+        std::thread::sleep(downtime);
+        Ok(())
+    }
+}
+
+/// Close `conns` one by one, [`ORDERED_CLOSE_GAP`] apart (and after the
+/// last one), so that the server sees the hangups in this order.
+pub fn close_in_order(conns: Vec<ConnHandle>) {
+    for c in conns {
+        c.close();
+        std::thread::sleep(ORDERED_CLOSE_GAP);
+    }
+}
+
+/// The open connections of a case, in the order they were opened.
+#[derive(Default)]
+struct Conns(Vec<(String, ConnHandle)>);
+
+impl Conns {
+    fn get_or_open(
+        &mut self,
+        name: &str,
+        addr: SocketAddr,
+        transport: &ClientTransport,
+    ) -> Result<&mut ConnHandle, std::io::Error> {
+        let idx = match self.0.iter().position(|(n, _)| n == name) {
+            Some(i) => i,
+            None => {
+                let handle = ConnHandle::connect(addr, transport)?;
+                self.0.push((name.to_string(), handle));
+                self.0.len() - 1
+            }
+        };
+        Ok(&mut self.0[idx].1)
+    }
+
+    fn remove(&mut self, name: &str) -> Option<ConnHandle> {
+        let idx = self.0.iter().position(|(n, _)| n == name)?;
+        Some(self.0.remove(idx).1)
+    }
+
+    fn take_all(&mut self) -> Vec<ConnHandle> {
+        self.0.drain(..).map(|(_, c)| c).collect()
+    }
+}
+
 /// Execute a whole case's steps against one server, returning one
 /// [`Outcome`] per step (same length and order as `steps`). `restart` /
-/// `crash` steps restart `server` in place.
-pub fn execute(steps: &[Step], server: &mut ServerProcess) -> Vec<Outcome> {
-    let transport = server.client_transport();
-    let mut conns: HashMap<String, ConnHandle> = HashMap::new();
+/// `crash` steps are handed to [`Target::restart`] with every open
+/// connection.
+pub fn execute<T: Target + ?Sized>(steps: &[Step], server: &mut T) -> Vec<Outcome> {
+    let mut conns = Conns::default();
     let mut out = Vec::with_capacity(steps.len());
 
     for step in steps {
@@ -558,32 +683,21 @@ pub fn execute(steps: &[Step], server: &mut ServerProcess) -> Vec<Outcome> {
             StepKind::Restart { how, downtime } => {
                 // Every connection is invalidated; later references to a
                 // connection name open a fresh one.
-                conns.clear();
-                match server.restart(*how, *downtime) {
+                let open = conns.take_all();
+                match server.restart(*how, *downtime, open) {
                     Ok(()) => Outcome::Restarted(*how),
                     Err(e) => Outcome::HarnessError(format!("{} failed: {e}", how.directive())),
                 }
             }
-            kind => run_step(&mut conns, server.addr(), &transport, server.pid(), kind),
+            kind => {
+                // Read per step: a restart may move the server.
+                let transport = server.client_transport();
+                run_step(&mut conns, server.addr(), &transport, server.pid(), kind)
+            }
         };
         out.push(outcome);
     }
     out
-}
-
-fn get_or_open<'a>(
-    conns: &'a mut HashMap<String, ConnHandle>,
-    name: &str,
-    addr: SocketAddr,
-    transport: &ClientTransport,
-) -> Result<&'a mut ConnHandle, std::io::Error> {
-    if !conns.contains_key(name) {
-        let handle = ConnHandle::connect(addr, transport)?;
-        conns.insert(name.to_string(), handle);
-    }
-    Ok(conns
-        .get_mut(name)
-        .expect("connection was just inserted above"))
 }
 
 /// Deliver `sig` to process `pid` via `kill(1)` (keeps this crate free of
@@ -602,29 +716,29 @@ fn send_signal(pid: u32, sig: Signal) -> Outcome {
 }
 
 fn run_step(
-    conns: &mut HashMap<String, ConnHandle>,
+    conns: &mut Conns,
     addr: SocketAddr,
     transport: &ClientTransport,
     pid: u32,
     kind: &StepKind,
 ) -> Outcome {
     match kind {
-        StepKind::Send { conn, data } => match get_or_open(conns, conn, addr, transport) {
+        StepKind::Send { conn, data } => match conns.get_or_open(conn, addr, transport) {
             Ok(c) => match c.send(data) {
                 Ok(n) => Outcome::Sent(n),
                 Err(e) => Outcome::IoError(e.to_string()),
             },
             Err(e) => Outcome::IoError(e.to_string()),
         },
-        StepKind::Recv { conn } => match get_or_open(conns, conn, addr, transport) {
+        StepKind::Recv { conn } => match conns.get_or_open(conn, addr, transport) {
             Ok(c) => c.recv_response(),
             Err(e) => Outcome::IoError(e.to_string()),
         },
-        StepKind::RecvNone { conn, dur } => match get_or_open(conns, conn, addr, transport) {
+        StepKind::RecvNone { conn, dur } => match conns.get_or_open(conn, addr, transport) {
             Ok(c) => c.recv_none(*dur),
             Err(e) => Outcome::IoError(e.to_string()),
         },
-        StepKind::RecvClosed { conn, dur } => match get_or_open(conns, conn, addr, transport) {
+        StepKind::RecvClosed { conn, dur } => match conns.get_or_open(conn, addr, transport) {
             Ok(c) => c.recv_closed(*dur),
             Err(e) => Outcome::IoError(e.to_string()),
         },
@@ -633,7 +747,7 @@ fn run_step(
             Outcome::Slept
         }
         StepKind::Signal(sig) => send_signal(pid, *sig),
-        StepKind::ShutdownWrite { conn } => match get_or_open(conns, conn, addr, transport) {
+        StepKind::ShutdownWrite { conn } => match conns.get_or_open(conn, addr, transport) {
             Ok(c) => c.shutdown_write(),
             Err(e) => Outcome::IoError(e.to_string()),
         },
@@ -1014,7 +1128,14 @@ mod tests {
         let a = Outcome::Received(b"OK 18\r\n---\nid: 1\nfile: 2\n\r\n".to_vec());
         let b = Outcome::Received(b"OK 18\r\n---\nid: 1\nfile: 5\n\r\n".to_vec());
         assert!(!outcomes_equal(&a, &b));
-        assert!(outcomes_equal_with(&a, &b, MaskMode { binlog: true }));
+        assert!(outcomes_equal_with(
+            &a,
+            &b,
+            MaskMode {
+                binlog: true,
+                cluster: false
+            }
+        ));
     }
 
     #[test]

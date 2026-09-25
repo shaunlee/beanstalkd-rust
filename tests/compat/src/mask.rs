@@ -45,6 +45,20 @@ const BINLOG_MASKED_KEYS: &[&str] = &[
     "binlog-records-migrated",
 ];
 
+/// Keys masked when server B is a cluster (docs/COMPAT.md, "Cluster
+/// mode"): the Raft log replaces the binlog, so every binlog counter and
+/// the job's binlog file number read 0 there, whatever server A reports.
+/// `binlog-max-size` (the `-s` value) is still reported and compared.
+const CLUSTER_MASKED_KEYS: &[&str] = &[
+    // stats-job
+    "file",
+    // stats
+    "binlog-oldest-index",
+    "binlog-current-index",
+    "binlog-records-migrated",
+    "binlog-records-written",
+];
+
 const MASKED_VALUE: &str = "<masked>";
 
 /// Which optional masks apply to a case.
@@ -53,6 +67,8 @@ pub struct MaskMode {
     /// The servers run with a binlog directory: also mask
     /// [`BINLOG_MASKED_KEYS`].
     pub binlog: bool,
+    /// Server B is a cluster: also mask [`CLUSTER_MASKED_KEYS`].
+    pub cluster: bool,
 }
 
 /// Mask volatile fields in a full response (as captured by the harness: the
@@ -118,7 +134,8 @@ fn mask_line(line: &[u8], server_stats: bool, mode: MaskMode) -> Vec<u8> {
         if let Ok(key_str) = std::str::from_utf8(key)
             && (MASKED_KEYS.contains(&key_str)
                 || (server_stats && SERVER_STATS_ONLY_KEYS.contains(&key_str))
-                || (mode.binlog && BINLOG_MASKED_KEYS.contains(&key_str)))
+                || (mode.binlog && BINLOG_MASKED_KEYS.contains(&key_str))
+                || (mode.cluster && CLUSTER_MASKED_KEYS.contains(&key_str)))
         {
             let mut out = Vec::with_capacity(key.len() + 2 + MASKED_VALUE.len());
             out.extend_from_slice(key);
@@ -214,7 +231,45 @@ mod tests {
         );
     }
 
-    const BINLOG: MaskMode = MaskMode { binlog: true };
+    const BINLOG: MaskMode = MaskMode {
+        binlog: true,
+        cluster: false,
+    };
+    const CLUSTER: MaskMode = MaskMode {
+        binlog: false,
+        cluster: true,
+    };
+
+    #[test]
+    fn cluster_mode_masks_every_binlog_counter_but_max_size() {
+        let a = ok_response(
+            "---\nbinlog-oldest-index: 1\nbinlog-current-index: 2\nbinlog-records-migrated: 3\nbinlog-records-written: 4\nbinlog-max-size: 1000\ntotal-connections: 1\n",
+        );
+        let b = ok_response(
+            "---\nbinlog-oldest-index: 0\nbinlog-current-index: 0\nbinlog-records-migrated: 0\nbinlog-records-written: 0\nbinlog-max-size: 1000\ntotal-connections: 1\n",
+        );
+        assert_eq!(
+            mask_response_with(&a, CLUSTER),
+            mask_response_with(&b, CLUSTER)
+        );
+        assert_ne!(
+            mask_response_with(&a, BINLOG),
+            mask_response_with(&b, BINLOG)
+        );
+        let c = ok_response(
+            "---\nbinlog-oldest-index: 0\nbinlog-current-index: 0\nbinlog-records-migrated: 0\nbinlog-records-written: 0\nbinlog-max-size: 2000\ntotal-connections: 1\n",
+        );
+        assert_ne!(
+            mask_response_with(&b, CLUSTER),
+            mask_response_with(&c, CLUSTER)
+        );
+        let job_a = ok_response("---\nid: 7\nfile: 3\nreserves: 2\n");
+        let job_b = ok_response("---\nid: 7\nfile: 0\nreserves: 2\n");
+        assert_eq!(
+            mask_response_with(&job_a, CLUSTER),
+            mask_response_with(&job_b, CLUSTER)
+        );
+    }
 
     #[test]
     fn binlog_fields_are_compared_without_binlog_mode() {

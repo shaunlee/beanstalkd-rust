@@ -40,7 +40,7 @@ const SPAWN_ATTEMPTS: u32 = 3;
 /// for the entire lifetime of the `ServerProcess`, not just during spawn.
 static CLAIMED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
-fn claim_free_port() -> std::io::Result<u16> {
+pub(crate) fn claim_free_port() -> std::io::Result<u16> {
     loop {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
@@ -54,7 +54,7 @@ fn claim_free_port() -> std::io::Result<u16> {
     }
 }
 
-fn release_port(port: u16) {
+pub(crate) fn release_port(port: u16) {
     CLAIMED_PORTS
         .lock()
         .expect("claimed-ports lock poisoned")
@@ -165,7 +165,7 @@ pub fn stunnel_config(front_port: u16, back_port: u16, material: &TlsMaterial) -
 }
 
 /// A TOML basic string holding `path`.
-fn toml_string(path: &Path) -> String {
+pub(crate) fn toml_string(path: &Path) -> String {
     let mut out = String::from("\"");
     for c in path.to_string_lossy().chars() {
         match c {
@@ -678,7 +678,11 @@ fn wait_until_accepting(
 /// Over TLS the probe is the same exchange on a TLS connection (a plaintext
 /// `quit` would never complete against a TLS listener); it counts as one
 /// connection as well.
-fn probe_ready(addr: SocketAddr, read_timeout: Duration, transport: &ClientTransport) -> bool {
+pub(crate) fn probe_ready(
+    addr: SocketAddr,
+    read_timeout: Duration,
+    transport: &ClientTransport,
+) -> bool {
     use std::io::{Read, Write};
     if transport.is_tls() {
         let Ok(mut conn) = crate::conn::connect(addr, transport, Duration::from_millis(200)) else {
@@ -704,7 +708,7 @@ fn probe_ready(addr: SocketAddr, read_timeout: Duration, transport: &ClientTrans
     stream.read(&mut buf).is_ok()
 }
 
-fn read_all(pipe: Option<impl std::io::Read>) -> String {
+pub(crate) fn read_all(pipe: Option<impl std::io::Read>) -> String {
     let Some(mut pipe) = pipe else {
         return String::new();
     };

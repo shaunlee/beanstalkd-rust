@@ -58,7 +58,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::signal::unix::{SignalKind, signal};
@@ -119,6 +119,17 @@ fn main() -> ExitCode {
     init_logging(config.log);
     for w in &config.warnings {
         tracing::warn!("{w}");
+    }
+    if let Some(c) = &cluster_settings
+        && c.tls.is_none()
+    {
+        tracing::warn!(
+            listen = %c.listen,
+            "INSECURE: cluster.insecure_plaintext = true: cluster traffic (Raft, forwarded \
+             client commands and job bodies) is neither authenticated nor encrypted, and \
+             anyone who can reach the cluster port can join as a peer; use [cluster.tls] \
+             outside of tests"
+        );
     }
 
     let tls = match config.tls.as_ref().map(tls::load).transpose() {
@@ -512,9 +523,11 @@ async fn serve(
     // Connection ids are unique across listeners (and, in cluster mode,
     // across the cluster and this node's restarts: `cluster::start` picks
     // the first one).
-    let first_id = cluster.as_ref().map_or(1, |c| c.first_conn_id);
+    let next_id = Arc::new(match &cluster {
+        None => conn::ConnIds::Local(AtomicU64::new(1)),
+        Some(c) => conn::ConnIds::Cluster(c.conn_ids.clone()),
+    });
     let clients = cluster.as_ref().map(|c| c.clients());
-    let next_id = Arc::new(AtomicU64::new(first_id));
     let mut tasks = Vec::with_capacity(listeners.len() + 1);
     for Bound { listener, kind } in listeners {
         let engine_tx = engine_tx.clone();
@@ -598,7 +611,7 @@ async fn serve(
 /// sent here, before the connection task is spawned.
 async fn accept_plain(
     listener: TcpListener,
-    next_id: Arc<AtomicU64>,
+    next_id: Arc<conn::ConnIds>,
     engine_tx: EngineHandle,
     max_job_size: u32,
     clients: Option<Arc<cluster::Clients>>,
@@ -619,7 +632,16 @@ async fn accept_plain(
         if let Err(e) = stream.set_nodelay(true) {
             tracing::debug!("set_nodelay() failed: {e}");
         }
-        let conn = next_id.fetch_add(1, Ordering::Relaxed);
+        // Cluster mode: refused while the node is cut off, shutting down
+        // or its forward queue is full (before an id is used).
+        if clients.as_ref().is_some_and(|c| !c.admit()) {
+            drop(stream);
+            continue;
+        }
+        let Some(conn) = next_id.next() else {
+            drop(stream);
+            continue;
+        };
         let (reply_tx, reply_rx) = mpsc::unbounded_channel();
         // Cluster mode: registered before `Connect` so the cluster can
         // close this connection.

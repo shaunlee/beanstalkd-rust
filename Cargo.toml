@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/engine", "crates/store", "crates/engine-oracle", "crates/raft", "crates/server", "tests/compat", "bench"]
+members = ["crates/proto", "crates/engine", "crates/store", "crates/engine-oracle", "crates/raft", "crates/server", "tests/compat", "tests/chaos", "bench"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,7 +12,7 @@ license = "MIT"
 bytes = { version = "1", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["use-std"] }
-openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
+openraft = { version = "=0.9.25", features = ["serde", "storage-v2", "loosen-follower-log-revert"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"

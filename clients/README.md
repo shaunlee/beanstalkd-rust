@@ -184,6 +184,48 @@ Only the volatile fields are skipped (`pid`, `uptime`, `rusage-*`,
 `pause-time-left`). `/readyz` returning 503 during binlog replay is
 covered by the server's integration tests, not here.
 
+### Cluster modes (`SMOKE_CLUSTER=1`, `SMOKE_CLUSTER_KILL=1`)
+
+```sh
+SMOKE_CLUSTER=1 clients/run-smoke.sh
+SMOKE_TLS=1 SMOKE_CLUSTER=1 clients/run-smoke.sh
+SMOKE_CLUSTER_KILL=1 clients/run-smoke.sh
+SMOKE_MTLS=1 SMOKE_CLUSTER_KILL=1 clients/run-smoke.sh
+```
+
+`SMOKE_CLUSTER=1` replaces the `beanstalkd-rs` server by a 3-node Raft
+cluster on 127.0.0.1: one generated config per node (the client listener
+of the current mode -- plaintext, TLS or mTLS --, `[http]`, and
+`[cluster]` with `insecure_plaintext = true` and a fresh data directory
+under `SMOKE_OUT/cluster`), node 1 started with `--cluster-init`. The
+runner waits until every node answers `/readyz` with 200 and one reports
+itself leader in `/admin`, then points the client at a **follower**, so
+every command is forwarded to the leader and every reply comes back from
+the follower's own apply. The transcripts must equal the reference's; the
+masks are unchanged (`stats` identity fields and `uptime` are already
+masked, and the binlog counters are 0 on both sides because the reference
+runs without `-b`). With `SMOKE_MTLS=1` the `mtls-reject` check also runs
+against a cluster follower. `SMOKE_BINLOG`, `SMOKE_RESTART`, `SMOKE_TOKEN`
+and `SMOKE_HTTP` cannot be combined with it (the Raft log replaces the
+binlog; the token and HTTP checks target a standalone server).
+
+`SMOKE_CLUSTER_KILL=1` (implies `SMOKE_CLUSTER=1`) runs the clients with
+`--kill-point`: after the full flow, a worker reserves a job in tube
+`smoke-kill` / `smoke-go-kill` and keeps it, a third connection starts a
+`reserve-with-timeout 60` on that (now empty) tube, and after a fixed
+0.5 s pause the client checks with one `stats-tube` that it is waiting,
+prints `KILL_POINT` and blocks on stdin. Against the cluster the runner
+then kill -9s the leader (never the client's follower), waits for a new
+leader among the survivors, and closes the client's stdin; against the
+reference it closes stdin at once. The client continues on the same
+connections: `stats-job` shows the job still reserved by the worker,
+`touch` succeeds, the worker releases it, the waiting reserve receives
+it, and final `stats` are dumped. The runner then restarts the killed
+node (without `--cluster-init`) and waits until it is ready again. The
+transcripts must still be identical: a leader kill loses no reply, no
+connection and no reservation on a surviving node. The runner logs the
+failover time (about 0.6 s with the default election timeouts).
+
 ### Mode matrix
 
 All of these pass (`python` and `go` transcripts identical, extra checks
@@ -200,6 +242,8 @@ green):
 | `SMOKE_MTLS=1 SMOKE_RESTART=1 SMOKE_SERVER_ARGS=-F` | kill / restart over mTLS with `-F` |
 | `SMOKE_TOKEN=1 SMOKE_HTTP=1 SMOKE_CLIENTS=` | token, http (plaintext listener) |
 | `SMOKE_BINLOG=1`, `SMOKE_RESTART=1` | unchanged plaintext modes |
+| `SMOKE_CLUSTER=1` (also with `SMOKE_TLS=1`, `SMOKE_MTLS=1`) | transcripts through a cluster follower (mtls-reject with mTLS) |
+| `SMOKE_CLUSTER_KILL=1` (also with `SMOKE_TLS=1`, `SMOKE_MTLS=1`) | leader kill -9 while a reservation is held and a reserve is waiting |
 
 Generated certificates and configuration files are removed when the run
 ends.
@@ -225,6 +269,8 @@ Environment overrides:
 | `SMOKE_MTLS` | `0` | `1`: like `SMOKE_TLS` with client certificates, plus the rejection checks (implies `SMOKE_TLS=1`) |
 | `SMOKE_TOKEN` | `0` | `1`: token authentication checks |
 | `SMOKE_HTTP` | `0` | `1`: `/healthz`, `/readyz`, `/metrics`, `/admin` checks |
+| `SMOKE_CLUSTER` | `0` | `1`: `beanstalkd-rs` is a 3-node cluster, clients on a follower |
+| `SMOKE_CLUSTER_KILL` | `0` | `1`: cluster mode plus a leader kill -9 mid-run (implies `SMOKE_CLUSTER=1`) |
 
 A single client can also be run by hand against any server:
 
@@ -233,7 +279,7 @@ python3 clients/python/smoke.py 127.0.0.1:11300
 (cd clients/go && go run . 127.0.0.1:11300)
 ```
 
-(`--leave-jobs` / `--after-restart` go before the address; see above.
+(`--leave-jobs` / `--after-restart` / `--kill-point` go before the address; see above.
 Set `SMOKE_TLS_CA` (and `SMOKE_TLS_CERT` / `SMOKE_TLS_KEY`) to connect over
 TLS.) The extra checks run by hand too:
 

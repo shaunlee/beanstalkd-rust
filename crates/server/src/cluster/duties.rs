@@ -8,10 +8,13 @@
 //!   engine, so a `Tick` is only needed when nothing else is applied; one
 //!   is re-proposed if the applied state has not moved [`TICK_RETRY`] later
 //!   (a proposal lost to a leader change).
-//! - **Node liveness**: the leader replicates to every follower (with
-//!   heartbeats every `cluster.heartbeat` when idle) over its cluster
-//!   network, which records when each peer last answered anything
-//!   (`Network::last_response`). A peer that has not answered for
+//! - **Node liveness**: a peer is alive only if the link works in both
+//!   directions. The leader replicates to every follower (with heartbeats
+//!   every `cluster.heartbeat` when idle) over its cluster network, which
+//!   records when each peer last answered anything
+//!   (`Network::last_response`); and every node sends the leader its
+//!   forwards, or pings when it has nothing to forward
+//!   (`Core::heard_from`). A peer from which either has been missing for
 //!   `2 × node_timeout` (counted from when this node became leader at the
 //!   earliest) is gone: if the state still holds connections it owns, the
 //!   leader proposes `DropNode { node: peer, up_to_local }` with the
@@ -100,10 +103,14 @@ async fn liveness(core: &Core, leader_since: Instant, dropped: &mut BTreeSet<Nod
         if peer == core.id {
             continue;
         }
-        let last = core
+        let answered = core
             .net
             .last_response(peer)
             .map_or(leader_since, |t| t.max(leader_since));
+        let heard = core
+            .last_heard(peer)
+            .map_or(leader_since, |t| t.max(leader_since));
+        let last = answered.min(heard);
         if last.elapsed() < silence {
             dropped.remove(&peer);
             continue;

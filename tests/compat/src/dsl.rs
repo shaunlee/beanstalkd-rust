@@ -39,6 +39,11 @@
 //! that the reference installs a SIGTERM handler only when running as pid
 //! 1, so for it both directives are an abrupt death; `beanstalkd-rs` may
 //! handle SIGTERM gracefully.
+//!
+//! In cluster mode (`crate::cluster`) both directives restart every node of
+//! server B's cluster, while server A keeps running and only sees each of
+//! the case's connections close, in the order they were opened
+//! (`crate::conn::DisconnectOnRestart`), the model of a cluster restart.
 
 use std::fmt;
 use std::fs;

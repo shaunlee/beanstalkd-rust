@@ -779,9 +779,18 @@ pub trait ClusterInfo: Send + Sync {
 /// | `beanstalkd_cluster_snapshot_index` | gauge | last log index in the snapshot |
 /// | `beanstalkd_cluster_snapshot_bytes` | gauge | size of the stored snapshot |
 /// | `beanstalkd_cluster_forward_queue` | gauge | this node's inputs not yet applied |
+/// | `beanstalkd_cluster_forward_queue_bytes` | gauge | approximate size of those inputs |
+/// | `beanstalkd_cluster_forward_queue_full` | gauge | 1 while the forward queue is at its bound |
+/// | `beanstalkd_cluster_refused_connections_total` | counter | client connections closed at accept (cut off, shutting down, or queue full) |
+/// | `beanstalkd_cluster_rejected_puts_total` | counter | puts answered `OUT_OF_MEMORY` because the forward queue was full |
+/// | `beanstalkd_cluster_resent_inputs_total` | counter | inputs sent to the leader again (duplicates the state machine discards) |
+/// | `beanstalkd_cluster_forward_rewinds_total{cause}` | counter | resends of the forward queue, by cause (`view`, `error`, `stall`, `dropped`) |
 /// | `beanstalkd_cluster_drop_node_proposals_total` | counter | `DropNode` proposals made by this node as leader for silent nodes |
 /// | `beanstalkd_cluster_ready` | gauge | 1 when `/readyz` is 200 |
 /// | `beanstalkd_cluster_isolated` | gauge | 1 while client sockets are closed for lack of a leader |
+/// | `beanstalkd_cluster_rejoining` | gauge | 1 while the node is in rejoin mode (no votes, no clients) |
+/// | `beanstalkd_cluster_votes_refused_total` | counter | vote requests refused in rejoin mode |
+/// | `beanstalkd_cluster_next_local_conn` | gauge | local number of the next client connection (-1 before clients are accepted) |
 ///
 /// Absent indexes are exported as -1. `/admin` has the same values under
 /// `"cluster"` (absent ones as `null`).
@@ -802,9 +811,19 @@ pub struct ClusterStats {
     pub snapshot_index: Option<u64>,
     pub snapshot_bytes: u64,
     pub forward_queue: u64,
+    pub forward_queue_bytes: u64,
+    pub forward_queue_full: bool,
+    pub refused_connections: u64,
+    pub rejected_puts: u64,
+    pub resent_items: u64,
+    /// Forward-queue rewinds by cause.
+    pub rewinds: [(&'static str, u64); 4],
     pub drop_node_proposals: u64,
     pub ready: bool,
     pub isolated: bool,
+    pub rejoining: bool,
+    pub votes_refused: u64,
+    pub next_local_conn: Option<u64>,
 }
 
 const ROLES: [&str; 5] = ["leader", "follower", "candidate", "learner", "shutdown"];
@@ -912,6 +931,55 @@ pub fn render_cluster_prometheus(out: &mut String, c: &ClusterStats) {
     );
     scalar(
         out,
+        "beanstalkd_cluster_forward_queue_bytes",
+        "Approximate size of the inputs of this node's connections not yet applied.",
+        Kind::Gauge,
+        c.forward_queue_bytes.to_string(),
+    );
+    scalar(
+        out,
+        "beanstalkd_cluster_forward_queue_full",
+        "1 while the forward queue is at its bound (new clients refused, puts rejected).",
+        Kind::Gauge,
+        u8::from(c.forward_queue_full).to_string(),
+    );
+    scalar(
+        out,
+        "beanstalkd_cluster_refused_connections_total",
+        "Client connections closed at accept (cut off, shutting down, or queue full).",
+        Kind::Counter,
+        c.refused_connections.to_string(),
+    );
+    scalar(
+        out,
+        "beanstalkd_cluster_rejected_puts_total",
+        "Puts answered OUT_OF_MEMORY because the forward queue was full.",
+        Kind::Counter,
+        c.rejected_puts.to_string(),
+    );
+    scalar(
+        out,
+        "beanstalkd_cluster_resent_inputs_total",
+        "Inputs sent to the leader again (duplicates the state machine discards).",
+        Kind::Counter,
+        c.resent_items.to_string(),
+    );
+    family(
+        out,
+        "beanstalkd_cluster_forward_rewinds_total",
+        "Resends of the forward queue, by cause.",
+        Kind::Counter,
+    );
+    for (cause, n) in c.rewinds {
+        sample(
+            out,
+            "beanstalkd_cluster_forward_rewinds_total",
+            &[("cause", cause)],
+            &n.to_string(),
+        );
+    }
+    scalar(
+        out,
         "beanstalkd_cluster_drop_node_proposals_total",
         "DropNode proposals made by this node, as leader, for silent nodes.",
         Kind::Counter,
@@ -930,6 +998,27 @@ pub fn render_cluster_prometheus(out: &mut String, c: &ClusterStats) {
         "1 while client connections are closed because no leader is reachable.",
         Kind::Gauge,
         u8::from(c.isolated).to_string(),
+    );
+    scalar(
+        out,
+        "beanstalkd_cluster_rejoining",
+        "1 while this node is in rejoin mode (no votes, no clients).",
+        Kind::Gauge,
+        u8::from(c.rejoining).to_string(),
+    );
+    scalar(
+        out,
+        "beanstalkd_cluster_votes_refused_total",
+        "Vote requests refused in rejoin mode.",
+        Kind::Counter,
+        c.votes_refused.to_string(),
+    );
+    scalar(
+        out,
+        "beanstalkd_cluster_next_local_conn",
+        "Local number of the next client connection (-1 before clients are accepted).",
+        Kind::Gauge,
+        opt_gauge(c.next_local_conn),
     );
 }
 
@@ -950,6 +1039,14 @@ pub fn append_cluster_json(json: &mut String, c: &ClusterStats) {
             s
         }
     };
+    let rewinds = {
+        let parts: Vec<String> = c
+            .rewinds
+            .iter()
+            .map(|(cause, n)| format!("\"{cause}\":{n}"))
+            .collect();
+        format!("{{{}}}", parts.join(","))
+    };
     let fields = [
         ("node_id", Json::Num(c.node_id)),
         ("role", Json::Str(c.role)),
@@ -965,9 +1062,18 @@ pub fn append_cluster_json(json: &mut String, c: &ClusterStats) {
         ("snapshot_index", Json::Raw(opt(c.snapshot_index))),
         ("snapshot_bytes", Json::Num(c.snapshot_bytes)),
         ("forward_queue", Json::Num(c.forward_queue)),
+        ("forward_queue_bytes", Json::Num(c.forward_queue_bytes)),
+        ("forward_queue_full", Json::Bool(c.forward_queue_full)),
+        ("refused_connections", Json::Num(c.refused_connections)),
+        ("rejected_puts", Json::Num(c.rejected_puts)),
+        ("resent_inputs", Json::Num(c.resent_items)),
+        ("forward_rewinds", Json::Raw(rewinds)),
         ("drop_node_proposals", Json::Num(c.drop_node_proposals)),
         ("ready", Json::Bool(c.ready)),
         ("isolated", Json::Bool(c.isolated)),
+        ("rejoining", Json::Bool(c.rejoining)),
+        ("votes_refused", Json::Num(c.votes_refused)),
+        ("next_local_conn", Json::Raw(opt(c.next_local_conn))),
     ];
     // The document is one object: reopen it before its closing brace.
     if json.ends_with('}') {

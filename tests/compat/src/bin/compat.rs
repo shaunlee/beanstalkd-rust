@@ -1,7 +1,8 @@
 //! CLI for manually running the differential compatibility test harness.
 //!
 //! ```text
-//! compat [--a BIN] [--b BIN] [--binlog] [--tls-b] [--stunnel-b] [--show]
+//! compat [--a BIN] [--b BIN] [--binlog] [--tls-b] [--stunnel-b]
+//!        [--cluster-leader | --cluster-follower] [--show]
 //!        [--filter substr] [cases...]
 //! ```
 //!
@@ -17,6 +18,11 @@
 //!   terminates TLS on B's port (validates the TLS path with the reference
 //!   as B; `stunnel` from `BSTK_STUNNEL_BIN`, the usual install locations,
 //!   or `PATH`).
+//! - `--cluster-leader` / `--cluster-follower` run server B as a 3-node
+//!   cluster and connect every client to its leader / to one follower
+//!   (also enabled by `BSTK_COMPAT_CLUSTER=leader|follower`); `restart`
+//!   and `crash` restart the whole cluster, while server A keeps running
+//!   and only sees its connections close (see `bstk_compat::cluster`).
 //! - `--show` prints server A's masked transcript for every case (useful to
 //!   see what the reference actually replied when writing a case).
 //! - `--filter substr` only runs cases whose file name contains `substr`.
@@ -26,6 +32,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use bstk_compat::cluster::ClusterTarget;
 use bstk_compat::runner::{
     RunOptions, cases_dir, default_parallelism, default_ref_bin, default_rs_bin, discover_cases,
     run_all_with,
@@ -66,11 +73,13 @@ fn main() -> ExitCode {
             "--binlog" => opts.force_binlog = true,
             "--tls-b" => opts.tls_b = true,
             "--stunnel-b" => opts.stunnel_b = true,
+            "--cluster-leader" => opts.cluster_b = Some(ClusterTarget::Leader),
+            "--cluster-follower" => opts.cluster_b = Some(ClusterTarget::Follower),
             "--show" => opts.keep_transcript = true,
             "-h" | "--help" => {
                 println!(
-                    "compat [--a BIN] [--b BIN] [--binlog] [--tls-b] [--stunnel-b] [--show] \
-                     [--filter substr] [cases...]"
+                    "compat [--a BIN] [--b BIN] [--binlog] [--tls-b] [--stunnel-b] \
+                     [--cluster-leader | --cluster-follower] [--show] [--filter substr] [cases...]"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -97,7 +106,11 @@ fn main() -> ExitCode {
     if opts.force_binlog {
         modes.push("binlog mode");
     }
-    if opts.stunnel_b {
+    let cluster_mode;
+    if let Some(t) = opts.cluster_b {
+        cluster_mode = format!("B = 3-node cluster, clients on the {}", t.name());
+        modes.push(cluster_mode.as_str());
+    } else if opts.stunnel_b {
         modes.push("B over TLS via stunnel");
     } else if opts.tls_b {
         modes.push("B over TLS");

@@ -164,12 +164,31 @@ pub enum TlsAuth {
     Token(Arc<TokenSet>),
 }
 
+/// Connection ids, shared by every listener of the process.
+pub enum ConnIds {
+    /// Standalone: a counter from 1.
+    Local(AtomicU64),
+    /// Cluster mode: this node's durably reserved blocks.
+    Cluster(Arc<crate::cluster::durable::ConnIdBlocks>),
+}
+
+impl ConnIds {
+    /// The next id, or `None` if none can be handed out (cluster mode: a
+    /// new block could not be reserved); the connection is then closed.
+    pub fn next(&self) -> Option<ConnId> {
+        match self {
+            ConnIds::Local(n) => Some(n.fetch_add(1, Ordering::Relaxed)),
+            ConnIds::Cluster(blocks) => blocks.next(),
+        }
+    }
+}
+
 /// What every connection of one TLS listener shares.
 pub struct TlsListener {
     pub acceptor: TlsAcceptor,
     pub auth: TlsAuth,
     /// Connection ids, unique across all listeners.
-    pub next_id: Arc<AtomicU64>,
+    pub next_id: Arc<ConnIds>,
     pub engine_tx: EngineHandle,
     pub max_job_size: u32,
     /// Pending-connection accounting and the authentication counters.
@@ -256,7 +275,16 @@ pub async fn handle_tls(
         }
     };
 
-    let conn = next_id.fetch_add(1, Ordering::Relaxed);
+    // Cluster mode: refused while the node is cut off, shutting down or
+    // its forward queue is full (before an id is used).
+    if clients.as_ref().is_some_and(|c| !c.admit()) {
+        close_tls(&mut stream).await;
+        return;
+    }
+    let Some(conn) = next_id.next() else {
+        close_tls(&mut stream).await;
+        return;
+    };
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
     // Cluster mode: registered before `Connect`, so the cluster can close
     // the connection from its first reply on.

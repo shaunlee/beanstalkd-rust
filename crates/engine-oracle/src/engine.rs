@@ -513,7 +513,7 @@ impl Engine {
             Some(j) => (j.tube.clone(), j.ttr),
             None => return,
         };
-        let deadline = now + (ttr as Nanos) * NANOS_PER_SEC;
+        let deadline = now.saturating_add((ttr as Nanos) * NANOS_PER_SEC);
         if let Some(j) = self.jobs.get_mut(&job_id) {
             j.state = JobState::Reserved;
             j.reserver = Some(cid);
@@ -852,7 +852,7 @@ impl Engine {
         }
 
         if delay > 0 {
-            let deadline = now + (delay as Nanos) * NANOS_PER_SEC;
+            let deadline = now.saturating_add((delay as Nanos) * NANOS_PER_SEC);
             self.insert_delayed(&tube, id, deadline);
         } else {
             self.insert_ready(&tube, id);
@@ -941,7 +941,7 @@ impl Engine {
             out.push((cid, Response::DeadlineSoon));
             return;
         }
-        let wait_deadline = timeout.map(|t| now + (t as Nanos) * NANOS_PER_SEC);
+        let wait_deadline = timeout.map(|t| now.saturating_add((t as Nanos) * NANOS_PER_SEC));
         let timeout_is_zero = timeout == Some(0);
         self.enqueue_waiting_conn(cid, wait_deadline);
         self.process_queue(now, out);
@@ -1073,7 +1073,7 @@ impl Engine {
             j.release_ct += 1;
         }
         if delay > 0 {
-            let deadline = now + (delay as Nanos) * NANOS_PER_SEC;
+            let deadline = now.saturating_add((delay as Nanos) * NANOS_PER_SEC);
             self.insert_delayed(&tube, id, deadline);
         } else {
             self.insert_ready(&tube, id);
@@ -1119,7 +1119,7 @@ impl Engine {
         }
         let ttr = self.jobs.get(&id).map(|j| j.ttr).unwrap_or(1);
         let old_deadline = self.jobs.get(&id).map(|j| j.deadline_at).unwrap_or(0);
-        let new_deadline = now + (ttr as Nanos) * NANOS_PER_SEC;
+        let new_deadline = now.saturating_add((ttr as Nanos) * NANOS_PER_SEC);
         if let Some(j) = self.jobs.get_mut(&id) {
             j.deadline_at = new_deadline;
         }
@@ -1344,7 +1344,7 @@ impl Engine {
         };
         if let Some(t) = self.tubes.get_mut(&tube) {
             t.pause = delay_nanos;
-            t.unpause_at = now + delay_nanos;
+            t.unpause_at = now.saturating_add(delay_nanos);
             t.stat.pause_ct += 1;
         }
         out.push((cid, Response::Paused));
