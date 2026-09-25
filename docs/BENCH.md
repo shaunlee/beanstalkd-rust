@@ -2,9 +2,216 @@
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`). The newest numbers
-are from task P1-T5 (write-ahead log, `-b`), first below. The T6b section
-(engine performance fix) follows, and the T6 first pass, whose profile
-motivated T6b, is kept at the end.
+are from task P2-T5 (TLS / mTLS, and the plaintext regression check),
+first below. P1-T5 (write-ahead log, `-b`) follows, then the T6b section
+(engine performance fix); the T6 first pass, whose profile motivated T6b,
+is kept at the end.
+
+## P2: TLS, mTLS and the plaintext regression check
+
+### Summary (P2-T5)
+
+- **TLS costs beanstalkd-rs 3% to 10% of its plaintext throughput** (ours
+  TLS / ours plaintext = 0.90x to 0.97x in the 16 cells of the TLS and mTLS
+  rows). mTLS costs the same as TLS once connected: the client certificate
+  is only checked during the handshake, which happens before the clock
+  starts. Server CPU rises by 7% to 22% (for example 130% to 141% at
+  10x16, 208% to 253% at 100x4096).
+- **The reference behind stunnel reaches 24k to 38k ops/s**, so ours over
+  TLS runs at **4.0x to 4.7x** of it at 10 connections and **7.4x to 8.4x**
+  at 100 connections. stunnel, not the reference, is the bottleneck: the
+  reference uses 22% to 41% of a core, while stunnel uses 3.7 to 10.2 cores
+  (see "CPU" below). This compares our built-in TLS with the obvious way
+  to put TLS in front of the reference, not with an ideal TLS proxy.
+- **TLS with `-b` (default fsync, 50 ms)** runs at 0.69x to 0.86x of our
+  plaintext no-`-b` throughput and at 0.91x to 0.96x of our plaintext `-b`
+  throughput measured in the same session; versus the reference behind
+  stunnel with `-b` it is 3.1x to 7.5x.
+- **Plaintext without a configuration file is unchanged.** Against the
+  P1 binary (commit `ca545ac`, the last before P2) in the same session:
+  0.99x to 1.00x in a focused 7-run re-run of the 16-byte cells, 0.95x to
+  1.01x in a noisier 5-run pass of all eight cells, 0.99x to 1.01x in a
+  3-run pass before the security fixes; inside the ±5% acceptance band
+  (see "Plaintext regression check").
+
+### Environment (P2-T5)
+
+| | |
+|---|---|
+| Machine | Apple M6, 12 cores, 32 GB RAM (same as P1-T5) |
+| OS | macOS 27.0 (Darwin 27.0.0, arm64) |
+| Rust | rustc 1.98.1; release build (opt-level 3, `debug = 1`) |
+| beanstalkd-rs | commit `eceb065` (includes the P2-T6b security fixes); TLS via rustls 0.23 / tokio-rustls 0.26, aws-lc-rs provider; generated config with one listener and defaults otherwise (`max_pending_connections` 1024 is far above the 100 connections here) |
+| Reference | `.ref/beanstalkd-opt/beanstalkd` (`scripts/build-ref.sh --optimized`, `-O2`) |
+| TLS proxy for the reference | stunnel 5.82 (Homebrew), OpenSSL 4.0.2, default thread-per-connection model, `TCP_NODELAY` on both sides, `debug = 3` |
+| Certificates | generated per matrix run by `clients/mkcerts.sh`: ECDSA P-256 CA and server certificate, client certificate for mTLS; both servers use the same files |
+| Negotiated | TLS 1.3, `TLS_AES_256_GCM_SHA384`, for both beanstalkd-rs and stunnel (checked with `openssl s_client`) |
+| Load generator | `bstk-bench --tls` (tokio-rustls, same provider), same machine, loopback, 5 s per run, a fresh server (and stunnel) process per run, ref and rs runs alternating; connections and handshakes are set up before the clock starts |
+| Background load | **Not idle.** An OrbStack VM owned by another user was running, and system services at times used up to 175% CPU. The 1-minute load average was 5.0 at the start and 23 at the end of the matrix, and 5.3 to 37 across runs (median 13.6; CSV `load_avg`); part of that is the benchmark itself, since stunnel alone keeps up to 10 cores busy in the reference's TLS runs. No cell spread by more than 20% over its 3 runs. Because runs alternate, drift affects both servers alike. |
+
+### Commands (P2-T5)
+
+```sh
+scripts/build-ref.sh --optimized
+brew install stunnel                       # TLS baseline for the reference
+cargo build --release -p bstk-server -p bstk-bench
+# SERVER_MODES (new): tls | mtls | tls-default. Ours runs from a generated
+# --config (one TLS listener, auth none or mtls); the reference runs behind
+# stunnel with the same certificate (and verifyChain/requireCert for mtls).
+OUT_CSV=p2-matrix.csv SCENARIOS="put-reserve-delete producers-consumers" \
+  CONNS="10 100" BODIES="16 4096" RUNS=3 DURATION=5 \
+  SERVER_MODES="none tls mtls default tls-default" bench/run-matrix.sh
+bench/summarize.py --baseline none p2-matrix.csv
+# Plaintext regression check: the P1 binary in place of the reference.
+git worktree add /tmp/p1 ca545ac && \
+  (cd /tmp/p1 && CARGO_TARGET_DIR=/tmp/p1/target cargo build --release -p bstk-server)
+REF_BIN=/tmp/p1/target/release/beanstalkd-rs OUT_CSV=p2-regress.csv \
+  SCENARIOS="put-reserve-delete producers-consumers" CONNS="10 100" \
+  BODIES="16 4096" RUNS=5 DURATION=5 SERVER_MODES=none bench/run-matrix.sh
+```
+
+A single TLS run by hand:
+
+```sh
+clients/mkcerts.sh /tmp/certs
+bstk-bench --addr 127.0.0.1:11301 --tls --ca /tmp/certs/ca.pem \
+  [--client-cert /tmp/certs/client.pem --client-key /tmp/certs/client.key] \
+  [--token TOKEN] --conns 10 --duration 5 --scenario put-reserve-delete
+```
+
+`bstk-bench` itself changed for `--tls` (the plaintext client now reads
+and writes through one `BufReader` over a plain/TLS stream enum instead
+of split TCP halves). Driving the same server (commit `e6df034`, in the same
+session), the P1 `bstk-bench` binary and the new one measure the same
+plaintext throughput (put-reserve-delete 16 B, medians of 3: 180.6k vs
+180.8k ops/s at 10 connections, 207.9k vs 207.4k at 100),
+so the load generator change does not affect comparisons with P1.
+
+Raw data: `bench/results/2026-09-25-p2-matrix.csv` (new column
+`proxy_cpu_pct`: stunnel's CPU), and for the regression check
+`bench/results/2026-09-25-p2-regress.csv`,
+`bench/results/2026-09-25-p2-regress-rerun.csv` and
+`bench/results/2026-09-25-p2-regress-e6df034.csv`.
+
+### Results (P2-T5)
+
+Medians of 3 runs. "rs/ref" is ours vs the reference in the same mode
+(for `tls` / `mtls` / `tls-default`: ours with built-in TLS vs the
+reference behind stunnel). "rs/rs[none]" is ours in that mode vs ours in
+plaintext without `-b`, same cell. "stunnel CPU %" is the proxy's CPU in
+front of the reference, not included in "ref CPU %"; "rs CPU %" includes
+our TLS work.
+
+| mode | scenario | conns | body | ref ops/s | rs ops/s | rs/ref | rs/rs[none] | ref CPU % | stunnel CPU % | rs CPU % | ref put p99 µs | rs put p99 µs |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| none | put-reserve-delete | 10 | 16 | 138,188 | 178,108 | 1.29 | 1.00 | 71 | - | 130 | 128 | 111 |
+| tls | put-reserve-delete | 10 | 16 | 36,548 | 170,065 | 4.65 | 0.95 | 36 | 627 | 141 | 440 | 116 |
+| mtls | put-reserve-delete | 10 | 16 | 37,080 | 172,757 | 4.66 | 0.97 | 36 | 615 | 141 | 429 | 111 |
+| default | put-reserve-delete | 10 | 16 | 103,769 | 147,140 | 1.42 | 0.83 | 91 | - | 167 | 185 | 124 |
+| tls-default | put-reserve-delete | 10 | 16 | 38,577 | 139,596 | 3.62 | 0.78 | 54 | 514 | 174 | 442 | 132 |
+| none | put-reserve-delete | 10 | 4096 | 135,547 | 176,777 | 1.30 | 1.00 | 72 | - | 138 | 122 | 107 |
+| tls | put-reserve-delete | 10 | 4096 | 36,089 | 158,269 | 4.39 | 0.90 | 38 | 643 | 156 | 442 | 126 |
+| mtls | put-reserve-delete | 10 | 4096 | 37,123 | 159,855 | 4.31 | 0.90 | 39 | 628 | 156 | 436 | 121 |
+| default | put-reserve-delete | 10 | 4096 | 105,766 | 133,822 | 1.27 | 0.76 | 95 | - | 170 | 182 | 139 |
+| tls-default | put-reserve-delete | 10 | 4096 | 36,674 | 121,475 | 3.31 | 0.69 | 54 | 550 | 181 | 475 | 157 |
+| none | put-reserve-delete | 100 | 16 | 186,566 | 209,089 | 1.12 | 1.00 | 99 | - | 196 | 768 | 617 |
+| tls | put-reserve-delete | 100 | 16 | 24,061 | 199,330 | 8.28 | 0.95 | 22 | 1,012 | 221 | 83,711 | 678 |
+| mtls | put-reserve-delete | 100 | 16 | 24,065 | 201,199 | 8.36 | 0.96 | 22 | 1,017 | 223 | 84,144 | 656 |
+| default | put-reserve-delete | 100 | 16 | 126,500 | 187,942 | 1.49 | 0.90 | 99 | - | 265 | 1,090 | 682 |
+| tls-default | put-reserve-delete | 100 | 16 | 24,048 | 179,160 | 7.45 | 0.86 | 36 | 1,003 | 283 | 107,777 | 778 |
+| none | put-reserve-delete | 100 | 4096 | 179,614 | 201,362 | 1.12 | 1.00 | 99 | - | 208 | 858 | 747 |
+| tls | put-reserve-delete | 100 | 4096 | 24,128 | 187,798 | 7.78 | 0.93 | 23 | 1,008 | 253 | 79,436 | 710 |
+| mtls | put-reserve-delete | 100 | 4096 | 24,447 | 187,416 | 7.67 | 0.93 | 24 | 1,015 | 254 | 79,156 | 722 |
+| default | put-reserve-delete | 100 | 4096 | 106,739 | 173,954 | 1.63 | 0.86 | 98 | - | 268 | 9,148 | 2,134 |
+| tls-default | put-reserve-delete | 100 | 4096 | 24,211 | 161,974 | 6.69 | 0.80 | 42 | 986 | 305 | 91,699 | 2,174 |
+| none | producers-consumers | 10 | 16 | 137,352 | 180,287 | 1.31 | 1.00 | 69 | - | 134 | 116 | 104 |
+| tls | producers-consumers | 10 | 16 | 36,100 | 171,121 | 4.74 | 0.95 | 36 | 463 | 144 | 426 | 112 |
+| mtls | producers-consumers | 10 | 16 | 36,315 | 166,824 | 4.59 | 0.93 | 36 | 461 | 144 | 433 | 122 |
+| default | producers-consumers | 10 | 16 | 107,860 | 141,026 | 1.31 | 0.78 | 90 | - | 168 | 176 | 135 |
+| tls-default | producers-consumers | 10 | 16 | 38,703 | 133,489 | 3.45 | 0.74 | 52 | 373 | 175 | 431 | 142 |
+| none | producers-consumers | 10 | 4096 | 128,094 | 169,826 | 1.33 | 1.00 | 73 | - | 149 | 127 | 113 |
+| tls | producers-consumers | 10 | 4096 | 36,681 | 154,789 | 4.22 | 0.91 | 39 | 450 | 166 | 444 | 126 |
+| mtls | producers-consumers | 10 | 4096 | 38,308 | 154,767 | 4.04 | 0.91 | 41 | 441 | 166 | 424 | 126 |
+| default | producers-consumers | 10 | 4096 | 97,808 | 126,993 | 1.30 | 0.75 | 97 | - | 178 | 199 | 159 |
+| tls-default | producers-consumers | 10 | 4096 | 37,149 | 116,971 | 3.15 | 0.69 | 59 | 369 | 188 | 463 | 168 |
+| none | producers-consumers | 100 | 16 | 190,935 | 206,709 | 1.08 | 1.00 | 98 | - | 203 | 683 | 637 |
+| tls | producers-consumers | 100 | 16 | 24,434 | 199,741 | 8.17 | 0.97 | 23 | 881 | 226 | 93,835 | 663 |
+| mtls | producers-consumers | 100 | 16 | 24,410 | 199,782 | 8.18 | 0.97 | 23 | 886 | 225 | 82,013 | 668 |
+| default | producers-consumers | 100 | 16 | 118,685 | 184,357 | 1.55 | 0.89 | 98 | - | 269 | 1,261 | 728 |
+| tls-default | producers-consumers | 100 | 16 | 24,603 | 177,218 | 7.20 | 0.86 | 39 | 870 | 289 | 106,746 | 784 |
+| none | producers-consumers | 100 | 4096 | 172,757 | 193,406 | 1.12 | 1.00 | 98 | - | 236 | 941 | 744 |
+| tls | producers-consumers | 100 | 4096 | 24,188 | 177,791 | 7.35 | 0.92 | 25 | 862 | 276 | 81,014 | 818 |
+| mtls | producers-consumers | 100 | 4096 | 24,212 | 179,532 | 7.41 | 0.93 | 24 | 864 | 274 | 89,062 | 786 |
+| default | producers-consumers | 100 | 4096 | 99,259 | 163,930 | 1.65 | 0.85 | 97 | - | 294 | 8,812 | 1,582 |
+| tls-default | producers-consumers | 100 | 4096 | 23,921 | 154,145 | 6.44 | 0.80 | 46 | 829 | 322 | 76,468 | 1,626 |
+
+### CPU (P2-T5)
+
+- **Ours**: TLS adds 7% to 22% server CPU for the same or slightly lower
+  throughput: 130% to 141% (10x16), 138% to 156% (10x4096), 196% to 221%
+  (100x16), 208% to 253% (100x4096) for put-reserve-delete. Per operation
+  that is 7.3 to 10.3 µs of server CPU in plaintext and 8.3 to 13.5 µs
+  over TLS: about 1 to 2 µs more at 16 B, 2 to 3 µs more at 4 KiB, where
+  encrypting the body dominates. mTLS uses the same CPU as TLS.
+- **Reference behind stunnel**: the reference itself drops to 22% to 41% of
+  a core because it is starved by stunnel, which burns 3.7 to 6.4 cores at
+  10 connections and 8.3 to 10.2 cores at 100 connections for 24k to 38k
+  ops/s. That is 100 to 420 µs of proxy CPU per operation, against ours'
+  total of about 8 to 14 µs per operation. A `sample` profile of stunnel
+  at 10 connections shows its threads almost always in `poll` (4,661 of
+  4,909 samples), with `ps` showing system time at 96% of its CPU: the
+  thread-per-connection model spends its time in the kernel waking up and
+  polling, not in cryptography.
+- **Latency**: ours over TLS has put p99 within 10% of plaintext (111 →
+  116 µs at 10x16; 617 → 678 µs at 100x16). Behind stunnel the reference's
+  p99 goes from 128 µs to 440 µs at 10 connections and to 76 to 108 ms at
+  100 connections.
+
+### Plaintext regression check (P2-T5)
+
+"P1" is `beanstalkd-rs` built from commit `ca545ac` (the last commit
+before P2) and "P2" commit `eceb065` (with the P2-T6b security fixes), both started with `-l 127.0.0.1 -p PORT` and no
+configuration file, run by `bench/run-matrix.sh` with the P1 binary as
+`REF_BIN` (so the "ref" columns of the CSVs are P1). The acceptance band is
+±5%.
+
+Full matrix, medians of 5 runs (load average 4.9 to 11.1):
+
+| scenario | conns | body | P1 ops/s | P2 ops/s | P2/P1 | P1 CPU % | P2 CPU % | P1 put p99 µs | P2 put p99 µs |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| put-reserve-delete | 10 | 16 | 173,614 | 165,433 | 0.95 | 134 | 137 | 127 | 144 |
+| put-reserve-delete | 10 | 4096 | 172,524 | 173,891 | 1.01 | 139 | 139 | 119 | 116 |
+| put-reserve-delete | 100 | 16 | 218,731 | 208,280 | 0.95 | 182 | 197 | 652 | 664 |
+| put-reserve-delete | 100 | 4096 | 204,128 | 204,014 | 1.00 | 208 | 210 | 659 | 658 |
+| producers-consumers | 10 | 16 | 179,179 | 179,332 | 1.00 | 133 | 134 | 107 | 107 |
+| producers-consumers | 10 | 4096 | 169,496 | 170,772 | 1.01 | 146 | 148 | 120 | 113 |
+| producers-consumers | 100 | 16 | 195,556* | 186,699* | 0.95 | 207 | 214 | 810 | 884 |
+| producers-consumers | 100 | 4096 | 163,229* | 158,801* | 0.97 | 254 | 253 | 966 | 1,042 |
+
+Three cells came out at 0.95x; their individual runs were spread widely
+(put-reserve-delete 10x16: 148k to 181k ops/s for P2, 161k to 178k for
+P1). A focused re-run of the four 16-byte cells
+right after it, 7 runs each (load average 5.1 to 7.9):
+
+| scenario | conns | body | P1 ops/s | P2 ops/s | P2/P1 | P1 CPU % | P2 CPU % | P1 put p99 µs | P2 put p99 µs |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| put-reserve-delete | 10 | 16 | 180,227 | 180,758 | 1.00 | 132 | 132 | 106 | 105 |
+| put-reserve-delete | 100 | 16 | 207,858* | 205,634* | 0.99 | 199 | 201 | 674 | 731 |
+| producers-consumers | 10 | 16 | 179,302 | 178,707 | 1.00 | 132 | 134 | 105 | 106 |
+| producers-consumers | 100 | 16 | 205,620 | 205,554 | 1.00 | 200 | 202 | 639 | 641 |
+
+and an earlier 3-run pass of the full matrix on commit `e6df034` (before
+the security fixes, load average 4.3 to 7.3,
+`bench/results/2026-09-25-p2-regress-e6df034.csv`) gave 0.99x to 1.01x
+in all eight cells. **Conclusion: plaintext throughput, CPU and latency
+without a configuration file are at parity with P1.** The 0.95x cells are
+noise from the shared machine (`*` = runs spread by more than 20%).
+
+The no-config numbers here (about 178k to 209k ops/s) are higher than the
+"none" rows of the P1-T5 table (66k to 220k ops/s) for both servers
+most likely because that session ran under heavier background load:
+only same-session comparisons are meaningful.
+
 
 ## P1: write-ahead log (`-b`)
 

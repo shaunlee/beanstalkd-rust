@@ -73,7 +73,7 @@ Reference: beanstalkd commit `25085c5`. Each entry states the observed behavior,
 
 None of these change behavior unless enabled in the configuration file; with no config file the server is byte-identical to the reference as described above.
 
-1. **TLS / mTLS listeners**: the protocol is unchanged over TLS. The differential suites run every case over TLS against beanstalkd-rs.
+1. **TLS / mTLS listeners**: the protocol is unchanged over TLS. The differential suites run every case over TLS against beanstalkd-rs. A TLS connection enters `stats` (`total-connections`, `current-connections`) only once its handshake completes; failed handshakes and rejected mTLS clients are never counted. A TLS terminator in front of the reference, such as stunnel, makes the reference count every accepted connection.
 2. **Token authentication** (`auth = "token"` listeners only): `auth <token>\r\n` replies `AUTHENTICATED\r\n` or `UNAUTHORIZED\r\n` (then close). Before authentication any other input gets `UNAUTHORIZED` and a close. Unauthenticated connections are not counted in `stats`. On other listeners `auth` stays `UNKNOWN_COMMAND`.
 3. **Pending-connection limits** (TLS listeners): handshake timeout 10 s, `auth.timeout`, and `server.max_pending_connections`; excess connections are closed at accept.
 4. **HTTP monitoring**: `/healthz`, `/readyz`, `/metrics`, `/admin`; values match `stats` / `stats-tube`, and fetching them never changes counters such as `cmd-stats`.

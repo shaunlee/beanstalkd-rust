@@ -10,9 +10,17 @@
 //
 // --leave-jobs and --after-restart drive the binlog restart test exactly
 // like the Python client (see clients/python/smoke.py).
+//
+// TLS: when SMOKE_TLS_CA is set, every connection is a crypto/tls
+// connection verifying the server against that CA bundle (server name: the
+// host part of HOST:PORT); SMOKE_TLS_CERT / SMOKE_TLS_KEY add a client
+// certificate (mTLS). The library is unmodified: beanstalk.NewConn accepts
+// any io.ReadWriteCloser.
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -89,8 +97,38 @@ func dumpMap(scope string, m map[string]string, err error) map[string]string {
 	return m
 }
 
+// tlsConfig returns the client TLS configuration from the environment,
+// or nil for plain TCP.
+func tlsConfig(addr string) *tls.Config {
+	caFile := os.Getenv("SMOKE_TLS_CA")
+	if caFile == "" {
+		return nil
+	}
+	pem, err := os.ReadFile(caFile)
+	must(err, "read SMOKE_TLS_CA")
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(pem) {
+		fail("no certificate in %s", caFile)
+	}
+	host, _, err := net.SplitHostPort(addr)
+	must(err, "split address")
+	cfg := &tls.Config{RootCAs: roots, ServerName: host}
+	if certFile := os.Getenv("SMOKE_TLS_CERT"); certFile != "" {
+		cert, err := tls.LoadX509KeyPair(certFile, os.Getenv("SMOKE_TLS_KEY"))
+		must(err, "load client certificate")
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	return cfg
+}
+
 func dial(addr string) *beanstalk.Conn {
-	nc, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	var nc net.Conn
+	var err error
+	if cfg := tlsConfig(addr); cfg != nil {
+		nc, err = tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", addr, cfg)
+	} else {
+		nc, err = net.DialTimeout("tcp", addr, 5*time.Second)
+	}
 	must(err, "dial")
 	// A hung server must fail the run, not hang it.
 	must(nc.SetDeadline(time.Now().Add(60*time.Second)), "set deadline")

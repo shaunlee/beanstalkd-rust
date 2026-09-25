@@ -129,7 +129,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "nix",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

@@ -15,6 +15,10 @@ path = "src/main.rs"
 tokio.workspace = true
 clap.workspace = true
 nix = { version = "0.29", features = ["resource"] }
+# --tls (same versions and default aws-lc-rs provider as the server).
+rustls = "0.23"
+rustls-pki-types = { version = "1", features = ["std"] }
+tokio-rustls = "0.26"
 
 [lints]
 workspace = true

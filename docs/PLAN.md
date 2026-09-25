@@ -306,12 +306,12 @@ Only one agent at a time edits the server's wiring (T4); T1–T3 work in separat
 
 ### 5.5 Acceptance
 
-- [ ] Default configuration: all four differential suites pass unchanged; plaintext throughput within ±5% of P1
-- [ ] TLS differential mode passes for every case, including the half-close cases
-- [ ] Real clients (Python greenstalk, Go go-beanstalk) pass the smoke tests over TLS, and with mTLS
-- [ ] Auth tests: pipelined `auth wrong` followed by a command, `put` before auth, `stats` before auth; none reaches the engine (counters unchanged); constant-time comparison; tokens never logged
-- [ ] `/metrics` values equal what `stats` / `stats-tube` report; `/readyz` is 503 during binlog replay
-- [ ] Config: precedence (CLI over file), unknown keys rejected, invalid combinations rejected (token auth without TLS)
-- [ ] TLS throughput recorded in `docs/BENCH.md`
-- [ ] Security review findings resolved or documented
-- [ ] `docs/DESIGN.md`, `docs/COMPAT.md`, README updated
+- [x] Default configuration: all four differential suites pass unchanged; plaintext throughput within ±5% of P1
+- [x] TLS differential mode passes for every case, including the half-close cases
+- [x] Real clients (Python greenstalk, Go go-beanstalk) pass the smoke tests over TLS, and with mTLS
+- [x] Auth tests: pipelined `auth wrong` followed by a command, `put` before auth, `stats` before auth; none reaches the engine (counters unchanged); constant-time comparison; tokens never logged
+- [x] `/metrics` values equal what `stats` / `stats-tube` report; `/readyz` is 503 during binlog replay
+- [x] Config: precedence (CLI over file), unknown keys rejected, invalid combinations rejected (token auth without TLS)
+- [x] TLS throughput recorded in `docs/BENCH.md`
+- [x] Security review findings resolved or documented
+- [x] `docs/DESIGN.md`, `docs/COMPAT.md`, README updated

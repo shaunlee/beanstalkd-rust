@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """Summarizes bench/run-matrix.sh CSV output as a Markdown table.
 
-Usage: summarize.py results.csv [more.csv ...]
+Usage: summarize.py [--baseline MODE] results.csv [more.csv ...]
 
 For every (server mode, scenario, conns, body size, pipeline, idle conns,
 delayed tubes) cell it prints the median
 over runs of throughput, server CPU and put/reserve p99 latency for the
 reference ("ref") and beanstalkd-rs ("rs"), and the throughput ratio
 rs / ref. Cells whose runs spread by more than 20% are flagged with "*".
+
+When the CSV has proxy CPU (TLS modes: the reference behind stunnel), a
+"ref proxy CPU %" column shows stunnel's CPU next to the reference's own.
+--baseline MODE adds a column with rs ops/s divided by rs ops/s of the same
+cell in server mode MODE (e.g. `--baseline none`: TLS cost for ours).
 """
 
 from __future__ import annotations
@@ -35,9 +40,13 @@ def fmt(v: float | None, digits: int = 0) -> str:
 
 
 def main() -> int:
+    args = sys.argv[1:]
+    baseline = None
+    if len(args) >= 2 and args[0] == "--baseline":
+        baseline, args = args[1], args[2:]
     cells: dict[tuple, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     order: list[tuple] = []
-    for path in sys.argv[1:]:
+    for path in args:
         with open(path, newline="") as f:
             for r in csv.DictReader(f):
                 key = (
@@ -59,12 +68,20 @@ def main() -> int:
     mode_rule = "---|" if modes else ""
     extra_head = " idle conns | delayed tubes |" if scaling else ""
     extra_rule = "---:|---:|" if scaling else ""
+    proxy = any(r.get("proxy_cpu_pct") for c in cells.values() for r in c["ref"])
+    proxy_head = " ref proxy CPU % |" if proxy else ""
+    proxy_rule = "---:|" if proxy else ""
+    base_head = f" rs/rs[{baseline}] |" if baseline else ""
+    base_rule = "---:|" if baseline else ""
     print(
-        f"|{mode_head} scenario | conns | body | pipe |{extra_head} ref ops/s | rs ops/s | rs/ref "
-        "| ref CPU % | rs CPU % | ref put p99 µs | rs put p99 µs "
+        f"|{mode_head} scenario | conns | body | pipe |{extra_head} ref ops/s | rs ops/s | rs/ref |{base_head}"
+        f" ref CPU % |{proxy_head} rs CPU % | ref put p99 µs | rs put p99 µs "
         "| ref reserve p99 µs | rs reserve p99 µs |"
     )
-    print(f"|{mode_rule}---|---:|---:|---:|{extra_rule}---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    print(
+        f"|{mode_rule}---|---:|---:|---:|{extra_rule}---:|---:|---:|{base_rule}---:|{proxy_rule}"
+        "---:|---:|---:|---:|---:|"
+    )
     for key in order:
         ref, rs = cells[key]["ref"], cells[key]["rs"]
         r_ops, s_ops = med(ref, "ops_per_sec"), med(rs, "ops_per_sec")
@@ -74,9 +91,14 @@ def main() -> int:
         mode, scenario, conns, body, pipe, idle, delayed = key
         extra = f" {idle:,} | {delayed:,} |" if scaling else ""
         mode_col = f" {mode} |" if modes else ""
+        base_col = ""
+        if baseline:
+            b_ops = med(cells.get((baseline,) + key[1:], {}).get("rs", []), "ops_per_sec")
+            base_col = f" {fmt(s_ops / b_ops if b_ops and s_ops else None, 2)} |"
+        proxy_col = f" {fmt(med(ref, 'proxy_cpu_pct'))} |" if proxy else ""
         print(
             f"|{mode_col} {scenario} | {conns} | {body} | {pipe} |{extra} {fmt(r_ops)}{flag} | {fmt(s_ops)}{flag} "
-            f"| {fmt(ratio, 2)} | {fmt(med(ref, 'server_cpu_pct'))} | {fmt(med(rs, 'server_cpu_pct'))} "
+            f"| {fmt(ratio, 2)} |{base_col} {fmt(med(ref, 'server_cpu_pct'))} |{proxy_col} {fmt(med(rs, 'server_cpu_pct'))} "
             f"| {fmt(med(ref, 'put_p99_us'))} | {fmt(med(rs, 'put_p99_us'))} "
             f"| {fmt(med(ref, 'reserve_p99_us'))} | {fmt(med(rs, 'reserve_p99_us'))} |"
         )

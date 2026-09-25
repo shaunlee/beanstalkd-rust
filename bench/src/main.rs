@@ -3,6 +3,8 @@
 //! ```text
 //! bstk-bench --addr HOST:PORT --conns N --duration SECS --scenario <name>
 //!            [--body-size B] [--pipeline D] [--threads T] [--json]
+//!            [--tls --ca PEM [--server-name NAME]
+//!             [--client-cert PEM --client-key PEM] [--token TOKEN]]
 //! ```
 //!
 //! Scenarios:
@@ -25,6 +27,15 @@
 //! The soft `RLIMIT_NOFILE` is raised as far as needed (up to the hard
 //! limit).
 //!
+//! TLS (for beanstalkd-rs TLS listeners, or a server behind a TLS proxy):
+//! `--tls` makes every connection a TLS connection (tokio-rustls, the
+//! aws-lc-rs provider) that verifies the server against `--ca` (server
+//! name: `--server-name`, default the host part of `--addr`);
+//! `--client-cert` / `--client-key` present a client certificate (mTLS);
+//! `--token` sends `auth <token>` on every connection before anything
+//! else. Connections are set up before the clock starts, so handshakes are
+//! not measured. `--idle-conns` is plain TCP only.
+//!
 //! Any unexpected reply, or no reply within 10 s, fails the run (exit 1).
 //! At the end the server's `stats` must show zero ready, reserved, delayed
 //! and buried jobs. Server CPU is derived from `rusage-utime` +
@@ -33,6 +44,7 @@
 mod client;
 mod latency;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,7 +54,7 @@ use clap::{Parser, ValueEnum};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use client::{Client, Reply, Result, stats_f64, stats_u64, unexpected};
+use client::{Client, Reply, Result, Target, TlsOptions, stats_f64, stats_u64, unexpected};
 use latency::{Op, Recorder};
 
 const TTR: u32 = 60;
@@ -98,6 +110,60 @@ struct Args {
     /// Extra tubes, each holding one job delayed by `DELAYED_JOB_SECS`.
     #[arg(long, default_value_t = 0)]
     delayed_tubes: usize,
+    /// Connect with TLS (requires --ca).
+    #[arg(long, requires = "ca")]
+    tls: bool,
+    /// PEM CA bundle that verifies the server certificate.
+    #[arg(long, requires = "tls")]
+    ca: Option<PathBuf>,
+    /// Server name to verify (default: the host part of --addr).
+    #[arg(long, requires = "tls")]
+    server_name: Option<String>,
+    /// PEM client certificate chain (mTLS).
+    #[arg(long, requires_all = ["tls", "client_key"])]
+    client_cert: Option<PathBuf>,
+    /// PEM client private key (mTLS).
+    #[arg(long, requires = "client_cert")]
+    client_key: Option<PathBuf>,
+    /// Token sent with `auth` on every connection (requires --tls).
+    #[arg(long, requires = "tls")]
+    token: Option<String>,
+}
+
+impl Args {
+    fn target(&self) -> Result<Target> {
+        if !self.tls {
+            return Ok(Target::plain(&self.addr));
+        }
+        let Some(ca) = &self.ca else {
+            return Err("--tls needs --ca".into());
+        };
+        let server_name = match &self.server_name {
+            Some(n) => n.clone(),
+            None => {
+                let (host, _) = self
+                    .addr
+                    .rsplit_once(':')
+                    .ok_or_else(|| format!("--addr {}: expected HOST:PORT", self.addr))?;
+                host.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_owned()
+            }
+        };
+        let client_cert = match (&self.client_cert, &self.client_key) {
+            (Some(c), Some(k)) => Some((c.as_path(), k.as_path())),
+            _ => None,
+        };
+        Target::new(
+            &self.addr,
+            Some(TlsOptions {
+                ca,
+                server_name,
+                client_cert,
+            }),
+            self.token.clone(),
+        )
+    }
 }
 
 /// Delay of the jobs created by `--delayed-tubes`: far beyond any run.
@@ -130,6 +196,10 @@ fn main() -> ExitCode {
         eprintln!("bstk-bench: --conns, --pipeline and --duration must be > 0");
         return ExitCode::from(2);
     }
+    if args.tls && args.idle_conns > 0 {
+        eprintln!("bstk-bench: --idle-conns is not supported with --tls");
+        return ExitCode::from(2);
+    }
     if args.scenario == Scenario::ProducersConsumers && args.conns < 2 {
         eprintln!("bstk-bench: producers-consumers needs --conns >= 2");
         return ExitCode::from(2);
@@ -159,7 +229,8 @@ fn main() -> ExitCode {
 async fn run(args: &Args) -> Result<()> {
     let body: Arc<[u8]> = vec![b'x'; args.body_size].into();
     let tag = std::process::id();
-    let mut monitor = Client::connect(&args.addr).await?;
+    let target = Arc::new(args.target()?);
+    let mut monitor = Client::connect(&target).await?;
 
     // Idle connections first: the reference's per-event work grows with
     // the number of tubes, which slows down its accept loop.
@@ -183,12 +254,12 @@ async fn run(args: &Args) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
-    let delayed_ids = make_delayed_tubes(&args.addr, args.delayed_tubes, tag, &body).await?;
+    let delayed_ids = make_delayed_tubes(&target, args.delayed_tubes, tag, &body).await?;
 
     // Connect and configure every client before starting the clock.
     let mut clients = Vec::with_capacity(args.conns);
     for i in 0..args.conns {
-        let mut c = Client::connect(&args.addr).await?;
+        let mut c = Client::connect(&target).await?;
         let tube = match args.scenario {
             Scenario::PutReserveDelete => format!("bench-{tag}-{i}"),
             Scenario::ProducersConsumers | Scenario::PutOnly => format!("bench-{tag}-shared"),
@@ -258,10 +329,10 @@ async fn run(args: &Args) -> Result<()> {
     let finished = start.elapsed().as_secs_f64();
 
     if args.scenario == Scenario::PutOnly {
-        drain(&args.addr, args.conns, args.pipeline, tag).await?;
+        drain(&target, args.conns, args.pipeline, tag).await?;
     }
     let drain_secs = start.elapsed().as_secs_f64() - finished;
-    delete_ids(&args.addr, &delayed_ids).await?;
+    delete_ids(&target, &delayed_ids).await?;
     drop(idle);
 
     let stats_end = monitor.stats().await?;
@@ -366,13 +437,18 @@ async fn connect_with_retry(addr: &str) -> std::io::Result<tokio::net::TcpStream
 
 /// Creates `n` tubes named `bench-{tag}-delayed-{i}`, each holding one job
 /// delayed by `DELAYED_JOB_SECS`; returns the job ids.
-async fn make_delayed_tubes(addr: &str, n: usize, tag: u32, body: &[u8]) -> Result<Vec<u64>> {
+async fn make_delayed_tubes(
+    target: &Arc<Target>,
+    n: usize,
+    tag: u32,
+    body: &[u8],
+) -> Result<Vec<u64>> {
     let mut set: JoinSet<Result<Vec<u64>>> = JoinSet::new();
     for k in 0..SETUP_CONNS.min(n) {
-        let addr = addr.to_string();
+        let target = Arc::clone(target);
         let body = body.to_vec();
         set.spawn(async move {
-            let mut c = Client::connect(&addr).await?;
+            let mut c = Client::connect(&target).await?;
             let mine: Vec<usize> = (k..n).step_by(SETUP_CONNS).collect();
             let mut ids = Vec::with_capacity(mine.len());
             for chunk in mine.chunks(SETUP_BATCH) {
@@ -403,13 +479,13 @@ async fn make_delayed_tubes(addr: &str, n: usize, tag: u32, body: &[u8]) -> Resu
 }
 
 /// Deletes the given jobs (pipelined, over `SETUP_CONNS` connections).
-async fn delete_ids(addr: &str, ids: &[u64]) -> Result<()> {
+async fn delete_ids(target: &Arc<Target>, ids: &[u64]) -> Result<()> {
     let mut set: JoinSet<Result<()>> = JoinSet::new();
     for k in 0..SETUP_CONNS.min(ids.len()) {
-        let addr = addr.to_string();
+        let target = Arc::clone(target);
         let mine: Vec<u64> = ids.iter().copied().skip(k).step_by(SETUP_CONNS).collect();
         set.spawn(async move {
-            let mut c = Client::connect(&addr).await?;
+            let mut c = Client::connect(&target).await?;
             let mut rec = Recorder::default();
             for chunk in mine.chunks(SETUP_BATCH) {
                 delete_batch(&mut c, &mut rec, chunk).await?;
@@ -563,14 +639,14 @@ async fn consumer(
 
 /// Deletes every job left in the shared put-only tube, using `conns`
 /// fresh connections with pipelined `reserve-with-timeout 0` + `delete`.
-async fn drain(addr: &str, conns: usize, depth: usize, tag: u32) -> Result<()> {
+async fn drain(target: &Arc<Target>, conns: usize, depth: usize, tag: u32) -> Result<()> {
     let tube = format!("bench-{tag}-shared");
     let mut set: JoinSet<Result<()>> = JoinSet::new();
     for _ in 0..conns {
-        let addr = addr.to_string();
+        let target = Arc::clone(target);
         let tube = tube.clone();
         set.spawn(async move {
-            let mut c = Client::connect(&addr).await?;
+            let mut c = Client::connect(&target).await?;
             c.use_and_watch_only(&tube).await?;
             let mut rec = Recorder::default();
             loop {
@@ -616,9 +692,16 @@ fn report(
     let total = rec.total();
     let ops_per_sec = total as f64 / elapsed;
     println!(
-        "scenario={} addr={} conns={} duration={}s body={}B pipeline={} idle-conns={} delayed-tubes={}",
+        "scenario={} addr={} transport={} conns={} duration={}s body={}B pipeline={} idle-conns={} delayed-tubes={}",
         args.scenario.name(),
         args.addr,
+        match (args.tls, args.client_cert.is_some(), args.token.is_some()) {
+            (false, _, _) => "tcp",
+            (true, true, true) => "tls+mtls+token",
+            (true, true, false) => "tls+mtls",
+            (true, false, true) => "tls+token",
+            (true, false, false) => "tls",
+        },
         args.conns,
         args.duration,
         args.body_size,

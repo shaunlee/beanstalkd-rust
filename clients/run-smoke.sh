@@ -20,19 +20,44 @@
 #                  dir, and the client dumps the recovered state
 #   SMOKE_SERVER_ARGS  extra server arguments for both servers, e.g. "-f0"
 #                  or "-F" (split on whitespace)
+#   SMOKE_TLS      1: beanstalkd-rs is started with a generated --config
+#                  holding one TLS listener (auth none) and the clients
+#                  connect to it over TLS, verifying a generated CA; the
+#                  reference stays plaintext, and the transcripts must
+#                  still be identical
+#   SMOKE_MTLS     1 (implies SMOKE_TLS=1): the listener uses auth = "mtls"
+#                  and the clients present a client certificate; also
+#                  checks that a client without a certificate, and one with
+#                  a certificate from an untrusted CA, are rejected
+#   SMOKE_TOKEN    1: token authentication checks (clients/python/checks.py
+#                  token) against a beanstalkd-rs with an auth = "token"
+#                  TLS listener
+#   SMOKE_HTTP     1: HTTP endpoint checks (clients/python/checks.py http):
+#                  /healthz, /readyz, /metrics and /admin against `stats`
+#                  and `stats-tube`, on a beanstalkd-rs with [http] and the
+#                  listener of the current mode (plaintext, TLS or mTLS;
+#                  with -b in binlog modes)
+#   SMOKE_CLIENTS=""   skips the client transcript comparison (e.g. to run
+#                  only the SMOKE_TOKEN / SMOKE_HTTP checks)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLIENTS_DIR="$ROOT/clients"
 REF_BIN="${BSTK_REF_BIN:-$ROOT/.ref/beanstalkd/beanstalkd}"
 SMOKE_VENV="${SMOKE_VENV:-$CLIENTS_DIR/python/.venv}"
-SMOKE_CLIENTS="${SMOKE_CLIENTS:-python go}"
+SMOKE_CLIENTS="${SMOKE_CLIENTS-python go}"
 SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-120}"
 OUT="${SMOKE_OUT:-$(mktemp -d "${TMPDIR:-/tmp}/bstk-smoke.XXXXXX")}"
 mkdir -p "$OUT"
 SMOKE_RESTART="${SMOKE_RESTART:-0}"
 SMOKE_BINLOG="${SMOKE_BINLOG:-0}"
 [ "$SMOKE_RESTART" = 1 ] && SMOKE_BINLOG=1
+SMOKE_MTLS="${SMOKE_MTLS:-0}"
+SMOKE_TLS="${SMOKE_TLS:-0}"
+[ "$SMOKE_MTLS" = 1 ] && SMOKE_TLS=1
+SMOKE_TOKEN="${SMOKE_TOKEN:-0}"
+SMOKE_HTTP="${SMOKE_HTTP:-0}"
+CERTS="$OUT/certs"
 read -r -a SERVER_ARGS <<<"${SMOKE_SERVER_ARGS:-}"
 NORMALIZE_ARGS=()
 [ "$SMOKE_BINLOG" = 1 ] && NORMALIZE_ARGS=(--binlog)
@@ -61,10 +86,27 @@ free_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'
 }
 
+# wait_port PORT [CA [CERT KEY]]: waits until PORT accepts a connection;
+# with CA, the probe completes a TLS handshake (with a client certificate
+# if given). The probe is a full connection either way, so that the
+# servers' total-connections agree (beanstalkd-rs counts a TLS connection
+# once its handshake completes).
 wait_port() {
   local port="$1" i
   for i in $(seq 1 100); do
-    if python3 -c 'import socket,sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 0.2).close()' "$port" 2>/dev/null; then
+    if python3 - "$@" 2>/dev/null <<'PY'
+import socket, ssl, sys
+port, *tls = sys.argv[1:]
+s = socket.create_connection(("127.0.0.1", int(port)), 0.5)
+if tls:
+    ctx = ssl.create_default_context(cafile=tls[0])
+    if len(tls) == 3:
+        ctx.load_cert_chain(tls[1], tls[2])
+    s = ctx.wrap_socket(s, server_hostname="127.0.0.1")
+    s.unwrap()  # close_notify; the server has seen our Finished before it
+s.close()
+PY
+    then
       return 0
     fi
     sleep 0.05
@@ -79,21 +121,65 @@ cleanup() {
     [ -n "$p" ] && kill -9 "$p" 2>/dev/null || true
   done
   # Only remove what this script created.
-  rm -rf "$OUT/binlog" "$OUT/hold.fifo"
+  rm -rf "$OUT/binlog" "$OUT/hold.fifo" "$CERTS" "$OUT"/*.toml
 }
 trap cleanup EXIT
 
+# The listener's auth mode for beanstalkd-rs in TLS modes.
+LISTENER_AUTH=none
+[ "$SMOKE_MTLS" = 1 ] && LISTENER_AUTH=mtls
+# Token for SMOKE_TOKEN (never printed by the checks).
+TOKEN="smoke-$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+
+# write_config FILE PORT AUTH TLS [HTTP_PORT]: a beanstalkd-rs config with
+# one listener on 127.0.0.1:PORT (plus [http] on HTTP_PORT if given).
+write_config() {
+  local file="$1" port="$2" auth="$3" tls="$4" http="${5:-}"
+  {
+    printf '[[listener]]\naddr = "127.0.0.1:%s"\ntls = %s\nauth = "%s"\n' "$port" "$tls" "$auth"
+    if [ "$tls" = true ]; then
+      printf '[tls]\ncert = "%s"\nkey = "%s"\n' "$CERTS/server.pem" "$CERTS/server.key"
+      if [ "$auth" = mtls ]; then printf 'client_ca = "%s"\n' "$CERTS/ca.pem"; fi
+    fi
+    if [ "$auth" = token ]; then printf '[auth]\ntokens = ["%s"]\ntimeout = "1s"\n' "$TOKEN"; fi
+    # No snapshot cache: /metrics and /admin must reflect the `stats` the
+    # checks ran just before.
+    if [ -n "$http" ]; then printf '[http]\naddr = "127.0.0.1:%s"\nsnapshot_min_interval = "0s"\n' "$http"; fi
+  } >"$file"
+}
+
 # start_server NAME BIN [BINLOG_DIR] -> sets SERVER_PORT, SERVER_PID.
 # Always a fresh port: a restarted server must not depend on SO_REUSEADDR.
+# beanstalkd-rs runs from a generated --config in TLS modes (and when
+# SERVER_AUTH / SERVER_HTTP_PORT are set, for the extra checks).
 start_server() {
-  local name="$1" bin="$2" dir="${3:-}" args=()
+  local name="$1" bin="$2" dir="${3:-}" args=() tls=false auth="${SERVER_AUTH:-none}" probe=()
   [ -n "$dir" ] && args=(-b "$dir")
   SERVER_PORT="$(free_port)"
-  "$bin" -l 127.0.0.1 -p "$SERVER_PORT" ${args[@]:+"${args[@]}"} \
+  if [ "$bin" = "$RS_BIN" ] && { [ "$SMOKE_TLS" = 1 ] || [ -n "${SERVER_AUTH:-}" ] || [ -n "${SERVER_HTTP_PORT:-}" ]; }; then
+    if [ "$SMOKE_TLS" = 1 ]; then
+      tls=true
+      if [ -z "${SERVER_AUTH:-}" ]; then auth="$LISTENER_AUTH"; fi
+    fi
+    if [ "$auth" = token ]; then tls=true; fi
+    # A token listener is probed with plain TCP (nothing to answer
+    # without `auth`).
+    case "$auth" in
+      none) [ "$tls" = true ] && probe=("$CERTS/ca.pem") ;;
+      mtls) probe=("$CERTS/ca.pem" "$CERTS/client.pem" "$CERTS/client.key") ;;
+    esac
+    write_config "$OUT/$name.toml" "$SERVER_PORT" "$auth" "$tls" "${SERVER_HTTP_PORT:-}"
+    "$bin" --config "$OUT/$name.toml" --check-config >/dev/null 2>>"$OUT/$name.server.log" ||
+      die "invalid generated config $OUT/$name.toml (see $OUT/$name.server.log)"
+    args+=(--config "$OUT/$name.toml")
+  else
+    args+=(-l 127.0.0.1 -p "$SERVER_PORT")
+  fi
+  "$bin" ${args[@]:+"${args[@]}"} \
     ${SERVER_ARGS[@]:+"${SERVER_ARGS[@]}"} >>"$OUT/$name.server.log" 2>&1 &
   SERVER_PID=$!
   PIDS+=("$SERVER_PID")
-  wait_port "$SERVER_PORT"
+  wait_port "$SERVER_PORT" ${probe[@]:+"${probe[@]}"}
 }
 
 stop_server() {
@@ -111,7 +197,7 @@ crash_server() {
 # appending to RAW; returns its status.
 run_client() {
   local name="$1" raw="$2"; shift 2
-  with_timeout "$SMOKE_TIMEOUT" "${CLIENT_CMD[@]}" "$@" "127.0.0.1:$SERVER_PORT" \
+  with_timeout "$SMOKE_TIMEOUT" "${CLIENT_ENV[@]}" "${CLIENT_CMD[@]}" "$@" "127.0.0.1:$SERVER_PORT" \
     >>"$raw" 2>>"$OUT/$name.err"
 }
 
@@ -121,7 +207,7 @@ run_client() {
 run_restart() {
   local name="$1" bin="$2" dir="$3" raw="$4" fifo="$OUT/hold.fifo" cpid rc=0 i
   rm -f "$fifo"; mkfifo "$fifo"
-  with_timeout "$SMOKE_TIMEOUT" "${CLIENT_CMD[@]}" --leave-jobs "127.0.0.1:$SERVER_PORT" \
+  with_timeout "$SMOKE_TIMEOUT" "${CLIENT_ENV[@]}" "${CLIENT_CMD[@]}" --leave-jobs "127.0.0.1:$SERVER_PORT" \
     <"$fifo" >>"$raw" 2>>"$OUT/$name.err" &
   cpid=$!
   exec 3>"$fifo" # opening the write end unblocks the client's stdin
@@ -159,6 +245,18 @@ prepare_go() {
   CLIENT_CMD=("$OUT/smoke-go")
 }
 
+if [ "$SMOKE_TLS" = 1 ] || [ "$SMOKE_TOKEN" = 1 ]; then
+  "$CLIENTS_DIR/mkcerts.sh" "$CERTS"
+fi
+# Environment of the client processes: TLS settings only against
+# beanstalkd-rs in TLS modes (the reference is always plaintext).
+CLEAN_ENV=(env -u SMOKE_TLS_CA -u SMOKE_TLS_CERT -u SMOKE_TLS_KEY)
+RS_ENV=("${CLEAN_ENV[@]}")
+if [ "$SMOKE_TLS" = 1 ]; then
+  RS_ENV+=("SMOKE_TLS_CA=$CERTS/ca.pem")
+  [ "$SMOKE_MTLS" = 1 ] && RS_ENV+=("SMOKE_TLS_CERT=$CERTS/client.pem" "SMOKE_TLS_KEY=$CERTS/client.key")
+fi
+
 failed=0
 for client in $SMOKE_CLIENTS; do
   case "$client" in
@@ -169,7 +267,11 @@ for client in $SMOKE_CLIENTS; do
 
   status=()
   for server in ref rs; do
-    if [ "$server" = ref ]; then bin="$REF_BIN"; else bin="$RS_BIN"; fi
+    if [ "$server" = ref ]; then
+      bin="$REF_BIN"; CLIENT_ENV=("${CLEAN_ENV[@]}")
+    else
+      bin="$RS_BIN"; CLIENT_ENV=("${RS_ENV[@]}")
+    fi
     name="$client-$server"
     raw="$OUT/$name.raw.txt"
     : >"$raw"; : >"$OUT/$name.err"; : >"$OUT/$name.server.log"
@@ -212,9 +314,66 @@ for client in $SMOKE_CLIENTS; do
   fi
 done
 
+# check NAME CMD...: runs one of the extra checks, reporting PASS/FAIL.
+check() {
+  local name="$1"; shift
+  if with_timeout "$SMOKE_TIMEOUT" "$@" >"$OUT/$name.txt" 2>"$OUT/$name.err"; then
+    echo "PASS: $name ($(grep -c '^ok:' "$OUT/$name.txt") checks)"
+  else
+    echo "FAIL: $name (see $OUT/$name.txt, $OUT/$name.err):" >&2
+    tail -n 5 "$OUT/$name.txt" "$OUT/$name.err" >&2 || true
+    failed=1
+  fi
+}
+
+# extra_server NAME: a fresh beanstalkd-rs for one extra check (with a
+# fresh binlog dir in binlog modes).
+extra_server() {
+  local dir=""
+  : >"$OUT/$1.server.log"
+  if [ "$SMOKE_BINLOG" = 1 ]; then
+    dir="$OUT/binlog/$1"; rm -rf "$dir"; mkdir -p "$dir"
+  fi
+  start_server "$1" "$RS_BIN" "$dir"
+}
+
+PY="python3"
+[ -x "$SMOKE_VENV/bin/python" ] && PY="$SMOKE_VENV/bin/python"
+CHECKS="$CLIENTS_DIR/python/checks.py"
+
+if [ "$SMOKE_MTLS" = 1 ]; then
+  extra_server mtls-reject
+  check mtls-reject "$PY" "$CHECKS" mtls-reject --ca "$CERTS/ca.pem" \
+    --rogue-cert "$CERTS/rogue-client.pem" --rogue-key "$CERTS/rogue-client.key" "127.0.0.1:$SERVER_PORT"
+  stop_server "$SERVER_PID"
+fi
+
+if [ "$SMOKE_TOKEN" = 1 ]; then
+  SERVER_AUTH=token extra_server token
+  check token "$PY" "$CHECKS" token --ca "$CERTS/ca.pem" --token "$TOKEN" "127.0.0.1:$SERVER_PORT"
+  stop_server "$SERVER_PID"
+fi
+
+if [ "$SMOKE_HTTP" = 1 ]; then
+  command -v curl >/dev/null || die "curl not found (needed for SMOKE_HTTP=1)"
+  http_port="$(free_port)"
+  SERVER_HTTP_PORT="$http_port" extra_server http
+  wait_port "$http_port"
+  tls_args=()
+  [ "$SMOKE_TLS" = 1 ] && tls_args=(--ca "$CERTS/ca.pem")
+  [ "$SMOKE_MTLS" = 1 ] && tls_args+=(--cert "$CERTS/client.pem" --key "$CERTS/client.key")
+  check http "$PY" "$CHECKS" http --http "127.0.0.1:$http_port" \
+    ${tls_args[@]:+"${tls_args[@]}"} "127.0.0.1:$SERVER_PORT"
+  stop_server "$SERVER_PID"
+fi
+
 mode="default"
 [ "$SMOKE_BINLOG" = 1 ] && mode="binlog"
 [ "$SMOKE_RESTART" = 1 ] && mode="binlog+restart"
+[ "$SMOKE_TLS" = 1 ] && mode="$mode+tls"
+[ "$SMOKE_MTLS" = 1 ] && mode="$mode+mtls"
+[ "$SMOKE_TOKEN" = 1 ] && mode="$mode+token"
+[ "$SMOKE_HTTP" = 1 ] && mode="$mode+http"
 echo "mode: $mode; server args: ${SMOKE_SERVER_ARGS:-(none)}"
 echo "transcripts: $OUT"
 exit "$failed"

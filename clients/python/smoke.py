@@ -23,11 +23,20 @@ Transcript line formats (consumed by normalize.py):
     [<scope>] <key>: <value>            one line per stats field, in the
                                         order the server sent them
 Job ids are always printed as `job=<n>` so they can be normalized.
+
+TLS (driven by clients/run-smoke.sh with SMOKE_TLS=1 / SMOKE_MTLS=1): when
+SMOKE_TLS_CA is set, every connection is a TLS connection that verifies the
+server certificate against that CA bundle (server name: the host part of
+HOST:PORT); SMOKE_TLS_CERT / SMOKE_TLS_KEY add a client certificate (mTLS).
+The library is unmodified: greenstalk.Client accepts a connected socket,
+and ssl.SSLSocket is one.
 """
 
 from __future__ import annotations
 
+import os
 import socket
+import ssl
 import sys
 import time
 from typing import Any, Callable
@@ -41,6 +50,28 @@ TUBE_A = "smoke-a"
 TUBE_B = "smoke-b"
 TUBE_C = "smoke-c"
 TUBE_KEEP = "smoke-keep"
+
+
+def tls_context() -> ssl.SSLContext | None:
+    ca = os.environ.get("SMOKE_TLS_CA")
+    if not ca:
+        return None
+    ctx = ssl.create_default_context(cafile=ca)
+    cert = os.environ.get("SMOKE_TLS_CERT")
+    if cert:
+        ctx.load_cert_chain(cert, os.environ.get("SMOKE_TLS_KEY"))
+    return ctx
+
+
+TLS = tls_context()
+
+
+def connect(addr: tuple[str, int], **kw: Any) -> greenstalk.Client:
+    """A greenstalk client over plain TCP, or over TLS when configured."""
+    if TLS is None:
+        return greenstalk.Client(addr, **kw)
+    sock = socket.create_connection(addr)
+    return greenstalk.Client(TLS.wrap_socket(sock, server_hostname=addr[0]), **kw)
 
 
 def out(line: str) -> None:
@@ -89,8 +120,8 @@ def main() -> int:
 
 def full_flow(addr: tuple[str, int], leave_jobs: bool) -> int:
     # --- tubes: use / watch / ignore / list -----------------------------
-    prod = greenstalk.Client(addr, use=TUBE_A, watch=TUBE_A)
-    work = greenstalk.Client(addr, use="default", watch=[TUBE_A, TUBE_B])
+    prod = connect(addr, use=TUBE_A, watch=TUBE_A)
+    work = connect(addr, use="default", watch=[TUBE_A, TUBE_B])
     out(f"producer using: {prod.using()}")
     out(f"producer watching: {prod.watching()}")
     out(f"worker watching: {sorted(work.watching())}")
@@ -281,7 +312,7 @@ def leave_jobs_and_hold(addr: tuple[str, int], prod: greenstalk.Client) -> int:
     """Leaves jobs in known journaled states, then holds two reservations
     until stdin is closed (the runner kills the server meanwhile)."""
     prod.use(TUBE_KEEP)
-    hold = greenstalk.Client(addr, use=TUBE_KEEP, watch=TUBE_KEEP)
+    hold = connect(addr, use=TUBE_KEEP, watch=TUBE_KEEP)
 
     def put(body: str, pri: int, delay: int = 0) -> int:
         i = prod.put(body, priority=pri, delay=delay, ttr=60)
@@ -334,7 +365,7 @@ def leave_jobs_and_hold(addr: tuple[str, int], prod: greenstalk.Client) -> int:
 def after_restart(addr: tuple[str, int]) -> int:
     """Dumps and checks the state recovered from the binlog, then drains it."""
     out("--- after restart ---")
-    c = greenstalk.Client(addr, use=TUBE_KEEP, watch=TUBE_KEEP)
+    c = connect(addr, use=TUBE_KEEP, watch=TUBE_KEEP)
     st = c.stats()
     dump("stats", st)
     for k, want in [
