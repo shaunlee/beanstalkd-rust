@@ -32,7 +32,10 @@ pub const URGENT_THRESHOLD: u32 = 1024;
 pub type JobId = u64;
 
 /// A validated tube name (1..=200 bytes of `NAME_CHARS`, not starting with '-').
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "String", into = "String")]
 pub struct TubeName(String);
 
 impl TubeName {
@@ -50,6 +53,24 @@ impl TubeName {
     }
 }
 
+impl TryFrom<String> for TubeName {
+    type Error = String;
+
+    /// Validating conversion, used when deserializing (P3 log entries).
+    fn try_from(name: String) -> Result<Self, String> {
+        match parse::validate_tube_name(&name) {
+            Some(()) => Ok(TubeName(name)),
+            None => Err(format!("invalid tube name {name:?}")),
+        }
+    }
+}
+
+impl From<TubeName> for String {
+    fn from(name: TubeName) -> String {
+        name.0
+    }
+}
+
 impl std::fmt::Display for TubeName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -59,7 +80,7 @@ impl std::fmt::Display for TubeName {
 /// A fully-decoded client command. Durations (`delay`, `ttr`, timeouts) are
 /// in whole seconds exactly as sent on the wire; `ttr == 0` is NOT adjusted
 /// here (the engine bumps it to 1).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     Put {
         pri: u32,
@@ -194,7 +215,7 @@ pub enum Frame {
 /// `JobTooBig` → `JOB_TOO_BIG`, `TrailingGarbage` → `BAD_FORMAT`,
 /// `ExpectedCrlf` → `EXPECTED_CRLF`. `OutOfMemory` comes from the server
 /// when binlog space for the job cannot be reserved (`OUT_OF_MEMORY`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PutRejection {
     /// Body size above `max_job_size`; the body has been discarded.
     JobTooBig,

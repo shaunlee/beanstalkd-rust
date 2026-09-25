@@ -7,7 +7,7 @@
 //! `now` (monotonic nanoseconds). Identical inputs must yield identical
 //! outputs. Ground truth for semantics is `.ref/beanstalkd/{prot,job,tube,conn}.c`.
 
-use bstk_proto::Response;
+use bstk_proto::{Command, PutRejection, Response};
 
 mod engine;
 mod model;
@@ -60,7 +60,7 @@ impl SysInfo for StaticSysInfo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EngineConfig {
     /// `-z`; reported as `max-job-size` in stats. (Size enforcement happens in
     /// the codec.)
@@ -179,6 +179,72 @@ pub struct Snapshot {
     pub tubes: Vec<bstk_proto::StatsTube>,
 }
 
+/// One engine input, as replicated through the Raft log in cluster mode
+/// (P3). `Engine::apply_input` maps each variant onto the matching method
+/// and then runs `tick(now)`, so replaying the same inputs with the same
+/// `now` values yields the same state and replies on every node.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EngineInput {
+    Connect(ConnId),
+    Disconnect(ConnId),
+    HalfClose(ConnId),
+    PutStarted {
+        conn: ConnId,
+        too_big: bool,
+    },
+    PutRejected {
+        conn: ConnId,
+        why: PutRejection,
+    },
+    /// `Command::Quit` is never sent (the server handles it).
+    Command {
+        conn: ConnId,
+        cmd: Command,
+    },
+    /// Time-driven transitions only (delays, TTRs, timeouts, pauses).
+    Tick,
+    SetDraining(bool),
+}
+
+impl EngineInput {
+    /// The connection this input belongs to, if any.
+    pub fn conn(&self) -> Option<ConnId> {
+        match self {
+            EngineInput::Connect(c) | EngineInput::Disconnect(c) | EngineInput::HalfClose(c) => {
+                Some(*c)
+            }
+            EngineInput::PutStarted { conn, .. }
+            | EngineInput::PutRejected { conn, .. }
+            | EngineInput::Command { conn, .. } => Some(*conn),
+            EngineInput::Tick | EngineInput::SetDraining(_) => None,
+        }
+    }
+}
+
+/// The complete engine state (P3 Raft snapshots): everything except the
+/// `SysInfo` handle and the (always empty in cluster mode) journal. Opaque;
+/// only produced by `Engine::export_state` and consumed by
+/// `Engine::import_state`. Importing and continuing must be
+/// indistinguishable from never having exported.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EngineState {
+    // Filled in by P3-T1.
+    pub(crate) _todo: (),
+}
+
+/// `Engine::import_state` rejected a state that violates engine
+/// invariants (corrupt or hostile snapshot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateError(pub String);
+
+impl std::fmt::Display for StateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid engine state: {}", self.0)
+    }
+}
+
+impl std::error::Error for StateError {}
+
 /// Public API surface (implemented in `engine.rs`):
 ///
 /// ```ignore
@@ -229,6 +295,16 @@ pub struct Snapshot {
 ///     pub fn snapshot_limited(&self, now: Nanos, max_tubes: usize) -> Snapshot;
 ///     /// SIGUSR1 drain mode (put -> DRAINING).
 ///     pub fn set_draining(&mut self, on: bool);
+///     /// P3: run one input (see `EngineInput`), then `tick(now)`.
+///     pub fn apply_input(&mut self, now: Nanos, input: EngineInput, out: &mut Outbox);
+///     /// P3: ids of all connections, ascending.
+///     pub fn conn_ids(&self) -> Vec<ConnId>;
+///     pub fn config(&self) -> &EngineConfig;
+///     /// P3: full state for a snapshot; no side effects.
+///     pub fn export_state(&self) -> EngineState;
+///     /// P3: rebuild from a snapshot, validating every invariant
+///     /// (indexes, counters, references); never panics on bad input.
+///     pub fn import_state(state: EngineState, sys: Box<dyn SysInfo>) -> Result<Engine, StateError>;
 /// }
 /// ```
 #[doc(hidden)]

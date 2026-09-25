@@ -31,8 +31,8 @@ use bstk_proto::{
 use crate::model::{ConnState, JobRec, JobState, PendingPut, TubeId, TubeState};
 use crate::ms::Ms;
 use crate::{
-    BinlogStats, ConnId, EngineConfig, JobRecord, JournalEntry, NANOS_PER_SEC, Nanos, Outbox,
-    RecordState, Recovery, SysInfo,
+    BinlogStats, ConnId, EngineConfig, EngineInput, EngineState, JobRecord, JournalEntry,
+    NANOS_PER_SEC, Nanos, Outbox, RecordState, Recovery, StateError, SysInfo,
 };
 
 /// `SAFETY_MARGIN` in conn.c: 1 second.
@@ -411,6 +411,42 @@ impl Engine {
         .into_iter()
         .flatten()
         .min()
+    }
+
+    /// P3: run one input, then `tick(now)` (see `EngineInput`).
+    pub fn apply_input(&mut self, now: Nanos, input: EngineInput, out: &mut Outbox) {
+        match input {
+            EngineInput::Connect(c) => self.connect(now, c),
+            EngineInput::Disconnect(c) => self.disconnect(now, c, out),
+            EngineInput::HalfClose(c) => self.half_close(now, c, out),
+            EngineInput::PutStarted { conn, too_big } => self.put_started(now, conn, too_big),
+            EngineInput::PutRejected { conn, why } => self.put_rejected(now, conn, why, out),
+            EngineInput::Command { conn, cmd } => self.handle(now, conn, cmd, out),
+            EngineInput::Tick => {}
+            EngineInput::SetDraining(on) => self.set_draining(on),
+        }
+        self.tick(now, out);
+    }
+
+    /// P3: ids of all connections, ascending.
+    pub fn conn_ids(&self) -> Vec<ConnId> {
+        let mut ids: Vec<ConnId> = self.conns.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    pub fn config(&self) -> &EngineConfig {
+        &self.cfg
+    }
+
+    /// P3: full state for a snapshot. Implemented by P3-T1.
+    pub fn export_state(&self) -> EngineState {
+        todo!("P3-T1")
+    }
+
+    /// P3: rebuild from a snapshot. Implemented by P3-T1.
+    pub fn import_state(_state: EngineState, _sys: Box<dyn SysInfo>) -> Result<Engine, StateError> {
+        todo!("P3-T1")
     }
 
     pub fn set_draining(&mut self, on: bool) {

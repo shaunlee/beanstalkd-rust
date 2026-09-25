@@ -200,7 +200,7 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 |---|---|---|
 | P1 | Write-ahead log; see §4 | see §4.5 |
 | P2 | Operability; see §5 | see §5.5 |
-| P3 | openraft, Tick proposals, replicated reservations, follower proxy | on a 3-node cluster, random kills / partitions lose no acknowledged job and never double-deliver a reserved job (Jepsen-style tests) |
+| P3 | Raft replication; see §6 | see §6.6 |
 | P4 | Profiling and optimization (incl. compaction write amplification: about one extra record per operation under churn with small `-s`) | throughput ≥ 1× reference; multi-core scaling curve |
 
 ## 4. P1: Write-Ahead Log (detailed plan)
@@ -315,3 +315,83 @@ Only one agent at a time edits the server's wiring (T4); T1–T3 work in separat
 - [x] TLS throughput recorded in `docs/BENCH.md`
 - [x] Security review findings resolved or documented
 - [x] `docs/DESIGN.md`, `docs/COMPAT.md`, README updated
+
+## 6. P3: Raft Replication (detailed plan)
+
+### 6.1 Scope
+
+- **Cluster mode** (opt-in `[cluster]` section): 3 or 5 nodes replicate every engine input through Raft (openraft), so the cluster behaves like one reference server that survives the loss of a minority of nodes.
+- **Clients are unchanged**: a client may connect to any node, over any listener type from P2; the protocol, replies and ordering are those of a single server.
+- **Membership is static** (listed in the config); the cluster is bootstrapped once with `--cluster-init`. Dynamic membership changes (adding or replacing nodes at runtime) are out of scope for P3.
+- **Invariant**: without `[cluster]`, behavior is byte-identical to P2 (all differential suites unchanged) and throughput stays within ±5%.
+
+### 6.2 Facts checked before planning
+
+- **Library**: openraft `0.9.25` (2026-07) is the current stable line and is maintained; `0.10` is still alpha with near-weekly releases; tikv's `raft` crate has had no release since 0.7.0 (2023). We pin `openraft = "=0.9.25"` with the `serde` and `storage-v2` features.
+- **openraft 0.9 API**: `RaftLogStorage` / `RaftStateMachine` (storage v2; `apply` receives committed entries in order and returns one response per entry), `RaftNetwork` / `RaftNetworkFactory`, `client_write` and `client_write_ff`, `ensure_linearizable`, `initialize`, `change_membership`. `openraft::testing::Suite::test_all` is a conformance suite for storage implementations. Defaults: heartbeat 50 ms, election timeout 150–300 ms.
+- **Commit propagation**: when the commit index advances, the leader immediately sends it to followers (a heartbeat is filled in if nothing else is pending), so a follower applies a committed entry about one round trip after the leader.
+- **Engine determinism across processes**: engine `HashMap`s are used for lookups only (iteration appears only in `#[cfg(test)]` helpers); every order-carrying structure is a `Vec`, `Ms` or `BTreeSet`. Time arithmetic uses saturating or signed subtraction, so a lower `now` cannot panic.
+- **Engine state is plain data**: all fields of `Engine` except `sys` are integers, `Bytes`, `Vec`, `BTreeSet`, `HashMap` or small structs, so a full-state serialization via serde is straightforward. `sys` is read only when rendering `stats`.
+- **No iptables on macOS**: network faults need a user-space mechanism (an in-process simulated network, and a pausable TCP proxy between processes).
+
+### 6.3 Design decisions
+
+1. **What is replicated: every engine input.** A log entry is `{now, input}` where `input` is one of `Connect`, `Disconnect`, `HalfClose`, `PutStarted`, `PutRejected`, `Command`, `Tick`, `SetDraining`, `DropNode`. Applying an entry runs the engine call and then `tick(now)` on every node, the same "tick after every message" rule as today. Because the engine is deterministic, all nodes hold identical state, including connections, watch lists, waiting reserves and reservations. Every reply is therefore linearizable: nothing is acknowledged before it is committed on a majority (commit-before-reply replaces P1's write-before-reply). Considered and rejected: replicating only the binlog journal plus a leader lease; it is faster but loses reservations on failover and relies on clock bounds for safety.
+2. **Connections belong to nodes.** `ConnId` packs `(node_id, local_seq)` into the existing `u64` (high 16 bits = node id), so ids are unique across the cluster and never reused. The node holding the socket (the *owner*) forwards the connection's inputs to the leader; each input carries `(conn, seq)` and the state machine ignores duplicates, so an owner may safely resend after a leader change. Every node computes every reply during apply, and **each node delivers the replies for its own connections from its own apply**. As a result, a leader change loses no replies, and a waiting `reserve` on a surviving node stays waiting. Only one input per connection is in flight at a time, as today.
+3. **Losing a node.** If a node cannot reach a leader for `cluster.node_timeout` (default 5 s), it closes all of its client connections. If the leader has not heard from a node for `2 × node_timeout`, it proposes `DropNode(id)`, which applies `Disconnect` to every connection that node owns: their reservations return to ready, as when a client disconnects from the reference. An owner that applies a `Disconnect` or `DropNode` for a connection it still holds closes that socket. Connections on surviving nodes, including their reservations, are unaffected by leader changes.
+4. **Time.** The leader stamps each entry with `now = max(local wall-anchored clock, last applied now)`, so engine time never goes backwards across leader changes, even with clock skew between nodes. When the leader is idle it proposes `Tick{now}` at `next_deadline()`; followers never tick on their own.
+5. **Persistence.** In cluster mode the Raft log plus snapshots replace the binlog; `-b` together with `[cluster]` is a configuration error. The log is a new segmented append-only store in `bstk-raft`: CRC-32C records like `bstk-store`, `fdatasync` before acknowledging an append, batched appends (group commit). A snapshot is the full serialized engine state (serde + postcard), taken every `cluster.snapshot_every` entries (default 100,000) and before purging the log.
+6. **Transport and security.** A dedicated cluster port carrying length-prefixed postcard frames over TCP: Raft RPCs plus input forwarding. Cluster traffic requires mTLS by default, reusing P2's TLS code and certificate settings, and a peer's node id must match its certificate. Plaintext is allowed only with an explicit `cluster.insecure_plaintext = true` (tests). No gRPC / tonic.
+7. **Protocol-visible behavior in cluster mode.**
+   - `stats` shows the pid, hostname, id and rusage of the node the client is connected to.
+   - `uptime` counts from the cluster's first entry.
+   - The `binlog-*` fields report 0, except `binlog-max-size`.
+   - SIGUSR1 on any node proposes a cluster-wide `SetDraining`.
+   - A client whose node is cut off from the majority gets no replies until the node rejoins or `node_timeout` closes its connection; it never gets a reply for an uncommitted change.
+   - These are recorded in COMPAT as cluster-mode differences.
+8. **Monitoring.** `/readyz` is 200 on a node that can reach a leader and has applied up to the commit index it last learned. `/metrics` and `/admin` add role, term, leader id, commit/applied indexes, per-peer replication lag, and snapshot / log sizes.
+9. **Two network implementations behind one trait.** The real TCP/TLS transport lives in the server; the in-process simulated network (per-link drop, delay, duplication, partition; seeded) lives only in test code, so no test harness code ships in the binary.
+
+### 6.4 Tasks
+
+| ID | Task | Owner | Depends on | Wave |
+|---|---|---|---|---|
+| P3-T0 | Contracts: `EngineInput` + `Engine::apply_input`, `EngineState` (serde) + `Engine::export_state` / `Engine::import_state`, `ConnId` packing, serde for the `bstk-proto` types in inputs, `bstk-raft` crate skeleton (type config, entry and RPC types), `[cluster]` config schema | lead | — | 0 |
+| P3-T1 | Engine: state export/import, `apply_input`, duplicate-input filter, determinism tests (two engines with different hash seeds; restore mid-run and continue ≡ uninterrupted run), oracle proptest still green | subagent | T0 | 1 |
+| P3-T2 | `bstk-raft` storage: segmented log store, vote store, snapshot store, state-machine wrapper (apply → engine, reply routing by owner node); passes `openraft::testing::Suite`; crash / torn-write tests | subagent | T0 | 1 |
+| P3-T3 | `bstk-raft` network: framed RPC codec, `RaftNetwork` over TCP/TLS, input forwarding with resend on leader change; simulated network and 3-node in-process cluster harness for tests | subagent | T0 | 1 |
+| P3-T4 | Server: cluster mode wiring: config, `--cluster-init`, engine handle (local actor vs cluster), owner-side reply delivery, leader tracking, `Tick` proposals, node timeout / `DropNode`, drain, `/readyz` and metrics | subagent | T1–T3 | 2 |
+| P3-T5 | Differential and clients: harness cluster mode (3 local nodes; whole corpus through the leader and through a follower), real-client smoke tests against a cluster, including a leader kill mid-run | subagent | T4 | 3 |
+| P3-T6 | Chaos: seeded fault schedules on the in-process cluster; multi-process harness with kill -9, SIGSTOP/SIGCONT and a pausable TCP proxy for partitions; history checker (§6.5) | subagent | T4 | 3 |
+| P3-T7 | Cluster benchmarks; adversarial security review of the cluster port and forwarding | subagent(s) | T4 | 3 |
+| P3-T8 | P3 acceptance | lead | all | 4 |
+
+Only one agent at a time edits the server's wiring (T4); T1–T3 work in separate crates or modules.
+
+### 6.5 Tests
+
+- **Engine**: proptests that (a) random input sequences give identical outputs and states on two engines built independently (different `HashMap` seeds), (b) exporting and importing the state at any point and continuing gives the same outputs as not doing so, (c) a duplicate `(conn, seq)` input is a no-op.
+- **Storage**: the openraft conformance suite; truncation at every byte offset of the last record; restart after crash mid-append and mid-snapshot.
+- **Differential**: the whole `.bt` corpus against a 3-node cluster, connected to the leader and, separately, to a follower, compared with the reference (masking the binlog fields and anything COMPAT lists for cluster mode).
+- **History checker** (used by T6): every client operation is recorded with send and reply times. A run fails if any of these hold:
+  1. An acknowledged `INSERTED` job is missing although no acknowledged `DELETE` removed it.
+  2. An acknowledged `DELETED` job reappears.
+  3. Job ids are not unique, or not increasing in commit order.
+  4. A job is held by two connections at once: a connection gets an acknowledged `DELETED` / `RELEASED` / `BURIED` / `TOUCHED` for a job that another connection reserved after it (per-job linearizability against a model with TTR expiry and disconnect).
+  5. Any reply is inconsistent with a single-server execution of the per-job history.
+
+  TTR expiry followed by a new reservation is legitimate beanstalkd behavior and is allowed by the model.
+- **Faults** (both harnesses): leader kill, follower kill, kill -9 of all nodes and restart, minority / majority partitions, asymmetric partitions, message loss and delay, paused processes, clock skew between nodes, and a node rejoining with an empty data directory (installed from a snapshot).
+
+### 6.6 Acceptance
+
+- [ ] Standalone mode unchanged: all 7 differential suites pass, plaintext throughput within ±5% of P2
+- [ ] The whole differential corpus passes against a 3-node cluster, through the leader and through a follower
+- [ ] Real clients (Python, Go) pass the smoke tests against a cluster, including a leader kill mid-run
+- [ ] Chaos: ≥ 1,000 seeded in-process fault schedules and ≥ 100 multi-process fault runs with zero checker violations
+- [ ] Failover: after a leader kill, a new leader serves within 2 s; connections and reservations on surviving nodes are kept; connections on the lost node are closed
+- [ ] A wiped node rejoins from a snapshot and converges; a full-cluster kill -9 and restart loses no committed change
+- [ ] Engine determinism and state export/import proptests pass; openraft storage conformance suite passes
+- [ ] Cluster throughput and latency recorded in `docs/BENCH.md`; target ≥ 50k ops/s for put-reserve-delete with 100 connections on a 3-node cluster on one machine
+- [ ] Security review of the cluster port resolved or documented
+- [ ] `docs/DESIGN.md`, `docs/COMPAT.md`, README updated

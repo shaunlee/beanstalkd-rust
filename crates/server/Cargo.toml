@@ -22,7 +22,7 @@ bstk-engine.workspace = true
 bstk-store = { path = "../store" }
 nix = { version = "0.29", features = ["hostname", "resource", "signal", "feature"] }
 getrandom = "0.2"
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 toml = "1"
 # TLS listeners (rustls with its default aws-lc-rs provider).
 rustls = "0.23"

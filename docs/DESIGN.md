@@ -47,7 +47,7 @@
 | `bstk-compat` (`tests/compat`) | Differential harness and `.bt` case corpus against the reference | — |
 | `bstk-bench` (`bench/`) | Load generator and benchmark matrix | tokio |
 | `bstk-store` | Write-ahead log: segments, CRC records, reservation, compaction, replay | bstk-engine (types), crc32c, nix |
-| `bstk-raft` (P3) | openraft integration | — |
+| `bstk-raft` | Raft replication (P3): log entry and RPC types, log / snapshot storage, state-machine wrapper, network | openraft, bstk-engine, postcard |
 
 `clients/` holds real-client smoke tests (Python greenstalk, Go go-beanstalk).
 
@@ -179,10 +179,51 @@ Tube creation and destruction follow the reference's refcounting (use + watch + 
 - Compaction: while (allocated − live) / live ≥ 2, move a live job out of the oldest segment; delete segments without live records. Crash-safe at every step.
 - fsync: `fdatasync`, per the `-f` / `-F` policy.
 
-## 8. Later Phases (summary)
+## 8. Raft Replication (P3, `bstk-raft`)
 
-- **P3 Raft (openraft)**: messages are log entries; the leader proposes `Tick{now}` for time-driven transitions; reservations are replicated; followers proxy to the leader.
-- **P4 Performance**: reduce the per-command cross-thread hop (ops per CPU-second is about 0.4× the reference), O(1) buried-job removal, profiling-driven work.
+Plan and rationale: `docs/PLAN.md` §6. Summary:
+
+- **Replicated inputs**: every engine input is a log entry `Request { now, op }` (`Op::Conn { seq, input }`, `Tick`, `SetDraining`, `DropNode`). Each node applies committed entries to its own `Engine` via `Engine::apply_input` (engine call, then `tick(now)`), so all nodes hold the same state, including connections and reservations. Nothing is acknowledged before it is committed on a majority.
+- **Time**: the leader stamps `now = max(its wall-anchored clock, last applied now)`; idle timers are driven by leader-proposed `Tick` entries.
+- **Connections**: `ConnId = node_id << 48 | local number`. The owner (the node holding the socket) forwards inputs to the leader (`ForwardRequest`), one in flight per connection, resending unapplied inputs after a leader change; the state machine drops duplicates by `(conn, seq)`. Each node delivers the replies for its own connections from its own apply, so leader changes lose no replies and keep waiting reserves and reservations of surviving nodes.
+- **Node loss**: a node without a leader for `node_timeout` closes its client sockets; the leader proposes `DropNode` for a node silent for `2 × node_timeout`, which disconnects its connections (reservations return to ready).
+- **Storage**: segmented CRC-checked Raft log with `fdatasync` and group commit, vote file, snapshots of `Engine::export_state` (postcard) every `snapshot_every` entries. `-b` is not used in cluster mode.
+- **Transport**: one cluster port, length-prefixed postcard frames (Raft RPCs and forwarding), mTLS by default with the node id bound to the certificate.
+
+Configuration (`[cluster]`; absent = standalone, byte-identical to P2):
+
+```toml
+[cluster]
+node_id = 1                          # 1..=65535, must appear in [[cluster.peer]]
+listen = "10.0.0.1:11400"            # cluster port
+data_dir = "/var/lib/beanstalkd-rs"  # raft log, vote, snapshots
+node_timeout = "5s"
+snapshot_every = 100000              # entries between snapshots
+heartbeat = "50ms"
+election_timeout = ["150ms", "300ms"]
+insecure_plaintext = false           # true only for tests; otherwise [cluster.tls] is required
+
+[cluster.tls]
+cert = "node1.pem"                   # certificate subject/SAN must name this node (see T3)
+key = "node1.key"
+ca = "cluster-ca.pem"                # peers must present certificates from this CA
+
+[[cluster.peer]]
+id = 1
+addr = "10.0.0.1:11400"
+[[cluster.peer]]
+id = 2
+addr = "10.0.0.2:11400"
+[[cluster.peer]]
+id = 3
+addr = "10.0.0.3:11400"
+```
+
+Rules: 3 or 5 peers (1 allowed for tests); `-b` / `binlog` with `[cluster]` is an error; `-z` must match on every node (checked when joining); `--cluster-init` bootstraps membership from `[[cluster.peer]]` once and is refused if `data_dir` already holds state.
+
+## 8a. Later Phases (summary)
+
+- **P4 Performance**: reduce the per-command cross-thread hop (ops per CPU-second is about 0.4× the reference), O(1) buried-job removal, cluster batching and reply computation only on owners, profiling-driven work.
 
 ## 9. Compatibility Strategy
 
