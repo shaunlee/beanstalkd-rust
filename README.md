@@ -40,3 +40,7 @@ Benchmarks: see `docs/BENCH.md` (`scripts/build-ref.sh --optimized`, then `bench
 - `docs/PLAN.md`: development, test and acceptance plan
 - `docs/COMPAT.md`: behavior quirks of the reference we mirror, and known differences
 - `docs/BENCH.md`: performance results
+
+## License
+
+MIT, see `LICENSE`. beanstalkd itself is also MIT-licensed.
