@@ -10,6 +10,24 @@
 //! ([`owner_of`]). Nothing is acknowledged to a client before its input is
 //! committed on a majority.
 
+// Network (P3-T3).
+pub mod client;
+pub mod forward;
+pub mod listener;
+#[cfg(test)]
+mod net_tests;
+#[cfg(any(test, feature = "sim"))]
+pub mod sim;
+#[cfg(test)]
+mod sim_tests;
+#[cfg(test)]
+mod test_store;
+pub mod tls;
+pub mod wire;
+
+// Storage: log store, state machine, snapshots (P3-T2).
+pub mod storage;
+
 use std::io::Cursor;
 
 use bstk_engine::{ConnId, EngineInput, Nanos};

@@ -5,10 +5,12 @@
 //! list-tubes-watched output order and which waiting connection gets the
 //! next reserved job.
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Ms<T> {
     pub(crate) items: Vec<T>,
-    last: usize,
+    /// Round-robin cursor of `take()` (`ms->last`). Any value is valid:
+    /// `take()` reduces it modulo the length first.
+    pub(crate) last: usize,
 }
 
 impl<T: PartialEq + Clone> Ms<T> {

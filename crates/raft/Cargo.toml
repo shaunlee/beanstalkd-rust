@@ -14,9 +14,24 @@ tokio.workspace = true
 tracing.workspace = true
 bstk-proto.workspace = true
 bstk-engine.workspace = true
+# Raft storage (P3-T2).
+crc32c = "0.6.8"
+nix = { version = "0.29", features = ["fs"] }
+# Cluster transport (P3-T3): TLS with rustls' aws-lc-rs provider, as in P2.
+rustls = "0.23"
+rustls-pki-types = { version = "1", features = ["std"] }
+rustls-webpki = "0.103"
+tokio-rustls = "0.26"
 
 [dev-dependencies]
 proptest.workspace = true
+tempfile = "3.27.0"
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+
+[features]
+# The in-process simulated network and cluster harness (tests only; never
+# enabled by the server).
+sim = []
 
 [lints]
 workspace = true

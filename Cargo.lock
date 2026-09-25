@@ -207,6 +207,7 @@ dependencies = [
  "bstk-engine-oracle",
  "bstk-proto",
  "bytes",
+ "postcard",
  "proptest",
  "serde",
 ]
@@ -236,11 +237,19 @@ dependencies = [
  "bstk-engine",
  "bstk-proto",
  "bytes",
+ "crc32c",
+ "nix",
  "openraft",
  "postcard",
  "proptest",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
  "serde",
+ "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

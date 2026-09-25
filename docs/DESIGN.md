@@ -204,7 +204,14 @@ election_timeout = ["150ms", "300ms"]
 insecure_plaintext = false           # true only for tests; otherwise [cluster.tls] is required
 
 [cluster.tls]
-cert = "node1.pem"                   # certificate subject/SAN must name this node (see T3)
+# One certificate per node, used both as the listener's server certificate and
+# as the dialer's client certificate: it must chain to `ca`, carry the SAN DNS
+# name "bstk-node-<node_id>" (the CN is not consulted), and allow both server
+# and client authentication (EKU serverAuth and clientAuth). A dialer
+# verifies the listener as "bstk-node-<target id>"; a listener requires a client
+# certificate from `ca` and, after the hello, checks it is valid for
+# "bstk-node-<hello id>" and that the id is a [[cluster.peer]].
+cert = "node1.pem"                   # SAN DNS "bstk-node-1"
 key = "node1.key"
 ca = "cluster-ca.pem"                # peers must present certificates from this CA
 

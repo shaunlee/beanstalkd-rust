@@ -350,15 +350,15 @@ Only one agent at a time edits the server's wiring (T4); T1–T3 work in separat
    - A client whose node is cut off from the majority gets no replies until the node rejoins or `node_timeout` closes its connection; it never gets a reply for an uncommitted change.
    - These are recorded in COMPAT as cluster-mode differences.
 8. **Monitoring.** `/readyz` is 200 on a node that can reach a leader and has applied up to the commit index it last learned. `/metrics` and `/admin` add role, term, leader id, commit/applied indexes, per-peer replication lag, and snapshot / log sizes.
-9. **Two network implementations behind one trait.** The real TCP/TLS transport lives in the server; the in-process simulated network (per-link drop, delay, duplication, partition; seeded) lives only in test code, so no test harness code ships in the binary.
+9. **Two network implementations behind one trait.** The real TCP/TLS transport lives in `bstk-raft`; the in-process simulated network (per-link drop, delay, duplication, partition; seeded) is compiled only for tests or with the `sim` feature, which the server never enables, so no test harness code ships in the binary.
 
 ### 6.4 Tasks
 
 | ID | Task | Owner | Depends on | Wave |
 |---|---|---|---|---|
 | P3-T0 | Contracts: `EngineInput` + `Engine::apply_input`, `EngineState` (serde) + `Engine::export_state` / `Engine::import_state`, `ConnId` packing, serde for the `bstk-proto` types in inputs, `bstk-raft` crate skeleton (type config, entry and RPC types), `[cluster]` config schema | lead | — | 0 |
-| P3-T1 | Engine: state export/import, `apply_input`, duplicate-input filter, determinism tests (two engines with different hash seeds; restore mid-run and continue ≡ uninterrupted run), oracle proptest still green | subagent | T0 | 1 |
-| P3-T2 | `bstk-raft` storage: segmented log store, vote store, snapshot store, state-machine wrapper (apply → engine, reply routing by owner node); passes `openraft::testing::Suite`; crash / torn-write tests | subagent | T0 | 1 |
+| P3-T1 | Engine: state export/import with validation, determinism tests (two engines with different hash seeds; restore mid-run and continue ≡ uninterrupted run), oracle proptest still green | subagent | T0 | 1 |
+| P3-T2 | `bstk-raft` storage: segmented log store, vote store, snapshot store, state-machine wrapper (apply → engine, `(conn, seq)` duplicate filter, reply routing by owner node); passes `openraft::testing::Suite`; crash / torn-write tests | subagent | T0 | 1 |
 | P3-T3 | `bstk-raft` network: framed RPC codec, `RaftNetwork` over TCP/TLS, input forwarding with resend on leader change; simulated network and 3-node in-process cluster harness for tests | subagent | T0 | 1 |
 | P3-T4 | Server: cluster mode wiring: config, `--cluster-init`, engine handle (local actor vs cluster), owner-side reply delivery, leader tracking, `Tick` proposals, node timeout / `DropNode`, drain, `/readyz` and metrics | subagent | T1–T3 | 2 |
 | P3-T5 | Differential and clients: harness cluster mode (3 local nodes; whole corpus through the leader and through a follower), real-client smoke tests against a cluster, including a leader kill mid-run | subagent | T4 | 3 |

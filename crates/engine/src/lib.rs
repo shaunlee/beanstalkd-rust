@@ -16,6 +16,8 @@ mod ms;
 mod oracle_tests;
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod state_tests;
 
 pub use engine::Engine;
 
@@ -160,7 +162,7 @@ pub struct Recovery {
 }
 
 /// Binlog fields of `stats`, owned by the store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct BinlogStats {
     pub oldest_index: u64,
     pub current_index: u64,
@@ -226,10 +228,71 @@ impl EngineInput {
 /// only produced by `Engine::export_state` and consumed by
 /// `Engine::import_state`. Importing and continuing must be
 /// indistinguishable from never having exported.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// It mirrors `Engine` field by field. Maps are stored as vectors sorted by
+/// key, so equal states serialize to identical bytes on every node.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EngineState {
-    // Filled in by P3-T1.
-    pub(crate) _todo: (),
+    pub(crate) cfg: EngineConfig,
+    pub(crate) start: Nanos,
+    pub(crate) draining: bool,
+
+    pub(crate) next_job_id: bstk_proto::JobId,
+    /// Sorted by id (strictly ascending).
+    pub(crate) jobs: Vec<model::JobRec>,
+
+    pub(crate) tubes: Vec<Option<model::TubeState>>,
+    pub(crate) free_tube_ids: Vec<model::TubeId>,
+    /// Sorted by name (strictly ascending).
+    pub(crate) tube_ids: Vec<(bstk_proto::TubeName, model::TubeId)>,
+    pub(crate) tube_order: ms::Ms<model::TubeId>,
+
+    /// Sorted by id (strictly ascending).
+    pub(crate) conns: Vec<(ConnId, model::ConnState)>,
+
+    pub(crate) conn_ticks: std::collections::BTreeSet<(Nanos, ConnId)>,
+    pub(crate) delay_heads: std::collections::BTreeSet<(Nanos, model::TubeId)>,
+    pub(crate) pauses: std::collections::BTreeSet<(Nanos, model::TubeId)>,
+    pub(crate) dispatchable: std::collections::BTreeSet<model::TubeId>,
+
+    pub(crate) ready_ct: u64,
+    pub(crate) urgent_ct: u64,
+    pub(crate) reserved_ct: u64,
+    pub(crate) buried_ct: u64,
+    pub(crate) delayed_ct: u64,
+    pub(crate) waiting_ct: u64,
+    pub(crate) total_jobs_ct: u64,
+    pub(crate) timeout_ct: u64,
+
+    pub(crate) cur_conns: u32,
+    pub(crate) tot_conns: u32,
+    pub(crate) cur_producers: u32,
+    pub(crate) cur_workers: u32,
+
+    pub(crate) cmd_put: u64,
+    pub(crate) cmd_peek: u64,
+    pub(crate) cmd_peek_ready: u64,
+    pub(crate) cmd_peek_delayed: u64,
+    pub(crate) cmd_peek_buried: u64,
+    pub(crate) cmd_reserve: u64,
+    pub(crate) cmd_reserve_with_timeout: u64,
+    pub(crate) cmd_delete: u64,
+    pub(crate) cmd_release: u64,
+    pub(crate) cmd_use: u64,
+    pub(crate) cmd_watch: u64,
+    pub(crate) cmd_ignore: u64,
+    pub(crate) cmd_bury: u64,
+    pub(crate) cmd_kick: u64,
+    pub(crate) cmd_touch: u64,
+    pub(crate) cmd_stats: u64,
+    pub(crate) cmd_stats_job: u64,
+    pub(crate) cmd_stats_tube: u64,
+    pub(crate) cmd_list_tubes: u64,
+    pub(crate) cmd_list_tube_used: u64,
+    pub(crate) cmd_list_tubes_watched: u64,
+    pub(crate) cmd_pause_tube: u64,
+
+    pub(crate) binlog: BinlogStats,
 }
 
 /// `Engine::import_state` rejected a state that violates engine

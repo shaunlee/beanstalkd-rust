@@ -439,14 +439,271 @@ impl Engine {
         &self.cfg
     }
 
-    /// P3: full state for a snapshot. Implemented by P3-T1.
+    /// P3: full state for a snapshot (everything but `sys` and the pending
+    /// journal). No side effects. Maps are exported sorted by key, so equal
+    /// engines export equal states (and identical serialized bytes).
     pub fn export_state(&self) -> EngineState {
-        todo!("P3-T1")
+        // Exhaustive destructuring: a new `Engine` field fails to compile
+        // here until it is added to `EngineState`.
+        let Engine {
+            cfg,
+            sys: _,
+            start,
+            draining,
+            next_job_id,
+            jobs,
+            tubes,
+            free_tube_ids,
+            tube_ids,
+            tube_order,
+            conns,
+            conn_ticks,
+            delay_heads,
+            pauses,
+            dispatchable,
+            ready_ct,
+            urgent_ct,
+            reserved_ct,
+            buried_ct,
+            delayed_ct,
+            waiting_ct,
+            total_jobs_ct,
+            timeout_ct,
+            cur_conns,
+            tot_conns,
+            cur_producers,
+            cur_workers,
+            cmd_put,
+            cmd_peek,
+            cmd_peek_ready,
+            cmd_peek_delayed,
+            cmd_peek_buried,
+            cmd_reserve,
+            cmd_reserve_with_timeout,
+            cmd_delete,
+            cmd_release,
+            cmd_use,
+            cmd_watch,
+            cmd_ignore,
+            cmd_bury,
+            cmd_kick,
+            cmd_touch,
+            cmd_stats,
+            cmd_stats_job,
+            cmd_stats_tube,
+            cmd_list_tubes,
+            cmd_list_tube_used,
+            cmd_list_tubes_watched,
+            cmd_pause_tube,
+            journal: _,
+            binlog,
+        } = self;
+
+        let mut jobs: Vec<JobRec> = jobs.values().cloned().collect();
+        jobs.sort_unstable_by_key(|j| j.id);
+        let mut tube_ids: Vec<(TubeName, TubeId)> =
+            tube_ids.iter().map(|(n, &id)| (n.clone(), id)).collect();
+        tube_ids.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut conns: Vec<(ConnId, ConnState)> =
+            conns.iter().map(|(&id, c)| (id, c.clone())).collect();
+        conns.sort_unstable_by_key(|&(id, _)| id);
+
+        EngineState {
+            cfg: cfg.clone(),
+            start: *start,
+            draining: *draining,
+            next_job_id: *next_job_id,
+            jobs,
+            tubes: tubes.clone(),
+            free_tube_ids: free_tube_ids.clone(),
+            tube_ids,
+            tube_order: tube_order.clone(),
+            conns,
+            conn_ticks: conn_ticks.clone(),
+            delay_heads: delay_heads.clone(),
+            pauses: pauses.clone(),
+            dispatchable: dispatchable.clone(),
+            ready_ct: *ready_ct,
+            urgent_ct: *urgent_ct,
+            reserved_ct: *reserved_ct,
+            buried_ct: *buried_ct,
+            delayed_ct: *delayed_ct,
+            waiting_ct: *waiting_ct,
+            total_jobs_ct: *total_jobs_ct,
+            timeout_ct: *timeout_ct,
+            cur_conns: *cur_conns,
+            tot_conns: *tot_conns,
+            cur_producers: *cur_producers,
+            cur_workers: *cur_workers,
+            cmd_put: *cmd_put,
+            cmd_peek: *cmd_peek,
+            cmd_peek_ready: *cmd_peek_ready,
+            cmd_peek_delayed: *cmd_peek_delayed,
+            cmd_peek_buried: *cmd_peek_buried,
+            cmd_reserve: *cmd_reserve,
+            cmd_reserve_with_timeout: *cmd_reserve_with_timeout,
+            cmd_delete: *cmd_delete,
+            cmd_release: *cmd_release,
+            cmd_use: *cmd_use,
+            cmd_watch: *cmd_watch,
+            cmd_ignore: *cmd_ignore,
+            cmd_bury: *cmd_bury,
+            cmd_kick: *cmd_kick,
+            cmd_touch: *cmd_touch,
+            cmd_stats: *cmd_stats,
+            cmd_stats_job: *cmd_stats_job,
+            cmd_stats_tube: *cmd_stats_tube,
+            cmd_list_tubes: *cmd_list_tubes,
+            cmd_list_tube_used: *cmd_list_tube_used,
+            cmd_list_tubes_watched: *cmd_list_tubes_watched,
+            cmd_pause_tube: *cmd_pause_tube,
+            binlog: *binlog,
+        }
     }
 
-    /// P3: rebuild from a snapshot. Implemented by P3-T1.
-    pub fn import_state(_state: EngineState, _sys: Box<dyn SysInfo>) -> Result<Engine, StateError> {
-        todo!("P3-T1")
+    /// P3: rebuild from a snapshot. The state comes from disk or from a
+    /// peer, so it is untrusted: every invariant the engine relies on is
+    /// checked (see `validate`) and a violation is an error, never a panic.
+    /// The journal starts empty.
+    pub fn import_state(state: EngineState, sys: Box<dyn SysInfo>) -> Result<Engine, StateError> {
+        let EngineState {
+            cfg,
+            start,
+            draining,
+            next_job_id,
+            jobs: job_list,
+            tubes,
+            free_tube_ids,
+            tube_ids: tube_id_list,
+            tube_order,
+            conns: conn_list,
+            conn_ticks,
+            delay_heads,
+            pauses,
+            dispatchable,
+            ready_ct,
+            urgent_ct,
+            reserved_ct,
+            buried_ct,
+            delayed_ct,
+            waiting_ct,
+            total_jobs_ct,
+            timeout_ct,
+            cur_conns,
+            tot_conns,
+            cur_producers,
+            cur_workers,
+            cmd_put,
+            cmd_peek,
+            cmd_peek_ready,
+            cmd_peek_delayed,
+            cmd_peek_buried,
+            cmd_reserve,
+            cmd_reserve_with_timeout,
+            cmd_delete,
+            cmd_release,
+            cmd_use,
+            cmd_watch,
+            cmd_ignore,
+            cmd_bury,
+            cmd_kick,
+            cmd_touch,
+            cmd_stats,
+            cmd_stats_job,
+            cmd_stats_tube,
+            cmd_list_tubes,
+            cmd_list_tube_used,
+            cmd_list_tubes_watched,
+            cmd_pause_tube,
+            binlog,
+        } = state;
+
+        // The sorted-vector encodings must be strictly ascending (canonical,
+        // no duplicate keys).
+        let err = |m: String| StateError(m);
+        let mut jobs: HashMap<JobId, JobRec> = HashMap::with_capacity(job_list.len());
+        let mut prev: Option<JobId> = None;
+        for j in job_list {
+            if prev.is_some_and(|p| j.id <= p) {
+                return Err(err(format!("jobs not strictly ascending at id {}", j.id)));
+            }
+            prev = Some(j.id);
+            jobs.insert(j.id, j);
+        }
+        let mut tube_ids: HashMap<TubeName, TubeId> = HashMap::with_capacity(tube_id_list.len());
+        let mut prev: Option<TubeName> = None;
+        for (name, id) in tube_id_list {
+            if prev.as_ref().is_some_and(|p| name <= *p) {
+                return Err(err(format!("tube_ids not strictly ascending at {name}")));
+            }
+            prev = Some(name.clone());
+            tube_ids.insert(name, id);
+        }
+        let mut conns: HashMap<ConnId, ConnState> = HashMap::with_capacity(conn_list.len());
+        let mut prev: Option<ConnId> = None;
+        for (id, c) in conn_list {
+            if prev.is_some_and(|p| id <= p) {
+                return Err(err(format!("conns not strictly ascending at id {id}")));
+            }
+            prev = Some(id);
+            conns.insert(id, c);
+        }
+
+        let e = Engine {
+            cfg,
+            sys,
+            start,
+            draining,
+            next_job_id,
+            jobs,
+            tubes,
+            free_tube_ids,
+            tube_ids,
+            tube_order,
+            conns,
+            conn_ticks,
+            delay_heads,
+            pauses,
+            dispatchable,
+            ready_ct,
+            urgent_ct,
+            reserved_ct,
+            buried_ct,
+            delayed_ct,
+            waiting_ct,
+            total_jobs_ct,
+            timeout_ct,
+            cur_conns,
+            tot_conns,
+            cur_producers,
+            cur_workers,
+            cmd_put,
+            cmd_peek,
+            cmd_peek_ready,
+            cmd_peek_delayed,
+            cmd_peek_buried,
+            cmd_reserve,
+            cmd_reserve_with_timeout,
+            cmd_delete,
+            cmd_release,
+            cmd_use,
+            cmd_watch,
+            cmd_ignore,
+            cmd_bury,
+            cmd_kick,
+            cmd_touch,
+            cmd_stats,
+            cmd_stats_job,
+            cmd_stats_tube,
+            cmd_list_tubes,
+            cmd_list_tube_used,
+            cmd_list_tubes_watched,
+            cmd_pause_tube,
+            journal: Vec::new(),
+            binlog,
+        };
+        e.validate().map_err(err)?;
+        Ok(e)
     }
 
     pub fn set_draining(&mut self, on: bool) {
@@ -1166,6 +1423,448 @@ impl Engine {
             }
             None => Response::NotFound,
         }
+    }
+}
+
+// ---------------------------------------------------------------------
+// State validation (P3 snapshots)
+// ---------------------------------------------------------------------
+impl Engine {
+    /// Checks every structural invariant the engine relies on, recomputing
+    /// each index and counter from scratch and comparing it with the stored
+    /// value. Used by `import_state` on untrusted snapshots, and by the test
+    /// invariant checks. Never panics: only `get`-style lookups, and sums
+    /// are bounded by collection sizes.
+    ///
+    /// Accepted as-is (history that cannot be recomputed): `cfg`, `start`,
+    /// `draining`, `binlog`, `cmd_*`, `total_jobs_ct`, `timeout_ct`,
+    /// per-tube `total_jobs_ct` / `total_delete_ct` / `pause_ct`, the
+    /// `unpause_at` of an unpaused tube, the `deadline_at` of a ready or
+    /// buried job, `created_at`, the job counters, and every `Ms` cursor.
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        macro_rules! ensure {
+            ($cond:expr, $($arg:tt)+) => {
+                if !$cond {
+                    return Err(format!($($arg)+));
+                }
+            };
+        }
+        let n_tubes = self.tubes.len();
+
+        // --- Tube slab, names, list order, free list -------------------
+        let default = self
+            .tube(DEFAULT_TUBE)
+            .ok_or_else(|| "tube 0 (default) is missing".to_string())?;
+        ensure!(
+            default.name == TubeName::default_tube(),
+            "tube 0 is {:?}, not default",
+            default.name
+        );
+        ensure!(
+            default.pos == 0,
+            "default tube is not first in the tube list"
+        );
+        let mut live = 0usize;
+        for (tid, t) in self.tubes.iter().enumerate() {
+            let Some(t) = t else { continue };
+            live += 1;
+            ensure!(
+                self.tube_ids.get(&t.name) == Some(&tid),
+                "tube_ids does not map {:?} to tube {tid}",
+                t.name
+            );
+            ensure!(
+                self.tube_order.items.get(t.pos) == Some(&tid),
+                "tube {tid} is not at its position {} in the tube list",
+                t.pos
+            );
+        }
+        // With the per-tube checks above, equal sizes make `tube_ids` and
+        // `tube_order` exact images of the live slots.
+        ensure!(
+            self.tube_ids.len() == live,
+            "tube_ids has {} entries for {live} tubes",
+            self.tube_ids.len()
+        );
+        ensure!(
+            self.tube_order.len() == live,
+            "tube list has {} entries for {live} tubes",
+            self.tube_order.len()
+        );
+        let free_slots = n_tubes - live;
+        ensure!(
+            self.free_tube_ids.len() == free_slots,
+            "free list has {} entries for {free_slots} free slots",
+            self.free_tube_ids.len()
+        );
+        let mut seen_free: HashSet<TubeId> = HashSet::with_capacity(free_slots);
+        for &id in &self.free_tube_ids {
+            ensure!(
+                matches!(self.tubes.get(id), Some(None)),
+                "free list names tube {id}, which is not a free slot"
+            );
+            ensure!(seen_free.insert(id), "free list repeats tube {id}");
+        }
+
+        ensure!(self.next_job_id >= 1, "next job id is 0");
+
+        // --- Connections -------------------------------------------------
+        let mut using = vec![0u64; n_tubes];
+        let mut watching = vec![0u64; n_tubes];
+        let mut waiters = vec![0u64; n_tubes];
+        // (conn, tube) for every waiting connection and tube it watches.
+        let mut wait_pairs: HashSet<(ConnId, TubeId)> = HashSet::new();
+        let mut producers = 0u64;
+        let mut workers = 0u64;
+        let mut waiting = 0u64;
+        let mut reserved_entries = 0u64;
+        let mut pending_ids: HashSet<JobId> = HashSet::new();
+        let mut conn_ticks: BTreeSet<(Nanos, ConnId)> = BTreeSet::new();
+        for (&cid, c) in &self.conns {
+            ensure!(
+                self.tube(c.use_tube).is_some(),
+                "conn {cid} uses missing tube {}",
+                c.use_tube
+            );
+            if let Some(u) = using.get_mut(c.use_tube) {
+                *u += 1;
+            }
+            ensure!(!c.watch.is_empty(), "conn {cid} watches no tube");
+            let mut seen: HashSet<TubeId> = HashSet::with_capacity(c.watch.len());
+            for &t in &c.watch.items {
+                ensure!(
+                    self.tube(t).is_some(),
+                    "conn {cid} watches missing tube {t}"
+                );
+                ensure!(seen.insert(t), "conn {cid} watches tube {t} twice");
+                if let Some(w) = watching.get_mut(t) {
+                    *w += 1;
+                }
+                if c.waiting {
+                    if let Some(w) = waiters.get_mut(t) {
+                        *w += 1;
+                    }
+                    wait_pairs.insert((cid, t));
+                }
+            }
+            if c.waiting {
+                waiting += 1;
+            } else {
+                ensure!(
+                    c.wait_deadline.is_none(),
+                    "conn {cid} has a wait deadline but is not waiting"
+                );
+            }
+            producers += u64::from(c.is_producer);
+            workers += u64::from(c.is_worker);
+            if let Some(PendingPut { id: Some(id), .. }) = c.pending_put {
+                ensure!(
+                    id < self.next_job_id,
+                    "conn {cid} has pending job id {id} >= next id {}",
+                    self.next_job_id
+                );
+                ensure!(
+                    !self.jobs.contains_key(&id),
+                    "conn {cid} has pending job id {id}, which is a live job"
+                );
+                ensure!(pending_ids.insert(id), "pending job id {id} is shared");
+            }
+
+            // Reservations: `reserved_fifo` and `reserved_by_deadline` hold
+            // the same jobs, each reserved by this connection.
+            ensure!(
+                c.reserved_fifo.len() == c.reserved_by_deadline.len(),
+                "conn {cid}: reservation lists differ in length"
+            );
+            let mut seen: HashSet<JobId> = HashSet::with_capacity(c.reserved_fifo.len());
+            for &id in &c.reserved_fifo {
+                ensure!(seen.insert(id), "conn {cid} reserves job {id} twice");
+                let j = self
+                    .jobs
+                    .get(&id)
+                    .ok_or_else(|| format!("conn {cid} reserves missing job {id}"))?;
+                ensure!(
+                    j.state == JobState::Reserved && j.reserver == Some(cid),
+                    "conn {cid} lists job {id}, which it has not reserved"
+                );
+            }
+            for &(d, id) in &c.reserved_by_deadline {
+                ensure!(
+                    seen.contains(&id),
+                    "conn {cid}: job {id} is in the deadline index only"
+                );
+                ensure!(
+                    self.jobs.get(&id).is_some_and(|j| j.deadline_at == d),
+                    "conn {cid}: stale deadline for job {id}"
+                );
+            }
+            reserved_entries += c.reserved_fifo.len() as u64;
+
+            let tick = conn_tickat(c);
+            ensure!(c.tick_key == tick, "tick_key of conn {cid} is stale");
+            if let Some(t) = tick {
+                conn_ticks.insert((t, cid));
+            }
+        }
+        ensure!(self.conn_ticks == conn_ticks, "conn_ticks index is stale");
+        ensure!(
+            self.cur_conns as usize == self.conns.len(),
+            "cur_conns is {} for {} conns",
+            self.cur_conns,
+            self.conns.len()
+        );
+        ensure!(
+            self.tot_conns >= self.cur_conns,
+            "tot_conns below cur_conns"
+        );
+        ensure!(
+            u64::from(self.cur_producers) == producers,
+            "cur_producers is {}, recomputed {producers}",
+            self.cur_producers
+        );
+        ensure!(
+            u64::from(self.cur_workers) == workers,
+            "cur_workers is {}, recomputed {workers}",
+            self.cur_workers
+        );
+        ensure!(
+            self.waiting_ct == waiting,
+            "waiting_ct is {}, recomputed {waiting}",
+            self.waiting_ct
+        );
+
+        // --- Jobs --------------------------------------------------------
+        let mut job_refs = vec![0u64; n_tubes];
+        let mut reserved_in = vec![0u64; n_tubes];
+        let mut n_ready = 0u64;
+        let mut n_delayed = 0u64;
+        let mut n_buried = 0u64;
+        let mut n_reserved = 0u64;
+        for (&id, j) in &self.jobs {
+            ensure!(j.id == id, "job stored under id {id} has id {}", j.id);
+            ensure!(
+                id < self.next_job_id,
+                "job {id} is not below next id {}",
+                self.next_job_id
+            );
+            ensure!(j.ttr >= 1, "job {id} has ttr 0");
+            let t = self
+                .tube(j.tube)
+                .ok_or_else(|| format!("job {id} is in missing tube {}", j.tube))?;
+            if let Some(r) = job_refs.get_mut(j.tube) {
+                *r += 1;
+            }
+            if j.state == JobState::Reserved {
+                let cid = j
+                    .reserver
+                    .ok_or_else(|| format!("reserved job {id} has no reserver"))?;
+                ensure!(
+                    self.conns.contains_key(&cid),
+                    "job {id} is reserved by missing conn {cid}"
+                );
+            } else {
+                ensure!(j.reserver.is_none(), "unreserved job {id} has a reserver");
+            }
+            match j.state {
+                JobState::Ready => {
+                    n_ready += 1;
+                    ensure!(
+                        t.ready.contains(&(j.pri, id)),
+                        "ready job {id} is not in its tube's ready set"
+                    );
+                }
+                JobState::Delayed => {
+                    n_delayed += 1;
+                    ensure!(
+                        t.delayed.contains(&(j.deadline_at, id)),
+                        "delayed job {id} is not in its tube's delayed set"
+                    );
+                }
+                JobState::Buried => n_buried += 1,
+                JobState::Reserved => {
+                    n_reserved += 1;
+                    if let Some(r) = reserved_in.get_mut(j.tube) {
+                        *r += 1;
+                    }
+                }
+            }
+        }
+        // Each reservation entry names a distinct job reserved by that conn;
+        // equal counts make them the exact set of reserved jobs.
+        ensure!(
+            reserved_entries == n_reserved,
+            "{reserved_entries} reservation entries for {n_reserved} reserved jobs"
+        );
+        ensure!(
+            self.reserved_ct == n_reserved,
+            "reserved_ct is {}, recomputed {n_reserved}",
+            self.reserved_ct
+        );
+
+        // --- Per-tube sets, counters and indexes -------------------------
+        let mut ready_entries = 0u64;
+        let mut urgent = 0u64;
+        let mut delayed_entries = 0u64;
+        let mut buried_entries = 0u64;
+        let mut seen_buried: HashSet<JobId> = HashSet::new();
+        let mut delay_heads: BTreeSet<(Nanos, TubeId)> = BTreeSet::new();
+        let mut pauses: BTreeSet<(Nanos, TubeId)> = BTreeSet::new();
+        let mut dispatchable: BTreeSet<TubeId> = BTreeSet::new();
+        for (tid, t) in self.tubes.iter().enumerate() {
+            let Some(t) = t else { continue };
+            let mut tube_urgent = 0u64;
+            for &(pri, id) in &t.ready {
+                ensure!(
+                    self.jobs
+                        .get(&id)
+                        .is_some_and(|j| j.state == JobState::Ready
+                            && j.tube == tid
+                            && j.pri == pri),
+                    "ready set of tube {tid} holds a stale entry for job {id}"
+                );
+                if pri < URGENT_THRESHOLD {
+                    tube_urgent += 1;
+                }
+            }
+            for &(d, id) in &t.delayed {
+                ensure!(
+                    self.jobs
+                        .get(&id)
+                        .is_some_and(|j| j.state == JobState::Delayed
+                            && j.tube == tid
+                            && j.deadline_at == d),
+                    "delayed set of tube {tid} holds a stale entry for job {id}"
+                );
+            }
+            for &id in &t.buried {
+                ensure!(
+                    self.jobs
+                        .get(&id)
+                        .is_some_and(|j| j.state == JobState::Buried && j.tube == tid),
+                    "buried list of tube {tid} holds a stale entry for job {id}"
+                );
+                ensure!(seen_buried.insert(id), "job {id} is buried twice");
+            }
+            let mut seen: HashSet<ConnId> = HashSet::with_capacity(t.waiting_conns.len());
+            for &cid in &t.waiting_conns.items {
+                ensure!(
+                    wait_pairs.contains(&(cid, tid)),
+                    "tube {tid} lists conn {cid} as waiting"
+                );
+                ensure!(seen.insert(cid), "tube {tid} lists conn {cid} twice");
+            }
+            let get = |v: &[u64]| v.get(tid).copied().unwrap_or(0);
+            ensure!(
+                t.waiting_conns.len() as u64 == get(&waiters),
+                "tube {tid} misses waiting conns"
+            );
+            ensure!(
+                t.stat.urgent_ct == tube_urgent,
+                "urgent count of tube {tid} is {}, recomputed {tube_urgent}",
+                t.stat.urgent_ct
+            );
+            ensure!(
+                t.stat.buried_ct == t.buried.len() as u64,
+                "buried count of tube {tid} is stale"
+            );
+            ensure!(
+                t.stat.reserved_ct == get(&reserved_in),
+                "reserved count of tube {tid} is stale"
+            );
+            ensure!(
+                t.stat.waiting_ct == get(&waiters),
+                "waiting count of tube {tid} is stale"
+            );
+            ensure!(
+                u64::from(t.using_ct) == get(&using),
+                "using count of tube {tid} is stale"
+            );
+            ensure!(
+                u64::from(t.watching_ct) == get(&watching),
+                "watching count of tube {tid} is stale"
+            );
+            ensure!(
+                t.job_ref_ct == get(&job_refs),
+                "job count of tube {tid} is stale"
+            );
+            // Unreferenced tubes are destroyed at once (except default).
+            ensure!(
+                tid == DEFAULT_TUBE || get(&using) + get(&watching) + get(&job_refs) > 0,
+                "tube {tid} is unreferenced"
+            );
+
+            let head = t.delayed.first().map(|&(d, _)| d);
+            ensure!(t.delay_head == head, "delay_head of tube {tid} is stale");
+            if let Some(d) = head {
+                delay_heads.insert((d, tid));
+            }
+            if t.pause > 0 {
+                pauses.insert((t.unpause_at, tid));
+            }
+            let disp = !t.waiting_conns.is_empty() && !t.ready.is_empty();
+            ensure!(
+                t.dispatchable == disp,
+                "dispatchable flag of tube {tid} is stale"
+            );
+            if disp {
+                dispatchable.insert(tid);
+                // `process_queue` runs after every change that adds a
+                // ready job or a waiter, so only a pause can hold them apart.
+                ensure!(
+                    t.pause > 0,
+                    "tube {tid} has ready jobs and waiting conns but is not paused"
+                );
+            }
+
+            ready_entries += t.ready.len() as u64;
+            urgent += tube_urgent;
+            delayed_entries += t.delayed.len() as u64;
+            buried_entries += t.buried.len() as u64;
+        }
+        // Every entry names a distinct job in that state; equal counts make
+        // the sets partition the jobs.
+        ensure!(
+            ready_entries == n_ready,
+            "{ready_entries} ready entries for {n_ready} ready jobs"
+        );
+        ensure!(
+            delayed_entries == n_delayed,
+            "{delayed_entries} delayed entries for {n_delayed} delayed jobs"
+        );
+        ensure!(
+            buried_entries == n_buried,
+            "{buried_entries} buried entries for {n_buried} buried jobs"
+        );
+        ensure!(
+            self.ready_ct == n_ready,
+            "ready_ct is {}, recomputed {n_ready}",
+            self.ready_ct
+        );
+        ensure!(
+            self.urgent_ct == urgent,
+            "urgent_ct is {}, recomputed {urgent}",
+            self.urgent_ct
+        );
+        ensure!(
+            self.delayed_ct == n_delayed,
+            "delayed_ct is {}, recomputed {n_delayed}",
+            self.delayed_ct
+        );
+        ensure!(
+            self.buried_ct == n_buried,
+            "buried_ct is {}, recomputed {n_buried}",
+            self.buried_ct
+        );
+        ensure!(
+            self.delay_heads == delay_heads,
+            "delay_heads index is stale"
+        );
+        ensure!(self.pauses == pauses, "pauses index is stale");
+        ensure!(
+            self.dispatchable == dispatchable,
+            "dispatchable set is stale"
+        );
+        Ok(())
     }
 }
 
@@ -1946,6 +2645,14 @@ impl Engine {
         self.conns.keys().copied().collect()
     }
 
+    /// `Some(too_big)` while `cid` has a put in flight.
+    pub(crate) fn t_conn_pending_put(&self, cid: ConnId) -> Option<bool> {
+        self.conns
+            .get(&cid)
+            .and_then(|c| c.pending_put)
+            .map(|p| p.id.is_none())
+    }
+
     pub(crate) fn t_cur_conns(&self) -> u32 {
         self.cur_conns
     }
@@ -1990,6 +2697,9 @@ impl Engine {
     /// Asserts that every index equals what a from-scratch recomputation
     /// gives, and that `next_deadline()` equals the scan.
     pub(crate) fn t_check_indexes(&self) {
+        if let Err(e) = self.validate() {
+            panic!("engine state is invalid: {e}");
+        }
         let conn_ticks: BTreeSet<(Nanos, ConnId)> = self
             .conns
             .iter()

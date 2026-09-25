@@ -17,7 +17,7 @@ use crate::{ConnId, Nanos};
 /// removed when it is destroyed.
 pub(crate) type TubeId = usize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum JobState {
     Ready,
     Reserved,
@@ -25,7 +25,7 @@ pub(crate) enum JobState {
     Buried,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct JobRec {
     pub(crate) id: JobId,
     pub(crate) tube: TubeId,
@@ -63,7 +63,7 @@ impl JobRec {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TubeStat {
     /// Ready jobs with pri < URGENT_THRESHOLD (ready-only, per prot.c).
     pub(crate) urgent_ct: u64,
@@ -75,7 +75,7 @@ pub(crate) struct TubeStat {
     pub(crate) total_jobs_ct: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TubeState {
     pub(crate) name: TubeName,
     pub(crate) ready: BTreeSet<(u32, JobId)>,
@@ -131,7 +131,7 @@ impl TubeState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ConnState {
     pub(crate) use_tube: TubeId,
     pub(crate) watch: Ms<TubeId>,
@@ -156,7 +156,7 @@ pub(crate) struct ConnState {
 }
 
 /// Header-time state of an in-flight put (see `ConnState::pending_put`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PendingPut {
     /// The job id `make_job` already allocated; `None` for an oversized
     /// put, which the reference only counts before discarding its body.
