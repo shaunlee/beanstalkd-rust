@@ -21,8 +21,13 @@
 //! (`engine_actor::EXIT_WAL_FAILURE`); clap's usage errors exit with 2.
 
 mod cli;
+// Standalone until P2-T4 wires it into startup.
+#[allow(dead_code)]
+mod config;
 mod conn;
 mod engine_actor;
+#[allow(dead_code)] // Wired into the HTTP listener by P2-T4.
+mod metrics;
 mod sysinfo;
 
 use std::io;

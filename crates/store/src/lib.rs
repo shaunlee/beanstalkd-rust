@@ -34,6 +34,12 @@ use std::time::Duration;
 
 pub use bstk_engine::{BinlogStats, JournalEntry, Recovery};
 
+/// Largest accepted `WalOptions::file_size` (4 GiB): room for the largest
+/// allowed job (1 GiB) with margin. Segments are preallocated in full, so an
+/// absurd `-s` (e.g. a wrapped `-1`) is rejected by `Wal::open` rather than
+/// overflowing or filling the disk.
+pub const MAX_FILE_SIZE: u64 = 1 << 32;
+
 /// When to fsync, mirroring `-f MS` / `-f0` / `-F`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPolicy {

@@ -9,7 +9,8 @@
 //! @c1 recv                        # read one complete response (line [+ body])
 //! @c1 recv_none 200ms             # assert (record) that nothing arrives for 200ms
 //! @c1 recv_closed 200ms           # record whether the peer closed the connection
-//! @c1 shutdown_write              # half-close (TCP FIN on the write side)
+//! @c1 shutdown_write              # half-close (TCP FIN on the write side;
+//!                                 # over TLS: close_notify, then the FIN)
 //! @c1 close                       # close and forget the connection
 //! sleep 1100ms                    # sleep the whole harness for a duration
 //! signal USR1                     # send SIGUSR1 to the server process under test
@@ -19,7 +20,9 @@
 //! ```
 //!
 //! Connections are named `@c1`, `@c2`, ... and are opened lazily the first
-//! time they are referenced.
+//! time they are referenced. Over TLS (see [`crate::conn`] for the exact
+//! mapping of every action), a connection completes its handshake when it
+//! is opened.
 //!
 //! `!binlog` (a header, like `!args`, allowed anywhere in the file) makes the
 //! harness create a fresh temporary directory per server process and pass

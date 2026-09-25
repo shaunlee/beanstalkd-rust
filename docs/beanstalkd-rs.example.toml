@@ -1,0 +1,106 @@
+# Example configuration file for beanstalkd-rs.
+#
+# Use it with:   beanstalkd-rs --config /path/to/beanstalkd-rs.toml
+# Validate with: beanstalkd-rs --config /path/to/beanstalkd-rs.toml --check-config
+#                (prints a short summary and exits 0, or prints the error and
+#                exits non-zero)
+#
+# Every key is optional; unknown keys (at any level) are errors. Without a
+# configuration file, beanstalkd-rs behaves exactly as with its command-line
+# flags alone.
+#
+# Precedence: command-line flags override this file for -z, -b, -f / -F, -s
+# and -V (-V can only make logging more verbose). -l / -p may only be used
+# when this file defines no [[listener]]; combining them is an error.
+#
+# Relative paths below are relative to the directory of this file.
+
+[server]
+# Maximum job body size in bytes (like -z). Must be between 0 and
+# 1073741824 (unlike -z, which clamps larger values, this is an error).
+# Default: 65535.
+max_job_size = 65535
+
+# Listening sockets. Zero or more [[listener]] entries; with none, a single
+# plaintext listener on -l / -p (default 0.0.0.0:11300) is used.
+#
+#   addr  IP:port, with an IP literal (no host names), e.g. "0.0.0.0:11300"
+#         or "[::1]:11300". Two listeners may not use the same port on the
+#         same address or when either is a wildcard (0.0.0.0 / [::]); port 0
+#         (an ephemeral port) never conflicts.
+#   tls   true to serve TLS with the certificate in [tls]. Default: false.
+#   auth  "none" (default): the protocol is unchanged.
+#         "token": clients must send `auth <token>` first; requires tls = true
+#                  (a token must never travel in clear text) and at least one
+#                  token in [auth].
+#         "mtls":  clients must present a certificate signed by
+#                  [tls] client_ca; requires tls = true.
+
+[[listener]]
+# Plaintext, unauthenticated: compatible with every beanstalkd client.
+addr = "127.0.0.1:11300"
+tls = false
+auth = "none"
+
+[[listener]]
+# TLS with token authentication.
+addr = "0.0.0.0:11301"
+tls = true
+auth = "token"
+
+[[listener]]
+# TLS with client certificates (mutual TLS).
+addr = "0.0.0.0:11302"
+tls = true
+auth = "mtls"
+
+[tls]
+# PEM certificate chain and private key; both required when any listener has
+# tls = true (and each requires the other).
+cert = "server.pem"
+key = "server.key"
+# PEM CA bundle used to verify client certificates; required when any
+# listener uses auth = "mtls".
+client_ca = "ca.pem"
+
+[auth]
+# Accepted tokens for auth = "token" listeners. A token is 1 to 217 bytes
+# (so that `auth <token>\r\n` fits in a 224-byte protocol line) and contains
+# no whitespace or control characters. Tokens are never logged or printed.
+#
+# Inline tokens (keep this file private if you use them):
+# tokens = ["replace-with-a-long-random-token"]
+#
+# And/or a file with one token per line; blank lines and lines starting with
+# '#' are ignored, and surrounding whitespace is trimmed.
+tokens_file = "tokens.txt"
+
+[binlog]
+# Write-ahead log directory (like -b). Without it, jobs are kept in memory
+# only.
+dir = "/var/lib/beanstalkd"
+# When to fsync the write-ahead log:
+#   "always"            fsync on every write (like -f0)
+#   "never"             never fsync (like -F)
+#   "<N>ms" or "<N>s"   at most once per interval (like -f MS); "0ms" means
+#                       "always"
+# Default: "50ms".
+fsync = "50ms"
+# Size of each write-ahead log file in bytes (like -s), rounded up to a
+# multiple of 4096. At most 4294967296. Default: 10485760.
+file_size = 10485760
+
+[http]
+# HTTP listener for /metrics, /healthz, /readyz and /admin (read-only).
+# Without an [http] table there is no HTTP listener; with one, addr is
+# required as a full IP:port and must not conflict with any listener.
+addr = "127.0.0.1:9180"
+# Maximum number of tubes exported as per-tube metric series. Default: 1000.
+max_tube_series = 1000
+
+[log]
+# "error", "warn", "info", "debug" or "trace". Default: "warn" (each -V on
+# the command line raises it: info, debug, trace).
+level = "info"
+# "text" (default) or "json".
+format = "text"

@@ -6,6 +6,10 @@
 //! `-f` / `-F` interact in argument order: `-f MS` sets the fsync rate and
 //! turns fsync on, `-F` turns it off (keeping the rate), so the last of the
 //! two wins (`-f 10 -F` never fsyncs, `-F -f 10` fsyncs every 10 ms).
+//!
+//! Options that the reference does not have are long-only (`--config`,
+//! `--check-config`) so they never shadow a reference short flag
+//! (including the removed `-c` and `-n`).
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -89,10 +93,47 @@ pub struct Cli {
     #[arg(short = 'v', action = ArgAction::SetTrue)]
     pub version: bool,
 
+    /// Read settings from a TOML configuration file (command-line flags
+    /// override its values)
+    // Read by `config.rs`; wired into startup in P2-T4.
+    #[allow(dead_code)]
+    #[arg(long = "config", value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Validate the configuration, print a summary and exit
+    // Read by `config.rs`; wired into startup in P2-T4.
+    #[allow(dead_code)]
+    #[arg(long = "check-config", action = ArgAction::SetTrue)]
+    pub check_config: bool,
+
     /// Resolved fsync policy (from `-f` / `-F` in argument order); only
     /// meaningful with `-b`.
     #[arg(skip = SyncPolicy::Interval(Duration::from_millis(DEFAULT_FSYNC_MS)))]
     pub sync: SyncPolicy,
+
+    /// Which defaulted options were given on the command line (so that a
+    /// configuration file value applies only when they were not).
+    #[arg(skip)]
+    pub given: Given,
+}
+
+/// Whether an option with a default value (or a derived value, like
+/// `sync`) was given on the command line. Filled in by `from_matches`;
+/// all `false` for a `Cli` built any other way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+// Read by `config.rs`; wired into startup in P2-T4.
+#[allow(dead_code)]
+pub struct Given {
+    /// `-l`
+    pub listen_addr: bool,
+    /// `-p`
+    pub port: bool,
+    /// `-z`
+    pub max_job_size: bool,
+    /// `-s`
+    pub binlog_file_size: bool,
+    /// `-f` or `-F`
+    pub sync: bool,
 }
 
 impl Cli {
@@ -103,7 +144,7 @@ impl Cli {
         Cli::from_matches(&matches).unwrap_or_else(|e| e.exit())
     }
 
-    fn from_matches(matches: &ArgMatches) -> Result<Cli, clap::Error> {
+    pub(crate) fn from_matches(matches: &ArgMatches) -> Result<Cli, clap::Error> {
         let mut cli = Cli::from_arg_matches(matches)?;
         // Defaults (e.g. `-F`'s implicit `false`) have indices too; only
         // occurrences on the command line count.
@@ -118,7 +159,23 @@ impl Cli {
             (None, _) => false,
         };
         cli.sync = sync_policy(cli.fsync_ms.unwrap_or(DEFAULT_FSYNC_MS), never);
+        let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+        cli.given = Given {
+            listen_addr: given("listen_addr"),
+            port: given("port"),
+            max_job_size: given("max_job_size"),
+            binlog_file_size: given("binlog_file_size"),
+            sync: given("never_fsync") || given("fsync_ms"),
+        };
         Ok(cli)
+    }
+
+    /// Parses `args` (including the program name) like `from_env`, but
+    /// returns the error instead of exiting.
+    #[cfg(test)]
+    pub(crate) fn try_parse_args(args: &[&str]) -> Result<Cli, clap::Error> {
+        let matches = Cli::command().try_get_matches_from(args)?;
+        Cli::from_matches(&matches)
     }
 }
 
@@ -261,8 +318,48 @@ mod tests {
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         let mut argv = vec!["beanstalkd-rs"];
         argv.extend_from_slice(args);
-        let matches = Cli::command().try_get_matches_from(argv)?;
-        Cli::from_matches(&matches)
+        Cli::try_parse_args(&argv)
+    }
+
+    #[test]
+    fn given_tracks_command_line_occurrences() {
+        let cli = parse(&[]).expect("no args");
+        assert_eq!(cli.given, Given::default());
+        assert_eq!(cli.config, None);
+        assert!(!cli.check_config);
+        let cli = parse(&["-l", "127.0.0.1", "-p", "1", "-z", "9", "-s", "5", "-F"]).expect("all");
+        assert_eq!(
+            cli.given,
+            Given {
+                listen_addr: true,
+                port: true,
+                max_job_size: true,
+                binlog_file_size: true,
+                sync: true,
+            }
+        );
+        assert!(parse(&["-f", "3"]).expect("-f").given.sync);
+        // Giving the default value explicitly still counts as given.
+        assert!(parse(&["-p", "11300"]).expect("-p").given.port);
+    }
+
+    #[test]
+    fn new_options_are_long_only() {
+        let cli = parse(&["--config", "/etc/b.toml", "--check-config"]).expect("long flags");
+        assert_eq!(cli.config, Some(PathBuf::from("/etc/b.toml")));
+        assert!(cli.check_config);
+        let cmd = Cli::command();
+        for id in ["config", "check_config"] {
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .expect("argument exists");
+            assert_eq!(arg.get_short(), None, "{id} must have no short flag");
+        }
+        // No new short flag at all: exactly the reference's set (plus -h).
+        let mut shorts: Vec<char> = cmd.get_arguments().filter_map(|a| a.get_short()).collect();
+        shorts.sort_unstable();
+        assert_eq!(shorts, ['F', 'V', 'b', 'f', 'l', 'p', 's', 'u', 'v', 'z']);
     }
 
     #[test]

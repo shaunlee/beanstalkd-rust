@@ -99,11 +99,7 @@ use crate::{SyncPolicy, WalError, WalOptions};
 
 const BLOCK: u64 = 4096;
 
-/// Largest accepted segment size (4 GiB): room for the largest allowed job
-/// (1 GiB) with margin. Segments are preallocated in full, so an absurd
-/// `-s` (e.g. a wrapped `-1`) must be rejected up front rather than
-/// overflow or start filling the disk.
-const MAX_SEGMENT_SIZE: u64 = 1 << 32;
+use crate::MAX_FILE_SIZE as MAX_SEGMENT_SIZE;
 
 #[derive(Debug)]
 struct Seg {

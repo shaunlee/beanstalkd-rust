@@ -1,13 +1,22 @@
 //! CLI for manually running the differential compatibility test harness.
 //!
 //! ```text
-//! compat [--a BIN] [--b BIN] [--binlog] [--show] [--filter substr] [cases...]
+//! compat [--a BIN] [--b BIN] [--binlog] [--tls-b] [--stunnel-b] [--show]
+//!        [--filter substr] [cases...]
 //! ```
 //!
 //! - `--a BIN` / `--b BIN` override the two server binaries (default:
 //!   `BSTK_REF_BIN`/reference build vs `BSTK_RS_BIN`/`beanstalkd-rs` build).
 //! - `--binlog` runs every case with a fresh per-server `-b <dir>` (global
 //!   binlog mode; also enabled by `BSTK_COMPAT_BINLOG=1`).
+//! - `--tls-b` connects to server B over TLS: B is started with a generated
+//!   `--config` file declaring one TLS listener (throwaway CA and server
+//!   certificate); server A stays plaintext (also enabled by
+//!   `BSTK_COMPAT_TLS=1`). Needs a server B with TLS listeners.
+//! - `--stunnel-b` runs server B plaintext behind `stunnel`, which
+//!   terminates TLS on B's port (validates the TLS path with the reference
+//!   as B; `stunnel` from `BSTK_STUNNEL_BIN`, the usual install locations,
+//!   or `PATH`).
 //! - `--show` prints server A's masked transcript for every case (useful to
 //!   see what the reference actually replied when writing a case).
 //! - `--filter substr` only runs cases whose file name contains `substr`.
@@ -55,10 +64,13 @@ fn main() -> ExitCode {
                 filter = Some(args.next().expect("--filter requires a value"));
             }
             "--binlog" => opts.force_binlog = true,
+            "--tls-b" => opts.tls_b = true,
+            "--stunnel-b" => opts.stunnel_b = true,
             "--show" => opts.keep_transcript = true,
             "-h" | "--help" => {
                 println!(
-                    "compat [--a BIN] [--b BIN] [--binlog] [--show] [--filter substr] [cases...]"
+                    "compat [--a BIN] [--b BIN] [--binlog] [--tls-b] [--stunnel-b] [--show] \
+                     [--filter substr] [cases...]"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -81,15 +93,24 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let mut modes = Vec::new();
+    if opts.force_binlog {
+        modes.push("binlog mode");
+    }
+    if opts.stunnel_b {
+        modes.push("B over TLS via stunnel");
+    } else if opts.tls_b {
+        modes.push("B over TLS");
+    }
     println!(
         "running {} case(s): A={} B={}{}",
         cases.len(),
         bin_a.display(),
         bin_b.display(),
-        if opts.force_binlog {
-            " (binlog mode)"
+        if modes.is_empty() {
+            String::new()
         } else {
-            ""
+            format!(" ({})", modes.join(", "))
         }
     );
 

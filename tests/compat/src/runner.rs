@@ -9,11 +9,20 @@ use crate::compare::{Mismatch, compare_with, format_outcome};
 use crate::conn::execute;
 use crate::dsl::{CaseFile, parse_case_file};
 use crate::mask::MaskMode;
-use crate::server::{ServerConfig, spawn};
+use crate::server::{ServerConfig, ServerTransport, spawn};
+use crate::tls::TlsMaterial;
 
 /// Environment variable enabling the global binlog mode in the `compat`
 /// CLI (any value other than empty or `0`).
 pub const BINLOG_ENV: &str = "BSTK_COMPAT_BINLOG";
+
+/// Environment variable enabling TLS mode for server B in the `compat` CLI
+/// (any value other than empty or `0`); see [`RunOptions::tls_b`].
+pub const TLS_ENV: &str = "BSTK_COMPAT_TLS";
+
+/// Environment variable overriding the path of the `stunnel` binary used by
+/// [`RunOptions::stunnel_b`].
+pub const STUNNEL_BIN_ENV: &str = "BSTK_STUNNEL_BIN";
 
 /// Options that apply to every case of a run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -23,18 +32,96 @@ pub struct RunOptions {
     pub force_binlog: bool,
     /// Keep server A's (masked) transcript in [`CaseResult::transcript`].
     pub keep_transcript: bool,
+    /// TLS mode: server B is started with a generated `--config` file
+    /// declaring one TLS listener (throwaway certificate, generated once
+    /// per run) and every connection to it is a TLS client connection.
+    /// Server A stays plaintext. Requires server B to support TLS
+    /// listeners (`beanstalkd-rs`, from task P2-T4).
+    pub tls_b: bool,
+    /// Stunnel mode: server B runs plaintext behind `stunnel`, which
+    /// terminates TLS on B's public port; every connection to B is a TLS
+    /// client connection. Meant for validating the harness's TLS path with
+    /// the reference as server B. Takes precedence over `tls_b`. No extra
+    /// masks apply: stunnel opens exactly one backend connection per client
+    /// connection (and none for the readiness check), so even the
+    /// connection counts in `stats` match.
+    pub stunnel_b: bool,
 }
 
 impl RunOptions {
-    /// Default options, with `force_binlog` taken from [`BINLOG_ENV`].
+    /// Default options, with `force_binlog` taken from [`BINLOG_ENV`] and
+    /// `tls_b` from [`TLS_ENV`].
     pub fn from_env() -> Self {
-        let force_binlog = std::env::var(BINLOG_ENV)
-            .map(|v| !v.is_empty() && v != "0")
-            .unwrap_or(false);
         RunOptions {
-            force_binlog,
+            force_binlog: env_flag(BINLOG_ENV),
+            tls_b: env_flag(TLS_ENV),
             ..RunOptions::default()
         }
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// Locate a `stunnel` binary: [`STUNNEL_BIN_ENV`] if set, else the usual
+/// install locations, else the first `stunnel` on `PATH`.
+pub fn find_stunnel() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(STUNNEL_BIN_ENV) {
+        return Some(PathBuf::from(p));
+    }
+    let known = [
+        "/opt/homebrew/bin/stunnel",
+        "/usr/local/bin/stunnel",
+        "/usr/bin/stunnel",
+        "/usr/sbin/stunnel",
+    ];
+    let on_path = std::env::var_os("PATH")
+        .map(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("stunnel"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    known
+        .iter()
+        .map(PathBuf::from)
+        .chain(on_path)
+        .find(|p| p.is_file())
+}
+
+/// Per-run shared state derived from [`RunOptions`]: the transport of
+/// server B (with its TLS material, generated once per run), or the error
+/// that prevented setting it up.
+struct RunContext {
+    opts: RunOptions,
+    transport_b: Result<ServerTransport, String>,
+}
+
+impl RunContext {
+    fn new(opts: RunOptions) -> Self {
+        let transport_b = if opts.stunnel_b {
+            match find_stunnel() {
+                Some(stunnel) if !stunnel.is_file() => {
+                    Err(format!("stunnel binary not found: {}", stunnel.display()))
+                }
+                Some(stunnel) => TlsMaterial::generate().map(|m| ServerTransport::Stunnel {
+                    stunnel,
+                    material: Arc::new(m),
+                }),
+                None => Err(format!(
+                    "stunnel mode requested but no stunnel binary was found \
+                     (set {STUNNEL_BIN_ENV} or install stunnel)"
+                )),
+            }
+        } else if opts.tls_b {
+            TlsMaterial::generate().map(|m| ServerTransport::Tls(Arc::new(m)))
+        } else {
+            Ok(ServerTransport::Plain)
+        };
+        RunContext { opts, transport_b }
     }
 }
 
@@ -137,6 +224,15 @@ pub fn run_case_pair_with(
     bin_b: &Path,
     opts: RunOptions,
 ) -> CaseResult {
+    run_case_pair_ctx(case_path, bin_a, bin_b, &RunContext::new(opts))
+}
+
+fn run_case_pair_ctx(case_path: &Path, bin_a: &Path, bin_b: &Path, ctx: &RunContext) -> CaseResult {
+    let opts = ctx.opts;
+    let transport_b = match &ctx.transport_b {
+        Ok(t) => t.clone(),
+        Err(e) => return error_result(case_path, format!("TLS setup for server B failed: {e}")),
+    };
     let case: CaseFile = match parse_case_file(case_path) {
         Ok(c) => c,
         Err(e) => return error_result(case_path, format!("parse error: {e}")),
@@ -156,17 +252,20 @@ pub fn run_case_pair_with(
     }
 
     let binlog = case.binlog || opts.force_binlog;
+    // No transport-specific masks: TLS (and stunnel) must be invisible in
+    // every response, including the connection counts in `stats`.
     let mode = MaskMode { binlog };
-    let cfg = |bin| ServerConfig {
+    let cfg = |bin, transport| ServerConfig {
         bin,
         extra_args: &case.extra_args,
         binlog,
+        transport,
     };
-    let mut server_a = match spawn(&cfg(bin_a)) {
+    let mut server_a = match spawn(&cfg(bin_a, ServerTransport::Plain)) {
         Ok(s) => s,
         Err(e) => return error_result(case_path, format!("failed to start server A: {e}")),
     };
-    let mut server_b = match spawn(&cfg(bin_b)) {
+    let mut server_b = match spawn(&cfg(bin_b, transport_b)) {
         Ok(s) => s,
         Err(e) => return error_result(case_path, format!("failed to start server B: {e}")),
     };
@@ -233,6 +332,8 @@ pub fn run_all_with(
     opts: RunOptions,
 ) -> Vec<CaseResult> {
     let max_parallel = max_parallel.max(1);
+    let ctx = RunContext::new(opts);
+    let ctx = &ctx;
     let queue: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(case_paths.to_vec()));
     let results: Arc<Mutex<Vec<CaseResult>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -244,7 +345,7 @@ pub fn run_all_with(
                 loop {
                     let next = { queue.lock().expect("case queue lock poisoned").pop() };
                     let Some(path) = next else { break };
-                    let result = run_case_pair_with(&path, bin_a, bin_b, opts);
+                    let result = run_case_pair_ctx(&path, bin_a, bin_b, ctx);
                     results.lock().expect("results lock poisoned").push(result);
                 }
             });

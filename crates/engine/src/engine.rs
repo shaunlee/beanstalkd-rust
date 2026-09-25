@@ -520,9 +520,22 @@ impl Engine {
         self.binlog = stats;
     }
 
+    /// Monitoring view (docs/PLAN.md §5.3 decision 4): `server` is exactly
+    /// what `stats` would report at `now` (before that command's own
+    /// `cmd-stats` increment) and `tubes` is what `stats-tube` would report
+    /// for every tube, in `list-tubes` order. Read-only: no counter moves
+    /// and no journal entry is produced.
     pub fn snapshot(&self, now: Nanos) -> crate::Snapshot {
-        let _ = now;
-        todo!("P2-T2")
+        crate::Snapshot {
+            server: self.build_stats_server(now),
+            tubes: self
+                .tube_order
+                .items
+                .iter()
+                .filter_map(|&tid| self.tube(tid))
+                .map(|t| Self::stats_tube_of(t, now))
+                .collect(),
+        }
     }
 }
 
@@ -1676,12 +1689,18 @@ impl Engine {
 
     pub(crate) fn build_stats_tube(&self, name: &TubeName, now: Nanos) -> Option<StatsTube> {
         let t = self.tube(*self.tube_ids.get(name)?)?;
+        Some(Self::stats_tube_of(t, now))
+    }
+
+    /// `stats-tube` data for one live tube (shared by `stats-tube` and
+    /// `snapshot`).
+    fn stats_tube_of(t: &TubeState, now: Nanos) -> StatsTube {
         let pause_time_left = if t.pause > 0 {
             t.unpause_at.saturating_sub(now) / NANOS_PER_SEC
         } else {
             0
         };
-        Some(StatsTube {
+        StatsTube {
             name: t.name.clone(),
             current_jobs_urgent: t.stat.urgent_ct,
             current_jobs_ready: t.ready.len() as u64,
@@ -1696,7 +1715,7 @@ impl Engine {
             cmd_pause_tube: t.stat.pause_ct,
             pause: t.pause / NANOS_PER_SEC,
             pause_time_left,
-        })
+        }
     }
 
     pub(crate) fn build_stats_server(&self, now: Nanos) -> StatsServer {
@@ -3490,6 +3509,253 @@ mod tests {
 }
 
 // -----------------------------------------------------------------------
+// `Engine::snapshot` (P2-T2): equals what `stats` / `stats-tube` /
+// `list-tubes` report at the same `now`, and never changes state.
+// -----------------------------------------------------------------------
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod snapshot_tests {
+    use bytes::Bytes;
+
+    use bstk_proto::{Command, Response, StatsServer, TubeName};
+
+    use crate::{ConnId, EngineConfig, Nanos, Outbox, StaticSysInfo, SysSnapshot};
+
+    use super::Engine;
+
+    const SEC: Nanos = crate::NANOS_PER_SEC;
+    /// Connection used only to issue the introspection commands.
+    const OBSERVER: ConnId = 99;
+
+    fn tube(name: &str) -> TubeName {
+        TubeName::new(name).unwrap()
+    }
+
+    fn engine(journal: bool) -> Engine {
+        let sys = SysSnapshot {
+            pid: 4242,
+            version: "1.13-test".into(),
+            rusage_utime: (3, 250_000),
+            rusage_stime: (1, 7),
+            id: "abcdef0123456789".into(),
+            hostname: "host".into(),
+            os: "os".into(),
+            platform: "plat".into(),
+        };
+        let mut e = Engine::new(
+            0,
+            EngineConfig {
+                journal,
+                ..EngineConfig::default()
+            },
+            Box::new(StaticSysInfo(sys)),
+        );
+        e.connect(0, OBSERVER);
+        e
+    }
+
+    fn run(e: &mut Engine, now: Nanos, cid: ConnId, cmd: Command) -> Outbox {
+        let mut out = Outbox::new();
+        e.handle(now, cid, cmd, &mut out);
+        out
+    }
+
+    fn put(e: &mut Engine, now: Nanos, cid: ConnId, pri: u32, delay: u32, ttr: u32) -> u64 {
+        let out = run(
+            e,
+            now,
+            cid,
+            Command::Put {
+                pri,
+                delay,
+                ttr,
+                body: Bytes::from_static(b"body"),
+            },
+        );
+        match out.as_slice() {
+            [(c, Response::Inserted(id))] if *c == cid => *id,
+            other => panic!("expected Inserted, got {other:?}"),
+        }
+    }
+
+    fn only_reply(out: &Outbox) -> Response {
+        match out.as_slice() {
+            [(c, r)] if *c == OBSERVER => r.clone(),
+            other => panic!("expected one reply to the observer, got {other:?}"),
+        }
+    }
+
+    /// Takes a snapshot at `now` and checks it against the wire commands:
+    /// the snapshot itself must leave `stats` untouched, `stats` must
+    /// report the snapshot plus its own `cmd-stats` increment, and
+    /// `list-tubes` / `stats-tube` must match `tubes`.
+    fn check_snapshot(e: &mut Engine, now: Nanos) {
+        let mut journal = Vec::new();
+        e.take_journal(&mut journal);
+        journal.clear();
+        let before = e.build_stats_server(now);
+
+        let snap = e.snapshot(now);
+        assert_eq!(snap.server, before, "snapshot.server != stats at now");
+        assert_eq!(e.build_stats_server(now), before, "snapshot changed stats");
+        e.take_journal(&mut journal);
+        assert!(journal.is_empty(), "snapshot journaled {journal:?}");
+        // Deterministic: a second snapshot is identical.
+        assert_eq!(e.snapshot(now), snap);
+
+        // `stats` = snapshot + exactly its own cmd-stats increment.
+        let reply = only_reply(&run(e, now, OBSERVER, Command::Stats));
+        let mut expected = snap.server.clone();
+        expected.cmd_stats += 1;
+        assert_eq!(reply, Response::Ok(expected.to_yaml()));
+        assert_eq!(
+            StatsServer {
+                cmd_stats: before.cmd_stats,
+                ..e.build_stats_server(now)
+            },
+            before,
+            "stats changed something besides cmd-stats"
+        );
+
+        // Tube order and content.
+        let reply = only_reply(&run(e, now, OBSERVER, Command::ListTubes));
+        let names: Vec<TubeName> = snap.tubes.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(reply, Response::Ok(bstk_proto::yaml_list(names.iter())));
+        assert_eq!(names, e.tube_names());
+        assert_eq!(snap.server.current_tubes, snap.tubes.len() as u64);
+        for t in &snap.tubes {
+            let reply = only_reply(&run(e, now, OBSERVER, Command::StatsTube(t.name.clone())));
+            assert_eq!(reply, Response::Ok(t.to_yaml()));
+        }
+    }
+
+    /// A state with jobs in every state, a paused tube, a waiting
+    /// reserver and a tube order that is not creation order (a destroyed
+    /// tube was swap-removed).
+    fn busy_state(journal: bool) -> Engine {
+        let mut e = engine(journal);
+        for c in 1..=3 {
+            e.connect(0, c);
+        }
+        // Creates tubes a, b, c (watched by conn 2), then drops `a` so `c`
+        // moves into its slot: list order becomes default, c, b.
+        for name in ["a", "b", "c"] {
+            run(&mut e, 0, 2, Command::Watch(tube(name)));
+        }
+        run(&mut e, 0, 2, Command::Ignore(tube("a")));
+        run(&mut e, 0, 1, Command::Use(tube("b")));
+        let urgent = put(&mut e, 0, 1, 5, 0, 10);
+        let _ready = put(&mut e, 0, 1, 2000, 0, 10);
+        let _delayed = put(&mut e, 0, 1, 100, 30, 10);
+        let to_bury = put(&mut e, 0, 1, 100, 0, 10);
+        run(&mut e, 0, 1, Command::ReserveJob(to_bury));
+        run(
+            &mut e,
+            0,
+            1,
+            Command::Bury {
+                id: to_bury,
+                pri: 1,
+            },
+        );
+        run(&mut e, 0, 1, Command::ReserveJob(urgent));
+        run(&mut e, 0, 1, Command::Use(tube("c")));
+        let doomed = put(&mut e, 0, 1, 0, 0, 10);
+        run(&mut e, 0, 1, Command::Delete(doomed));
+        run(
+            &mut e,
+            0,
+            OBSERVER,
+            Command::PauseTube {
+                tube: tube("c"),
+                delay: 20,
+            },
+        );
+        // conn 3 waits on `default`, which is empty.
+        let out = run(&mut e, 0, 3, Command::ReserveWithTimeout(100));
+        assert!(out.is_empty());
+        e
+    }
+
+    #[test]
+    fn snapshot_of_fresh_engine() {
+        for journal in [false, true] {
+            let mut e = engine(journal);
+            let snap = e.snapshot(0);
+            assert_eq!(snap.tubes.len(), 1);
+            assert_eq!(snap.tubes[0].name, tube("default"));
+            assert_eq!(snap.server.cmd_stats, 0);
+            assert_eq!(snap.server.pid, 4242);
+            assert_eq!(snap.server.rusage_utime, (3, 250_000));
+            check_snapshot(&mut e, 0);
+        }
+    }
+
+    #[test]
+    fn snapshot_matches_stats_across_states_and_times() {
+        for journal in [false, true] {
+            let mut e = busy_state(journal);
+            let snap = e.snapshot(0);
+            let names: Vec<&str> = snap.tubes.iter().map(|t| t.name.as_str()).collect();
+            assert_eq!(names, ["default", "c", "b"]);
+            assert_eq!(snap.server.current_jobs_urgent, 0);
+            assert_eq!(snap.server.current_jobs_ready, 1);
+            assert_eq!(snap.server.current_jobs_reserved, 1);
+            assert_eq!(snap.server.current_jobs_delayed, 1);
+            assert_eq!(snap.server.current_jobs_buried, 1);
+            assert_eq!(snap.server.current_waiting, 1);
+            assert_eq!(snap.tubes[1].pause, 20);
+            assert_eq!(snap.tubes[1].pause_time_left, 20);
+            assert_eq!(snap.tubes[1].cmd_delete, 1);
+            assert_eq!(snap.tubes[1].cmd_pause_tube, 1);
+
+            // Same state observed at several times, with ticks in between
+            // (TTR expiry, delay expiry, pause expiry, reserve timeout).
+            let mut out = Outbox::new();
+            for now in [0, SEC / 2, 5 * SEC, 11 * SEC, 25 * SEC, 31 * SEC, 200 * SEC] {
+                e.tick(now, &mut out);
+                check_snapshot(&mut e, now);
+            }
+            // A binlog stats push and drain mode are reflected too.
+            e.set_binlog_stats(crate::BinlogStats {
+                oldest_index: 2,
+                current_index: 5,
+                records_written: 17,
+                records_migrated: 3,
+            });
+            e.set_draining(true);
+            let snap = e.snapshot(200 * SEC);
+            assert!(snap.server.draining);
+            assert_eq!(snap.server.binlog_records_written, 17);
+            check_snapshot(&mut e, 200 * SEC);
+            // Disconnecting everyone collapses the tube list again.
+            for c in 1..=3 {
+                e.disconnect(200 * SEC, c, &mut out);
+            }
+            check_snapshot(&mut e, 201 * SEC);
+        }
+    }
+
+    #[test]
+    fn snapshot_does_not_count_as_a_command() {
+        let e = busy_state(false);
+        for _ in 0..5 {
+            let _ = e.snapshot(SEC);
+        }
+        let s = e.build_stats_server(SEC);
+        assert_eq!(
+            (
+                s.cmd_stats,
+                s.cmd_stats_tube,
+                s.cmd_list_tubes,
+                s.cmd_stats_job
+            ),
+            (0, 0, 0, 0)
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
 // Property-based state machine test.
 //
 // Drives random sequences of (conn, command, time advance) over a handful
@@ -3730,6 +3996,23 @@ pub(crate) mod proptests {
         }
     }
 
+    /// `snapshot` equals the stats builders and leaves them (and the
+    /// journal) untouched. Expects the journal to have just been drained.
+    fn check_snapshot_is_pure(e: &mut Engine, now: Nanos) {
+        let before = e.build_stats_server(now);
+        let snap = e.snapshot(now);
+        assert_eq!(snap.server, before);
+        let names: Vec<TubeName> = snap.tubes.iter().map(|t| t.name.clone()).collect();
+        assert_eq!(names, e.tube_names());
+        for t in &snap.tubes {
+            assert_eq!(e.build_stats_tube(&t.name, now).as_ref(), Some(t));
+        }
+        assert_eq!(e.build_stats_server(now), before);
+        let mut journal = Vec::new();
+        e.take_journal(&mut journal);
+        assert!(journal.is_empty(), "snapshot journaled {journal:?}");
+    }
+
     fn run_actions(actions: Vec<Action>, journal: bool) {
         let mut e = Engine::new(
             0,
@@ -3822,6 +4105,7 @@ pub(crate) mod proptests {
             e.take_journal(&mut journal_buf);
             assert!(journal || journal_buf.is_empty());
             check_invariants(&e);
+            check_snapshot_is_pure(&mut e, now);
         }
     }
 

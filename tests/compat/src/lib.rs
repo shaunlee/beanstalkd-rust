@@ -10,6 +10,13 @@
 //! - [`runner::discover_cases`] lists the `.bt` files under `cases/`.
 //! - [`runner::default_ref_bin`] / [`runner::default_rs_bin`] resolve the
 //!   default binary paths (overridable via `BSTK_REF_BIN` / `BSTK_RS_BIN`).
+//!
+//! TLS mode ([`runner::RunOptions::tls_b`], `BSTK_COMPAT_TLS=1`) runs
+//! server B behind a TLS listener of its own while server A stays
+//! plaintext; [`runner::RunOptions::stunnel_b`] instead puts server B behind
+//! `stunnel` (used to validate the TLS path with the reference on both
+//! sides). See [`server`] and [`conn`] for how each DSL action maps onto
+//! TLS.
 
 pub mod compare;
 pub mod conn;
@@ -18,6 +25,7 @@ pub mod escape;
 pub mod mask;
 pub mod runner;
 pub mod server;
+pub mod tls;
 
 pub use compare::Mismatch;
 pub use runner::CaseResult;
