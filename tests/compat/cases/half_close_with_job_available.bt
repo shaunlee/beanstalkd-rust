@@ -1,0 +1,10 @@
+# reserve then half-close with a job available: RESERVED (not TIMED_OUT), then the server closes the connection and releases the job.
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@c1 send "reserve\r\n"
+@c1 shutdown_write
+@c1 recv
+@c1 recv_closed 500ms
+sleep 100ms
+@p send "stats-job 1\r\n"
+@p recv

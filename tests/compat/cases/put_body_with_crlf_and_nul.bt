@@ -1,0 +1,7 @@
+# a body containing CRLF, NUL and non-ASCII bytes is stored and returned verbatim.
+@p send "put 0 0 60 12\r\na\r\nb\x00c\xff\r\n\r\nd\r\n"
+@p recv
+@p send "peek 1\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv

@@ -1,0 +1,19 @@
+[package]
+name = "bstk-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Load generator / benchmark for beanstalkd-compatible servers"
+
+[[bin]]
+name = "bstk-bench"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

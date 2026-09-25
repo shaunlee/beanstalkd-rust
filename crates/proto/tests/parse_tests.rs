@@ -631,6 +631,27 @@ fn pause_tube_extra_spaces_before_delay_ok() {
 }
 
 #[test]
+fn pause_tube_invalid_name_is_a_counted_command() {
+    // prot.c counts cmd-pause-tube before validating the name span, so an
+    // invalid name (leading '-', or > 200 bytes) is not a plain decode
+    // error: it is forwarded to the engine, which replies BAD_FORMAT.
+    assert_eq!(
+        parse_line(b"pause-tube -foo 5"),
+        Ok(Command::PauseTubeBadName)
+    );
+    let long = format!("pause-tube {} 5", "a".repeat(201));
+    assert_eq!(parse_line(long.as_bytes()), Ok(Command::PauseTubeBadName));
+    let ok = format!("pause-tube {} 5", "a".repeat(200));
+    assert!(matches!(
+        parse_line(ok.as_bytes()),
+        Ok(Command::PauseTube { delay: 5, .. })
+    ));
+    // Failures before the counter (no name span, bad delay) stay errors.
+    assert_eq!(parse_line(b"pause-tube -foo x"), Err(Response::BadFormat));
+    assert_eq!(parse_line(b"pause-tube *foo 5"), Err(Response::BadFormat));
+}
+
+#[test]
 fn pause_tube_missing_delay() {
     assert_eq!(parse_line(b"pause-tube foo"), Err(Response::BadFormat));
 }

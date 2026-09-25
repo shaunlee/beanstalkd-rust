@@ -1,0 +1,12 @@
+# framing: one write mixing unknown commands, bad formats, a put with body and valid commands; replies come back in order.
+@p send "bogus\r\nstats-job x\r\nput 0 0 60 1\r\na\r\npeek 1\r\nreserve-\r\nuse t1\r\nbury 1\r\nlist-tube-used\r\nput 1 0 60 2\r\nbc\r\nstats-tube t1\r\n"
+@p recv
+@p recv
+@p recv
+@p recv
+@p recv
+@p recv
+@p recv
+@p recv
+@p recv
+@p recv

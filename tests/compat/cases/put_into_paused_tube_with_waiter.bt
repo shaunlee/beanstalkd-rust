@@ -1,0 +1,10 @@
+# a put into a paused tube does not wake a blocked waiter until the pause expires.
+@p send "pause-tube default 1\r\n"
+@p recv
+@w1 send "reserve\r\n"
+sleep 100ms
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@w1 recv_none 300ms
+sleep 1200ms
+@w1 recv

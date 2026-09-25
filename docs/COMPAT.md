@@ -9,7 +9,7 @@ Reference: beanstalkd commit `25085c5`. Each entry states the observed behavior,
 | D1 | engine | Reference: when a connection's own reserved job expires in the same event pass in which it is waiting, `process_queue` may re-reserve that job to the same connection, then the queued `RESERVED` reply is discarded and `DEADLINE_SOON` is sent instead. We recompute the DEADLINE_SOON / TIMED_OUT decision after draining expirations, using live state. | Reproducing it would require retracting an already-queued reply; practically unreachable with real client timing. | Yes | engine unit tests (tick) |
 | D2 | engine / proto | `time-left` (stats-job) and `pause-time-left` (stats-tube) are signed in the reference and can be briefly negative (job overdue but not yet ticked). We clamp them to 0. | Stats types are unsigned; the window is sub-tick. Revisit if differential tests observe it. | Yes | — |
 | D3 | server | A connection blocked awaiting a reply (e.g. `reserve`) stops reading once 64 KiB of pipelined input is buffered. The reference does not read at all while waiting but detects hangup via EPOLLRDHUP, so it notices a half-close even with unread data. We notice it only while under the cap. | Bounded memory per connection; only matters for a client that pipelines > 64 KiB behind a blocking reserve and then half-closes. | Yes | `large_pipeline_behind_blocked_reserve_is_processed_in_order` |
-| D4 | server CLI | An unparsable `-z` exits with status 2 (clap) instead of the reference's 5. `-l` accepts IP literals only, not hostnames. | Standard CLI tooling; hostnames rarely used. | Yes | — |
+| D4 | server CLI | A `-z` value the reference's `sscanf("%zu")` cannot parse exits with status 2 (clap) instead of 5. `-l` accepts IP literals only, not hostnames. | Standard CLI tooling; hostnames rarely used. | Yes | — |
 
 ## Reference behaviors that differ from protocol.txt (we follow the implementation)
 
@@ -22,14 +22,16 @@ Reference: beanstalkd commit `25085c5`. Each entry states the observed behavior,
 5. `kick` parses its bound with raw `strtoul`: skips any whitespace, accepts a sign (a negative value wraps to 64 bits, then truncates to u32), ignores trailing garbage, and fails only when there are no digits or on 64-bit overflow.
 6. `reserve-with-timeout` never checks for trailing garbage after the timeout; bare `reserve` requires an exact match.
 7. `quit` closes the connection as soon as the 4-byte prefix matches, with no check on the rest of the line.
-8. `put`: `JOB_TOO_BIG` is decided from the parsed size before the trailing-garbage check, and the body is skipped. For a size within the limit, trailing garbage gives `BAD_FORMAT` and **no** body bytes are consumed; they are re-parsed as command lines, which can produce extra replies (e.g. `BAD_FORMAT` then `UNKNOWN_COMMAND`). In both cases `cmd-put` has already been incremented, and on the EXPECTED_CRLF path the connection has also been marked a producer and a job id consumed. The codec therefore forwards these rejections as `Frame::PutRejected` so the engine applies the side effects (covered by `put_rejections_side_effects.bt`).
+8. `put`: `JOB_TOO_BIG` is decided from the parsed size before the trailing-garbage check, and the body is skipped. For a size within the limit, trailing garbage gives `BAD_FORMAT` and **no** body bytes are consumed; they are re-parsed as command lines, which can produce extra replies (e.g. `BAD_FORMAT` then `UNKNOWN_COMMAND`). In both cases `cmd-put` has already been incremented.
+   The reference applies a put's side effects as soon as its command line parses, before any body byte arrives: `cmd-put` is counted and, unless the job is too big, the connection becomes a producer and a job id is allocated (so a connection that closes mid-body, or a body that fails with EXPECTED_CRLF, still consumes an id, and puts overlapping on two connections get ids in header order). The server's codec emits `Frame::PutStarted` at that point and the engine's `put_started` applies these effects exactly once; the completion arrives later as `Command::Put` or `Frame::PutRejected`. Covered by `put_rejections_side_effects.bt` and the `put_started_*` engine tests.
 9. A NUL byte anywhere in a command line gives `BAD_FORMAT` before any command-specific parsing.
 10. Numeric fields (`read_u32` / `read_u64`) skip only literal spaces, not tabs; overflow gives `BAD_FORMAT`.
 11. `stats-tube` with no name falls through to the `stats` prefix and is rejected as `BAD_FORMAT`, not `UNKNOWN_COMMAND`.
+12. `pause-tube` counts `cmd-pause-tube` once the name span and delay parse, before validating the name (leading `-`, over 200 bytes), then replies `BAD_FORMAT`. Parsed as `Command::PauseTubeBadName` so the engine can count it.
 
 ### State machine (engine)
 
-1. A `put` rejected with `DRAINING` still consumes a job id.
+1. A `put` rejected with `DRAINING` still consumes a job id (allocated when the put line parses).
 2. Tubes are reference-counted by use + watch + jobs. `default` is never destroyed. Other empty, unreferenced tubes are destroyed immediately when the last reference goes away.
 3. Tube lists, watch lists and wait queues use swap-remove, so `list-tubes` and `list-tubes-watched` order can change after `ignore` or tube destruction.
 4. Waiting connections are taken round-robin (`ms_take`). With an even number of waiters drained without an intervening append, the service order is not FIFO (e.g. 4 waiters are served 1, 2, 4, 3).
@@ -37,3 +39,10 @@ Reference: beanstalkd commit `25085c5`. Each entry states the observed behavior,
 6. TTR expiry requires strictly passing the deadline (`<`); the safety margin uses `>=`.
 7. `urgent` counts only ready jobs with pri < 1024.
 8. The reference counts kick-job and reserve-job operations internally but never reports them in `stats`.
+9. `pause-tube <tube> 0` converts the delay to nanoseconds before bumping 0 to the minimum, so it pauses for 1 ns and `stats-tube` shows `pause: 0`.
+10. On disconnect the reference empties the watch list by repeatedly deleting item 0 (moving the last item into its place) and destroys unreferenced tubes in that order, which determines the later `list-tubes` order.
+11. `reserve-with-timeout 0` replies `DEADLINE_SOON`, not `TIMED_OUT`, when the connection holds a job inside the safety margin and no ready job can be given to it (e.g. the only ready job is in a paused tube, or another waiter took it).
+
+### Server CLI
+
+1. `-z` is parsed with `sscanf("%zu")`: leading whitespace is skipped, `-1` wraps, values beyond u64 saturate, and the result is clamped to 1 GiB with a warning.

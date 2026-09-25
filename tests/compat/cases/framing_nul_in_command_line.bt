@@ -1,0 +1,9 @@
+# framing: a NUL byte anywhere in a command line is BAD_FORMAT, including after a valid quit prefix, and the connection stays open.
+@p send "list-tube-used\x00\r\n"
+@p recv
+@p send "quit\x00now\r\n"
+@p recv
+@p send "\x00\r\n"
+@p recv
+@p send "list-tube-used\r\n"
+@p recv

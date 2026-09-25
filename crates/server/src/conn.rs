@@ -59,7 +59,7 @@ pub async fn handle_connection(
         engine_tx: engine_tx.clone(),
     };
     let (mut rh, mut wh) = stream.into_split();
-    let mut codec = ServerCodec::new(max_job_size);
+    let mut codec = ServerCodec::new(max_job_size).emit_put_started();
     let mut rbuf = BytesMut::with_capacity(INITIAL_BUF_CAPACITY);
     let mut wbuf = BytesMut::with_capacity(256);
     // Once true, the peer will never produce more bytes (EOF or a write
@@ -140,6 +140,17 @@ pub async fn handle_connection(
                         }
                     }
                     None => return,
+                }
+            }
+            Ok(Some(Frame::PutStarted { too_big })) => {
+                // prot.c counts the put, marks the producer and allocates
+                // the job id as soon as the command line parses, before the
+                // body arrives. No reply, so nothing to wait for.
+                if engine_tx
+                    .send(EngineMsg::PutStarted { conn, too_big })
+                    .is_err()
+                {
+                    return;
                 }
             }
             Ok(Some(Frame::Error(resp))) => {

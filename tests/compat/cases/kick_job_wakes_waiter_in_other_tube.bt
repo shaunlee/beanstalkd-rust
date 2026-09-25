@@ -1,0 +1,20 @@
+# kick-job of a buried job wakes a waiter watching that job's tube, even though the kicker uses another tube.
+@p send "use a\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@p send "reserve-job 1\r\n"
+@p recv
+@p send "bury 1 0\r\n"
+@p recv
+@p send "use default\r\n"
+@p recv
+@w send "watch a\r\n"
+@w recv
+@w send "reserve\r\n"
+sleep 100ms
+@p send "kick-job 1\r\n"
+@p recv
+@w recv
+@p send "stats-job 1\r\n"
+@p recv

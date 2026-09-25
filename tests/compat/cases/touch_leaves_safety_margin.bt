@@ -1,0 +1,14 @@
+# a held job inside its safety margin gives DEADLINE_SOON; touch restores its TTR so the next reserve simply times out.
+@p send "put 0 0 3 1\r\nx\r\n"
+@p recv
+@h send "reserve\r\n"
+@h recv
+sleep 2300ms
+@h send "reserve-with-timeout 0\r\n"
+@h recv
+@h send "touch 1\r\n"
+@h recv
+@h send "reserve-with-timeout 0\r\n"
+@h recv
+@h send "stats-job 1\r\n"
+@h recv

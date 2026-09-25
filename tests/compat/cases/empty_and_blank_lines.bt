@@ -1,0 +1,11 @@
+# an empty line and a line of spaces are UNKNOWN_COMMAND; a line of only a tab too.
+@p send "\r\n"
+@p recv
+@p send "   \r\n"
+@p recv
+@p send "\t\r\n"
+@p recv
+@p send "\r\n\r\nlist-tube-used\r\n"
+@p recv
+@p recv
+@p recv

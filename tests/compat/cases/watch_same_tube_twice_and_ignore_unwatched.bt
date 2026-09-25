@@ -1,0 +1,17 @@
+# watch/ignore: watching an already-watched tube is a no-op count; ignoring an unwatched tube replies WATCHING without creating it.
+@c1 send "watch a\r\n"
+@c1 recv
+@c1 send "watch a\r\n"
+@c1 recv
+@c1 send "ignore zzz\r\n"
+@c1 recv
+@c1 send "list-tubes\r\n"
+@c1 recv
+@c1 send "ignore a\r\n"
+@c1 recv
+@c1 send "ignore a\r\n"
+@c1 recv
+@c1 send "ignore default\r\n"
+@c1 recv
+@c1 send "stats\r\n"
+@c1 recv

@@ -1,0 +1,10 @@
+# put: an oversized put is counted in cmd-put as soon as its line parses, while its body is still being discarded; it does not mark a producer or take an id.
+!args -z 5
+@c1 send "put 0 0 60 10\r\n012"
+sleep 200ms
+@c2 send "stats\r\n"
+@c2 recv
+@c1 send "3456789\r\n"
+@c1 recv
+@c1 send "put 0 0 60 1\r\nx\r\n"
+@c1 recv

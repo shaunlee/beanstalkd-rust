@@ -1,0 +1,13 @@
+# pause-tube 0 on a paused tube ends the pause almost at once (1 ns), waking a waiter that was blocked by the long pause.
+@p send "pause-tube default 100\r\n"
+@p recv
+@w send "reserve\r\n"
+sleep 100ms
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@w recv_none 200ms
+@p send "pause-tube default 0\r\n"
+@p recv
+@w recv
+@p send "stats-tube default\r\n"
+@p recv

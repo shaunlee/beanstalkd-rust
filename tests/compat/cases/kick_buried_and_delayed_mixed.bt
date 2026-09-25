@@ -1,0 +1,31 @@
+# kick in a tube holding both buried and delayed jobs: only buried jobs are kicked while any remain, then delayed ones (soonest first).
+@p send "put 0 100 60 2\r\nd1\r\n"
+@p recv
+@p send "put 0 50 60 2\r\nd2\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nb3\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nb4\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 3 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 4 0\r\n"
+@p recv
+@p send "kick 10\r\n"
+@p recv
+@p send "stats-tube default\r\n"
+@p recv
+@p send "kick 1\r\n"
+@p recv
+@p send "peek-ready\r\n"
+@p recv
+@p send "kick 10\r\n"
+@p recv
+@p send "stats-job 1\r\n"
+@p recv
+@p send "stats-job 2\r\n"
+@p recv

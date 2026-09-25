@@ -1,0 +1,39 @@
+# peek-ready/peek-delayed/peek-buried ordering: pri ties by id, soonest delay first, buried FIFO after kick-job from the middle.
+@p send "put 5 0 60 1\r\na\r\n"
+@p recv
+@p send "put 5 0 60 1\r\nb\r\n"
+@p recv
+@p send "put 4 100 60 1\r\nc\r\n"
+@p recv
+@p send "put 1 50 60 1\r\nd\r\n"
+@p recv
+@p send "peek-ready\r\n"
+@p recv
+@p send "peek-delayed\r\n"
+@p recv
+@p send "reserve-job 1\r\n"
+@p recv
+@p send "bury 1 0\r\n"
+@p recv
+@p send "reserve-job 2\r\n"
+@p recv
+@p send "bury 2 0\r\n"
+@p recv
+@p send "put 0 0 60 1\r\ne\r\n"
+@p recv
+@p send "reserve-job 5\r\n"
+@p recv
+@p send "bury 5 0\r\n"
+@p recv
+@p send "peek-buried\r\n"
+@p recv
+@p send "kick-job 1\r\n"
+@p recv
+@p send "peek-buried\r\n"
+@p recv
+@p send "kick 1\r\n"
+@p recv
+@p send "peek-buried\r\n"
+@p recv
+@p send "peek-ready\r\n"
+@p recv

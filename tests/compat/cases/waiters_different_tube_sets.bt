@@ -1,0 +1,46 @@
+# reserve: waiters watching different tube sets; each put only goes to waiters watching that tube, in ms_take order per tube.
+@w1 send "watch a\r\n"
+@w1 recv
+@w1 send "ignore default\r\n"
+@w1 recv
+@w2 send "watch a\r\n"
+@w2 recv
+@w2 send "watch b\r\n"
+@w2 recv
+@w3 send "watch b\r\n"
+@w3 recv
+@w3 send "ignore default\r\n"
+@w3 recv
+@w4 send "list-tubes-watched\r\n"
+@w4 recv
+@p send "use b\r\n"
+@p recv
+@w1 send "reserve\r\n"
+sleep 50ms
+@w2 send "reserve\r\n"
+sleep 50ms
+@w3 send "reserve\r\n"
+sleep 50ms
+@w4 send "reserve\r\n"
+sleep 50ms
+@p send "put 0 0 60 4\r\ntob1\r\n"
+@p recv
+sleep 50ms
+@p send "put 0 0 60 4\r\ntob2\r\n"
+@p recv
+sleep 50ms
+@p send "use a\r\n"
+@p recv
+@p send "put 0 0 60 4\r\ntoa1\r\n"
+@p recv
+sleep 50ms
+@p send "use default\r\n"
+@p recv
+@p send "put 0 0 60 5\r\ntodef\r\n"
+@p recv
+@w1 recv
+@w2 recv
+@w3 recv
+@w4 recv
+@p send "stats\r\n"
+@p recv

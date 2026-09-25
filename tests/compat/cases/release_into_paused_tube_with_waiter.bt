@@ -1,0 +1,20 @@
+# release into a paused tube does not wake a waiter; kick-job of a delayed job into a paused tube neither.
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@p send "put 0 100 60 1\r\ny\r\n"
+@p recv
+@h send "reserve\r\n"
+@h recv
+@p send "pause-tube default 2\r\n"
+@p recv
+@w send "reserve\r\n"
+sleep 100ms
+@h send "release 1 0 0\r\n"
+@h recv
+@p send "kick-job 2\r\n"
+@p recv
+@w recv_none 300ms
+@p send "stats-tube default\r\n"
+@p recv
+sleep 2000ms
+@w recv

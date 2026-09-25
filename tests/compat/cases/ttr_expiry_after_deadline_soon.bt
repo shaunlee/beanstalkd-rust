@@ -1,0 +1,14 @@
+# a waiting holder gets DEADLINE_SOON, then its job times out and becomes ready (job-timeouts counted).
+@p send "put 0 0 2 1\r\nx\r\n"
+@p recv
+@h send "reserve\r\n"
+@h recv
+@h send "reserve\r\n"
+@h recv
+sleep 1500ms
+@p send "stats-job 1\r\n"
+@p recv
+@p send "stats\r\n"
+@p recv
+@h send "reserve\r\n"
+@h recv

@@ -1,0 +1,13 @@
+# tube names are case sensitive: Foo and foo are distinct tubes.
+@p send "use Foo\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@p send "use foo\r\n"
+@p recv
+@p send "list-tubes\r\n"
+@p recv
+@p send "stats-tube FOO\r\n"
+@p recv
+@p send "stats-tube Foo\r\n"
+@p recv

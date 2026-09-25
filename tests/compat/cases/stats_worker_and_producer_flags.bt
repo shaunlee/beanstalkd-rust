@@ -1,0 +1,32 @@
+# current-workers / current-producers: which commands mark a connection (reserve variants incl. DEADLINE_SOON and timeout 0, successful reserve-job, puts incl. EXPECTED_CRLF).
+@a send "reserve-with-timeout 0\r\n"
+@a recv
+@b send "reserve-job 1\r\n"
+@b recv
+@b send "reserve-with-timeout x\r\n"
+@b recv
+@c send "put 0 0 60 1\r\nxyz"
+@c recv
+@d send "put 0 0 60 1 x\r\n"
+@d recv
+@s send "stats\r\n"
+@s recv
+@e send "put 0 0 60 1\r\nj\r\n"
+@e recv
+@f send "reserve-job 2\r\n"
+@f recv
+@s send "stats\r\n"
+@s recv
+@g send "put 0 0 1 1\r\nk\r\n"
+@g recv
+@g send "reserve\r\n"
+@g recv
+@g send "reserve\r\n"
+@g recv
+@s send "stats\r\n"
+@s recv
+@a close
+@c close
+sleep 200ms
+@s send "stats\r\n"
+@s recv

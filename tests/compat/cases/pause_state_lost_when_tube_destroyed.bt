@@ -1,0 +1,15 @@
+# a paused tube that is garbage collected and recreated comes back unpaused with fresh counters.
+@p send "watch t\r\n"
+@p recv
+@p send "pause-tube t 100\r\n"
+@p recv
+@p send "stats-tube t\r\n"
+@p recv
+@p send "ignore t\r\n"
+@p recv
+@p send "stats-tube t\r\n"
+@p recv
+@p send "watch t\r\n"
+@p recv
+@p send "stats-tube t\r\n"
+@p recv

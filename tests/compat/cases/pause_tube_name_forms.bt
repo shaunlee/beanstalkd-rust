@@ -1,0 +1,19 @@
+# pause-tube name parsing: leading spaces skipped, name greedily swallows digits, missing delay or trailing garbage is BAD_FORMAT.
+@p send "watch t1\r\n"
+@p recv
+@p send "pause-tube    t1 1\r\n"
+@p recv
+@p send "pause-tubet1 1\r\n"
+@p recv
+@p send "pause-tube t1\r\n"
+@p recv
+@p send "pause-tube t1 1 x\r\n"
+@p recv
+@p send "pause-tube t1  2\r\n"
+@p recv
+@p send "pause-tube t1 -1\r\n"
+@p recv
+@p send "pause-tube nosuch 1\r\n"
+@p recv
+@p send "stats-tube t1\r\n"
+@p recv

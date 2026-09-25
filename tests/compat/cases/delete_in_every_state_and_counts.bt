@@ -1,0 +1,33 @@
+# delete of ready, delayed, buried and own-reserved jobs; per-tube cmd-delete and global cmd-delete counters.
+@p send "use t\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nr\r\n"
+@p recv
+@p send "put 0 100 60 1\r\nd\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nb\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nv\r\n"
+@p recv
+@p send "watch t\r\n"
+@p recv
+@p send "reserve-job 3\r\n"
+@p recv
+@p send "bury 3 0\r\n"
+@p recv
+@p send "reserve-job 4\r\n"
+@p recv
+@p send "delete 1\r\n"
+@p recv
+@p send "delete 2\r\n"
+@p recv
+@p send "delete 3\r\n"
+@p recv
+@p send "delete 4\r\n"
+@p recv
+@p send "delete 4\r\n"
+@p recv
+@p send "stats-tube t\r\n"
+@p recv
+@p send "stats\r\n"
+@p recv

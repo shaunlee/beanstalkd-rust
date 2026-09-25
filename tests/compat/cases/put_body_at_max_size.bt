@@ -1,0 +1,9 @@
+# with -z 10, a 10-byte body is accepted and an 11-byte body is JOB_TOO_BIG (body discarded, next command parsed).
+!args -z 10
+@p send "put 0 0 60 10\r\n0123456789\r\n"
+@p recv
+@p send "put 0 0 60 11\r\n01234567890\r\nstats-job 1\r\n"
+@p recv
+@p recv
+@p send "stats\r\n"
+@p recv

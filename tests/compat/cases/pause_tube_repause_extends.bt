@@ -1,0 +1,13 @@
+# pause-tube while already paused replaces the pause; a 1 s pause re-paused to 4 s still blocks reserve after 2 s.
+@c1 send "put 0 0 60 1\r\nx\r\n"
+@c1 recv
+@c1 send "pause-tube default 1\r\n"
+@c1 recv
+@c1 send "pause-tube default 4\r\n"
+@c1 recv
+@c1 send "stats-tube default\r\n"
+@c1 recv
+@c2 send "reserve-with-timeout 2\r\n"
+@c2 recv
+@c1 send "stats-tube default\r\n"
+@c1 recv

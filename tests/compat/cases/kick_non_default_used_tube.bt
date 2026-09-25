@@ -1,0 +1,17 @@
+# kick only affects the connection's used tube; a connection using default kicks nothing buried elsewhere.
+@p send "use a\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@p send "reserve-job 1\r\n"
+@p recv
+@p send "bury 1 0\r\n"
+@p recv
+@k send "kick 5\r\n"
+@k recv
+@k send "use a\r\n"
+@k recv
+@k send "kick 5\r\n"
+@k recv
+@k send "stats-tube a\r\n"
+@k recv

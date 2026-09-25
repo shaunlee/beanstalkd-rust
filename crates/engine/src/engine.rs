@@ -10,7 +10,7 @@ use bstk_proto::{
     URGENT_THRESHOLD,
 };
 
-use crate::model::{ConnState, JobRec, JobState, TubeState};
+use crate::model::{ConnState, JobRec, JobState, PendingPut, TubeState};
 use crate::ms::Ms;
 use crate::{ConnId, EngineConfig, NANOS_PER_SEC, Nanos, Outbox, SysInfo};
 
@@ -158,14 +158,19 @@ impl Engine {
             self.process_queue(now, out);
         }
 
-        if let Some(c) = self.conns.get(&conn) {
-            let watched: Vec<TubeName> = c.watch.items.clone();
-            for t in watched {
-                if let Some(ts) = self.tubes.get_mut(&t) {
-                    ts.watching_ct = ts.watching_ct.saturating_sub(1);
-                }
-                self.gc_tube_if_orphan(&t);
+        // `ms_clear(&c->watch)` deletes index 0 repeatedly (swap with last),
+        // dropping each tube's reference in that order. Tube destruction
+        // order decides the survivors' order in the global tube list.
+        let watched: Vec<TubeName> = self
+            .conns
+            .get_mut(&conn)
+            .map(|c| c.watch.clear_in_delete_order())
+            .unwrap_or_default();
+        for t in watched {
+            if let Some(ts) = self.tubes.get_mut(&t) {
+                ts.watching_ct = ts.watching_ct.saturating_sub(1);
             }
+            self.gc_tube_if_orphan(&t);
         }
 
         if let Some(c) = self.conns.get(&conn) {
@@ -195,18 +200,49 @@ impl Engine {
         }
     }
 
-    /// A `put` rejected by the codec. Mirrors the side effects prot.c
-    /// performs before each rejection: `op_ct[OP_PUT]++` happens right after
-    /// the numeric fields parse, and the EXPECTED_CRLF path has already run
-    /// `connsetproducer` and `make_job` (which consumes a job id).
-    pub fn put_rejected(&mut self, _now: Nanos, conn: ConnId, why: PutRejection, out: &mut Outbox) {
+    /// A `put` command line was accepted and its body is about to be read
+    /// (`Frame::PutStarted`). Applies prot.c's header-time side effects:
+    /// `op_ct[OP_PUT]++`, and unless `too_big`, `connsetproducer` plus
+    /// `make_job` (allocating the job id). No reply. The put's completion
+    /// (`handle(Put)` or `put_rejected`) then skips those side effects.
+    pub fn put_started(&mut self, now: Nanos, conn: ConnId, too_big: bool) {
         if !self.conns.contains_key(&conn) {
             return;
         }
         self.cmd_put += 1;
-        if why == PutRejection::ExpectedCrlf {
+        let id = if too_big {
+            None
+        } else {
             self.connsetproducer(conn);
+            let id = self.next_job_id;
             self.next_job_id += 1;
+            Some(id)
+        };
+        if let Some(c) = self.conns.get_mut(&conn) {
+            c.pending_put = Some(PendingPut {
+                id,
+                created_at: now,
+            });
+        }
+    }
+
+    /// A `put` rejected by the codec. Mirrors the side effects prot.c
+    /// performs before each rejection: `op_ct[OP_PUT]++` happens right after
+    /// the numeric fields parse, and the EXPECTED_CRLF path has already run
+    /// `connsetproducer` and `make_job` (which consumes a job id). If
+    /// `put_started` already applied them for this put, they are not
+    /// repeated.
+    pub fn put_rejected(&mut self, _now: Nanos, conn: ConnId, why: PutRejection, out: &mut Outbox) {
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        let started = c.pending_put.take().is_some();
+        if !started {
+            self.cmd_put += 1;
+            if why == PutRejection::ExpectedCrlf {
+                self.connsetproducer(conn);
+                self.next_job_id += 1;
+            }
         }
         out.push((conn, why.response()));
     }
@@ -247,6 +283,11 @@ impl Engine {
             // The server must never forward Quit to the engine.
             Command::Quit => {}
             Command::PauseTube { tube, delay } => self.cmd_pause_tube(now, conn, tube, delay, out),
+            Command::PauseTubeBadName => {
+                // prot.c: op_ct[OP_PAUSE_TUBE]++ precedes is_valid_tube().
+                self.cmd_pause_tube += 1;
+                out.push((conn, Response::BadFormat));
+            }
         }
     }
 
@@ -753,15 +794,27 @@ impl Engine {
         body: Bytes,
         out: &mut Outbox,
     ) {
-        self.cmd_put += 1;
-        self.connsetproducer(cid);
         let ttr = ttr.max(1);
 
         // The reference always allocates a job id (bumping next_id) before
         // checking drain mode, even though a draining put discards the job
-        // afterwards. We mirror that: the id is consumed either way.
-        let id = self.next_job_id;
-        self.next_job_id += 1;
+        // afterwards. We mirror that: the id is consumed either way. When
+        // `put_started` ran for this put, that already happened at header
+        // time (as in prot.c), so reuse its id.
+        let pending = self.conns.get_mut(&cid).and_then(|c| c.pending_put.take());
+        let (id, created_at) = match pending {
+            Some(PendingPut {
+                id: Some(id),
+                created_at,
+            }) => (id, created_at),
+            _ => {
+                self.cmd_put += 1;
+                self.connsetproducer(cid);
+                let id = self.next_job_id;
+                self.next_job_id += 1;
+                (id, now)
+            }
+        };
 
         if self.draining {
             out.push((cid, Response::Draining));
@@ -782,7 +835,7 @@ impl Engine {
             delay,
             ttr,
             body,
-            created_at: now,
+            created_at,
             deadline_at: 0,
             state: JobState::Ready,
             reserver: None,
@@ -893,8 +946,20 @@ impl Engine {
         self.process_queue(now, out);
         let still_waiting = self.conns.get(&cid).map(|c| c.waiting).unwrap_or(false);
         if timeout_is_zero && still_waiting {
+            // The reference keeps waiting until the next prottick, whose
+            // conn_timeout checks "deadline soon" before the explicit
+            // timeout. That is true here when the ready job that skipped the
+            // DEADLINE_SOON shortcut above could not be handed to this
+            // connection: it sits in a paused tube, or process_queue gave it
+            // to another waiter ahead in ms_take order.
+            let soon = self.conn_deadline_soon(cid, now);
             self.do_remove_waiting_conn(cid);
-            out.push((cid, Response::TimedOut));
+            let reply = if soon {
+                Response::DeadlineSoon
+            } else {
+                Response::TimedOut
+            };
+            out.push((cid, reply));
         }
     }
 
@@ -1268,8 +1333,14 @@ impl Engine {
             out.push((cid, Response::NotFound));
             return;
         }
-        let delay = delay.max(1);
-        let delay_nanos = (delay as Nanos) * NANOS_PER_SEC;
+        // prot.c: `if (delay == 0) delay = 1;` runs on the delay already
+        // converted to nanoseconds, so "pause 0" pauses for 1 ns (which
+        // `stats-tube` reports as `pause: 0`), not for 1 second.
+        let delay_nanos = if delay == 0 {
+            1
+        } else {
+            (delay as Nanos) * NANOS_PER_SEC
+        };
         if let Some(t) = self.tubes.get_mut(&tube) {
             t.pause = delay_nanos;
             t.unpause_at = now + delay_nanos;
@@ -1527,7 +1598,7 @@ impl Engine {
 mod tests {
     use bytes::Bytes;
 
-    use bstk_proto::{Command, Response, TubeName};
+    use bstk_proto::{Command, PutRejection, Response, TubeName};
 
     use crate::{EngineConfig, Nanos, Outbox, StaticSysInfo};
 
@@ -2691,6 +2762,213 @@ mod tests {
         assert_eq!(s.time_left, 2); // deadline=5s, now=3s
         assert_eq!(s.reserves, 1);
         assert_eq!(s.file, 0);
+    }
+
+    // -----------------------------------------------------------------
+    // T5 differential-test regressions
+    // -----------------------------------------------------------------
+
+    /// prot.c applies `if (delay == 0) delay = 1;` to nanoseconds, so
+    /// `pause-tube x 0` pauses for 1 ns: a reserve an instant later is
+    /// served, and stats-tube reports `pause: 0`.
+    #[test]
+    fn pause_tube_zero_pauses_for_one_nanosecond() {
+        let mut e = engine_at(0);
+        e.connect(0, 1);
+        let id = put(&mut e, 0, 1, 0, 0, 60, "x");
+        let out = handle(
+            &mut e,
+            SEC,
+            1,
+            Command::PauseTube {
+                tube: tube("default"),
+                delay: 0,
+            },
+        );
+        assert_eq!(only(&out, 1), Response::Paused);
+        let stats = e.build_stats_tube(&tube("default"), SEC).unwrap();
+        assert_eq!(stats.pause, 0);
+        assert_eq!(stats.cmd_pause_tube, 1);
+        assert_eq!(e.next_deadline(), Some(SEC + 1));
+
+        let out = handle(&mut e, SEC + 1_000, 1, Command::ReserveWithTimeout(0));
+        assert_eq!(
+            only(&out, 1),
+            Response::Reserved {
+                id,
+                body: Bytes::from_static(b"x")
+            }
+        );
+    }
+
+    /// An invalid pause-tube name is counted before being rejected.
+    #[test]
+    fn pause_tube_bad_name_counts_and_replies_bad_format() {
+        let mut e = engine_at(0);
+        e.connect(0, 1);
+        let out = handle(&mut e, 0, 1, Command::PauseTubeBadName);
+        assert_eq!(only(&out, 1), Response::BadFormat);
+        assert_eq!(e.build_stats_server(0).cmd_pause_tube, 1);
+        // No tube stats change: the reference never looked the tube up.
+        let stats = e.build_stats_tube(&tube("default"), 0).unwrap();
+        assert_eq!(stats.cmd_pause_tube, 0);
+    }
+
+    /// connclose runs `ms_clear(&c->watch)`, which deletes index 0 over and
+    /// over; tubes are therefore destroyed in the order watch[0],
+    /// watch[last], watch[last-1], ... and each destruction swap-removes
+    /// from the global tube list.
+    #[test]
+    fn disconnect_destroys_watched_tubes_in_ms_clear_order() {
+        let mut e = engine_at(0);
+        e.connect(0, 1);
+        e.connect(0, 2);
+        handle(&mut e, 0, 1, Command::Watch(tube("a")));
+        handle(&mut e, 0, 1, Command::Watch(tube("b")));
+        handle(&mut e, 0, 2, Command::Watch(tube("x")));
+        handle(&mut e, 0, 2, Command::Watch(tube("y")));
+        let names =
+            |e: &Engine| -> Vec<String> { e.tube_names().iter().map(|t| t.to_string()).collect() };
+        assert_eq!(names(&e), ["default", "a", "b", "x", "y"]);
+
+        let mut out = Outbox::new();
+        e.disconnect(0, 1, &mut out);
+        // b is destroyed first ([default,a,y,x]), then a ([default,x,y]).
+        assert_eq!(names(&e), ["default", "x", "y"]);
+    }
+
+    /// reserve-with-timeout 0 while holding a job inside the safety margin,
+    /// with the only ready job in a paused tube: the reference starts
+    /// waiting (conn_ready ignores pause) and its next conn_timeout checks
+    /// "deadline soon" before the timeout, so the reply is DEADLINE_SOON.
+    #[test]
+    fn reserve_with_timeout_zero_in_margin_with_paused_ready_job_is_deadline_soon() {
+        let mut e = engine_at(0);
+        e.connect(0, 1);
+        handle(&mut e, 0, 1, Command::Use(tube("p")));
+        put(&mut e, 0, 1, 0, 0, 60, "paused");
+        handle(
+            &mut e,
+            0,
+            1,
+            Command::PauseTube {
+                tube: tube("p"),
+                delay: 10,
+            },
+        );
+        handle(&mut e, 0, 1, Command::Watch(tube("p")));
+        handle(&mut e, 0, 1, Command::Use(tube("default")));
+        let held = put(&mut e, 0, 1, 0, 0, 1, "short");
+        let out = handle(&mut e, 0, 1, Command::Reserve);
+        assert!(matches!(only(&out, 1), Response::Reserved { id, .. } if id == held));
+
+        let out = handle(&mut e, 1_000, 1, Command::ReserveWithTimeout(0));
+        assert_eq!(only(&out, 1), Response::DeadlineSoon);
+        assert!(!e.t_conn_waiting(1));
+
+        // Without a held job in the margin it is still a plain TIMED_OUT.
+        e.connect(0, 2);
+        handle(&mut e, 0, 2, Command::Watch(tube("p")));
+        handle(&mut e, 0, 2, Command::Ignore(tube("default")));
+        let out = handle(&mut e, 1_000, 2, Command::ReserveWithTimeout(0));
+        assert_eq!(only(&out, 2), Response::TimedOut);
+    }
+
+    /// prot.c allocates the job id (make_job) when the put *line* is
+    /// parsed, so a put whose body is still in flight owns an id that a
+    /// put completed meanwhile on another connection cannot take.
+    #[test]
+    fn put_started_allocates_the_id_at_header_time() {
+        let mut e = engine_at(0);
+        e.connect(0, 1);
+        e.connect(0, 2);
+        e.put_started(0, 1, false);
+        let stats = e.build_stats_server(0);
+        assert_eq!(stats.cmd_put, 1);
+        assert_eq!(stats.current_producers, 1);
+
+        assert_eq!(put(&mut e, 0, 2, 0, 0, 60, "second"), 2);
+        let out = handle(
+            &mut e,
+            0,
+            1,
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 60,
+                body: Bytes::from_static(b"first"),
+            },
+        );
+        assert_eq!(only(&out, 1), Response::Inserted(1));
+        let stats = e.build_stats_server(0);
+        assert_eq!(stats.cmd_put, 2);
+        assert_eq!(stats.total_jobs, 2);
+    }
+
+    /// A connection that closes mid-body has still been counted and has
+    /// consumed its id (job_free of `c->in_job` in connclose).
+    #[test]
+    fn put_started_then_disconnect_consumes_the_id() {
+        let mut e = engine_at(0);
+        e.connect(0, 1);
+        e.connect(0, 2);
+        e.put_started(0, 1, false);
+        let mut out = Outbox::new();
+        e.disconnect(0, 1, &mut out);
+        assert!(out.is_empty());
+        let stats = e.build_stats_server(0);
+        assert_eq!(stats.cmd_put, 1);
+        assert_eq!(stats.current_producers, 0);
+        assert_eq!(put(&mut e, 0, 2, 0, 0, 60, "x"), 2);
+    }
+
+    /// Completion rejections after `put_started` do not repeat the
+    /// header-time side effects.
+    #[test]
+    fn put_started_then_rejection_counts_once() {
+        let mut e = engine_at(0);
+        e.connect(0, 1);
+        e.put_started(0, 1, true);
+        assert_eq!(e.build_stats_server(0).current_producers, 0);
+        let mut out = Outbox::new();
+        e.put_rejected(0, 1, PutRejection::JobTooBig, &mut out);
+        assert_eq!(only(&out, 1), Response::JobTooBig);
+
+        e.put_started(0, 1, false);
+        let mut out = Outbox::new();
+        e.put_rejected(0, 1, PutRejection::ExpectedCrlf, &mut out);
+        assert_eq!(only(&out, 1), Response::ExpectedCrlf);
+
+        let stats = e.build_stats_server(0);
+        assert_eq!(stats.cmd_put, 2);
+        assert_eq!(stats.current_producers, 1);
+        // Only the EXPECTED_CRLF put consumed an id.
+        assert_eq!(put(&mut e, 0, 1, 0, 0, 60, "x"), 2);
+    }
+
+    /// Drain mode is checked at body completion, after the header-time id
+    /// allocation: the id is consumed exactly once.
+    #[test]
+    fn put_started_while_draining_consumes_one_id() {
+        let mut e = engine_at(0);
+        e.connect(0, 1);
+        e.set_draining(true);
+        e.put_started(0, 1, false);
+        let out = handle(
+            &mut e,
+            0,
+            1,
+            Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 60,
+                body: Bytes::from_static(b"x"),
+            },
+        );
+        assert_eq!(only(&out, 1), Response::Draining);
+        e.set_draining(false);
+        assert_eq!(put(&mut e, 0, 1, 0, 0, 60, "y"), 2);
+        assert_eq!(e.build_stats_server(0).cmd_put, 2);
     }
 
     #[test]

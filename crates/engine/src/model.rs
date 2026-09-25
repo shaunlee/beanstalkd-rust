@@ -126,6 +126,19 @@ pub(crate) struct ConnState {
     pub(crate) reserved_fifo: Vec<JobId>,
     /// Same set, ordered by TTR deadline for fast "soonest" lookups.
     pub(crate) reserved_by_deadline: BTreeSet<(Nanos, JobId)>,
+    /// A put whose command line was accepted (`Engine::put_started`) but
+    /// whose body has not completed yet: prot.c's `c->in_job`.
+    pub(crate) pending_put: Option<PendingPut>,
+}
+
+/// Header-time state of an in-flight put (see `ConnState::pending_put`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingPut {
+    /// The job id `make_job` already allocated; `None` for an oversized
+    /// put, which the reference only counts before discarding its body.
+    pub(crate) id: Option<JobId>,
+    /// `created_at` as set by `make_job` at header time.
+    pub(crate) created_at: Nanos,
 }
 
 impl ConnState {
@@ -141,6 +154,7 @@ impl ConnState {
             wait_deadline: None,
             reserved_fifo: Vec::new(),
             reserved_by_deadline: BTreeSet::new(),
+            pending_put: None,
         }
     }
 

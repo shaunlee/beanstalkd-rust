@@ -1,0 +1,43 @@
+# reserve: 4 waiters, one job served, the served worker re-enters the queue (an append resets the round-robin run), then 4 more jobs.
+@w1 send "list-tube-used\r\n"
+@w1 recv
+@w2 send "list-tube-used\r\n"
+@w2 recv
+@w3 send "list-tube-used\r\n"
+@w3 recv
+@w4 send "list-tube-used\r\n"
+@w4 recv
+@p send "list-tube-used\r\n"
+@p recv
+@w1 send "reserve\r\n"
+sleep 50ms
+@w2 send "reserve\r\n"
+sleep 50ms
+@w3 send "reserve\r\n"
+sleep 50ms
+@w4 send "reserve\r\n"
+sleep 50ms
+@p send "put 0 0 60 1\r\na\r\n"
+@p recv
+@w1 recv
+@w2 recv_none 100ms
+@w1 send "delete 1\r\n"
+@w1 recv
+@w1 send "reserve\r\n"
+sleep 50ms
+@p send "put 0 0 60 1\r\nb\r\n"
+@p recv
+sleep 50ms
+@p send "put 0 0 60 1\r\nc\r\n"
+@p recv
+sleep 50ms
+@p send "put 0 0 60 1\r\nd\r\n"
+@p recv
+sleep 50ms
+@p send "put 0 0 60 1\r\ne\r\n"
+@p recv
+sleep 50ms
+@w1 recv
+@w2 recv
+@w3 recv
+@w4 recv

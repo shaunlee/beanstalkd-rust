@@ -1,0 +1,17 @@
+# kick 0 kicks nothing even when buried jobs exist.
+@p send "put 0 0 60 2\r\nj1\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj2\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 1 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 2 0\r\n"
+@p recv
+@p send "kick 0\r\n"
+@p recv
+@p send "stats-tube default\r\n"
+@p recv

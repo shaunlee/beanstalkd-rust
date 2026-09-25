@@ -1,0 +1,4 @@
+# -z above 1 GiB is clamped to 1073741824 in stats max-job-size.
+!args -z 2000000000
+@p send "stats\r\n"
+@p recv

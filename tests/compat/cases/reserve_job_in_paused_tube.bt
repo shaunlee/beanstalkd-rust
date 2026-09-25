@@ -1,0 +1,9 @@
+# reserve-job ignores tube pause.
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@p send "pause-tube default 10\r\n"
+@p recv
+@c send "reserve-job 1\r\n"
+@c recv
+@c send "reserve-with-timeout 0\r\n"
+@c recv

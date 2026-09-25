@@ -1,0 +1,41 @@
+# tube names: every allowed punctuation character, a leading digit or punctuation; invalid characters are BAD_FORMAT.
+@p send "use a-+/;.$_()Z9\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@p send "use 9lives\r\n"
+@p recv
+@p send "use (paren)\r\n"
+@p recv
+@p send "use $dollar\r\n"
+@p recv
+@p send "use +plus\r\n"
+@p recv
+@p send "use /slash\r\n"
+@p recv
+@p send "use ;semi\r\n"
+@p recv
+@p send "use .dot\r\n"
+@p recv
+@p send "use _under\r\n"
+@p recv
+@p send "use )\r\n"
+@p recv
+@p send "use a b\r\n"
+@p recv
+@p send "use a*b\r\n"
+@p recv
+@p send "use a\xc3\xa9\r\n"
+@p recv
+@p send "use -x\r\n"
+@p recv
+@p send "use a\tb\r\n"
+@p recv
+@p send "watch 9lives\r\n"
+@p recv
+@p send "stats-tube a-+/;.$_()Z9\r\n"
+@p recv
+@p send "list-tubes\r\n"
+@p recv
+@p send "list-tubes-watched\r\n"
+@p recv

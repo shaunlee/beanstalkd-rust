@@ -1,0 +1,11 @@
+# framing: a CR arriving as the last byte of one read, with LF in the next, still ends the line.
+@p send "list-tube-used\r"
+@p recv_none 200ms
+@p send "\n"
+@p recv
+@p send "put 0 0 60 2\r"
+sleep 50ms
+@p send "\nab\r"
+sleep 50ms
+@p send "\n"
+@p recv

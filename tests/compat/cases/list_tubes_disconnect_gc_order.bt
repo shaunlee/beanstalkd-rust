@@ -1,0 +1,15 @@
+# list-tubes: when a connection closes, its watch list is cleared by repeatedly deleting index 0 (swap with last), so its tubes are destroyed in that order.
+@c1 send "watch a\r\n"
+@c1 recv
+@c1 send "watch b\r\n"
+@c1 recv
+@c2 send "watch x\r\n"
+@c2 recv
+@c2 send "watch y\r\n"
+@c2 recv
+@c2 send "list-tubes\r\n"
+@c2 recv
+@c1 close
+sleep 200ms
+@c2 send "list-tubes\r\n"
+@c2 recv

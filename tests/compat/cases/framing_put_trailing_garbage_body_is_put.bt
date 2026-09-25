@@ -1,0 +1,8 @@
+# framing: put with trailing garbage is BAD_FORMAT and its intended body (itself a put) is parsed as commands; no id is consumed.
+@p send "put 0 0 60 17 x\r\nput 0 0 60 1\r\nz\r\n"
+@p recv
+@p recv
+@p send "stats-job 1\r\n"
+@p recv
+@p send "stats\r\n"
+@p recv

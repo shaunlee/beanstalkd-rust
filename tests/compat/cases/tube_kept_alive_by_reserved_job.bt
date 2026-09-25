@@ -1,0 +1,25 @@
+# a tube stays alive while one of its jobs is reserved, even after its last watcher ignores it.
+@p send "use t\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@p send "use default\r\n"
+@p recv
+@c send "watch t\r\n"
+@c recv
+@c send "reserve\r\n"
+@c recv
+@c send "ignore t\r\n"
+@c recv
+@c send "list-tubes\r\n"
+@c recv
+@c send "release 1 0 0\r\n"
+@c recv
+@c send "list-tubes\r\n"
+@c recv
+@c send "reserve-job 1\r\n"
+@c recv
+@c send "delete 1\r\n"
+@c recv
+@c send "list-tubes\r\n"
+@c recv

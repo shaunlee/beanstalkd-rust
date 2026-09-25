@@ -1,0 +1,10 @@
+# framing: a CR not followed by LF hides every later CRLF until 224 bytes accumulate and the line overflows.
+@p send "list-tube-used\rX\r\n"
+@p recv_none 200ms
+@p send "list-tube-used\r\n"
+@p recv_none 200ms
+@p send "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+@p recv_none 200ms
+@p send "junk\r\nlist-tube-used\r\n"
+@p recv
+@p recv

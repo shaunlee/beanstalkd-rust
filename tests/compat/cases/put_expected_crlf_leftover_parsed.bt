@@ -1,0 +1,10 @@
+# EXPECTED_CRLF: the body is read as exactly size+2 bytes; bytes after that are parsed as the next commands.
+@p send "put 0 0 60 1\r\nabc\r\n"
+@p recv
+@p recv
+@p send "put 0 0 60 2\r\nab\r\r\nlist-tube-used\r\n"
+@p recv
+@p recv
+@p recv_none 200ms
+@p send "stats\r\n"
+@p recv

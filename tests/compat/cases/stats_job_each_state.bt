@@ -1,0 +1,25 @@
+# stats-job in ready, delayed, reserved, buried and kicked states (delay/ttr/counters; time-left masked).
+@p send "put 5 0 30 1\r\na\r\n"
+@p recv
+@p send "put 6 20 40 1\r\nb\r\n"
+@p recv
+@p send "stats-job 1\r\n"
+@p recv
+@p send "stats-job 2\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "stats-job 1\r\n"
+@p recv
+@p send "bury 1 9\r\n"
+@p recv
+@p send "stats-job 1\r\n"
+@p recv
+@p send "kick 1\r\n"
+@p recv
+@p send "stats-job 1\r\n"
+@p recv
+@p send "kick-job 2\r\n"
+@p recv
+@p send "stats-job 2\r\n"
+@p recv

@@ -1,0 +1,35 @@
+# kick with a negative bound: strtoul wraps -1 to ULONG_MAX (all), -0 is 0, -4294967295 truncates to 1.
+@p send "put 0 0 60 2\r\nj1\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj2\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj3\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj4\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 1 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 2 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 3 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 4 0\r\n"
+@p recv
+@p send "kick -0\r\n"
+@p recv
+@p send "kick -4294967295\r\n"
+@p recv
+@p send "kick -1\r\n"
+@p recv
+@p send "kick -\r\n"
+@p recv
+@p send "stats-tube default\r\n"
+@p recv

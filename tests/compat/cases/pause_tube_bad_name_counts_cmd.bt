@@ -1,0 +1,13 @@
+# pause-tube with an invalid tube name (leading hyphen, 201 chars) is BAD_FORMAT but the reference has already counted cmd-pause-tube.
+@c1 send "pause-tube -foo 5\r\n"
+@c1 recv
+@c1 send "pause-tube aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 5\r\n"
+@c1 recv
+@c1 send "pause-tube 5\r\n"
+@c1 recv
+@c1 send "pause-tube default x\r\n"
+@c1 recv
+@c1 send "stats\r\n"
+@c1 recv
+@c1 send "stats-tube default\r\n"
+@c1 recv

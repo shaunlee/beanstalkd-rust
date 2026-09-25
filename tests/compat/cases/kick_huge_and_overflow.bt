@@ -1,0 +1,27 @@
+# kick bound parsed by strtoul: ULONG_MAX truncates to u32 max (kicks all); ULONG_MAX+1 overflows to BAD_FORMAT.
+@p send "put 0 0 60 2\r\nj1\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj2\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj3\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 1 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 2 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 3 0\r\n"
+@p recv
+@p send "kick 18446744073709551616\r\n"
+@p recv
+@p send "kick 99999999999999999999\r\n"
+@p recv
+@p send "kick 18446744073709551615\r\n"
+@p recv
+@p send "stats\r\n"
+@p recv

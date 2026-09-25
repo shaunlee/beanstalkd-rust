@@ -319,3 +319,54 @@ fn empty_buffer_buf_advance_noop_sanity() {
     assert_eq!(codec.decode(&mut buf).unwrap(), None);
     buf.advance(0);
 }
+
+// ---- emit_put_started (header-time put side effects) ----
+
+#[test]
+fn put_started_is_emitted_before_the_body_arrives() {
+    let mut codec = ServerCodec::new(DEFAULT_MAX_JOB_SIZE).emit_put_started();
+    let mut buf = BytesMut::from(&b"put 1 2 3 5\r\nhe"[..]);
+    assert_eq!(
+        decode_all(&mut codec, &mut buf),
+        vec![Frame::PutStarted { too_big: false }]
+    );
+    buf.extend_from_slice(b"llo\r\nlist-tubes\r\n");
+    assert_eq!(
+        decode_all(&mut codec, &mut buf),
+        vec![
+            Frame::Command(Command::Put {
+                pri: 1,
+                delay: 2,
+                ttr: 3,
+                body: bytes::Bytes::from_static(b"hello"),
+            }),
+            Frame::Command(Command::ListTubes),
+        ]
+    );
+}
+
+#[test]
+fn put_started_precedes_every_put_completion_but_not_trailing_garbage() {
+    let mut codec = ServerCodec::new(3).emit_put_started();
+    let mut buf =
+        BytesMut::from(&b"put 0 0 1 5\r\n01234\r\nput 0 0 1 1\r\nxyz\r\nput 0 0 1 1 junk\r\n"[..]);
+    assert_eq!(
+        decode_all(&mut codec, &mut buf),
+        vec![
+            Frame::PutStarted { too_big: true },
+            Frame::PutRejected(PutRejection::JobTooBig),
+            Frame::PutStarted { too_big: false },
+            Frame::PutRejected(PutRejection::ExpectedCrlf),
+            // "\r\n" left over after the 3-byte body window is an empty line.
+            Frame::Error(Response::UnknownCommand),
+            Frame::PutRejected(PutRejection::TrailingGarbage),
+        ]
+    );
+}
+
+#[test]
+fn default_codec_never_emits_put_started() {
+    let mut codec = ServerCodec::new(DEFAULT_MAX_JOB_SIZE);
+    let mut buf = BytesMut::from(&b"put 0 0 1 1\r\nx"[..]);
+    assert!(decode_all(&mut codec, &mut buf).is_empty());
+}

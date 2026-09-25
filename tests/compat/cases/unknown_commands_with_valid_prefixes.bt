@@ -1,0 +1,55 @@
+# commands sharing a prefix with real ones: some are BAD_FORMAT (prefix matched), others UNKNOWN_COMMAND.
+@p send "reserve-\r\n"
+@p recv
+@p send "reserve-job\r\n"
+@p recv
+@p send "reserve-with-timeout\r\n"
+@p recv
+@p send "stats-\r\n"
+@p recv
+@p send "stats-job\r\n"
+@p recv
+@p send "peek-foo\r\n"
+@p recv
+@p send "peek\r\n"
+@p recv
+@p send "peek-readyx\r\n"
+@p recv
+@p send "kick\r\n"
+@p recv
+@p send "kick-job\r\n"
+@p recv
+@p send "list-tubes-\r\n"
+@p recv
+@p send "list-tubes-watchedx\r\n"
+@p recv
+@p send "list-tube-usedx\r\n"
+@p recv
+@p send "use\r\n"
+@p recv
+@p send "watch\r\n"
+@p recv
+@p send "ignore\r\n"
+@p recv
+@p send "pause-tube\r\n"
+@p recv
+@p send "delete\r\n"
+@p recv
+@p send "release\r\n"
+@p recv
+@p send "bury\r\n"
+@p recv
+@p send "touch\r\n"
+@p recv
+@p send "put\r\n"
+@p recv
+@p send "stats-tube\r\n"
+@p recv
+@p send "stats-tubex\r\n"
+@p recv
+@p send "Stats\r\n"
+@p recv
+@p send "puts 0 0 1 1\r\n"
+@p recv
+@p send "stats\r\n"
+@p recv

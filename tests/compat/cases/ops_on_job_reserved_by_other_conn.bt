@@ -1,0 +1,19 @@
+# release, bury, touch and delete of a job reserved by another connection are NOT_FOUND but still counted.
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c2 send "release 1 0 0\r\n"
+@c2 recv
+@c2 send "bury 1 0\r\n"
+@c2 recv
+@c2 send "touch 1\r\n"
+@c2 recv
+@c2 send "delete 1\r\n"
+@c2 recv
+@c2 send "stats-job 1\r\n"
+@c2 recv
+@c2 send "stats\r\n"
+@c2 recv
+@c1 send "delete 1\r\n"
+@c1 recv

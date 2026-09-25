@@ -435,8 +435,13 @@ pub(crate) fn parse_line_raw(line: &[u8]) -> Result<ParsedLine, Response> {
         Op::PauseTube => {
             let (name, rest) = read_tube_name_span(rest).ok_or(Response::BadFormat)?;
             let delay = read_u32_full(rest).ok_or(Response::BadFormat)?;
-            let tube = tube_name_from_bytes(name).ok_or(Response::BadFormat)?;
-            Ok(ParsedLine::Command(Command::PauseTube { tube, delay }))
+            // prot.c increments op_ct[OP_PAUSE_TUBE] *before* running
+            // is_valid_tube on the name span, so an invalid name is still a
+            // counted command (the engine replies BAD_FORMAT).
+            match tube_name_from_bytes(name) {
+                Some(tube) => Ok(ParsedLine::Command(Command::PauseTube { tube, delay })),
+                None => Ok(ParsedLine::Command(Command::PauseTubeBadName)),
+            }
         }
     }
 }

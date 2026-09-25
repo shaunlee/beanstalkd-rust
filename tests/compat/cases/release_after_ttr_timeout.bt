@@ -1,0 +1,16 @@
+# release/touch/bury after the job's TTR expired are NOT_FOUND; the job is ready with timeouts 1.
+@p send "put 0 0 1 1\r\nx\r\n"
+@p recv
+@c1 send "reserve\r\n"
+@c1 recv
+sleep 2200ms
+@c1 send "release 1 0 0\r\n"
+@c1 recv
+@c1 send "touch 1\r\n"
+@c1 recv
+@c1 send "bury 1 0\r\n"
+@c1 recv
+@c1 send "stats-job 1\r\n"
+@c1 recv
+@c1 send "stats\r\n"
+@c1 recv

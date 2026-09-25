@@ -1,0 +1,47 @@
+# kick bound: trailing garbage is ignored, tabs and plus sign accepted, no digits is BAD_FORMAT.
+@p send "put 0 0 60 2\r\nj1\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj2\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj3\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj4\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj5\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 1 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 2 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 3 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 4 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 5 0\r\n"
+@p recv
+@p send "kick 1abc\r\n"
+@p recv
+@p send "kick \t1\r\n"
+@p recv
+@p send "kick +1 junk\r\n"
+@p recv
+@p send "kick 0x2\r\n"
+@p recv
+@p send "kick abc\r\n"
+@p recv
+@p send "kick  \r\n"
+@p recv
+@p send "kick ++1\r\n"
+@p recv
+@p send "stats-tube default\r\n"
+@p recv

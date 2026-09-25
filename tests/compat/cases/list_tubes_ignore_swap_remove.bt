@@ -1,0 +1,27 @@
+# list-tubes / list-tubes-watched: ignoring a middle tube swap-removes it from both the watch list and (on GC) the global tube list.
+@c1 send "watch a\r\n"
+@c1 recv
+@c1 send "watch b\r\n"
+@c1 recv
+@c1 send "watch c\r\n"
+@c1 recv
+@c1 send "watch d\r\n"
+@c1 recv
+@c1 send "ignore b\r\n"
+@c1 recv
+@c1 send "list-tubes-watched\r\n"
+@c1 recv
+@c1 send "list-tubes\r\n"
+@c1 recv
+@c1 send "ignore default\r\n"
+@c1 recv
+@c1 send "list-tubes-watched\r\n"
+@c1 recv
+@c1 send "list-tubes\r\n"
+@c1 recv
+@c1 send "watch b\r\n"
+@c1 recv
+@c1 send "list-tubes-watched\r\n"
+@c1 recv
+@c1 send "list-tubes\r\n"
+@c1 recv

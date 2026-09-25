@@ -1,0 +1,25 @@
+# priority edges: 0, 1023 and 1024 (urgent threshold), u32 max; u32 max + 1 is BAD_FORMAT; reserve order follows priority.
+@p send "put 4294967295 0 60 3\r\nmax\r\n"
+@p recv
+@p send "put 1024 0 60 5\r\np1024\r\n"
+@p recv
+@p send "put 1023 0 60 5\r\np1023\r\n"
+@p recv
+@p send "put 0 0 60 2\r\np0\r\n"
+@p recv
+@p send "put 4294967296 0 60 1\r\n"
+@p recv
+@p send "stats\r\n"
+@p recv
+@p send "stats-tube default\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "stats\r\n"
+@p recv

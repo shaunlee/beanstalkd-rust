@@ -1,0 +1,4 @@
+# -z beyond u64: strtoull saturates to ULLONG_MAX, which is then clamped to 1 GiB.
+!args -z 18446744073709551616
+@p send "stats\r\n"
+@p recv

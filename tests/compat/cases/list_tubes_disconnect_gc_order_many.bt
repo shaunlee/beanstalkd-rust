@@ -1,0 +1,27 @@
+# list-tubes: closing a connection that watches five private tubes and uses a sixth; tube destruction order determines the survivors' order.
+@c1 send "watch t1\r\n"
+@c1 recv
+@c2 send "watch keep1\r\n"
+@c2 recv
+@c1 send "watch t2\r\n"
+@c1 recv
+@c1 send "watch t3\r\n"
+@c1 recv
+@c2 send "watch keep2\r\n"
+@c2 recv
+@c1 send "watch t4\r\n"
+@c1 recv
+@c1 send "use t5\r\n"
+@c1 recv
+@c2 send "watch keep3\r\n"
+@c2 recv
+@c1 send "watch t6\r\n"
+@c1 recv
+@c2 send "list-tubes\r\n"
+@c2 recv
+@c1 close
+sleep 200ms
+@c2 send "list-tubes\r\n"
+@c2 recv
+@c2 send "list-tubes-watched\r\n"
+@c2 recv

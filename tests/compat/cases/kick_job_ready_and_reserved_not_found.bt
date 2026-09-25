@@ -1,0 +1,23 @@
+# kick-job on a ready job and on a reserved job replies NOT_FOUND; kick-job of a delayed job in another tube works.
+@p send "put 0 0 60 2\r\nr1\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nr2\r\n"
+@p recv
+@p send "kick-job 1\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "kick-job 1\r\n"
+@p recv
+@p send "use other\r\n"
+@p recv
+@p send "put 0 100 60 2\r\nd3\r\n"
+@p recv
+@p send "use default\r\n"
+@p recv
+@p send "kick-job 3\r\n"
+@p recv
+@p send "stats-job 3\r\n"
+@p recv
+@p send "kick-job 3\r\n"
+@p recv

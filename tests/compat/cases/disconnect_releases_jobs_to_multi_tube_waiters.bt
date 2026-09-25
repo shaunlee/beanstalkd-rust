@@ -1,0 +1,33 @@
+# disconnect returns jobs from different tubes; waiters watching only one tube get only that tube's job.
+@p send "use a\r\n"
+@p recv
+@p send "put 0 0 60 3\r\nina\r\n"
+@p recv
+@p send "use b\r\n"
+@p recv
+@p send "put 0 0 60 3\r\ninb\r\n"
+@p recv
+@h send "watch a\r\n"
+@h recv
+@h send "watch b\r\n"
+@h recv
+@h send "reserve\r\n"
+@h recv
+@h send "reserve\r\n"
+@h recv
+@w1 send "watch b\r\n"
+@w1 recv
+@w1 send "ignore default\r\n"
+@w1 recv
+@w2 send "watch a\r\n"
+@w2 recv
+@w2 send "ignore default\r\n"
+@w2 recv
+@w1 send "reserve\r\n"
+sleep 50ms
+@w2 send "reserve\r\n"
+sleep 50ms
+@h close
+sleep 200ms
+@w1 recv
+@w2 recv

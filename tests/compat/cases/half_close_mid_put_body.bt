@@ -1,0 +1,8 @@
+# half-close in the middle of a put body: no reply, connection closed, no job created.
+@c1 send "put 0 0 60 5\r\nhel"
+@c1 shutdown_write
+@c1 recv_closed 500ms
+@p send "stats\r\n"
+@p recv
+@p send "peek 1\r\n"
+@p recv

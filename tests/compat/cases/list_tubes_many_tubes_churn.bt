@@ -1,0 +1,45 @@
+# list-tubes: many tubes created via use/watch, then several destroyed by ignore and use switches.
+@c1 send "watch t01\r\n"
+@c1 recv
+@c1 send "watch t02\r\n"
+@c1 recv
+@c1 send "watch t03\r\n"
+@c1 recv
+@c1 send "watch t04\r\n"
+@c1 recv
+@c1 send "watch t05\r\n"
+@c1 recv
+@c1 send "watch t06\r\n"
+@c1 recv
+@c1 send "watch t07\r\n"
+@c1 recv
+@c1 send "watch t08\r\n"
+@c1 recv
+@c1 send "watch t09\r\n"
+@c1 recv
+@c1 send "watch t10\r\n"
+@c1 recv
+@c1 send "watch t11\r\n"
+@c1 recv
+@c1 send "watch t12\r\n"
+@c1 recv
+@c2 send "use u1\r\n"
+@c2 recv
+@c2 send "use u2\r\n"
+@c2 recv
+@c1 send "ignore t03\r\n"
+@c1 recv
+@c1 send "ignore t07\r\n"
+@c1 recv
+@c1 send "ignore t01\r\n"
+@c1 recv
+@c1 send "ignore t12\r\n"
+@c1 recv
+@c1 send "ignore t05\r\n"
+@c1 recv
+@c1 send "list-tubes\r\n"
+@c1 recv
+@c1 send "list-tubes-watched\r\n"
+@c1 recv
+@c1 send "stats\r\n"
+@c1 recv

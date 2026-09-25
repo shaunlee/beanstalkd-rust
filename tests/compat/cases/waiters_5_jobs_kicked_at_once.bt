@@ -1,0 +1,60 @@
+# reserve: 5 blocked waiters, 5 buried jobs kicked by one kick command (several jobs at once).
+@w1 send "list-tube-used\r\n"
+@w1 recv
+@w2 send "list-tube-used\r\n"
+@w2 recv
+@w3 send "list-tube-used\r\n"
+@w3 recv
+@w4 send "list-tube-used\r\n"
+@w4 recv
+@w5 send "list-tube-used\r\n"
+@w5 recv
+@p send "list-tube-used\r\n"
+@p recv
+@p send "put 0 0 60 4\r\njob1\r\n"
+@p recv
+@p send "put 0 0 60 4\r\njob2\r\n"
+@p recv
+@p send "put 0 0 60 4\r\njob3\r\n"
+@p recv
+@p send "put 0 0 60 4\r\njob4\r\n"
+@p recv
+@p send "put 0 0 60 4\r\njob5\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 1 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 2 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 3 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 4 0\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 5 0\r\n"
+@p recv
+@w1 send "reserve\r\n"
+sleep 50ms
+@w2 send "reserve\r\n"
+sleep 50ms
+@w3 send "reserve\r\n"
+sleep 50ms
+@w4 send "reserve\r\n"
+sleep 50ms
+@w5 send "reserve\r\n"
+sleep 50ms
+@p send "kick 5\r\n"
+@p recv
+@w1 recv
+@w2 recv
+@w3 recv
+@w4 recv
+@w5 recv

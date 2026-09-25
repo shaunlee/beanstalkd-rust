@@ -54,6 +54,11 @@ impl ServerProcess {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
+
+    /// OS process id of the server (target of `signal` steps).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
 }
 
 impl Drop for ServerProcess {

@@ -101,6 +101,11 @@ pub enum Command {
         tube: TubeName,
         delay: u32,
     },
+    /// `pause-tube` whose tube-name span and delay both parsed, but whose
+    /// name then failed validation (leading `-`, or longer than 200 bytes).
+    /// prot.c has already counted `cmd-pause-tube` at that point, so this
+    /// must reach the engine, which counts it and replies `BAD_FORMAT`.
+    PauseTubeBadName,
 }
 
 /// A server reply. `encode` must produce byte-identical output to the
@@ -160,6 +165,16 @@ pub enum Frame {
     /// `cmd-put` (and, for `ExpectedCrlf`, marks the connection as a producer
     /// and consumes a job id) before rejecting it. The engine emits the reply.
     PutRejected(PutRejection),
+    /// A `put` command line was accepted and the codec is now reading its
+    /// body (or, when `too_big`, discarding it). Emitted only by a codec
+    /// built with [`ServerCodec::emit_put_started`]. prot.c applies a put's
+    /// header-time side effects right here, before any body byte arrives:
+    /// `cmd-put` is counted and, unless `too_big`, the connection becomes a
+    /// producer and a job id is allocated. On the same connection it is
+    /// followed by exactly one completion frame (`Command(Put)`,
+    /// `PutRejected(ExpectedCrlf)` or `PutRejected(JobTooBig)`), unless the
+    /// connection closes first. No reply.
+    PutStarted { too_big: bool },
     /// A protocol-level error with no engine side effects (BAD_FORMAT,
     /// UNKNOWN_COMMAND, ...). The connection replies with it directly and
     /// stays open.

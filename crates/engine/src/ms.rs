@@ -62,6 +62,18 @@ impl<T: PartialEq + Clone> Ms<T> {
         Some(item)
     }
 
+    /// `ms_clear`: empties the set by deleting index 0 until empty (each
+    /// deletion swaps the last item into slot 0). Returns the items in the
+    /// order they were deleted, which is the order `onremove` fires in.
+    pub(crate) fn clear_in_delete_order(&mut self) -> Vec<T> {
+        let mut order = Vec::with_capacity(self.items.len());
+        while !self.items.is_empty() {
+            order.push(self.items.swap_remove(0));
+        }
+        self.last = 0;
+        order
+    }
+
     #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.items.clear();
@@ -119,6 +131,17 @@ mod tests {
         }
         let order: Vec<char> = std::iter::from_fn(|| m.take()).collect();
         assert_eq!(order, vec!['A', 'B', 'D', 'C']);
+    }
+
+    #[test]
+    fn clear_in_delete_order_matches_ms_clear() {
+        let mut m: Ms<char> = Ms::new();
+        for c in ['A', 'B', 'C', 'D', 'E'] {
+            m.append(c);
+        }
+        // delete(0): A out, E moves to 0 -> [E,B,C,D]; then E, D, C, B.
+        assert_eq!(m.clear_in_delete_order(), vec!['A', 'E', 'D', 'C', 'B']);
+        assert!(m.is_empty());
     }
 
     #[test]

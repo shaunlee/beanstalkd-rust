@@ -1,0 +1,27 @@
+# ttr 0 is bumped to 1; delay and ttr at u32 max are accepted and reported; release/bury priority at u32 max.
+@p send "put 0 0 0 2\r\nt0\r\n"
+@p recv
+@p send "put 0 4294967295 4294967295 3\r\nbig\r\n"
+@p recv
+@p send "stats-job 1\r\n"
+@p recv
+@p send "stats-job 2\r\n"
+@p recv
+@p send "put 0 4294967296 60 1\r\n"
+@p recv
+@p send "put 0 0 4294967296 1\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "release 1 4294967295 0\r\n"
+@p recv
+@p send "stats-job 1\r\n"
+@p recv
+@p send "kick-job 2\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "bury 2 4294967295\r\n"
+@p recv
+@p send "stats-job 2\r\n"
+@p recv

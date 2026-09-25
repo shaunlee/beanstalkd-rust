@@ -1,0 +1,9 @@
+# pause-tube with delay 0 pauses for 1 nanosecond (not 1 second): a job is still reservable immediately; stats-tube shows pause 0.
+@c1 send "put 0 0 60 1\r\nx\r\n"
+@c1 recv
+@c1 send "pause-tube default 0\r\n"
+@c1 recv
+@c1 send "reserve-with-timeout 0\r\n"
+@c1 recv
+@c1 send "stats-tube default\r\n"
+@c1 recv

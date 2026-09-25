@@ -1,0 +1,7 @@
+# half-close while an oversized body is being discarded: no JOB_TOO_BIG reply, connection closed.
+!args -z 5
+@c1 send "put 0 0 60 10\r\n0123"
+@c1 shutdown_write
+@c1 recv_closed 500ms
+@p send "stats\r\n"
+@p recv

@@ -1,0 +1,4 @@
+# -z -1: the reference's sscanf("%zu") wraps a negative size to SIZE_MAX, which is then clamped to 1 GiB.
+!args -z -1
+@p send "stats\r\n"
+@p recv

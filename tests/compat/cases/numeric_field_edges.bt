@@ -1,0 +1,31 @@
+# numeric fields: u64 max job id is NOT_FOUND, u64 max + 1 is BAD_FORMAT, extra leading spaces accepted, trailing space rejected.
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@p send "peek 18446744073709551615\r\n"
+@p recv
+@p send "peek 18446744073709551616\r\n"
+@p recv
+@p send "peek  1\r\n"
+@p recv
+@p send "peek 1 \r\n"
+@p recv
+@p send "peek 01\r\n"
+@p recv
+@p send "stats-job 00001\r\n"
+@p recv
+@p send "delete 1 \r\n"
+@p recv
+@p send "bury 1\r\n"
+@p recv
+@p send "release 1 2\r\n"
+@p recv
+@p send "touch  1\r\n"
+@p recv
+@p send "kick-job 18446744073709551616\r\n"
+@p recv
+@p send "reserve-job   1\r\n"
+@p recv
+@p send "release 1   5    0\r\n"
+@p recv
+@p send "delete\t1\r\n"
+@p recv

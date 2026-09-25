@@ -1,0 +1,17 @@
+# drain mode: a blocked waiter is not served by a DRAINING put, but a release of an existing job still wakes it.
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@w send "reserve\r\n"
+sleep 100ms
+signal USR1
+sleep 300ms
+@p send "put 0 0 60 3\r\nnew\r\n"
+@p recv
+@w recv_none 200ms
+@p send "release 1 0 0\r\n"
+@p recv
+@w recv
+@p send "stats-tube default\r\n"
+@p recv

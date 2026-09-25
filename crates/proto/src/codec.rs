@@ -38,6 +38,8 @@ enum State {
 pub struct ServerCodec {
     max_job_size: u32,
     state: State,
+    /// Whether to emit `Frame::PutStarted` when a put header is accepted.
+    emit_put_started: bool,
 }
 
 impl ServerCodec {
@@ -45,7 +47,16 @@ impl ServerCodec {
         ServerCodec {
             max_job_size,
             state: State::Line { overflowed: false },
+            emit_put_started: false,
         }
+    }
+
+    /// Also emit `Frame::PutStarted` as soon as a put command line is
+    /// accepted, before its body is read, so the caller can apply the
+    /// reference's header-time side effects (see `Frame::PutStarted`).
+    pub fn emit_put_started(mut self) -> Self {
+        self.emit_put_started = true;
+        self
     }
 }
 
@@ -129,6 +140,9 @@ impl Decoder for ServerCodec {
                                     self.state = State::Discard {
                                         remaining: u64::from(header.body_size) + 2,
                                     };
+                                    if self.emit_put_started {
+                                        return Ok(Some(Frame::PutStarted { too_big: true }));
+                                    }
                                 } else if header.trailing_garbage {
                                     self.state = State::Line { overflowed: false };
                                     return Ok(Some(Frame::PutRejected(
@@ -141,6 +155,9 @@ impl Decoder for ServerCodec {
                                         ttr: header.ttr,
                                         body_size: header.body_size,
                                     };
+                                    if self.emit_put_started {
+                                        return Ok(Some(Frame::PutStarted { too_big: false }));
+                                    }
                                 }
                             }
                         }

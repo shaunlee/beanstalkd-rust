@@ -428,6 +428,52 @@ fn put_body_split_across_writes() {
 // timing: reserve-with-timeout and TTR expiry
 // ---------------------------------------------------------------------
 
+/// prot.c counts a put and allocates its job id as soon as the command
+/// line parses (`Frame::PutStarted`), before the body arrives: a put
+/// completed meanwhile on another connection gets the *next* id, and
+/// another connection's stats already show the pending put.
+#[test]
+fn put_header_allocates_job_id_before_body_arrives() {
+    let server = Server::start(&[]);
+    let mut slow = server.connect();
+    let mut fast = server.connect();
+
+    slow.send(b"put 0 0 60 5\r\nhe");
+    std::thread::sleep(Duration::from_millis(200));
+
+    fast.send(b"stats\r\n");
+    let (_, body) = fast.read_body_reply();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("\ncmd-put: 1\n"), "body={body}");
+    assert!(body.contains("\ncurrent-producers: 1\n"), "body={body}");
+
+    fast.send(b"put 0 0 60 1\r\nx\r\n");
+    assert_eq!(fast.read_line(), "INSERTED 2\r\n");
+    slow.send(b"llo\r\n");
+    assert_eq!(slow.read_line(), "INSERTED 1\r\n");
+
+    // A put abandoned mid-body has still consumed its id.
+    let mut quitter = server.connect();
+    quitter.send(b"put 0 0 60 5\r\nab");
+    std::thread::sleep(Duration::from_millis(100));
+    drop(quitter);
+    std::thread::sleep(Duration::from_millis(200));
+    fast.send(b"put 0 0 60 1\r\ny\r\n");
+    assert_eq!(fast.read_line(), "INSERTED 4\r\n");
+}
+
+/// `-z -1` is accepted like the reference's `sscanf("%zu")`: it wraps to
+/// SIZE_MAX and is clamped to 1 GiB.
+#[test]
+fn negative_max_job_size_is_clamped_like_the_reference() {
+    let server = Server::start(&["-z", "-1"]);
+    let mut c = server.connect();
+    c.send(b"stats\r\n");
+    let (_, body) = c.read_body_reply();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("\nmax-job-size: 1073741824\n"), "body={body}");
+}
+
 #[test]
 fn reserve_with_timeout_times_out_after_about_one_second() {
     let server = Server::start(&[]);

@@ -1,0 +1,20 @@
+# reserve-with-timeout: INT_MAX waits (woken by a put), INT_MAX+1 and above are BAD_FORMAT, trailing garbage is ignored.
+@c1 send "reserve-with-timeout 2147483648\r\n"
+@c1 recv
+@c1 send "reserve-with-timeout 4294967295\r\n"
+@c1 recv
+@c1 send "reserve-with-timeout 4294967296\r\n"
+@c1 recv
+@c1 send "reserve-with-timeout -1\r\n"
+@c1 recv
+@c1 send "reserve-with-timeout\r\n"
+@c1 recv
+@c1 send "reserve-with-timeout 2147483647\r\n"
+@c1 recv_none 300ms
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@c1 recv
+@c1 send "reserve-with-timeout 1 junk\r\n"
+@c1 recv
+@c1 send "stats\r\n"
+@c1 recv

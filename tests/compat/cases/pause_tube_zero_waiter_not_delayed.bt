@@ -1,0 +1,8 @@
+# pause-tube 0 then a blocked reserve is woken by a put right away (no 1 s pause window).
+@c1 send "pause-tube default 0\r\n"
+@c1 recv
+@c2 send "reserve-with-timeout 5\r\n"
+sleep 100ms
+@c1 send "put 0 0 60 1\r\nx\r\n"
+@c1 recv
+@c2 recv

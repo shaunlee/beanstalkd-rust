@@ -1,0 +1,18 @@
+# stats-tube and stats reflect pause-tube: pause seconds, cmd-pause-tube per tube and global, pause cleared after expiry.
+@c1 send "pause-tube default 1\r\n"
+@c1 recv
+@c1 send "watch other\r\n"
+@c1 recv
+@c1 send "pause-tube other 7\r\n"
+@c1 recv
+@c1 send "pause-tube other 8\r\n"
+@c1 recv
+@c1 send "stats-tube default\r\n"
+@c1 recv
+@c1 send "stats-tube other\r\n"
+@c1 recv
+sleep 1500ms
+@c1 send "stats-tube default\r\n"
+@c1 recv
+@c1 send "stats\r\n"
+@c1 recv

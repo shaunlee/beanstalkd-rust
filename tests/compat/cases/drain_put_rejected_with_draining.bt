@@ -1,0 +1,26 @@
+# drain mode (SIGUSR1): put replies DRAINING and is counted; framing rejections still win; stats shows draining true; existing jobs remain reservable.
+!args -z 5
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+signal USR1
+sleep 300ms
+@d send "put 0 0 60 1\r\ny\r\n"
+@d recv
+@d send "put 3 0 60 1\r\nz\r\n"
+@d recv
+@d send "put 0 0 60 1\r\nabc"
+@d recv
+@d send "put 0 0 60 6\r\n123456\r\n"
+@d recv
+@d send "stats\r\n"
+@d recv
+@d send "reserve\r\n"
+@d recv
+@d send "stats-job 1\r\n"
+@d recv
+@d send "delete 1\r\n"
+@d recv
+@d send "put 0 0 60 1\r\nw\r\n"
+@d recv
+@d send "stats\r\n"
+@d recv

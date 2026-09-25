@@ -1,0 +1,19 @@
+# list-tubes: a tube stays alive while it holds a job, and is destroyed when the last job is deleted (and nothing uses or watches it).
+@c1 send "use jobs\r\n"
+@c1 recv
+@c1 send "put 0 0 60 1\r\nx\r\n"
+@c1 recv
+@c1 send "use other\r\n"
+@c1 recv
+@c1 send "list-tubes\r\n"
+@c1 recv
+@c1 send "use default\r\n"
+@c1 recv
+@c1 send "list-tubes\r\n"
+@c1 recv
+@c1 send "delete 1\r\n"
+@c1 recv
+@c1 send "list-tubes\r\n"
+@c1 recv
+@c1 send "stats-tube jobs\r\n"
+@c1 recv

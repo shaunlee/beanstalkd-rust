@@ -65,6 +65,7 @@ fn format_outcome(o: &Outcome) -> String {
         Outcome::Closed => "<connection closed>".to_string(),
         Outcome::StillOpen => "<connection still open>".to_string(),
         Outcome::Slept => "<slept>".to_string(),
+        Outcome::Signaled => "<signaled>".to_string(),
         Outcome::ShutdownDone => "<shutdown_write done>".to_string(),
         Outcome::ClosedDone => "<close done>".to_string(),
         Outcome::IoError(msg) => format!("<io error: {msg}>"),

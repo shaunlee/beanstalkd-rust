@@ -1,0 +1,29 @@
+# reserve-job on delayed, buried and ready jobs succeeds and stats-job reflects each; a job reserved by another connection is NOT_FOUND.
+@p send "put 0 0 60 5\r\nready\r\n"
+@p recv
+@p send "put 0 100 60 7\r\ndelayed\r\n"
+@p recv
+@p send "put 0 0 60 6\r\nburied\r\n"
+@p recv
+@p send "reserve-job 3\r\n"
+@p recv
+@p send "bury 3 7\r\n"
+@p recv
+@c1 send "reserve-job 2\r\n"
+@c1 recv
+@c1 send "stats-job 2\r\n"
+@c1 recv
+@c1 send "reserve-job 3\r\n"
+@c1 recv
+@c1 send "stats-job 3\r\n"
+@c1 recv
+@c1 send "reserve-job 1\r\n"
+@c1 recv
+@c2 send "reserve-job 1\r\n"
+@c2 recv
+@c2 send "reserve-job 999\r\n"
+@c2 recv
+@c2 send "stats\r\n"
+@c2 recv
+@c1 send "stats\r\n"
+@c1 recv

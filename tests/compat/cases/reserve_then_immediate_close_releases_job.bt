@@ -1,0 +1,10 @@
+# reserve followed immediately by close: the job is reserved then released back to ready (reserves 1).
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@c1 send "reserve\r\n"
+@c1 close
+sleep 200ms
+@p send "stats-job 1\r\n"
+@p recv
+@p send "stats\r\n"
+@p recv

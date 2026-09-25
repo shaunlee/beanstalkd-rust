@@ -1,0 +1,18 @@
+# release with a delay moves the job to delayed with the new pri and delay; it becomes ready again after the delay.
+@p send "put 10 0 60 1\r\nx\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "release 1 3 1\r\n"
+@p recv
+@p send "stats-job 1\r\n"
+@p recv
+@p send "peek-delayed\r\n"
+@p recv
+@p send "stats-tube default\r\n"
+@p recv
+sleep 1500ms
+@p send "stats-job 1\r\n"
+@p recv
+@p send "peek-ready\r\n"
+@p recv

@@ -124,5 +124,6 @@ pub fn encode_command(cmd: &Command) -> Vec<u8> {
         Command::ListTubesWatched => b"list-tubes-watched\r\n".to_vec(),
         Command::Quit => b"quit\r\n".to_vec(),
         Command::PauseTube { tube, delay } => format!("pause-tube {tube} {delay}\r\n").into_bytes(),
+        Command::PauseTubeBadName => b"pause-tube -bad 0\r\n".to_vec(),
     }
 }

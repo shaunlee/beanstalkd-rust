@@ -1,0 +1,38 @@
+# pause-tube expiry hands several ready jobs to 4 blocked waiters in one pass (ms_take order).
+@w1 send "list-tube-used\r\n"
+@w1 recv
+@w2 send "list-tube-used\r\n"
+@w2 recv
+@w3 send "list-tube-used\r\n"
+@w3 recv
+@w4 send "list-tube-used\r\n"
+@w4 recv
+@p send "list-tube-used\r\n"
+@p recv
+@p send "pause-tube default 1\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj1\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj2\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj3\r\n"
+@p recv
+@p send "put 0 0 60 2\r\nj4\r\n"
+@p recv
+@w1 send "reserve\r\n"
+sleep 50ms
+@w2 send "reserve\r\n"
+sleep 50ms
+@w3 send "reserve\r\n"
+sleep 50ms
+@w4 send "reserve\r\n"
+sleep 50ms
+@p send "stats-tube default\r\n"
+@p recv
+sleep 1500ms
+@w1 recv
+@w2 recv
+@w3 recv
+@w4 recv
+@p send "stats-tube default\r\n"
+@p recv

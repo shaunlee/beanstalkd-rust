@@ -1,0 +1,8 @@
+# -z 0: only zero-length bodies are accepted; stats reports max-job-size 0.
+!args -z 0
+@p send "put 0 0 60 0\r\n\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@p send "stats\r\n"
+@p recv

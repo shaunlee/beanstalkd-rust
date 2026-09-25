@@ -1,0 +1,16 @@
+# put header numbers: leading zeros and extra spaces accepted, sign or tab rejected, trailing space is counted BAD_FORMAT.
+@p send "put 00 00 060 01\r\na\r\n"
+@p recv
+@p send "put  1  0  60  1\r\nb\r\n"
+@p recv
+@p send "put +1 0 60 1\r\n"
+@p recv
+@p send "put 1 0 60 -1\r\n"
+@p recv
+@p send "put 1\t0 60 1\r\n"
+@p recv
+@p send "put 1 0 60 1 \r\nc\r\n"
+@p recv
+@p recv
+@p send "stats\r\n"
+@p recv

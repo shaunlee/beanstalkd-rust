@@ -1,0 +1,11 @@
+# a connection blocked in reserve-with-timeout with a huge timeout disconnects; stats no longer count it as waiting.
+@c1 send "reserve-with-timeout 1000000\r\n"
+sleep 100ms
+@p send "stats-tube default\r\n"
+@p recv
+@c1 close
+sleep 200ms
+@p send "stats-tube default\r\n"
+@p recv
+@p send "stats\r\n"
+@p recv

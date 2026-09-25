@@ -1,0 +1,12 @@
+# reserve-with-timeout is not woken by a put into a tube it does not watch; it times out and the job stays ready.
+@c1 send "reserve-with-timeout 1\r\n"
+sleep 100ms
+@p send "use other\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@c1 recv
+@p send "stats-tube other\r\n"
+@p recv
+@p send "stats-tube default\r\n"
+@p recv

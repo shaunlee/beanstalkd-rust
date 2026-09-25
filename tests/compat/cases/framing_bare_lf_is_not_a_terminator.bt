@@ -1,0 +1,8 @@
+# framing: a bare LF does not end a line; the text up to the next CRLF is one (malformed) command.
+@p send "list-tubes\nlist-tube-used\r\n"
+@p recv
+@p send "stats\n"
+@p recv_none 200ms
+@p send "\r\nlist-tube-used\r\n"
+@p recv
+@p recv

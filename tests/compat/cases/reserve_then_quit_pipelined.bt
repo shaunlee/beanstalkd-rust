@@ -1,0 +1,13 @@
+# "reserve\r\nquit\r\n": quit is only processed after the reserve is answered; closing then releases the job.
+@c1 send "reserve\r\nquit\r\n"
+@c1 recv_none 300ms
+@p send "put 0 0 60 1\r\nx\r\n"
+@p recv
+@c1 recv
+@c1 recv_closed 500ms
+sleep 100ms
+@p send "stats-job 1\r\n"
+@p recv
+@c2 send "reserve-with-timeout 1\r\nquit\r\nstats\r\n"
+@c2 recv
+@c2 recv_closed 500ms

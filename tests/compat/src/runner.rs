@@ -122,13 +122,13 @@ pub fn run_case_pair(case_path: &Path, bin_a: &Path, bin_b: &Path) -> CaseResult
         Err(e) => return error_result(case_path, format!("failed to start server B: {e}")),
     };
 
-    let addr_a = server_a.addr();
-    let addr_b = server_b.addr();
+    let (addr_a, pid_a) = (server_a.addr(), server_a.pid());
+    let (addr_b, pid_b) = (server_b.addr(), server_b.pid());
     let steps = &case.steps;
 
     let (outcomes_a, outcomes_b) = thread::scope(|scope| {
-        let handle_a = scope.spawn(|| execute(steps, addr_a));
-        let handle_b = scope.spawn(|| execute(steps, addr_b));
+        let handle_a = scope.spawn(|| execute(steps, addr_a, pid_a));
+        let handle_b = scope.spawn(|| execute(steps, addr_b, pid_b));
         (
             handle_a.join().expect("server A execution thread panicked"),
             handle_b.join().expect("server B execution thread panicked"),

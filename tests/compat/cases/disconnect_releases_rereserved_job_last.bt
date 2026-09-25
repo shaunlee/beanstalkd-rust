@@ -1,0 +1,34 @@
+# disconnect order: a job released and reserved again moves to the end of the connection's reserved list.
+@p send "put 0 0 60 1\r\na\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nb\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nc\r\n"
+@p recv
+@h send "reserve\r\n"
+@h recv
+@h send "reserve\r\n"
+@h recv
+@h send "release 1 0 0\r\n"
+@h recv
+@h send "reserve\r\n"
+@h recv
+@h send "reserve\r\n"
+@h recv
+@w1 send "list-tube-used\r\n"
+@w1 recv
+@w2 send "list-tube-used\r\n"
+@w2 recv
+@w3 send "list-tube-used\r\n"
+@w3 recv
+@w1 send "reserve\r\n"
+sleep 50ms
+@w2 send "reserve\r\n"
+sleep 50ms
+@w3 send "reserve\r\n"
+sleep 50ms
+@h close
+sleep 200ms
+@w1 recv
+@w2 recv
+@w3 recv

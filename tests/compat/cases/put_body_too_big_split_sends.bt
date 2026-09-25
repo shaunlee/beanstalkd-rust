@@ -1,0 +1,11 @@
+# JOB_TOO_BIG body discarded across several sends, with the next command split too.
+!args -z 5
+@p send "put 0 0 60 8\r\n0123"
+sleep 50ms
+@p send "4567\r"
+sleep 50ms
+@p send "\nlist-tube"
+sleep 50ms
+@p send "-used\r\n"
+@p recv
+@p recv

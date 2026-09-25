@@ -1,0 +1,19 @@
+# pausing one watched tube does not block reserving from another watched tube.
+@c1 send "use a\r\n"
+@c1 recv
+@c1 send "put 0 0 60 3\r\nina\r\n"
+@c1 recv
+@c1 send "use b\r\n"
+@c1 recv
+@c1 send "put 5 0 60 3\r\ninb\r\n"
+@c1 recv
+@c2 send "watch a\r\n"
+@c2 recv
+@c2 send "watch b\r\n"
+@c2 recv
+@c2 send "pause-tube a 5\r\n"
+@c2 recv
+@c2 send "reserve-with-timeout 0\r\n"
+@c2 recv
+@c2 send "reserve-with-timeout 0\r\n"
+@c2 recv

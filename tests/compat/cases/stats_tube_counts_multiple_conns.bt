@@ -1,0 +1,30 @@
+# stats-tube current-using/watching/waiting and stats current-* with several connections using, watching and waiting on one tube.
+@a send "use t\r\n"
+@a recv
+@b send "use t\r\n"
+@b recv
+@b send "watch t\r\n"
+@b recv
+@c send "watch t\r\n"
+@c recv
+@c send "ignore default\r\n"
+@c recv
+@d send "watch t\r\n"
+@d recv
+@c send "reserve\r\n"
+sleep 50ms
+@d send "reserve-with-timeout 10\r\n"
+sleep 100ms
+@a send "stats-tube t\r\n"
+@a recv
+@a send "stats-tube default\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nx\r\n"
+@a recv
+@c recv
+@a send "stats-tube t\r\n"
+@a recv
+@a send "stats\r\n"
+@a recv

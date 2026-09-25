@@ -1,0 +1,13 @@
+# reserve while holding a job inside the safety margin but with a ready job available returns the ready job, not DEADLINE_SOON.
+@p send "put 0 0 1 1\r\na\r\n"
+@p recv
+@p send "put 0 0 60 1\r\nb\r\n"
+@p recv
+@c send "reserve\r\n"
+@c recv
+@c send "reserve\r\n"
+@c recv
+@c send "reserve-with-timeout 0\r\n"
+@c recv
+@c send "stats\r\n"
+@c recv

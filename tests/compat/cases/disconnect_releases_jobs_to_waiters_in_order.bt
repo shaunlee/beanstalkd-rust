@@ -1,0 +1,29 @@
+# disconnect of a connection holding 3 reserved jobs: jobs return in reservation order, each immediately offered to waiters.
+@p send "put 3 0 60 1\r\na\r\n"
+@p recv
+@p send "put 2 0 60 1\r\nb\r\n"
+@p recv
+@p send "put 1 0 60 1\r\nc\r\n"
+@p recv
+@h send "reserve\r\n"
+@h recv
+@h send "reserve\r\n"
+@h recv
+@h send "reserve\r\n"
+@h recv
+@w1 send "list-tube-used\r\n"
+@w1 recv
+@w2 send "list-tube-used\r\n"
+@w2 recv
+@w1 send "reserve\r\n"
+sleep 50ms
+@w2 send "reserve\r\n"
+sleep 50ms
+@h close
+sleep 200ms
+@w1 recv
+@w2 recv
+@p send "peek-ready\r\n"
+@p recv
+@p send "stats\r\n"
+@p recv

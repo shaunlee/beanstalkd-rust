@@ -12,6 +12,7 @@
 //! @c1 shutdown_write              # half-close (TCP FIN on the write side)
 //! @c1 close                       # close and forget the connection
 //! sleep 1100ms                    # sleep the whole harness for a duration
+//! signal USR1                     # send SIGUSR1 to the server process under test
 //! ```
 //!
 //! Connections are named `@c1`, `@c2`, ... and are opened lazily the first
@@ -31,13 +32,30 @@ pub struct Step {
 
 #[derive(Debug, Clone)]
 pub enum StepKind {
-    Send { conn: String, data: Vec<u8> },
-    Recv { conn: String },
-    RecvNone { conn: String, dur: Duration },
-    RecvClosed { conn: String, dur: Duration },
+    Send {
+        conn: String,
+        data: Vec<u8>,
+    },
+    Recv {
+        conn: String,
+    },
+    RecvNone {
+        conn: String,
+        dur: Duration,
+    },
+    RecvClosed {
+        conn: String,
+        dur: Duration,
+    },
     Sleep(Duration),
-    ShutdownWrite { conn: String },
-    Close { conn: String },
+    /// Send a signal to the server process under test (both A and B).
+    Signal(Signal),
+    ShutdownWrite {
+        conn: String,
+    },
+    Close {
+        conn: String,
+    },
 }
 
 impl StepKind {
@@ -50,7 +68,7 @@ impl StepKind {
             | StepKind::RecvClosed { conn, .. }
             | StepKind::ShutdownWrite { conn }
             | StepKind::Close { conn } => Some(conn.as_str()),
-            StepKind::Sleep(_) => None,
+            StepKind::Sleep(_) | StepKind::Signal(_) => None,
         }
     }
 
@@ -64,8 +82,35 @@ impl StepKind {
             StepKind::RecvNone { conn, dur } => format!("@{conn} recv_none {dur:?}"),
             StepKind::RecvClosed { conn, dur } => format!("@{conn} recv_closed {dur:?}"),
             StepKind::Sleep(dur) => format!("sleep {dur:?}"),
+            StepKind::Signal(sig) => format!("signal {}", sig.name()),
             StepKind::ShutdownWrite { conn } => format!("@{conn} shutdown_write"),
             StepKind::Close { conn } => format!("@{conn} close"),
+        }
+    }
+}
+
+/// A signal the harness can deliver to the server under test. Only
+/// signals whose reference behavior is non-fatal are supported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// SIGUSR1: the reference enters drain mode.
+    Usr1,
+}
+
+impl Signal {
+    /// The name as accepted by `kill -<name>` and written in case files.
+    pub fn name(self) -> &'static str {
+        match self {
+            Signal::Usr1 => "USR1",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "USR1" => Ok(Signal::Usr1),
+            other => Err(format!(
+                "unsupported signal '{other}': only USR1 is allowed"
+            )),
         }
     }
 }
@@ -149,6 +194,18 @@ pub fn parse_case_str(path: &Path, text: &str) -> Result<CaseFile, ParseError> {
             steps.push(Step {
                 line: line_no,
                 kind: StepKind::Sleep(dur),
+            });
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("signal") {
+            if !rest.starts_with(char::is_whitespace) {
+                return Err(err(format!("unknown directive: {line}")));
+            }
+            let sig = Signal::parse(rest.trim()).map_err(&err)?;
+            steps.push(Step {
+                line: line_no,
+                kind: StepKind::Signal(sig),
             });
             continue;
         }
@@ -477,6 +534,28 @@ mod tests {
         let err = parse_case_str(Path::new("cases/foo.bt"), src).expect_err("should fail");
         let text = err.to_string();
         assert!(text.starts_with("cases/foo.bt:2:"));
+    }
+
+    #[test]
+    fn parses_signal_usr1() {
+        let src = "signal USR1\nsignal   USR1   # trailing comment\n";
+        let case = parse_case_str(&path(), src).expect("should parse");
+        assert_eq!(case.steps.len(), 2);
+        for step in &case.steps {
+            assert!(matches!(step.kind, StepKind::Signal(Signal::Usr1)));
+            assert_eq!(step.kind.conn(), None);
+        }
+        assert_eq!(case.steps[0].kind.describe(), "signal USR1");
+    }
+
+    #[test]
+    fn error_on_unsupported_or_missing_signal() {
+        let err = parse_case_str(&path(), "signal TERM\n").expect_err("should fail");
+        assert!(err.message.contains("unsupported signal"));
+        let err = parse_case_str(&path(), "signal\n").expect_err("should fail");
+        assert!(err.message.contains("unknown directive"));
+        let err = parse_case_str(&path(), "signalUSR1\n").expect_err("should fail");
+        assert!(err.message.contains("unknown directive"));
     }
 
     #[test]

@@ -1,0 +1,21 @@
+# DEADLINE_SOON while waiting is driven by the soonest of several reserved jobs; releasing that job removes it.
+@p send "put 0 0 10 4\r\nlong\r\n"
+@p recv
+@p send "put 0 0 2 5\r\nshort\r\n"
+@p recv
+@h send "reserve\r\n"
+@h recv
+@h send "reserve\r\n"
+@h recv
+@h send "reserve-with-timeout 5\r\n"
+@h recv
+@h send "release 2 0 0\r\n"
+@h recv
+@h send "reserve-job 2\r\n"
+@h recv
+@h send "delete 2\r\n"
+@h recv
+@h send "reserve-with-timeout 1\r\n"
+@h recv
+@h send "stats\r\n"
+@h recv

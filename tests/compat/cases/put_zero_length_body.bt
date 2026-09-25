@@ -1,0 +1,9 @@
+# a zero-length body is valid and round-trips through reserve and peek.
+@p send "put 0 0 60 0\r\n\r\n"
+@p recv
+@p send "peek 1\r\n"
+@p recv
+@p send "reserve\r\n"
+@p recv
+@p send "stats-job 1\r\n"
+@p recv

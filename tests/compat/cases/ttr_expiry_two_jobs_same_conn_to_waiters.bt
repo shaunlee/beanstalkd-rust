@@ -1,0 +1,22 @@
+# two jobs of one connection expire together; each is re-offered to waiters in turn.
+@p send "put 0 0 1 1\r\na\r\n"
+@p recv
+@p send "put 0 0 1 1\r\nb\r\n"
+@p recv
+@h send "reserve\r\n"
+@h recv
+@h send "reserve\r\n"
+@h recv
+@w1 send "list-tube-used\r\n"
+@w1 recv
+@w2 send "list-tube-used\r\n"
+@w2 recv
+@w1 send "reserve\r\n"
+sleep 50ms
+@w2 send "reserve\r\n"
+sleep 50ms
+sleep 2200ms
+@w1 recv
+@w2 recv
+@p send "stats\r\n"
+@p recv

@@ -31,6 +31,9 @@ pub enum EngineMsg {
     /// One fully-decoded command, sent only after the previous command on
     /// this connection has received its reply.
     Command { conn: ConnId, cmd: Command },
+    /// A put command line was accepted; its body is still to come
+    /// (`Frame::PutStarted`). Produces no reply.
+    PutStarted { conn: ConnId, too_big: bool },
     /// A `put` rejected by the codec during framing (`Frame::PutRejected`).
     PutRejected { conn: ConnId, why: PutRejection },
     /// The connection's socket reached EOF while a reply was outstanding
@@ -91,6 +94,9 @@ async fn run(mut rx: mpsc::UnboundedReceiver<EngineMsg>, cfg: EngineConfig, sys:
                         engine.connect(now, conn);
                     }
                     EngineMsg::Command { conn, cmd } => engine.handle(now, conn, cmd, &mut outbox),
+                    EngineMsg::PutStarted { conn, too_big } => {
+                        engine.put_started(now, conn, too_big);
+                    }
                     EngineMsg::PutRejected { conn, why } => {
                         engine.put_rejected(now, conn, why, &mut outbox);
                     }

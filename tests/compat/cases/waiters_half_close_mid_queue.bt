@@ -1,0 +1,27 @@
+# reserve: a waiter in the middle of the queue half-closes (TIMED_OUT); remaining waiters are served afterwards.
+@w1 send "list-tube-used\r\n"
+@w1 recv
+@w2 send "list-tube-used\r\n"
+@w2 recv
+@w3 send "list-tube-used\r\n"
+@w3 recv
+@p send "list-tube-used\r\n"
+@p recv
+@w1 send "reserve\r\n"
+sleep 50ms
+@w2 send "reserve\r\n"
+sleep 50ms
+@w3 send "reserve\r\n"
+sleep 50ms
+@w2 shutdown_write
+@w2 recv
+@p send "put 0 0 60 2\r\nj1\r\n"
+@p recv
+sleep 50ms
+@p send "put 0 0 60 2\r\nj2\r\n"
+@p recv
+sleep 50ms
+@w1 recv
+@w3 recv
+@p send "stats-tube default\r\n"
+@p recv

@@ -1,0 +1,9 @@
+# half-close after two pipelined blocking reserves: each gets TIMED_OUT in turn, then the server closes the connection.
+@c1 send "reserve-with-timeout 10\r\nreserve\r\n"
+sleep 100ms
+@c1 shutdown_write
+@c1 recv
+@c1 recv
+@c1 recv_closed 500ms
+@p send "stats\r\n"
+@p recv

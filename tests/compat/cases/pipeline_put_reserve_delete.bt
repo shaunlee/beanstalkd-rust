@@ -1,0 +1,12 @@
+# one write with put, reserve, touch, release, reserve, bury, kick, reserve, delete: replies in order.
+@c1 send "put 5 0 60 3\r\nabc\r\nreserve\r\ntouch 1\r\nrelease 1 7 0\r\nreserve\r\nbury 1 2\r\nkick 1\r\nreserve\r\ndelete 1\r\nstats-job 1\r\n"
+@c1 recv
+@c1 recv
+@c1 recv
+@c1 recv
+@c1 recv
+@c1 recv
+@c1 recv
+@c1 recv
+@c1 recv
+@c1 recv

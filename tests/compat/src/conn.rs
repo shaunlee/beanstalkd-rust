@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use crate::dsl::{Step, StepKind};
+use crate::dsl::{Signal, Step, StepKind};
 
 /// The observable result of executing one DSL step against one server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +27,8 @@ pub enum Outcome {
     StillOpen,
     /// `sleep` completed.
     Slept,
+    /// `signal` was delivered to the server process.
+    Signaled,
     /// `shutdown_write` completed.
     ShutdownDone,
     /// `close` completed.
@@ -70,9 +72,24 @@ impl ConnHandle {
         if remaining.is_zero() {
             return Ok(0);
         }
-        self.stream.set_read_timeout(Some(remaining))?;
+        // On macOS, setsockopt(SO_RCVTIMEO) fails with EINVAL once the
+        // connection is fully shut down (we half-closed and the peer
+        // closed), although unread data may still be buffered. Fall back
+        // to a non-blocking read then: it returns buffered data or EOF.
+        let nonblocking = self.stream.set_read_timeout(Some(remaining)).is_err();
+        if nonblocking {
+            self.stream.set_nonblocking(true)?;
+        }
         let mut tmp = [0u8; 4096];
-        match self.stream.read(&mut tmp) {
+        let res = self.stream.read(&mut tmp);
+        if nonblocking {
+            let _ = self.stream.set_nonblocking(false);
+            if matches!(&res, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock) {
+                // Not expected on a fully shut down socket; avoid spinning.
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        match res {
             Ok(0) => {
                 self.closed_seen = true;
                 Ok(0)
@@ -186,14 +203,15 @@ fn extra_body_len(line: &[u8]) -> Option<usize> {
     Some(n + 2)
 }
 
-/// Execute a whole case's steps against one server address, returning one
-/// [`Outcome`] per step (same length and order as `steps`).
-pub fn execute(steps: &[Step], addr: SocketAddr) -> Vec<Outcome> {
+/// Execute a whole case's steps against one server (listening on `addr`,
+/// running as process `pid`), returning one [`Outcome`] per step (same
+/// length and order as `steps`).
+pub fn execute(steps: &[Step], addr: SocketAddr, pid: u32) -> Vec<Outcome> {
     let mut conns: HashMap<String, ConnHandle> = HashMap::new();
     let mut out = Vec::with_capacity(steps.len());
 
     for step in steps {
-        let outcome = run_step(&mut conns, addr, &step.kind);
+        let outcome = run_step(&mut conns, addr, pid, &step.kind);
         out.push(outcome);
     }
     out
@@ -213,7 +231,27 @@ fn get_or_open<'a>(
         .expect("connection was just inserted above"))
 }
 
-fn run_step(conns: &mut HashMap<String, ConnHandle>, addr: SocketAddr, kind: &StepKind) -> Outcome {
+/// Deliver `sig` to process `pid` via `kill(1)` (keeps this crate free of
+/// `unsafe` and of a libc dependency). Delivery is asynchronous on the
+/// server side, so cases should `sleep` briefly afterwards.
+fn send_signal(pid: u32, sig: Signal) -> Outcome {
+    match std::process::Command::new("kill")
+        .arg(format!("-{}", sig.name()))
+        .arg(pid.to_string())
+        .status()
+    {
+        Ok(status) if status.success() => Outcome::Signaled,
+        Ok(status) => Outcome::IoError(format!("kill exited with {status}")),
+        Err(e) => Outcome::IoError(format!("failed to run kill: {e}")),
+    }
+}
+
+fn run_step(
+    conns: &mut HashMap<String, ConnHandle>,
+    addr: SocketAddr,
+    pid: u32,
+    kind: &StepKind,
+) -> Outcome {
     match kind {
         StepKind::Send { conn, data } => match get_or_open(conns, conn, addr) {
             Ok(c) => match c.send(data) {
@@ -238,6 +276,7 @@ fn run_step(conns: &mut HashMap<String, ConnHandle>, addr: SocketAddr, kind: &St
             std::thread::sleep(*dur);
             Outcome::Slept
         }
+        StepKind::Signal(sig) => send_signal(pid, *sig),
         StepKind::ShutdownWrite { conn } => match get_or_open(conns, conn, addr) {
             Ok(c) => c.shutdown_write(),
             Err(e) => Outcome::IoError(e.to_string()),
@@ -266,6 +305,27 @@ pub fn outcomes_equal(a: &Outcome, b: &Outcome) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Data buffered on a socket that we half-closed and the peer then
+    /// closed must still be readable (macOS rejects SO_RCVTIMEO there).
+    #[test]
+    fn buffered_data_is_read_after_both_sides_shut_down() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mut conn = ConnHandle::connect(addr).expect("connect");
+        let (mut server, _) = listener.accept().expect("accept");
+        conn.stream.shutdown(Shutdown::Write).expect("shutdown");
+        server.write_all(b"ONE\r\n").expect("write");
+        server.write_all(b"TWO\r\n").expect("write");
+        drop(server);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(conn.recv_response(), Outcome::Received(b"ONE\r\n".to_vec()));
+        assert_eq!(conn.recv_response(), Outcome::Received(b"TWO\r\n".to_vec()));
+        assert_eq!(
+            conn.recv_closed(Duration::from_millis(200)),
+            Outcome::Closed
+        );
+    }
 
     #[test]
     fn extra_body_len_parses_reserved_found_ok() {

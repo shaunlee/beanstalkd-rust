@@ -1,0 +1,19 @@
+# DEADLINE_SOON vs TIMED_OUT: reserve-with-timeout 0 while holding a job inside the safety margin and the only ready job is in a paused tube.
+@c1 send "use p\r\n"
+@c1 recv
+@c1 send "put 0 0 60 6\r\npaused\r\n"
+@c1 recv
+@c1 send "pause-tube p 10\r\n"
+@c1 recv
+@c1 send "watch p\r\n"
+@c1 recv
+@c1 send "use default\r\n"
+@c1 recv
+@c1 send "put 0 0 1 5\r\nshort\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "reserve-with-timeout 0\r\n"
+@c1 recv
+@c1 send "stats\r\n"
+@c1 recv

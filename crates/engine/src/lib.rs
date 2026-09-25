@@ -92,6 +92,10 @@ impl Default for EngineConfig {
 ///     /// Client half-closed its socket: if `conn` is waiting on reserve,
 ///     /// reply TIMED_OUT (see STATE_WAIT / halfclosed in prot.c).
 ///     pub fn half_close(&mut self, now: Nanos, conn: ConnId, out: &mut Outbox);
+///     /// A put command line was accepted (`Frame::PutStarted`): applies the
+///     /// reference's header-time side effects (cmd-put, producer, job id)
+///     /// before the body arrives. No reply.
+///     pub fn put_started(&mut self, now: Nanos, conn: ConnId, too_big: bool);
 ///     /// A `put` rejected by the codec (`Frame::PutRejected`): applies the
 ///     /// reference's pre-rejection side effects and emits the reply.
 ///     pub fn put_rejected(&mut self, now: Nanos, conn: ConnId, why: PutRejection, out: &mut Outbox);

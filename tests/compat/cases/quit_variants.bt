@@ -1,0 +1,19 @@
+# quit closes the connection on its 4-byte prefix regardless of trailing text; other spellings are UNKNOWN_COMMAND.
+@q1 send "quitx\r\n"
+@q1 recv_closed 500ms
+@q2 send "quit now please\r\n"
+@q2 recv_closed 500ms
+@q3 send "quit\r\nlist-tube-used\r\n"
+@q3 recv_closed 500ms
+@q4 send "QUIT\r\n"
+@q4 recv
+@q4 send " quit\r\n"
+@q4 recv
+@q4 send "qui\r\n"
+@q4 recv
+@q4 recv_closed 200ms
+@q5 send "bogus\r\nquit\r\n"
+@q5 recv
+@q5 recv_closed 500ms
+@s send "stats\r\n"
+@s recv

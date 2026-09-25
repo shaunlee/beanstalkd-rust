@@ -1,0 +1,14 @@
+# a job whose TTR expires returns to ready in a paused tube and is not handed to a waiter until the pause ends.
+@p send "put 0 0 1 1\r\nx\r\n"
+@p recv
+@h send "reserve\r\n"
+@h recv
+@p send "pause-tube default 3\r\n"
+@p recv
+@w send "reserve\r\n"
+sleep 1800ms
+@p send "stats-job 1\r\n"
+@p recv
+@w recv_none 100ms
+sleep 1500ms
+@w recv

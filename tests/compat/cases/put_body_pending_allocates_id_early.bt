@@ -1,0 +1,13 @@
+# put: cmd-put, the producer flag and the job id are taken when the put line parses, before the body arrives; a put completed meanwhile on another connection gets the next id.
+@c1 send "put 0 0 60 5\r\nhe"
+sleep 200ms
+@c2 send "stats\r\n"
+@c2 recv
+@c2 send "put 0 0 60 1\r\nx\r\n"
+@c2 recv
+@c1 send "llo\r\n"
+@c1 recv
+@c1 send "peek 1\r\n"
+@c1 recv
+@c2 send "stats\r\n"
+@c2 recv

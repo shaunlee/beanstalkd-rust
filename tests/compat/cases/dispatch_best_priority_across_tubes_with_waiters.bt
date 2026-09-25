@@ -1,0 +1,25 @@
+# process_queue picks the globally best job among tubes that have waiters; a waiter on two tubes is served once.
+@w1 send "watch a\r\n"
+@w1 recv
+@w1 send "watch b\r\n"
+@w1 recv
+@w2 send "watch b\r\n"
+@w2 recv
+@w2 send "ignore default\r\n"
+@w2 recv
+@w1 send "reserve\r\n"
+sleep 50ms
+@w2 send "reserve\r\n"
+sleep 50ms
+@p send "use a\r\n"
+@p recv
+@p send "put 5 0 60 2\r\na5\r\n"
+@p recv
+@w1 recv
+@p send "use b\r\n"
+@p recv
+@p send "put 9 0 60 2\r\nb9\r\n"
+@p recv
+@w2 recv
+@p send "stats\r\n"
+@p recv
