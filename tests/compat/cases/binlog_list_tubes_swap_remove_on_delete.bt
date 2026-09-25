@@ -1,0 +1,40 @@
+# Replay tube order when a delete frees a tube: the reference appends a tube at a job's full record and swap-removes it when a delete record frees its last job, so after a restart t5 takes t3's slot (t1, t2, t5, t4). A later put to t3 appends it at the end.
+!binlog
+@a send "use t1\r\n"
+@a recv
+@a send "put 0 0 60 1\r\n1\r\n"
+@a recv
+@a send "use t2\r\n"
+@a recv
+@a send "put 0 0 60 1\r\n2\r\n"
+@a recv
+@a send "use t3\r\n"
+@a recv
+@a send "put 0 0 60 1\r\n3\r\n"
+@a recv
+@a send "use t4\r\n"
+@a recv
+@a send "put 0 0 60 1\r\n4\r\n"
+@a recv
+@a send "use t5\r\n"
+@a recv
+@a send "put 0 0 60 1\r\n5\r\n"
+@a recv
+@a send "delete 3\r\n"
+@a recv
+@a send "list-tubes\r\n"
+@a recv
+restart
+@a send "list-tubes\r\n"
+@a recv
+@a send "use t3\r\n"
+@a recv
+@a send "put 0 0 60 1\r\nx\r\n"
+@a recv
+@a send "list-tubes\r\n"
+@a recv
+restart
+@a send "list-tubes\r\n"
+@a recv
+@a send "peek 6\r\n"
+@a recv

@@ -2,7 +2,7 @@
 
 A Rust reimplementation of [beanstalkd](https://github.com/beanstalkd/beanstalkd), the simple work queue, that is byte-for-byte compatible with the original protocol so existing clients work unmodified.
 
-Status: **P0 complete**, an in-memory server compatible with the reference. Persistence (P1), TLS/auth/metrics (P2) and Raft replication (P3) are planned; see `docs/PLAN.md`.
+Status: **P1 complete**: a server compatible with the reference, with an optional write-ahead log (`-b`) that survives crashes and restarts. TLS/auth/metrics (P2) and Raft replication (P3) are planned; see `docs/PLAN.md`.
 
 ## Build and run
 
@@ -12,6 +12,15 @@ cargo build --release -p bstk-server
 ```
 
 Flags: `-l ADDR`, `-p PORT`, `-z MAX_JOB_SIZE`, `-V` (verbose), `-v` (version). `SIGUSR1` enters drain mode.
+
+Persistence, as in the reference:
+
+- `-b DIR`: write-ahead log directory
+- `-f MS`: fsync at most once every MS milliseconds (default 50); `-f0` fsyncs every write before replying
+- `-F`: never fsync
+- `-s BYTES`: binlog file size (default 10 MiB)
+
+Behavior across restarts and the intentional differences from the reference are listed in `docs/COMPAT.md` (section "Binlog" and D5–D12).
 
 ## Test
 
