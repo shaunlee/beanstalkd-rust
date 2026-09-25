@@ -34,7 +34,7 @@ use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
-use crate::forward::{ForwardHandler, check_forward};
+use crate::forward::{ForwardHandler, check_control, check_forward};
 use crate::wire::{
     self, ClientMsg, FrameError, PROTOCOL_VERSION, RpcRequest, RpcResponse, ServerHello, ServerMsg,
     WireError,
@@ -57,10 +57,13 @@ pub struct ListenerConfig {
     pub max_connections: usize,
     /// TLS handshake plus hello.
     pub handshake_timeout: Duration,
+    /// This node's `-z`; hellos with another value are rejected.
+    pub max_job_size: u32,
 }
 
 impl ListenerConfig {
-    /// Defaults: 64 connections, 5 s handshake, 32 MiB frames.
+    /// Defaults: 64 connections, 5 s handshake, 32 MiB frames, the default
+    /// `-z`.
     pub fn new(node_id: NodeId, peers: BTreeSet<NodeId>, tls: Option<Arc<ServerConfig>>) -> Self {
         ListenerConfig {
             node_id,
@@ -69,6 +72,7 @@ impl ListenerConfig {
             max_frame: wire::DEFAULT_MAX_FRAME,
             max_connections: 64,
             handshake_timeout: Duration::from_secs(5),
+            max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
         }
     }
 }
@@ -214,6 +218,14 @@ where
         Err(format!("this is node {}, not {}", cfg.node_id, h.to))
     } else if h.from == cfg.node_id || !cfg.peers.contains(&h.from) {
         Err(format!("node {} is not a configured peer", h.from))
+    } else if h.max_job_size != cfg.max_job_size {
+        let reason = format!(
+            "max_job_size mismatch: node {} uses {}, node {} uses {} \
+             (every node must use the same -z)",
+            h.from, h.max_job_size, cfg.node_id, cfg.max_job_size
+        );
+        tracing::error!(from = h.from, "cluster hello rejected: {reason}");
+        Err(reason)
     } else {
         identity(h.from)
     };
@@ -221,6 +233,7 @@ where
         Ok(()) => ServerHello::Accepted {
             version: PROTOCOL_VERSION,
             node_id: cfg.node_id,
+            max_job_size: cfg.max_job_size,
         },
         Err(reason) => {
             tracing::warn!(from = h.from, %reason, "cluster hello rejected");
@@ -292,6 +305,10 @@ pub(crate) async fn dispatch<H: ForwardHandler>(
         ),
         RpcRequest::Forward(r) => RpcResponse::Forward(match check_forward(peer, &r) {
             Ok(()) => Ok(handler.forward(r).await),
+            Err(reason) => Err(WireError::Rejected(reason)),
+        }),
+        RpcRequest::Control(r) => RpcResponse::Control(match check_control(peer, &r) {
+            Ok(()) => Ok(handler.control(r).await),
             Err(reason) => Err(WireError::Rejected(reason)),
         }),
     }

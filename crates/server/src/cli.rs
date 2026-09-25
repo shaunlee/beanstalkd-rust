@@ -8,7 +8,7 @@
 //! two wins (`-f 10 -F` never fsyncs, `-F -f 10` fsyncs every 10 ms).
 //!
 //! Options that the reference does not have are long-only (`--config`,
-//! `--check-config`) so they never shadow a reference short flag
+//! `--check-config`, `--cluster-init`) so they never shadow a reference short flag
 //! (including the removed `-c` and `-n`).
 
 use std::net::IpAddr;
@@ -101,6 +101,11 @@ pub struct Cli {
     /// Validate the configuration, print a summary and exit
     #[arg(long = "check-config", action = ArgAction::SetTrue)]
     pub check_config: bool,
+
+    /// Cluster mode: bootstrap the cluster membership from [[cluster.peer]]
+    /// (once, on one node, with an empty cluster.data_dir)
+    #[arg(long = "cluster-init", action = ArgAction::SetTrue)]
+    pub cluster_init: bool,
 
     /// Resolved fsync policy (from `-f` / `-F` in argument order); only
     /// meaningful with `-b`.

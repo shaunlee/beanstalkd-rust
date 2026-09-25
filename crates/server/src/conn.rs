@@ -43,6 +43,7 @@ use bstk_engine::ConnId;
 use bstk_proto::{Command, Frame, Response, ServerCodec};
 
 use crate::auth::TokenSet;
+use crate::cluster::Clients;
 use crate::engine_actor::{EngineGone, EngineHandle, EngineMsg};
 use crate::pending::{PendingGuard, ServerCounters};
 
@@ -175,6 +176,8 @@ pub struct TlsListener {
     pub counters: Arc<ServerCounters>,
     /// `auth.timeout` (used by `auth = "token"` listeners only).
     pub auth_timeout: Duration,
+    /// Cluster mode: lets the cluster close this listener's connections.
+    pub clients: Option<Arc<Clients>>,
 }
 
 /// Drives one TLS client connection: handshake (bounded by
@@ -198,6 +201,7 @@ pub async fn handle_tls(
         max_job_size,
         counters,
         auth_timeout,
+        clients,
     } = &*listener;
     let mut stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
         Ok(Ok(stream)) => stream,
@@ -254,13 +258,16 @@ pub async fn handle_tls(
 
     let conn = next_id.fetch_add(1, Ordering::Relaxed);
     let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+    // Cluster mode: registered before `Connect`, so the cluster can close
+    // the connection from its first reply on.
+    let close = clients.as_ref().map(|c| c.register_closer(conn));
     // Sent by this task, before its first command on the same FIFO engine
     // channel, so the ordering the engine relies on holds.
     if guard.connect(conn, reply_tx).is_err() {
         tracing::error!("engine actor is gone; dropping new connection");
         return;
     }
-    command_loop(
+    let serve = command_loop(
         &mut stream,
         &mut codec,
         &mut rbuf,
@@ -269,8 +276,16 @@ pub async fn handle_tls(
         engine_tx,
         &mut reply_rx,
         token_auth,
-    )
-    .await;
+    );
+    match close {
+        None => serve.await,
+        Some(close) => {
+            tokio::select! {
+                () = serve => {}
+                Ok(()) = close => {}
+            }
+        }
+    }
     // The engine forgets the connection first (as when a plaintext socket
     // closes), then we end the TLS session cleanly.
     drop(guard);

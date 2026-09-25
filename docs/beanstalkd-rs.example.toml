@@ -125,3 +125,58 @@ snapshot_min_interval = "1s"
 level = "info"
 # "text" (default) or "json".
 format = "text"
+
+# Cluster mode: replicate every job and connection through Raft across 3 or
+# 5 nodes (docs/DESIGN.md §8). Without a [cluster] table beanstalkd-rs is a
+# single server, exactly as above. Every node has its own file with the same
+# [[cluster.peer]] list and its own node_id, listen and [cluster.tls] files.
+#
+# Rules: node_id must be listed in [[cluster.peer]]; 3 or 5 peers (1 for
+# tests), with unique ids and addresses; [cluster.tls] is required unless
+# insecure_plaintext = true; -b / binlog.dir cannot be combined with
+# [cluster] (the Raft log replaces the binlog); every node must use the same
+# max job size (-z / server.max_job_size), at most 33488896 in cluster mode.
+#
+# Bootstrap a new cluster once: start one node with --cluster-init (refused
+# if its data_dir already holds state) and the others without it; they wait
+# until the leader contacts them. Restart nodes without --cluster-init.
+#
+# [cluster]
+# # This node's id, 1..=65535.
+# node_id = 1
+# # Cluster port (Raft and forwarding between nodes), an IP:port.
+# listen = "10.0.0.1:11400"
+# # Raft log, vote and snapshots (relative paths: relative to this file).
+# data_dir = "/var/lib/beanstalkd-rs"
+# # A node that cannot reach a leader for this long closes its client
+# # connections; the leader drops a node silent for twice this long, which
+# # releases the jobs its clients had reserved. Default: "5s".
+# node_timeout = "5s"
+# # Log entries between snapshots. Default: 100000.
+# snapshot_every = 100000
+# # Raft heartbeat interval and election timeout range (whole milliseconds;
+# # heartbeat < minimum <= maximum). Defaults: "50ms", ["150ms", "300ms"].
+# heartbeat = "50ms"
+# election_timeout = ["150ms", "300ms"]
+# # true only for tests: cluster traffic in clear text, without [cluster.tls].
+# insecure_plaintext = false
+#
+# [cluster.tls]
+# # One certificate per node, used as the cluster listener's server
+# # certificate and as the client certificate when dialing peers. It must
+# # chain to `ca`, carry the SAN DNS name "bstk-node-<node_id>", and allow
+# # both server and client authentication.
+# cert = "node1.pem"
+# key = "node1.key"
+# ca = "cluster-ca.pem"
+#
+# # Every member of the cluster, this node included.
+# [[cluster.peer]]
+# id = 1
+# addr = "10.0.0.1:11400"
+# [[cluster.peer]]
+# id = 2
+# addr = "10.0.0.2:11400"
+# [[cluster.peer]]
+# id = 3
+# addr = "10.0.0.3:11400"

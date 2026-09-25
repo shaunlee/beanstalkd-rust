@@ -80,9 +80,14 @@ pub enum Op {
     Tick,
     /// Cluster-wide drain mode (SIGUSR1 on any node).
     SetDraining(bool),
-    /// The node is gone: disconnect every connection it owns, in ascending
-    /// `ConnId` order.
-    DropNode(NodeId),
+    /// The node is gone: disconnect every connection owned by `node` whose
+    /// local number is at most `up_to_local`, in ascending `ConnId` order.
+    /// The bound is the `highest_local(node)` the proposer observed, so a
+    /// `DropNode` that commits late (for example a leader's, proposed for a
+    /// node that has meanwhile restarted) never touches the connections the
+    /// node accepted afterwards: a restarted node numbers its new
+    /// connections above every local number the state has seen for it.
+    DropNode { node: NodeId, up_to_local: u64 },
 }
 
 /// The apply result returned to the proposer (openraft `R`). Replies to

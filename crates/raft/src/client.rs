@@ -45,7 +45,7 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 
-use crate::forward::{ForwardError, ForwardTransport};
+use crate::forward::{ControlRequest, ControlResponse, ForwardError, ForwardTransport};
 use crate::wire::{
     self, ClientMsg, FrameError, Hello, PROTOCOL_VERSION, RpcRequest, RpcResponse, ServerHello,
     ServerMsg, WireError,
@@ -79,11 +79,15 @@ pub struct NetworkConfig {
     pub backoff_max: Duration,
     /// Requests awaiting an answer on one connection; more fail at once.
     pub max_in_flight: usize,
+    /// This node's `-z`, sent in the hello; a peer with another value is
+    /// refused (by the peer's listener, and here).
+    pub max_job_size: u32,
 }
 
 impl NetworkConfig {
     /// Defaults: 1 s connect, 1 s append / vote, 10 s per snapshot chunk,
-    /// 2 s forward, backoff 50 ms .. 2 s, 1024 requests in flight.
+    /// 2 s forward, backoff 50 ms .. 2 s, 1024 requests in flight, the
+    /// default `-z`.
     pub fn new(
         node_id: NodeId,
         peers: BTreeMap<NodeId, String>,
@@ -102,6 +106,7 @@ impl NetworkConfig {
             backoff_min: Duration::from_millis(50),
             backoff_max: Duration::from_secs(2),
             max_in_flight: 1024,
+            max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
         }
     }
 
@@ -129,6 +134,8 @@ struct Peer {
     target: NodeId,
     addr: String,
     state: Mutex<DialState>,
+    /// When the last response from `target` arrived (any request kind).
+    last_response: Arc<StdMutex<Option<std::time::Instant>>>,
 }
 
 #[derive(Default)]
@@ -199,9 +206,44 @@ impl Network {
             target,
             addr,
             state: Mutex::new(DialState::default()),
+            last_response: Arc::new(StdMutex::new(None)),
         });
         peers.insert(target, p.clone());
         Some(p)
+    }
+
+    /// When the last response of any kind (Raft RPC, forward, control)
+    /// arrived from `target` over this network, if ever. On a leader the
+    /// heartbeats make this a liveness signal for every follower.
+    pub fn last_response(&self, target: NodeId) -> Option<std::time::Instant> {
+        let p = lock(&self.inner.peers).get(&target).cloned()?;
+        *lock(&p.last_response)
+    }
+
+    /// Sends a control request to `target` and waits for its answer (like
+    /// [`Network::forward`], no automatic resend).
+    pub async fn control(
+        &self,
+        target: NodeId,
+        req: ControlRequest,
+    ) -> Result<ControlResponse, ForwardError> {
+        let Some(peer) = self.peer(target, None) else {
+            return Err(ForwardError::Unreachable(format!(
+                "node {target} has no configured address"
+            )));
+        };
+        let t = self.inner.cfg.forward_timeout;
+        match self.call(&peer, RpcRequest::Control(req), t).await {
+            Ok(RpcResponse::Control(Ok(r))) => Ok(r),
+            Ok(RpcResponse::Control(Err(e))) => Err(ForwardError::Rejected(e.to_string())),
+            Ok(_) => Err(ForwardError::Network("unexpected response kind".into())),
+            Err(CallError::Unreachable(m)) => Err(ForwardError::Unreachable(m)),
+            Err(CallError::Timeout(_)) => Err(ForwardError::Timeout),
+            Err(CallError::Network(m)) => Err(ForwardError::Network(m)),
+            Err(CallError::TooLarge) => Err(ForwardError::Rejected(
+                "request exceeds the maximum frame size".into(),
+            )),
+        }
     }
 
     /// Sends `req` to `target` (see [`ForwardTransport::forward`]).
@@ -300,7 +342,7 @@ impl Network {
             Ok(Ok(io)) => {
                 st.failures = 0;
                 st.retry_at = None;
-                let c = spawn_conn(io, cfg, peer.target);
+                let c = spawn_conn(io, cfg, peer.target, peer.last_response.clone());
                 st.conn = Some(c.clone());
                 return Ok(c);
             }
@@ -338,21 +380,42 @@ impl Network {
             version: PROTOCOL_VERSION,
             from: cfg.node_id,
             to: peer.target,
+            max_job_size: cfg.max_job_size,
         });
         let frame = wire::encode(&hello, cfg.max_frame).map_err(|e| e.to_string())?;
         wire::write_frame(&mut io, &frame)
             .await
             .map_err(|e| format!("hello: {e}"))?;
         match wire::read_frame::<_, ServerMsg>(&mut io, cfg.max_frame).await {
-            Ok(Some(ServerMsg::Hello(ServerHello::Accepted { version, node_id })))
-                if version == PROTOCOL_VERSION && node_id == peer.target =>
-            {
-                Ok(io)
+            Ok(Some(ServerMsg::Hello(ServerHello::Accepted {
+                version,
+                node_id,
+                max_job_size,
+            }))) if version == PROTOCOL_VERSION && node_id == peer.target => {
+                if max_job_size == cfg.max_job_size {
+                    Ok(io)
+                } else {
+                    let m = format!(
+                        "max_job_size mismatch: node {node_id} uses {max_job_size}, \
+                         this node uses {} (every node must use the same -z)",
+                        cfg.max_job_size
+                    );
+                    tracing::error!(target_node = node_id, "{m}");
+                    Err(m)
+                }
             }
-            Ok(Some(ServerMsg::Hello(ServerHello::Accepted { version, node_id }))) => Err(format!(
+            Ok(Some(ServerMsg::Hello(ServerHello::Accepted {
+                version, node_id, ..
+            }))) => Err(format!(
                 "peer answered as node {node_id} with protocol version {version}"
             )),
             Ok(Some(ServerMsg::Hello(ServerHello::Rejected { reason }))) => {
+                if reason.starts_with("max_job_size mismatch") {
+                    tracing::error!(
+                        target_node = peer.target,
+                        "cluster peer refused this node: {reason}"
+                    );
+                }
                 Err(format!("rejected: {reason}"))
             }
             Ok(Some(ServerMsg::Response { .. })) => Err("response before hello".into()),
@@ -368,7 +431,12 @@ impl Network {
     }
 }
 
-fn spawn_conn(io: Box<dyn Io>, cfg: &NetworkConfig, target: NodeId) -> Arc<Conn> {
+fn spawn_conn(
+    io: Box<dyn Io>,
+    cfg: &NetworkConfig,
+    target: NodeId,
+    last_response: Arc<StdMutex<Option<std::time::Instant>>>,
+) -> Arc<Conn> {
     let (tx, rx) = mpsc::channel(cfg.max_in_flight.max(1));
     let conn = Arc::new(Conn {
         tx,
@@ -381,7 +449,7 @@ fn spawn_conn(io: Box<dyn Io>, cfg: &NetworkConfig, target: NodeId) -> Arc<Conn>
     let kill = conn.kill.clone();
     let max_frame = cfg.max_frame;
     tokio::spawn(async move {
-        let reason = run_conn(io, rx, &pending, &kill, max_frame).await;
+        let reason = run_conn(io, rx, &pending, &kill, max_frame, &last_response).await;
         tracing::debug!(target_node = target, %reason, "cluster connection closed");
         dead.store(true, Ordering::Release);
         lock(&pending).clear();
@@ -395,12 +463,14 @@ async fn run_conn(
     pending: &Pending,
     kill: &Notify,
     max_frame: usize,
+    last_response: &StdMutex<Option<std::time::Instant>>,
 ) -> String {
     let (mut r, mut w) = tokio::io::split(io);
     let reader = async {
         loop {
             match wire::read_frame::<_, ServerMsg>(&mut r, max_frame).await {
                 Ok(Some(ServerMsg::Response { id, body })) => {
+                    *lock(last_response) = Some(std::time::Instant::now());
                     // Absent if the caller timed out; the answer is dropped.
                     if let Some(tx) = lock(pending).remove(&id) {
                         let _ = tx.send(body);

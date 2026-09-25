@@ -750,6 +750,234 @@ fn push_json_str(out: &mut String, v: &str) {
     out.push('"');
 }
 
+// ---------------------------------------------------------------------------
+// Cluster mode (P3)
+// ---------------------------------------------------------------------------
+
+/// What the HTTP endpoints need from a cluster node (`cluster::Core`).
+pub trait ClusterInfo: Send + Sync {
+    /// `/readyz`: a leader is known, this node has applied up to the last
+    /// commit index it learned, and the startup cleanup is done.
+    fn ready(&self) -> bool;
+    fn stats(&self) -> ClusterStats;
+}
+
+/// Cluster figures for `/metrics` and `/admin` (cluster mode only).
+///
+/// | metric | type | meaning |
+/// |---|---|---|
+/// | `beanstalkd_cluster_node_id` | gauge | this node's id |
+/// | `beanstalkd_cluster_role{role}` | gauge | 1 for the current role (`leader`, `follower`, `candidate`, `learner`, `shutdown`), else 0 |
+/// | `beanstalkd_cluster_term` | gauge | current Raft term |
+/// | `beanstalkd_cluster_leader_id` | gauge | leader known to this node (0: none) |
+/// | `beanstalkd_cluster_commit_index` | gauge | last commit index this node learned |
+/// | `beanstalkd_cluster_applied_index` | gauge | last log index applied here |
+/// | `beanstalkd_cluster_last_log_index` | gauge | last log index stored here |
+/// | `beanstalkd_cluster_replication_lag{peer}` | gauge | leader only: entries a peer is missing |
+/// | `beanstalkd_cluster_log_bytes` | gauge | size of the log segments |
+/// | `beanstalkd_cluster_log_segments` | gauge | number of log segments |
+/// | `beanstalkd_cluster_snapshot_index` | gauge | last log index in the snapshot |
+/// | `beanstalkd_cluster_snapshot_bytes` | gauge | size of the stored snapshot |
+/// | `beanstalkd_cluster_forward_queue` | gauge | this node's inputs not yet applied |
+/// | `beanstalkd_cluster_drop_node_proposals_total` | counter | `DropNode` proposals made by this node as leader for silent nodes |
+/// | `beanstalkd_cluster_ready` | gauge | 1 when `/readyz` is 200 |
+/// | `beanstalkd_cluster_isolated` | gauge | 1 while client sockets are closed for lack of a leader |
+///
+/// Absent indexes are exported as -1. `/admin` has the same values under
+/// `"cluster"` (absent ones as `null`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClusterStats {
+    pub node_id: u64,
+    pub role: &'static str,
+    pub term: u64,
+    pub leader_id: Option<u64>,
+    pub commit_index: Option<u64>,
+    pub applied_index: Option<u64>,
+    pub last_log_index: Option<u64>,
+    /// Leader only: entries each peer is missing.
+    pub replication_lag: Option<std::collections::BTreeMap<u64, u64>>,
+    pub log_bytes: u64,
+    pub log_segments: u64,
+    pub log_first_index: Option<u64>,
+    pub snapshot_index: Option<u64>,
+    pub snapshot_bytes: u64,
+    pub forward_queue: u64,
+    pub drop_node_proposals: u64,
+    pub ready: bool,
+    pub isolated: bool,
+}
+
+const ROLES: [&str; 5] = ["leader", "follower", "candidate", "learner", "shutdown"];
+
+fn opt_gauge(v: Option<u64>) -> String {
+    v.map_or_else(|| "-1".to_owned(), |v| v.to_string())
+}
+
+/// Appends the cluster metrics (see [`ClusterStats`]) to a
+/// `render_prometheus` document.
+pub fn render_cluster_prometheus(out: &mut String, c: &ClusterStats) {
+    let scalar = |out: &mut String, name: &str, help: &str, kind: Kind, value: String| {
+        family(out, name, help, kind);
+        sample(out, name, &[], &value);
+    };
+    scalar(
+        out,
+        "beanstalkd_cluster_node_id",
+        "This node's cluster id.",
+        Kind::Gauge,
+        c.node_id.to_string(),
+    );
+    family(
+        out,
+        "beanstalkd_cluster_role",
+        "1 for this node's current Raft role.",
+        Kind::Gauge,
+    );
+    for role in ROLES {
+        let v = if role == c.role { "1" } else { "0" };
+        sample(out, "beanstalkd_cluster_role", &[("role", role)], v);
+    }
+    let gauges: [(&str, &str, String); 9] = [
+        (
+            "beanstalkd_cluster_term",
+            "Current Raft term.",
+            c.term.to_string(),
+        ),
+        (
+            "beanstalkd_cluster_leader_id",
+            "Leader known to this node (0: none).",
+            c.leader_id.unwrap_or(0).to_string(),
+        ),
+        (
+            "beanstalkd_cluster_commit_index",
+            "Last commit index this node learned (-1: none).",
+            opt_gauge(c.commit_index),
+        ),
+        (
+            "beanstalkd_cluster_applied_index",
+            "Last log index applied on this node (-1: none).",
+            opt_gauge(c.applied_index),
+        ),
+        (
+            "beanstalkd_cluster_last_log_index",
+            "Last log index stored on this node (-1: none).",
+            opt_gauge(c.last_log_index),
+        ),
+        (
+            "beanstalkd_cluster_log_bytes",
+            "Size of the Raft log segments in bytes.",
+            c.log_bytes.to_string(),
+        ),
+        (
+            "beanstalkd_cluster_log_segments",
+            "Number of Raft log segments.",
+            c.log_segments.to_string(),
+        ),
+        (
+            "beanstalkd_cluster_snapshot_index",
+            "Last log index covered by the snapshot (-1: none).",
+            opt_gauge(c.snapshot_index),
+        ),
+        (
+            "beanstalkd_cluster_snapshot_bytes",
+            "Size of the stored snapshot in bytes.",
+            c.snapshot_bytes.to_string(),
+        ),
+    ];
+    for (name, help, value) in gauges {
+        scalar(out, name, help, Kind::Gauge, value);
+    }
+    family(
+        out,
+        "beanstalkd_cluster_replication_lag",
+        "Leader only: log entries each peer is missing.",
+        Kind::Gauge,
+    );
+    if let Some(lag) = &c.replication_lag {
+        for (peer, n) in lag {
+            sample(
+                out,
+                "beanstalkd_cluster_replication_lag",
+                &[("peer", &peer.to_string())],
+                &n.to_string(),
+            );
+        }
+    }
+    scalar(
+        out,
+        "beanstalkd_cluster_forward_queue",
+        "Inputs of this node's connections not yet applied.",
+        Kind::Gauge,
+        c.forward_queue.to_string(),
+    );
+    scalar(
+        out,
+        "beanstalkd_cluster_drop_node_proposals_total",
+        "DropNode proposals made by this node, as leader, for silent nodes.",
+        Kind::Counter,
+        c.drop_node_proposals.to_string(),
+    );
+    scalar(
+        out,
+        "beanstalkd_cluster_ready",
+        "1 when this node is ready (/readyz 200).",
+        Kind::Gauge,
+        u8::from(c.ready).to_string(),
+    );
+    scalar(
+        out,
+        "beanstalkd_cluster_isolated",
+        "1 while client connections are closed because no leader is reachable.",
+        Kind::Gauge,
+        u8::from(c.isolated).to_string(),
+    );
+}
+
+/// Adds `"cluster": {...}` to a `render_admin_json` document.
+pub fn append_cluster_json(json: &mut String, c: &ClusterStats) {
+    let opt = |v: Option<u64>| v.map_or_else(|| "null".to_owned(), |v| v.to_string());
+    let lag = match &c.replication_lag {
+        None => "null".to_owned(),
+        Some(m) => {
+            let mut s = String::from("{");
+            for (i, (peer, n)) in m.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&format!("\"{peer}\":{n}"));
+            }
+            s.push('}');
+            s
+        }
+    };
+    let fields = [
+        ("node_id", Json::Num(c.node_id)),
+        ("role", Json::Str(c.role)),
+        ("term", Json::Num(c.term)),
+        ("leader_id", Json::Raw(opt(c.leader_id))),
+        ("commit_index", Json::Raw(opt(c.commit_index))),
+        ("applied_index", Json::Raw(opt(c.applied_index))),
+        ("last_log_index", Json::Raw(opt(c.last_log_index))),
+        ("replication_lag", Json::Raw(lag)),
+        ("log_bytes", Json::Num(c.log_bytes)),
+        ("log_segments", Json::Num(c.log_segments)),
+        ("log_first_index", Json::Raw(opt(c.log_first_index))),
+        ("snapshot_index", Json::Raw(opt(c.snapshot_index))),
+        ("snapshot_bytes", Json::Num(c.snapshot_bytes)),
+        ("forward_queue", Json::Num(c.forward_queue)),
+        ("drop_node_proposals", Json::Num(c.drop_node_proposals)),
+        ("ready", Json::Bool(c.ready)),
+        ("isolated", Json::Bool(c.isolated)),
+    ];
+    // The document is one object: reopen it before its closing brace.
+    if json.ends_with('}') {
+        json.pop();
+        json.push_str(",\"cluster\":");
+        push_object(json, &fields);
+        json.push('}');
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

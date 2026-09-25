@@ -367,6 +367,7 @@ struct RawFile {
     binlog: Option<RawBinlog>,
     http: Option<RawHttp>,
     log: Option<RawLog>,
+    cluster: Option<RawCluster>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -423,6 +424,37 @@ struct RawHttp {
 struct RawLog {
     level: Option<LogLevel>,
     format: Option<LogFormat>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCluster {
+    node_id: Option<i64>,
+    listen: Option<String>,
+    data_dir: Option<PathBuf>,
+    node_timeout: Option<String>,
+    snapshot_every: Option<i64>,
+    heartbeat: Option<String>,
+    election_timeout: Option<Vec<String>>,
+    insecure_plaintext: Option<bool>,
+    tls: Option<RawClusterTls>,
+    #[serde(default, rename = "peer")]
+    peers: Vec<RawPeer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawClusterTls {
+    cert: Option<PathBuf>,
+    key: Option<PathBuf>,
+    ca: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPeer {
+    id: i64,
+    addr: String,
 }
 
 /// The contents of `auth.tokens_file`. `Debug` hides them.
@@ -537,7 +569,9 @@ fn line_column(text: &str, offset: usize) -> (usize, usize) {
 // Resolution
 // ---------------------------------------------------------------------------
 
-/// Loads `--config` (if given) and resolves it against the command line.
+/// Loads `--config` (if given) and resolves it against the command line,
+/// ignoring `[cluster]` (the server uses `load_all`).
+#[cfg(test)]
 pub fn load(cli: &Cli) -> Result<ResolvedConfig, ConfigError> {
     let file = cli.config.as_deref().map(FileConfig::load).transpose()?;
     resolve(cli, file)
@@ -955,7 +989,13 @@ fn check_token(token: &str) -> Result<(), String> {
 /// `--check-config`: loads and resolves the configuration and returns a
 /// short summary (no secrets) and the warnings.
 pub fn check(cli: &Cli) -> Result<(String, Vec<String>), ConfigError> {
-    load(cli).map(|config| (summary(&config), config.warnings))
+    load_all(cli).map(|(config, cluster)| {
+        let mut text = summary(&config);
+        if let Some(c) = &cluster {
+            text.push_str(&cluster_summary(c));
+        }
+        (text, config.warnings)
+    })
 }
 
 /// `--check-config` as a whole: prints the summary to `out` and returns
@@ -1054,6 +1094,9 @@ pub fn summary(config: &ResolvedConfig) -> String {
     );
     s
 }
+
+mod cluster;
+pub use cluster::*;
 
 #[cfg(test)]
 mod tests;

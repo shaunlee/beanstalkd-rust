@@ -26,16 +26,25 @@
 //! file this is exactly the P1 behavior: one plaintext listener from
 //! `-l` / `-p`, no HTTP listener.
 //!
+//! Cluster mode (`[cluster]`, see `cluster`): step 3 also binds the
+//! cluster port, and step 5 instead opens the Raft storage, starts Raft
+//! and waits until this node is caught up with a leader and has closed out
+//! its previous process's connections (`cluster::start`). The connection
+//! tasks are the same; their `EngineMsg`s go to the cluster actor.
+//! Without `[cluster]` nothing of it runs.
+//!
 //! Exit statuses: 0 after SIGINT / SIGTERM, and for a valid
 //! `--check-config`; 1 for a startup error (invalid configuration, TLS
-//! files, socket, binlog replay or I/O); 5 for a usage error (`-u`); 10
-//! when another process holds the binlog directory lock (as the
+//! files, socket, binlog replay or I/O, `--cluster-init` on a data
+//! directory with state); 5 for a usage error (`-u`); 10 when another
+//! process holds the binlog (or cluster data) directory lock (as the
 //! reference); 20 after a binlog write, fsync or compaction error while
 //! serving (`engine_actor::EXIT_WAL_FAILURE`); clap's usage errors exit
 //! with 2.
 
 mod auth;
 mod cli;
+mod cluster;
 mod config;
 mod conn;
 mod engine_actor;
@@ -99,7 +108,7 @@ fn main() -> ExitCode {
         return check_config(&cli);
     }
 
-    let config = match config::load(&cli) {
+    let (config, cluster_settings) = match config::load_all(&cli) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("beanstalkd-rs: invalid configuration: {e}");
@@ -120,6 +129,21 @@ fn main() -> ExitCode {
         }
     };
 
+    let cluster_tls = match cluster_settings.as_ref().map(load_cluster_tls).transpose() {
+        Ok(t) => t.flatten(),
+        Err(e) => {
+            eprintln!("beanstalkd-rs: {e}");
+            return ExitCode::from(EXIT_STARTUP);
+        }
+    };
+    if let Some(c) = &cluster_settings
+        && c.init
+        && let Err(e) = cluster::check_init(&c.data_dir)
+    {
+        eprintln!("beanstalkd-rs: {e}");
+        return ExitCode::from(EXIT_STARTUP);
+    }
+
     sysinfo::raise_nofile_limit();
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -136,6 +160,19 @@ fn main() -> ExitCode {
     let listeners = match bind_listeners(&runtime, &config, tls.as_ref()) {
         Ok(l) => l,
         Err(code) => return code,
+    };
+    let cluster_listener = match &cluster_settings {
+        None => None,
+        Some(c) => match runtime.block_on(async { listen(c.listen) }) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!(
+                    "beanstalkd-rs: cannot listen on {} (cluster): {e}",
+                    c.listen
+                );
+                return ExitCode::from(EXIT_STARTUP);
+            }
+        },
     };
 
     // SIGINT / SIGTERM set this; every accept loop and the HTTP listener
@@ -168,11 +205,26 @@ fn main() -> ExitCode {
         }
     };
 
-    // Binlog replay is blocking file I/O: it runs here, on the main
-    // thread, outside the runtime (whose workers serve HTTP meanwhile).
-    let engine_tx = match start_engine(&config, runtime.handle()) {
-        Ok(tx) => tx,
-        Err(code) => return code,
+    let (engine_tx, cluster) = match (&cluster_settings, cluster_listener) {
+        (Some(settings), Some(listener)) => {
+            let args = cluster::StartArgs {
+                settings,
+                tls: cluster_tls,
+                listener,
+                engine: engine_config(&config),
+                sys: Arc::new(ProcessSysInfo::collect()),
+            };
+            match runtime.block_on(start_cluster(args)) {
+                Ok(node) => (node.engine.clone(), Some(node)),
+                Err(code) => return code,
+            }
+        }
+        // Binlog replay is blocking file I/O: it runs here, on the main
+        // thread, outside the runtime (whose workers serve HTTP meanwhile).
+        _ => match start_engine(&config, runtime.handle()) {
+            Ok(tx) => (tx, None),
+            Err(code) => return code,
+        },
     };
 
     let tokens = Arc::new(TokenSet::new(&config.tokens));
@@ -186,9 +238,74 @@ fn main() -> ExitCode {
             counters,
         },
         http,
+        cluster,
         stop_tx,
         stop_rx,
     ))
+}
+
+/// `[cluster.tls]`, loaded (`None` with `insecure_plaintext`).
+fn load_cluster_tls(
+    c: &config::ClusterSettings,
+) -> Result<Option<bstk_raft::tls::ClusterTls>, String> {
+    c.tls
+        .as_ref()
+        .map(|t| {
+            bstk_raft::tls::load_cluster_tls(c.node_id, &t.cert, &t.key, &t.ca)
+                .map_err(|e| e.to_string())
+        })
+        .transpose()
+}
+
+/// The engine configuration (`-z`, `-s`), shared by both modes.
+fn engine_config(config: &ResolvedConfig) -> EngineConfig {
+    EngineConfig {
+        max_job_size: config.max_job_size,
+        // `-s` is reported even without `-b`, as the reference does.
+        binlog_max_size: config.binlog.file_size,
+        journal: false,
+    }
+}
+
+/// `cluster::start`, interruptible by SIGINT / SIGTERM (a node may wait
+/// indefinitely for a leader).
+async fn start_cluster(args: cluster::StartArgs<'_>) -> Result<cluster::ClusterNode, ExitCode> {
+    let (mut sigint, mut sigterm) = match (
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::terminate()),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("beanstalkd-rs: cannot install signal handlers: {e}");
+            return Err(ExitCode::from(EXIT_STARTUP));
+        }
+    };
+    let data_dir = args.settings.data_dir.clone();
+    tokio::select! {
+        started = cluster::start(args) => match started {
+            Ok(node) => Ok(node),
+            Err(cluster::StartError::Locked(p)) => {
+                eprintln!(
+                    "beanstalkd-rs: failed to lock cluster data dir {} ({})",
+                    data_dir.display(),
+                    p.display()
+                );
+                Err(ExitCode::from(EXIT_LOCKED))
+            }
+            Err(cluster::StartError::Other(e)) => {
+                eprintln!("beanstalkd-rs: {e}");
+                Err(ExitCode::from(EXIT_STARTUP))
+            }
+        },
+        _ = sigint.recv() => {
+            tracing::info!("SIGINT received during cluster startup: exiting");
+            Err(ExitCode::SUCCESS)
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received during cluster startup: exiting");
+            Err(ExitCode::SUCCESS)
+        }
+    }
 }
 
 /// What `serve` hands to the connections of every listener.
@@ -210,12 +327,19 @@ fn check_config(cli: &Cli) -> ExitCode {
     let mut err = io::stderr();
     // Report a TLS problem first; otherwise print the summary (or the
     // configuration error) exactly as `config::run_check` does.
-    if let Ok(config) = config::load(cli)
-        && let Some(files) = &config.tls
-        && let Err(e) = tls::load(files)
-    {
-        eprintln!("beanstalkd-rs: invalid configuration: {e}");
-        return ExitCode::from(config::EXIT_CONFIG);
+    if let Ok((config, cluster)) = config::load_all(cli) {
+        if let Some(files) = &config.tls
+            && let Err(e) = tls::load(files)
+        {
+            eprintln!("beanstalkd-rs: invalid configuration: {e}");
+            return ExitCode::from(config::EXIT_CONFIG);
+        }
+        if let Some(c) = &cluster
+            && let Err(e) = load_cluster_tls(c)
+        {
+            eprintln!("beanstalkd-rs: invalid configuration: {e}");
+            return ExitCode::from(config::EXIT_CONFIG);
+        }
     }
     ExitCode::from(config::run_check(cli, &mut out, &mut err))
 }
@@ -321,12 +445,7 @@ fn start_engine(
 ) -> Result<EngineHandle, ExitCode> {
     let clock = Clock::start();
     let sys = Box::new(ProcessSysInfo::collect());
-    let mut cfg = EngineConfig {
-        max_job_size: config.max_job_size,
-        // `-s` is reported even without `-b`, as the reference does.
-        binlog_max_size: config.binlog.file_size,
-        journal: false,
-    };
+    let mut cfg = engine_config(config);
     let actor = match config.binlog.wal_options() {
         None => Actor::<Wal>::new(clock, Engine::new(clock.now(), cfg, sys), None),
         Some(opts) => {
@@ -371,6 +490,7 @@ async fn serve(
     engine_tx: EngineHandle,
     settings: ConnSettings,
     http: Option<(Arc<http::HttpState>, JoinHandle<()>)>,
+    cluster: Option<cluster::ClusterNode>,
     stop_tx: watch::Sender<bool>,
     stop_rx: watch::Receiver<bool>,
 ) -> ExitCode {
@@ -389,8 +509,12 @@ async fn serve(
         }
     };
 
-    // Connection ids are unique across listeners.
-    let next_id = Arc::new(AtomicU64::new(1));
+    // Connection ids are unique across listeners (and, in cluster mode,
+    // across the cluster and this node's restarts: `cluster::start` picks
+    // the first one).
+    let first_id = cluster.as_ref().map_or(1, |c| c.first_conn_id);
+    let clients = cluster.as_ref().map(|c| c.clients());
+    let next_id = Arc::new(AtomicU64::new(first_id));
     let mut tasks = Vec::with_capacity(listeners.len() + 1);
     for Bound { listener, kind } in listeners {
         let engine_tx = engine_tx.clone();
@@ -402,6 +526,7 @@ async fn serve(
                 next_id,
                 engine_tx,
                 settings.max_job_size,
+                clients.clone(),
                 stop,
             )),
             Kind::Tls { acceptor, auth } => {
@@ -417,6 +542,7 @@ async fn serve(
                     max_job_size: settings.max_job_size,
                     counters: Arc::clone(&settings.counters),
                     auth_timeout: settings.auth_timeout,
+                    clients: clients.clone(),
                 });
                 tokio::spawn(accept_tls(listener, shared, stop))
             }
@@ -424,6 +550,9 @@ async fn serve(
     }
     // Every listener is bound and the engine is recovered: ready.
     if let Some((state, task)) = http {
+        if let Some(c) = &cluster {
+            state.set_cluster(c.info());
+        }
         state.set_ready(engine_tx.clone());
         tasks.push(task);
     }
@@ -455,7 +584,12 @@ async fn serve(
     if engine_tx.send(EngineMsg::Shutdown { done }).is_ok() {
         // The actor finishes the messages queued before this one, syncs
         // the binlog and acknowledges. An error means it is already gone.
+        // In cluster mode it closes every client connection and waits
+        // (at most `cluster::SHUTDOWN_BOUND`) for their `Disconnect`s.
         let _ = synced.await;
+    }
+    if let Some(c) = cluster {
+        c.shutdown().await;
     }
     ExitCode::SUCCESS
 }
@@ -467,6 +601,7 @@ async fn accept_plain(
     next_id: Arc<AtomicU64>,
     engine_tx: EngineHandle,
     max_job_size: u32,
+    clients: Option<Arc<cluster::Clients>>,
     mut stop: watch::Receiver<bool>,
 ) {
     loop {
@@ -486,6 +621,9 @@ async fn accept_plain(
         }
         let conn = next_id.fetch_add(1, Ordering::Relaxed);
         let (reply_tx, reply_rx) = mpsc::unbounded_channel();
+        // Cluster mode: registered before `Connect` so the cluster can
+        // close this connection.
+        let close = clients.as_ref().map(|c| c.register_closer(conn));
         // Connect must reach the engine before this connection's first
         // command; sending it here, before spawning the connection task,
         // guarantees that ordering on the shared, FIFO engine channel.
@@ -496,13 +634,22 @@ async fn accept_plain(
             tracing::error!("engine actor is gone; dropping new connection");
             continue;
         }
-        tokio::spawn(conn::handle_plain(
-            stream,
-            conn,
-            engine_tx.clone(),
-            reply_rx,
-            max_job_size,
-        ));
+        let serve = conn::handle_plain(stream, conn, engine_tx.clone(), reply_rx, max_job_size);
+        match close {
+            None => {
+                tokio::spawn(serve);
+            }
+            Some(close) => {
+                // Dropping the connection future closes the socket and
+                // sends `Disconnect` (its guard).
+                tokio::spawn(async move {
+                    tokio::select! {
+                        () = serve => {}
+                        Ok(()) = close => {}
+                    }
+                });
+            }
+        }
     }
 }
 

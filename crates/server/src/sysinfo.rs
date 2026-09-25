@@ -71,6 +71,17 @@ impl SysInfo for ProcessSysInfo {
     }
 }
 
+/// One [`ProcessSysInfo`] shared by every engine the cluster state
+/// machine creates (it rebuilds its engine when it installs a snapshot), so
+/// the random instance id stays the same for the life of the process.
+pub struct SharedSysInfo(pub std::sync::Arc<ProcessSysInfo>);
+
+impl SysInfo for SharedSysInfo {
+    fn snapshot(&self) -> SysSnapshot {
+        self.0.snapshot()
+    }
+}
+
 /// Reads `getrusage(RUSAGE_SELF)` and returns `(utime, stime)` each as
 /// `(seconds, microseconds)`, matching `(int) ru.ru_utime.tv_sec, (int)
 /// ru.ru_utime.tv_usec` in `fmt_stats`.

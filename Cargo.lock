@@ -259,6 +259,7 @@ version = "0.1.0"
 dependencies = [
  "bstk-engine",
  "bstk-proto",
+ "bstk-raft",
  "bstk-store",
  "bytes",
  "clap",
@@ -268,6 +269,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "nix",
+ "openraft",
  "rcgen",
  "rustls",
  "rustls-pki-types",

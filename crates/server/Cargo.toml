@@ -20,6 +20,8 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 bstk-proto.workspace = true
 bstk-engine.workspace = true
 bstk-store = { path = "../store" }
+bstk-raft.workspace = true
+openraft.workspace = true
 nix = { version = "0.29", features = ["hostname", "resource", "signal", "feature"] }
 getrandom = "0.2"
 serde.workspace = true

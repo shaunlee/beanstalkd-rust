@@ -28,10 +28,15 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::forward::{ControlRequest, ControlResponse};
 use crate::{ForwardRequest, ForwardResponse, NodeId, TypeConfig};
 
 /// Version of this wire protocol, carried in the hellos.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// - 1: P3-T3 (Raft RPCs and input forwarding).
+/// - 2: P3-T4: the hellos carry `max_job_size` (peers with a different
+///   `-z` are rejected), and control requests ([`RpcRequest::Control`]).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Bytes of the length prefix.
 pub const HEADER_LEN: usize = 4;
@@ -49,6 +54,9 @@ pub struct Hello {
     pub from: NodeId,
     /// The node the dialer believes it is connected to.
     pub to: NodeId,
+    /// The dialer's `-z`. Every node must use the same value (the engine
+    /// replies `JOB_TOO_BIG` by it), so the listener rejects a mismatch.
+    pub max_job_size: u32,
 }
 
 /// The listener's answer to [`Hello`].
@@ -57,11 +65,12 @@ pub enum ServerHello {
     Accepted {
         version: u32,
         node_id: NodeId,
+        /// The listener's `-z` (equal to the dialer's, or the hello would
+        /// have been rejected); the dialer checks it too.
+        max_job_size: u32,
     },
     /// The connection is closed right after this frame.
-    Rejected {
-        reason: String,
-    },
+    Rejected { reason: String },
 }
 
 /// Dialer → listener.
@@ -85,6 +94,8 @@ pub enum RpcRequest {
     /// One chunk of openraft 0.9's chunked snapshot transfer.
     InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
     Forward(ForwardRequest),
+    /// A cluster-wide operation requested by a non-leader (version 2).
+    Control(ControlRequest),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,6 +104,7 @@ pub enum RpcResponse {
     Vote(Result<VoteResponse<NodeId>, WireError>),
     InstallSnapshot(Result<InstallSnapshotResponse<NodeId>, WireError>),
     Forward(Result<ForwardResponse, WireError>),
+    Control(Result<ControlResponse, WireError>),
 }
 
 /// A remote failure, transported as a value.
@@ -341,6 +353,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 from: 2,
                 to: 1,
+                max_job_size: 65535,
             }),
             sample_append(),
             ClientMsg::Request {
@@ -368,6 +381,23 @@ mod tests {
                     items: vec![(2 << 48 | 5, 3, EngineInput::HalfClose(2 << 48 | 5))],
                 }),
             },
+            ClientMsg::Request {
+                id: 11,
+                body: RpcRequest::Control(ControlRequest {
+                    from: 2,
+                    op: Op::DropNode {
+                        node: 2,
+                        up_to_local: 9,
+                    },
+                }),
+            },
+            ClientMsg::Request {
+                id: 12,
+                body: RpcRequest::Control(ControlRequest {
+                    from: 3,
+                    op: Op::SetDraining(true),
+                }),
+            },
         ];
         let mut stream = Vec::new();
         for m in &msgs {
@@ -391,6 +421,7 @@ mod tests {
             ServerMsg::Hello(ServerHello::Accepted {
                 version: PROTOCOL_VERSION,
                 node_id: 1,
+                max_job_size: 100,
             }),
             ServerMsg::Hello(ServerHello::Rejected {
                 reason: "no".into(),
@@ -421,6 +452,18 @@ mod tests {
             ServerMsg::Response {
                 id: 4,
                 body: RpcResponse::Forward(Ok(ForwardResponse::NotLeader { leader: Some(3) })),
+            },
+            ServerMsg::Response {
+                id: 5,
+                body: RpcResponse::Control(Ok(ControlResponse::Accepted { index: Some(42) })),
+            },
+            ServerMsg::Response {
+                id: 6,
+                body: RpcResponse::Control(Ok(ControlResponse::NotLeader { leader: None })),
+            },
+            ServerMsg::Response {
+                id: 7,
+                body: RpcResponse::Control(Err(WireError::Rejected("no".into()))),
             },
         ];
         for m in &responses {

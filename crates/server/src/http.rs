@@ -4,7 +4,7 @@
 //! | request | response |
 //! |---|---|
 //! | `GET /healthz` | 200 `ok` while the process runs |
-//! | `GET /readyz` | 503 until the engine is recovered (binlog replayed) and the listeners accept connections, then 200 `ready` |
+//! | `GET /readyz` | 503 until the engine is recovered (binlog replayed) and the listeners accept connections, then 200 `ready`; in cluster mode also 503 whenever no leader is known or this node lags behind the commit index it learned |
 //! | `GET /metrics` | Prometheus text format (`metrics::render_prometheus`), 503 before ready |
 //! | `GET /admin` | JSON (`metrics::render_admin_json`), 503 before ready |
 //! | another path | 404 |
@@ -62,7 +62,7 @@ use bstk_engine::Snapshot;
 
 use crate::config::HttpSettings;
 use crate::engine_actor::{EngineHandle, EngineMsg};
-use crate::metrics;
+use crate::metrics::{self, ClusterInfo};
 use crate::pending::ServerCounters;
 
 /// Concurrent HTTP connections served; further ones wait to be accepted.
@@ -96,6 +96,9 @@ pub struct HttpState {
     cache: Mutex<Option<(Instant, Arc<Snapshot>)>>,
     /// Server-side counters (`/metrics`, `/admin` `"server_rs"`).
     counters: Arc<ServerCounters>,
+    /// Cluster mode: readiness and the cluster figures. Set before
+    /// `engine`.
+    cluster: OnceLock<Arc<dyn ClusterInfo>>,
 }
 
 impl HttpState {
@@ -107,7 +110,15 @@ impl HttpState {
             snapshot_permits: Semaphore::new(MAX_SNAPSHOT_REQUESTS),
             cache: Mutex::new(None),
             counters,
+            cluster: OnceLock::new(),
         })
+    }
+
+    /// Cluster mode: `/readyz` also requires `info.ready()`, and
+    /// `/metrics` and `/admin` add the cluster figures. Call before
+    /// `set_ready`.
+    pub fn set_cluster(&self, info: Arc<dyn ClusterInfo>) {
+        let _ = self.cluster.set(info);
     }
 
     /// Marks the server ready (`/readyz` 200, `/metrics` and `/admin`
@@ -181,8 +192,10 @@ async fn route(state: &HttpState, req: &Request<Incoming>) -> Response<Full<Byte
         // Health checks never wait for anything.
         "/healthz" => text(StatusCode::OK, "ok"),
         "/readyz" => match state.engine.get() {
-            Some(_) => text(StatusCode::OK, "ready"),
-            None => not_ready(),
+            Some(_) if state.cluster.get().is_none_or(|c| c.ready()) => {
+                text(StatusCode::OK, "ready")
+            }
+            _ => not_ready(),
         },
         _ => monitoring(state, path == "/metrics").await,
     }
@@ -208,18 +221,19 @@ async fn monitoring(state: &HttpState, prometheus: bool) -> Response<Full<Bytes>
         Err(why) => return text(StatusCode::SERVICE_UNAVAILABLE, why),
     };
     let rs = state.counters.sample();
+    let cluster = state.cluster.get().map(|c| c.stats());
     if prometheus {
-        body(
-            StatusCode::OK,
-            PROMETHEUS_CONTENT_TYPE,
-            metrics::render_prometheus(&snap, state.max_tube_series, &rs),
-        )
+        let mut text = metrics::render_prometheus(&snap, state.max_tube_series, &rs);
+        if let Some(c) = &cluster {
+            metrics::render_cluster_prometheus(&mut text, c);
+        }
+        body(StatusCode::OK, PROMETHEUS_CONTENT_TYPE, text)
     } else {
-        body(
-            StatusCode::OK,
-            JSON_CONTENT_TYPE,
-            metrics::render_admin_json(&snap, state.max_tube_series, &rs),
-        )
+        let mut text = metrics::render_admin_json(&snap, state.max_tube_series, &rs);
+        if let Some(c) = &cluster {
+            metrics::append_cluster_json(&mut text, c);
+        }
+        body(StatusCode::OK, JSON_CONTENT_TYPE, text)
     }
 }
 

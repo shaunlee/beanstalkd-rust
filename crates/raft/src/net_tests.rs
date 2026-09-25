@@ -25,7 +25,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use crate::client::{Network, NetworkConfig, PeerClient};
-use crate::forward::{ForwardError, ForwardHandler, ForwardTransport};
+use crate::forward::{
+    ControlRequest, ControlResponse, ForwardError, ForwardHandler, ForwardTransport,
+};
 use crate::listener::{ClusterListener, ListenerConfig};
 use crate::test_store::{MemLog, MemSm};
 use crate::tls::{ClusterTls, cluster_tls_from_pem, node_dns_name};
@@ -38,6 +40,7 @@ use crate::{ForwardRequest, ForwardResponse, NodeId, Op, Request, TypeConfig, co
 struct CountingHandler {
     calls: AtomicUsize,
     last: Mutex<Option<ForwardRequest>>,
+    controls: Mutex<Vec<ControlRequest>>,
 }
 
 impl CountingHandler {
@@ -51,6 +54,11 @@ impl ForwardHandler for CountingHandler {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.last.lock().expect("lock") = Some(req);
         ForwardResponse::NotLeader { leader: Some(3) }
+    }
+
+    async fn control(&self, req: ControlRequest) -> ControlResponse {
+        self.controls.lock().expect("lock").push(req);
+        ControlResponse::Accepted { index: Some(7) }
     }
 }
 
@@ -613,6 +621,7 @@ async fn silent_server(answer_hello: bool) -> (String, Arc<AtomicUsize>) {
                         &ServerMsg::Hello(ServerHello::Accepted {
                             version: PROTOCOL_VERSION,
                             node_id: 1,
+                            max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
                         }),
                         wire::DEFAULT_MAX_FRAME,
                     )
@@ -742,6 +751,7 @@ async fn raw_hello(addr: SocketAddr, from: NodeId) -> tokio::net::TcpStream {
             version: PROTOCOL_VERSION,
             from,
             to: 1,
+            max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
         }),
         wire::DEFAULT_MAX_FRAME,
     )
@@ -806,6 +816,7 @@ async fn listener_closes_on_bad_frames() {
             version: PROTOCOL_VERSION,
             from: 2,
             to: 1,
+            max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
         }),
         wire::DEFAULT_MAX_FRAME,
     )
@@ -1045,4 +1056,195 @@ async fn wiped_node_catches_up_by_chunked_snapshot_over_tls() {
     nodes.push(fresh);
     replicate_and_check(&nodes, 200, 5).await;
     shutdown(nodes).await;
+}
+
+// ------------------------------------------------ protocol version 2 (P3-T4)
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_requests_are_checked_and_served() {
+    let (node, net) = single_target(None, None).await;
+    // Drain mode and dropping the sender itself are allowed.
+    for op in [
+        Op::SetDraining(true),
+        Op::DropNode {
+            node: 2,
+            up_to_local: 5,
+        },
+    ] {
+        let r = net
+            .control(
+                1,
+                ControlRequest {
+                    from: 2,
+                    op: op.clone(),
+                },
+            )
+            .await
+            .expect("control");
+        assert_eq!(r, ControlResponse::Accepted { index: Some(7) });
+    }
+    // Everything else is refused before the handler sees it.
+    for (from, op) in [
+        (3, Op::SetDraining(true)),
+        (
+            2,
+            Op::DropNode {
+                node: 3,
+                up_to_local: 5,
+            },
+        ),
+        (2, Op::Tick),
+        (
+            2,
+            Op::Conn {
+                seq: 1,
+                input: EngineInput::Connect(conn_id(2, 1)),
+            },
+        ),
+    ] {
+        let e = net
+            .control(1, ControlRequest { from, op })
+            .await
+            .expect_err("rejected");
+        assert!(matches!(e, ForwardError::Rejected(_)), "{e:?}");
+    }
+    let seen = node.handler.controls.lock().expect("lock").clone();
+    assert_eq!(
+        seen,
+        vec![
+            ControlRequest {
+                from: 2,
+                op: Op::SetDraining(true)
+            },
+            ControlRequest {
+                from: 2,
+                op: Op::DropNode {
+                    node: 2,
+                    up_to_local: 5,
+                }
+            },
+        ]
+    );
+    shutdown(vec![node]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_control_handler_refuses() {
+    struct Plain;
+    impl ForwardHandler for Plain {
+        async fn forward(&self, _req: ForwardRequest) -> ForwardResponse {
+            ForwardResponse::Accepted
+        }
+    }
+    let tcp = bind().await;
+    let addr = tcp.local_addr().expect("addr").to_string();
+    let addrs: BTreeMap<NodeId, String> = [(1, addr.clone()), (2, "127.0.0.1:1".into())].into();
+    let net1 = Network::new(net_config(1, addrs, None));
+    let raft = Raft::new(1, raft_config(), net1, MemLog::default(), MemSm::default())
+        .await
+        .expect("raft");
+    let l = ClusterListener::spawn(
+        tcp,
+        listener_config(1, &[1, 2], None),
+        raft.clone(),
+        Arc::new(Plain),
+    )
+    .expect("listener");
+    let net = Network::new(net_config(2, [(1, addr)].into(), None));
+    let r = net
+        .control(
+            1,
+            ControlRequest {
+                from: 2,
+                op: Op::SetDraining(true),
+            },
+        )
+        .await
+        .expect("control");
+    assert_eq!(r, ControlResponse::NotLeader { leader: None });
+    l.shutdown().await;
+    let _ = raft.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_job_size_mismatch_is_rejected() {
+    let (node, _) = single_target(None, None).await;
+    let addr = node.addr.to_string();
+    let mut cfg = net_config(2, [(1, addr.clone())].into(), None);
+    cfg.max_job_size = bstk_proto::DEFAULT_MAX_JOB_SIZE + 1;
+    let net = Network::new(cfg);
+    let e = net.forward(1, forward_from(2)).await.expect_err("rejected");
+    assert!(
+        matches!(e, ForwardError::Unreachable(ref m) if m.contains("max_job_size mismatch")),
+        "{e:?}"
+    );
+    assert_eq!(node.handler.calls(), 0);
+
+    // The dialer checks the listener's value too (a listener that accepts
+    // anything but reports another size).
+    let tcp = bind().await;
+    let fake = tcp.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let Ok((mut s, _)) = tcp.accept().await else {
+            return;
+        };
+        let _ = wire::read_frame::<_, ClientMsg>(&mut s, wire::DEFAULT_MAX_FRAME).await;
+        let f = wire::encode(
+            &ServerMsg::Hello(ServerHello::Accepted {
+                version: PROTOCOL_VERSION,
+                node_id: 1,
+                max_job_size: 5,
+            }),
+            wire::DEFAULT_MAX_FRAME,
+        )
+        .expect("encode");
+        let _ = wire::write_frame(&mut s, &f).await;
+        let _ = wire::read_frame::<_, ClientMsg>(&mut s, wire::DEFAULT_MAX_FRAME).await;
+    });
+    let net = Network::new(net_config(2, [(1, fake.to_string())].into(), None));
+    let e = net.forward(1, forward_from(2)).await.expect_err("rejected");
+    assert!(
+        matches!(e, ForwardError::Unreachable(ref m) if m.contains("max_job_size mismatch")),
+        "{e:?}"
+    );
+    shutdown(vec![node]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn old_protocol_version_is_rejected() {
+    let (node, _) = single_target(None, None).await;
+    let mut s = tokio::net::TcpStream::connect(node.addr)
+        .await
+        .expect("connect");
+    let f = wire::encode(
+        &ClientMsg::Hello(Hello {
+            version: 1,
+            from: 2,
+            to: 1,
+            max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
+        }),
+        wire::DEFAULT_MAX_FRAME,
+    )
+    .expect("encode");
+    wire::write_frame(&mut s, &f).await.expect("hello");
+    let a: Option<ServerMsg> = wire::read_frame(&mut s, wire::DEFAULT_MAX_FRAME)
+        .await
+        .expect("answer");
+    assert!(
+        matches!(a, Some(ServerMsg::Hello(ServerHello::Rejected { ref reason })) if reason.contains("version")),
+        "{a:?}"
+    );
+    shutdown(vec![node]).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn last_response_tracks_answers() {
+    let (node, net) = single_target(None, None).await;
+    assert_eq!(net.last_response(1), None);
+    let before = std::time::Instant::now();
+    let _ = net.forward(1, forward_from(2)).await.expect("forward");
+    let at = net.last_response(1).expect("a response arrived");
+    assert!(at >= before);
+    assert_eq!(net.last_response(3), None);
+    shutdown(vec![node]).await;
 }

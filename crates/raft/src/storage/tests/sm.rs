@@ -175,7 +175,8 @@ fn resend_after_leader_change() {
     assert_eq!(snap.server.current_jobs_ready, 1);
 }
 
-/// `DropNode(n)` disconnects exactly `n`'s connections, lowest id first,
+/// `DropNode { node: n, .. }` disconnects exactly `n`'s connections (up to
+/// the bound), lowest id first,
 /// releasing their reservations (which can wake other nodes' waiters).
 #[test]
 fn drop_node_disconnects_owner_connections_in_order() {
@@ -196,7 +197,13 @@ fn drop_node_disconnects_owner_connections_in_order() {
         req(S, c_in(2, cmd(r_lo, Command::Reserve))),
         req(S, c_in(1, EngineInput::Connect(w))),
         req(S, c_in(2, cmd(w, Command::Reserve))), // waits
-        req(2 * S, Op::DropNode(2)),
+        req(
+            2 * S,
+            Op::DropNode {
+                node: 2,
+                up_to_local: 5,
+            },
+        ),
         req(2 * S, c_in(1, EngineInput::Connect(conn_id(2, 4)))), // dup
         req(2 * S, c_in(3, cmd(r_lo, Command::ListTubeUsed))),    // dup
         req(2 * S, c_in(1, EngineInput::Connect(conn_id(2, 6)))), // new
@@ -291,7 +298,10 @@ fn workload(len: usize, seed: u64) -> Vec<Request> {
                 awaiting.remove(&c);
                 c_in(s, EngineInput::Disconnect(c))
             }
-            12 => Op::DropNode(1 + rnd(3)),
+            12 => Op::DropNode {
+                node: 1 + rnd(3),
+                up_to_local: if rnd(2) == 0 { u64::MAX } else { rnd(20) },
+            },
             13..=15 => Op::Tick,
             16 => Op::SetDraining(rnd(4) == 0),
             _ if !conns.is_empty() => {
@@ -346,12 +356,13 @@ fn workload(len: usize, seed: u64) -> Vec<Request> {
                 }
                 Op::Tick => e.apply_input(t, EngineInput::Tick, &mut o),
                 Op::SetDraining(on) => e.apply_input(t, EngineInput::SetDraining(*on), &mut o),
-                Op::DropNode(n) => {
-                    for c in e.conn_ids().into_iter().filter(|&c| owner_of(c) == *n) {
+                Op::DropNode { node, up_to_local } => {
+                    let hit = |c: ConnId| owner_of(c) == *node && local(c) <= *up_to_local;
+                    for c in e.conn_ids().into_iter().filter(|&c| hit(c)) {
                         awaiting.remove(&c);
                         e.apply_input(t, EngineInput::Disconnect(c), &mut o);
                     }
-                    conns.retain(|&(c, _)| owner_of(c) != *n);
+                    conns.retain(|&(c, _)| !hit(c));
                 }
             }
         }
@@ -434,8 +445,12 @@ fn nodes_fed_the_same_entries_agree() {
                 Op::SetDraining(on) => {
                     e.apply_input(now, EngineInput::SetDraining(*on), &mut expect)
                 }
-                Op::DropNode(n) => {
-                    for c in e.conn_ids().into_iter().filter(|&c| owner_of(c) == *n) {
+                Op::DropNode { node, up_to_local } => {
+                    for c in e
+                        .conn_ids()
+                        .into_iter()
+                        .filter(|&c| owner_of(c) == *node && local(c) <= *up_to_local)
+                    {
                         e.apply_input(now, EngineInput::Disconnect(c), &mut expect);
                     }
                 }
@@ -775,4 +790,124 @@ fn install_rejects_invalid_snapshots() {
     assert_eq!(block_on(b.sm.applied_state()).unwrap().0, Some(lid(1, 10)));
     assert!(install(&mut b, good).is_ok());
     assert_eq!(state_bytes(&b.sm), state_bytes(&a.sm));
+}
+
+/// The local number of a connection id.
+fn local(c: ConnId) -> u64 {
+    c & ((1 << crate::CONN_SEQ_BITS) - 1)
+}
+
+/// A bounded `DropNode` leaves the node's higher-numbered connections, and
+/// their reservations, untouched.
+#[test]
+fn drop_node_with_a_bound_spares_higher_connections() {
+    let old = conn_id(2, 3);
+    let new = conn_id(2, 4);
+    let reqs = [
+        req(S, c_in(1, EngineInput::Connect(old))),
+        req(S, c_in(1, EngineInput::Connect(new))),
+        req(S, c_in(2, put(old, "a"))),
+        req(S, c_in(3, put(old, "b"))),
+        req(S, c_in(2, cmd(new, Command::Reserve))),
+        req(
+            2 * S,
+            Op::DropNode {
+                node: 2,
+                up_to_local: 3,
+            },
+        ),
+        // `new` is still open at its next seq.
+        req(2 * S, c_in(3, cmd(new, Command::ListTubeUsed))),
+        // `old` is gone.
+        req(2 * S, c_in(4, cmd(old, Command::ListTubeUsed))),
+    ];
+    let mut n = node(2);
+    let res = apply(&mut n.sm, entries(1, &reqs));
+    assert_eq!(dups(&res)[5..], [false, false, true]);
+    let h = n.sm.handle();
+    assert_eq!(h.conn_ids(), vec![new]);
+    assert_eq!(h.applied_seq(old), None);
+    assert_eq!(h.applied_seq(new), Some(3));
+    let closed: Vec<ConnId> = n
+        .sink
+        .take()
+        .iter()
+        .filter_map(|e| match e {
+            Ev::Closed(c) => Some(*c),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed, vec![old]);
+    // The reservation of `new` is kept.
+    let snap = h.snapshot_limited(2 * S, 10).unwrap();
+    assert_eq!(snap.server.current_jobs_reserved, 1);
+    assert_eq!(snap.server.current_connections, 1);
+}
+
+/// The race of a leader's `DropNode` for a node that restarted meanwhile:
+/// the leader proposed it with the bound it saw (the old process's highest
+/// local number), the node restarted, dropped its old connections itself
+/// and accepted new ones above that number; the stale `DropNode` commits
+/// only then and must not touch the new connections.
+#[test]
+fn stale_drop_node_after_restart_spares_new_connections() {
+    let old = conn_id(2, 7);
+    let other = conn_id(1, 1);
+    let mut n = node(2);
+    let before = [
+        req(S, c_in(1, EngineInput::Connect(other))),
+        req(S, c_in(1, EngineInput::Connect(old))),
+        req(S, c_in(2, put(other, "job"))),
+        req(S, c_in(2, cmd(old, Command::Reserve))),
+    ];
+    apply(&mut n.sm, entries(1, &before));
+    let h = n.sm.handle();
+    // The leader observes node 2 (silent) and prepares its DropNode.
+    let leader_bound = h.highest_local(2);
+    assert_eq!(leader_bound, 7);
+    // Node 2 restarts: its own startup DropNode uses the bound it observed,
+    // then it numbers new connections above it (as the server does).
+    let own_bound = h.highest_local(2);
+    let first_new = own_bound + 1;
+    let new = conn_id(2, first_new);
+    let after = [
+        req(
+            2 * S,
+            Op::DropNode {
+                node: 2,
+                up_to_local: own_bound,
+            },
+        ),
+        req(2 * S, c_in(1, EngineInput::Connect(new))),
+        req(2 * S, c_in(2, cmd(new, Command::Reserve))),
+        // The leader's stale DropNode commits last.
+        req(
+            3 * S,
+            Op::DropNode {
+                node: 2,
+                up_to_local: leader_bound,
+            },
+        ),
+        req(3 * S, c_in(3, cmd(new, Command::ListTubeUsed))),
+    ];
+    let res = apply(&mut n.sm, entries(1 + before.len() as u64, &after));
+    assert_eq!(dups(&res), [false, false, false, false, false]);
+    assert_eq!(h.conn_ids(), vec![other, new]);
+    assert_eq!(h.applied_seq(new), Some(3));
+    let snap = h.snapshot_limited(3 * S, 10).unwrap();
+    // The job released from `old` is now reserved by `new`, and stays so.
+    assert_eq!(snap.server.current_jobs_reserved, 1);
+    let delivered: Vec<Ev> = n.sink.take();
+    assert!(
+        delivered
+            .iter()
+            .any(|e| matches!(e, Ev::Deliver(c, Response::Reserved { .. }) if *c == new)),
+        "{delivered:?}"
+    );
+    assert!(
+        !delivered
+            .iter()
+            .any(|e| matches!(e, Ev::Closed(c) if *c == new)),
+        "{delivered:?}"
+    );
 }

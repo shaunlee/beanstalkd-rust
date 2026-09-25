@@ -148,7 +148,7 @@ impl Clock {
     /// from now: a far deadline (a `u32::MAX` second delay or TTR on top
     /// of a wall-clock epoch) is never converted to an `Instant`, which
     /// could overflow. Waking up early is harmless.
-    fn instant_at(&self, at: Nanos) -> Instant {
+    pub(crate) fn instant_at(&self, at: Nanos) -> Instant {
         let now = Instant::now();
         let cap = now + MAX_WAIT;
         self.start

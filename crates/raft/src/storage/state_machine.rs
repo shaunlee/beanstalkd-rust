@@ -15,7 +15,8 @@
 //!   else is ignored (`Applied { duplicate: true }`). `Disconnect` forgets
 //!   the connection.
 //! - `Op::Tick`, `Op::SetDraining` map to the engine inputs;
-//!   `Op::DropNode(n)` disconnects every connection owned by `n` in
+//!   `Op::DropNode { node, up_to_local }` disconnects every connection
+//!   owned by `node` with a local number `<= up_to_local`, in
 //!   ascending order.
 //! - Blank and membership entries only update the metadata.
 //!
@@ -387,12 +388,15 @@ impl Core {
                     .apply_input(now, EngineInput::SetDraining(on), &mut out);
                 self.route(node, &mut out, events);
             }
-            Op::DropNode(n) => {
+            Op::DropNode {
+                node: n,
+                up_to_local,
+            } => {
                 let conns: Vec<ConnId> = self
                     .engine
                     .conn_ids()
                     .into_iter()
-                    .filter(|&c| owner_of(c) == n)
+                    .filter(|&c| owner_of(c) == n && local_of(c) <= up_to_local)
                     .collect();
                 for c in conns {
                     self.meta.next_seq.remove(&c);
