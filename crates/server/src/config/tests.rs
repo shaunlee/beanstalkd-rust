@@ -43,6 +43,7 @@ const TLS: &str = "[tls]\ncert = \"server.pem\"\nkey = \"server.key\"\n";
 const FULL: &str = r#"
 [server]
 max_job_size = 1000
+max_pending_connections = 64
 
 [[listener]]
 addr = "0.0.0.0:11300"
@@ -64,6 +65,7 @@ client_ca = "ca/ca.pem"
 
 [auth]
 tokens = ["s3cret-token-AAAA", "an0ther-token-BBBB", "s3cret-token-AAAA"]
+timeout = "2500ms"
 
 [binlog]
 dir = "wal"
@@ -73,6 +75,7 @@ file_size = 4096
 [http]
 addr = "127.0.0.1:9180"
 max_tube_series = 50
+snapshot_min_interval = "3s"
 
 [log]
 level = "debug"
@@ -115,6 +118,9 @@ fn full_example_parses() {
     let tokens: Vec<&[u8]> = c.tokens.iter().collect();
     assert_eq!(tokens, vec![TOKEN_A.as_bytes(), TOKEN_B.as_bytes()]);
     assert_eq!(c.max_job_size, 1000);
+    assert_eq!(c.max_pending_connections, 64);
+    assert_eq!(c.auth_timeout, Duration::from_millis(2500));
+    assert!(c.warnings.is_empty());
     assert_eq!(
         c.binlog,
         BinlogSettings {
@@ -135,7 +141,8 @@ fn full_example_parses() {
         c.http,
         Some(HttpSettings {
             addr: addr("127.0.0.1:9180"),
-            max_tube_series: 50
+            max_tube_series: 50,
+            snapshot_min_interval: Duration::from_secs(3),
         })
     );
     assert_eq!(
@@ -158,6 +165,7 @@ fn example_file_in_docs_is_valid() {
     file.tokens_file = Some(TokensFile {
         path: PathBuf::from("tokens.txt"),
         contents: format!("{TOKEN_B}\n"),
+        mode_warning: None,
     });
     let c = resolve(&cli(&[]), Some(file)).expect("example validates");
     assert!(!c.listeners.is_empty());
@@ -177,7 +185,9 @@ fn no_file_is_todays_command_line() {
             }],
             tls: None,
             tokens: Tokens::default(),
+            auth_timeout: DEFAULT_AUTH_TIMEOUT,
             max_job_size: DEFAULT_MAX_JOB_SIZE,
+            max_pending_connections: DEFAULT_MAX_PENDING_CONNECTIONS,
             binlog: BinlogSettings {
                 dir: None,
                 file_size: DEFAULT_BINLOG_MAX_SIZE,
@@ -188,8 +198,11 @@ fn no_file_is_todays_command_line() {
                 level: LogLevel::Warn,
                 format: LogFormat::Text
             },
+            warnings: Vec::new(),
         }
     );
+    assert_eq!(DEFAULT_AUTH_TIMEOUT, Duration::from_secs(10));
+    assert_eq!(DEFAULT_MAX_PENDING_CONNECTIONS, 1024);
     assert_eq!(c.binlog.wal_options(), None);
 
     // Every flag passes through unchanged, quirks included.
@@ -253,6 +266,9 @@ fn unknown_keys_are_rejected_everywhere() {
         ("bogus = 1\n", 1),
         ("[bogus]\n", 1),
         ("[server]\nmax_job_size = 1\nbogus = 1\n", 3),
+        ("[server]\nmax_pending_connection = 1\n", 2),
+        ("[auth]\ntimeouts = \"1s\"\n", 2),
+        ("[http]\nsnapshot_interval = \"1s\"\n", 2),
         ("[[listener]]\naddr = \"127.0.0.1:1\"\nbogus = 1\n", 3),
         ("[tls]\nbogus = \"x\"\n", 2),
         ("[auth]\nbogus = 1\n", 2),
@@ -291,6 +307,9 @@ fn bad_enum_values_and_types_are_rejected() {
         "[log]\nformat = \"xml\"\n",
         "[server]\nmax_job_size = \"10\"\n",
         "[binlog]\nfsync = 50\n",
+        "[auth]\ntimeout = 10\n",
+        "[server]\nmax_pending_connections = \"10\"\n",
+        "[http]\naddr = \"127.0.0.1:1\"\nsnapshot_min_interval = 1\n",
         "this is not toml",
     ] {
         assert!(
@@ -476,9 +495,29 @@ fn http_settings() {
         c.http,
         Some(HttpSettings {
             addr: addr("127.0.0.1:9180"),
-            max_tube_series: DEFAULT_MAX_TUBE_SERIES
+            max_tube_series: DEFAULT_MAX_TUBE_SERIES,
+            snapshot_min_interval: DEFAULT_SNAPSHOT_MIN_INTERVAL,
         })
     );
+    let interval = |v: &str| {
+        resolved(
+            &[],
+            &format!("[http]\naddr = \"127.0.0.1:9180\"\nsnapshot_min_interval = \"{v}\"\n"),
+        )
+        .http
+        .map(|h| h.snapshot_min_interval)
+    };
+    assert_eq!(interval("250ms"), Some(Duration::from_millis(250)));
+    assert_eq!(interval("2s"), Some(Duration::from_secs(2)));
+    // Zero disables the snapshot cache.
+    assert_eq!(interval("0s"), Some(Duration::ZERO));
+    for bad in ["", "1", "1m", "-1s", "1.5s", "never"] {
+        let e = error(
+            &[],
+            &format!("[http]\naddr = \"127.0.0.1:9180\"\nsnapshot_min_interval = \"{bad}\"\n"),
+        );
+        assert!(e.contains("http.snapshot_min_interval"), "{bad:?}: {e}");
+    }
     let e = error(&[], "[http]\nmax_tube_series = 5\n");
     assert!(e.contains("http.addr is required"), "{e}");
     let e = error(
@@ -551,6 +590,104 @@ fn fsync_values() {
         let e = error(&[], &format!("[binlog]\nfsync = \"{bad}\"\n"));
         assert!(e.contains("binlog.fsync"), "{bad:?}: {e}");
     }
+}
+
+#[test]
+fn auth_timeout_values() {
+    let timeout = |v: &str| resolved(&[], &format!("[auth]\ntimeout = \"{v}\"\n")).auth_timeout;
+    assert_eq!(timeout("1ms"), Duration::from_millis(1));
+    assert_eq!(timeout("500ms"), Duration::from_millis(500));
+    assert_eq!(timeout("30s"), Duration::from_secs(30));
+    assert_eq!(resolved(&[], "").auth_timeout, DEFAULT_AUTH_TIMEOUT);
+    for bad in [
+        "0s",
+        "0ms",
+        "",
+        "10",
+        "always",
+        "never",
+        "-1s",
+        "1.5s",
+        "5m",
+        "9223372036855ms",
+    ] {
+        let e = error(&[], &format!("[auth]\ntimeout = \"{bad}\"\n"));
+        assert!(e.contains("auth.timeout"), "{bad:?}: {e}");
+    }
+}
+
+#[test]
+fn max_pending_connections_values() {
+    let max = |v: i64| {
+        resolved(&[], &format!("[server]\nmax_pending_connections = {v}\n")).max_pending_connections
+    };
+    assert_eq!(max(1), 1);
+    assert_eq!(max(100_000), 100_000);
+    assert_eq!(
+        resolved(&[], "").max_pending_connections,
+        DEFAULT_MAX_PENDING_CONNECTIONS
+    );
+    for bad in [0, -1, i64::MIN] {
+        let e = error(&[], &format!("[server]\nmax_pending_connections = {bad}\n"));
+        assert!(e.contains("server.max_pending_connections"), "{bad}: {e}");
+    }
+}
+
+#[test]
+fn tokens_file_mode_warnings() {
+    let p = Path::new("/etc/beanstalkd/tokens.txt");
+    for ok in [0o600, 0o400, 0o700, 0o100_600, 0o4600] {
+        assert_eq!(tokens_file_mode_warning(p, ok), None, "{ok:o}");
+    }
+    for loose in [0o644, 0o640, 0o604, 0o660, 0o666, 0o610, 0o601, 0o100_644] {
+        let w = tokens_file_mode_warning(p, loose).expect("warning");
+        assert!(
+            w.contains("auth.tokens_file") && w.contains("tokens.txt") && w.contains("chmod 600"),
+            "{w}"
+        );
+        assert!(w.contains(&format!("{:04o}", loose & 0o7777)), "{w}");
+    }
+
+    // Through `load`: a group/world-readable file warns but still works.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tokens = dir.path().join("tokens.txt");
+    std::fs::write(&tokens, format!("{TOKEN_A}\n")).expect("write");
+    let conf = dir.path().join("b.toml");
+    std::fs::write(&conf, "[auth]\ntokens_file = \"tokens.txt\"\n").expect("write");
+    let conf_arg = conf.to_str().expect("utf-8");
+    let set_mode = |mode| {
+        std::fs::set_permissions(&tokens, std::fs::Permissions::from_mode(mode)).expect("chmod")
+    };
+    set_mode(0o644);
+    let c = load(&cli(&["--config", conf_arg])).expect("still valid");
+    assert_eq!(c.tokens.len(), 1);
+    assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings);
+    assert!(c.warnings[0].contains("0644"), "{:?}", c.warnings);
+    assert!(!c.warnings[0].contains(TOKEN_A));
+
+    let run = |args: &[&str]| {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let status = run_check(&cli(args), &mut out, &mut err);
+        (
+            status,
+            String::from_utf8(out).expect("utf-8"),
+            String::from_utf8(err).expect("utf-8"),
+        )
+    };
+    let (status, out, err) = run(&["--check-config", "--config", conf_arg]);
+    assert_eq!(status, 0);
+    assert!(out.starts_with("configuration OK"), "{out}");
+    assert!(
+        err.starts_with("beanstalkd-rs: warning: auth.tokens_file") && err.contains("0644"),
+        "{err}"
+    );
+
+    set_mode(0o600);
+    let c = load(&cli(&["--config", conf_arg])).expect("valid");
+    assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    let (status, _, err) = run(&["--check-config", "--config", conf_arg]);
+    assert_eq!(status, 0);
+    assert_eq!(err, "");
 }
 
 #[test]
@@ -804,6 +941,7 @@ fn debug_output_redacts_tokens() {
     let tf = TokensFile {
         path: PathBuf::from("t"),
         contents: TOKEN_A.to_owned(),
+        mode_warning: None,
     };
     assert!(!format!("{tf:?}").contains(TOKEN_A));
 }
@@ -819,16 +957,18 @@ fn check_config_summary() {
         "listener 0.0.0.0:11301 (tls, auth token)",
         "listener [::1]:11302 (tls, auth mtls)",
         "client_ca /etc/beanstalkd/ca/ca.pem",
-        "auth: 2 token(s)",
+        "auth: 2 token(s), timeout 2.5s",
+        "max pending connections: 64",
         "max job size: 1000",
         "binlog: /etc/beanstalkd/wal (file size 4096, fsync every 1s)",
-        "http: 127.0.0.1:9180 (max tube series 50)",
+        "http: 127.0.0.1:9180 (max tube series 50, snapshot min interval 3s)",
         "log: level debug, format json",
     ] {
         assert!(s.contains(expected), "missing {expected:?} in\n{s}");
     }
 
-    let s = check(&cli(&[])).expect("defaults are valid");
+    let (s, warnings) = check(&cli(&[])).expect("defaults are valid");
+    assert!(warnings.is_empty());
     assert_eq!(
         s,
         "configuration OK: command line only\n\
@@ -867,7 +1007,7 @@ fn run_check_exit_status_and_output() {
     let (status, out, err) = run(&["--check-config", "--config", good]);
     assert_eq!(status, 0);
     assert!(
-        out.starts_with("configuration OK: ") && out.contains("auth: 1 token(s)"),
+        out.starts_with("configuration OK: ") && out.contains("auth: 1 token(s), timeout 10s"),
         "{out}"
     );
     assert!(!out.contains(TOKEN_A), "{out}");

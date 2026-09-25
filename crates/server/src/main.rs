@@ -41,6 +41,7 @@ mod conn;
 mod engine_actor;
 mod http;
 mod metrics;
+mod pending;
 mod sysinfo;
 mod tls;
 
@@ -62,8 +63,9 @@ use bstk_store::{Wal, WalError};
 use auth::TokenSet;
 use cli::Cli;
 use config::{AuthMode, LogFormat, LogSettings, ResolvedConfig};
-use conn::TlsAuth;
+use conn::{TlsAuth, TlsListener};
 use engine_actor::{Actor, Clock, EngineHandle, EngineMsg};
+use pending::ServerCounters;
 use sysinfo::ProcessSysInfo;
 use tls::TlsConfigs;
 
@@ -106,6 +108,9 @@ fn main() -> ExitCode {
     };
 
     init_logging(config.log);
+    for w in &config.warnings {
+        tracing::warn!("{w}");
+    }
 
     let tls = match config.tls.as_ref().map(tls::load).transpose() {
         Ok(t) => t,
@@ -137,6 +142,10 @@ fn main() -> ExitCode {
     // stop on it.
     let (stop_tx, stop_rx) = watch::channel(false);
 
+    // Pending TLS connections and authentication counters (only TLS
+    // listeners touch them; the HTTP listener exports them).
+    let counters = ServerCounters::new(config.max_pending_connections);
+
     // Started before the binlog replay, so /healthz and /readyz answer
     // during recovery.
     let http = match &config.http {
@@ -153,7 +162,7 @@ fn main() -> ExitCode {
                 }
             };
             tracing::info!(addr = %settings.addr, "HTTP listener started");
-            let state = http::HttpState::new(settings.max_tube_series);
+            let state = http::HttpState::new(settings, Arc::clone(&counters));
             let task = runtime.spawn(http::serve(listener, Arc::clone(&state), stop_rx.clone()));
             Some((state, task))
         }
@@ -170,12 +179,27 @@ fn main() -> ExitCode {
     runtime.block_on(serve(
         listeners,
         engine_tx,
-        config.max_job_size,
-        tokens,
+        ConnSettings {
+            max_job_size: config.max_job_size,
+            auth_timeout: config.auth_timeout,
+            tokens,
+            counters,
+        },
         http,
         stop_tx,
         stop_rx,
     ))
+}
+
+/// What `serve` hands to the connections of every listener.
+struct ConnSettings {
+    max_job_size: u32,
+    /// `auth.timeout` (token listeners only).
+    auth_timeout: std::time::Duration,
+    /// Accepted tokens (token listeners only).
+    tokens: Arc<TokenSet>,
+    /// Pending-connection accounting (TLS listeners only).
+    counters: Arc<ServerCounters>,
 }
 
 /// `--check-config`: resolves the configuration and also loads its TLS
@@ -345,8 +369,7 @@ fn start_engine(
 async fn serve(
     listeners: Vec<Bound>,
     engine_tx: EngineHandle,
-    max_job_size: u32,
-    tokens: Arc<TokenSet>,
+    settings: ConnSettings,
     http: Option<(Arc<http::HttpState>, JoinHandle<()>)>,
     stop_tx: watch::Sender<bool>,
     stop_rx: watch::Receiver<bool>,
@@ -378,23 +401,24 @@ async fn serve(
                 listener,
                 next_id,
                 engine_tx,
-                max_job_size,
+                settings.max_job_size,
                 stop,
             )),
             Kind::Tls { acceptor, auth } => {
                 let auth = match auth {
                     Auth::Handshake => TlsAuth::Handshake,
-                    Auth::Token => TlsAuth::Token(Arc::clone(&tokens)),
+                    Auth::Token => TlsAuth::Token(Arc::clone(&settings.tokens)),
                 };
-                tokio::spawn(accept_tls(
-                    listener,
+                let shared = Arc::new(TlsListener {
                     acceptor,
                     auth,
                     next_id,
                     engine_tx,
-                    max_job_size,
-                    stop,
-                ))
+                    max_job_size: settings.max_job_size,
+                    counters: Arc::clone(&settings.counters),
+                    auth_timeout: settings.auth_timeout,
+                });
+                tokio::spawn(accept_tls(listener, shared, stop))
             }
         });
     }
@@ -484,13 +508,12 @@ async fn accept_plain(
 
 /// Accept loop of a TLS listener. The handshake (and authentication) runs
 /// in the connection task, so a slow client never holds up accepting.
+/// Every accepted connection counts as pending (`pending`) until its
+/// handshake or authentication is done; past `server.max_pending_connections`
+/// a new connection is closed right away.
 async fn accept_tls(
     listener: TcpListener,
-    acceptor: TlsAcceptor,
-    auth: TlsAuth,
-    next_id: Arc<AtomicU64>,
-    engine_tx: EngineHandle,
-    max_job_size: u32,
+    shared: Arc<TlsListener>,
     mut stop: watch::Receiver<bool>,
 ) {
     loop {
@@ -505,17 +528,15 @@ async fn accept_tls(
                 continue;
             }
         };
+        let Some(pending) = shared.counters.try_acquire() else {
+            // Too many pending connections: close this one (counted and
+            // logged, rate-limited, by `try_acquire`).
+            drop(stream);
+            continue;
+        };
         if let Err(e) = stream.set_nodelay(true) {
             tracing::debug!("set_nodelay() failed: {e}");
         }
-        tokio::spawn(conn::handle_tls(
-            stream,
-            peer,
-            acceptor.clone(),
-            auth.clone(),
-            Arc::clone(&next_id),
-            engine_tx.clone(),
-            max_job_size,
-        ));
+        tokio::spawn(conn::handle_tls(stream, peer, Arc::clone(&shared), pending));
     }
 }

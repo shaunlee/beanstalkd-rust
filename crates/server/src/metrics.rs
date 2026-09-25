@@ -90,18 +90,84 @@
 //!
 //! `beanstalkd_current_tubes` always reports the full tube count.
 //!
+//! The snapshot may already hold only some of the tubes (the HTTP listener
+//! asks the engine for `max_tube_series + 1` of them, see
+//! `Engine::snapshot_limited`): "truncated" means that the snapshot has more
+//! tubes than the limit, which that extra tube tells.
+//!
+//! ## Server-side (beanstalkd-rs only, not in `stats`)
+//!
+//! | metric | type | meaning |
+//! |---|---|---|
+//! | `beanstalkd_pending_connections` | gauge | TLS connections in their handshake or awaiting token authentication |
+//! | `beanstalkd_pending_rejected_total` | counter | TLS connections closed at accept because `server.max_pending_connections` was reached |
+//! | `beanstalkd_auth_timeouts_total` | counter | token connections closed for not authenticating within `auth.timeout` |
+//! | `beanstalkd_auth_failures_total` | counter | wrong tokens and commands sent before authentication |
+//!
 //! # Admin JSON
 //!
-//! `{"server": {...}, "tubes": [{...}, ...]}` where `server` holds every
-//! `stats` key and each `tubes` entry every `stats-tube` key, with the
+//! `{"server": {...}, "server_rs": {...}, "tube_limit": N,
+//! "tubes_truncated": bool, "tubes": [{...}, ...]}` where `server` holds
+//! every `stats` key and each `tubes` entry every `stats-tube` key, with the
 //! reference's key names in the reference's order. Numbers are JSON numbers
 //! (`rusage-utime` / `rusage-stime` as seconds with six decimals), `draining`
 //! is a boolean, and `version`, `id`, `hostname`, `os`, `platform` and the
-//! tube `name` are strings. Tubes appear in `list-tubes` order and are never
-//! capped.
+//! tube `name` are strings. Tubes appear in `list-tubes` order, at most
+//! `tube_limit` (`http.max_tube_series`) of them; `tubes_truncated` tells
+//! whether some were left out. `server_rs` holds the server-side counters
+//! above as `pending-connections`, `pending-rejected`, `auth-timeouts` and
+//! `auth-failures` (cumulative ones without the `_total` suffix, like the
+//! `stats` keys).
 
 use bstk_engine::Snapshot;
 use bstk_proto::{StatsServer, StatsTube};
+
+/// Server-side counters of beanstalkd-rs that `stats` does not have (see
+/// `pending::ServerCounters`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerRsStats {
+    pub pending_connections: u64,
+    pub pending_rejected: u64,
+    pub auth_timeouts: u64,
+    pub auth_failures: u64,
+}
+
+/// Server-side metrics: (name, help, kind, value).
+type RsScalar = (&'static str, &'static str, Kind, fn(&ServerRsStats) -> u64);
+
+const RS_SCALARS: [RsScalar; 4] = [
+    (
+        "beanstalkd_pending_connections",
+        "TLS connections in their handshake or awaiting token authentication (not in stats).",
+        Kind::Gauge,
+        |r| r.pending_connections,
+    ),
+    (
+        "beanstalkd_pending_rejected_total",
+        "TLS connections closed at accept because server.max_pending_connections was reached.",
+        Kind::Counter,
+        |r| r.pending_rejected,
+    ),
+    (
+        "beanstalkd_auth_timeouts_total",
+        "Token-auth connections closed for not authenticating within auth.timeout.",
+        Kind::Counter,
+        |r| r.auth_timeouts,
+    ),
+    (
+        "beanstalkd_auth_failures_total",
+        "Wrong tokens and commands sent before authentication.",
+        Kind::Counter,
+        |r| r.auth_failures,
+    ),
+];
+
+/// The tubes to show under a limit of `limit`, and whether some are left
+/// out.
+fn shown_tubes(s: &Snapshot, limit: usize) -> (&[StatsTube], bool) {
+    let shown = &s.tubes[..s.tubes.len().min(limit)];
+    (shown, shown.len() < s.tubes.len())
+}
 
 const TEXT_OVERHEAD_PER_TUBE: usize = 1024;
 const TEXT_OVERHEAD_SERVER: usize = 8192;
@@ -320,11 +386,11 @@ const TUBE_SCALARS: [TubeScalar; 6] = [
 /// Renders `s` in the Prometheus text exposition format 0.0.4 (serve it
 /// with `Content-Type: text/plain; version=0.0.4; charset=utf-8`).
 /// Per-tube series cover only the first `max_tube_series` tubes in
-/// `list-tubes` order; see the module docs for the full metric list.
-pub fn render_prometheus(s: &Snapshot, max_tube_series: usize) -> String {
+/// `list-tubes` order; `rs` adds the server-side metrics. See the module
+/// docs for the full metric list.
+pub fn render_prometheus(s: &Snapshot, max_tube_series: usize, rs: &ServerRsStats) -> String {
     let srv = &s.server;
-    let shown = &s.tubes[..s.tubes.len().min(max_tube_series)];
-    let truncated = shown.len() < s.tubes.len();
+    let (shown, truncated) = shown_tubes(s, max_tube_series);
     let mut out = String::with_capacity(
         TEXT_OVERHEAD_SERVER + shown.len().saturating_mul(TEXT_OVERHEAD_PER_TUBE),
     );
@@ -395,6 +461,11 @@ pub fn render_prometheus(s: &Snapshot, max_tube_series: usize) -> String {
         &[("version", &srv.version)],
         "1",
     );
+
+    for (name, help, kind, get) in RS_SCALARS {
+        family(&mut out, name, help, kind);
+        sample(&mut out, name, &[], &get(rs).to_string());
+    }
 
     family(
         &mut out,
@@ -610,14 +681,32 @@ fn tube_fields(t: &StatsTube) -> [(&'static str, Json<'_>); 14] {
     ]
 }
 
+fn rs_fields(r: &ServerRsStats) -> [(&'static str, Json<'static>); 4] {
+    use Json::Num;
+    [
+        ("pending-connections", Num(r.pending_connections)),
+        ("pending-rejected", Num(r.pending_rejected)),
+        ("auth-timeouts", Num(r.auth_timeouts)),
+        ("auth-failures", Num(r.auth_failures)),
+    ]
+}
+
 /// Renders `s` as the `/admin` JSON document (compact, keys in the
-/// reference's `stats` / `stats-tube` order; see the module docs).
-pub fn render_admin_json(s: &Snapshot) -> String {
-    let mut out = String::with_capacity(2048 + s.tubes.len().saturating_mul(512));
+/// reference's `stats` / `stats-tube` order; see the module docs), with
+/// at most `tube_limit` tubes and the server-side counters `rs`.
+pub fn render_admin_json(s: &Snapshot, tube_limit: usize, rs: &ServerRsStats) -> String {
+    let (shown, truncated) = shown_tubes(s, tube_limit);
+    let mut out = String::with_capacity(2048 + shown.len().saturating_mul(512));
     out.push_str("{\"server\":");
     push_object(&mut out, &server_fields(&s.server));
+    out.push_str(",\"server_rs\":");
+    push_object(&mut out, &rs_fields(rs));
+    out.push_str(",\"tube_limit\":");
+    out.push_str(&tube_limit.to_string());
+    out.push_str(",\"tubes_truncated\":");
+    out.push_str(if truncated { "true" } else { "false" });
     out.push_str(",\"tubes\":[");
-    for (i, t) in s.tubes.iter().enumerate() {
+    for (i, t) in shown.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
@@ -669,7 +758,17 @@ mod tests {
     use bstk_engine::{Engine, EngineConfig, Snapshot, StaticSysInfo, SysSnapshot};
     use bstk_proto::{Command, StatsServer, StatsTube, TubeName};
 
-    use super::{render_admin_json, render_prometheus};
+    use super::{ServerRsStats, render_admin_json, render_prometheus};
+
+    /// Every field distinct.
+    fn rs() -> ServerRsStats {
+        ServerRsStats {
+            pending_connections: 901,
+            pending_rejected: 902,
+            auth_timeouts: 903,
+            auth_failures: 904,
+        }
+    }
 
     // -----------------------------------------------------------------
     // Fixtures
@@ -998,7 +1097,7 @@ mod tests {
     /// Checks every sample against the `stats` / `stats-tube` YAML of the
     /// snapshot, and that every numeric stats key is covered.
     fn check_values(s: &Snapshot, limit: usize) {
-        let text = render_prometheus(s, limit);
+        let text = render_prometheus(s, limit, &rs());
         let families = parse(&text);
         let server_yaml: HashMap<String, String> =
             yaml_map(&s.server.to_yaml()).into_iter().collect();
@@ -1038,6 +1137,10 @@ mod tests {
                     };
                     assert_eq!(value, &expected, "{name} {labels:?}");
                     assert!(server_covered.insert(key));
+                } else if let Some(v) = rs_value(name) {
+                    assert!(labels.is_empty(), "{name} {labels:?}");
+                    assert_eq!(value, &v.to_string(), "{name}");
+                    assert!(server_covered.insert(name.clone()));
                 } else {
                     assert!(
                         name == "beanstalkd_tube_series_limit"
@@ -1048,11 +1151,19 @@ mod tests {
             }
         }
         let not_exported = ["pid", "id", "hostname", "os", "platform"];
-        let expected_server: BTreeSet<String> = server_yaml
+        let mut expected_server: BTreeSet<String> = server_yaml
             .keys()
             .filter(|k| !not_exported.contains(&k.as_str()))
             .cloned()
             .collect();
+        for name in [
+            "beanstalkd_pending_connections",
+            "beanstalkd_pending_rejected_total",
+            "beanstalkd_auth_timeouts_total",
+            "beanstalkd_auth_failures_total",
+        ] {
+            expected_server.insert(name.to_owned());
+        }
         assert_eq!(server_covered, expected_server);
 
         let shown: Vec<&str> = s
@@ -1093,6 +1204,18 @@ mod tests {
         assert_eq!(order, shown);
     }
 
+    /// The value of a server-side metric in `rs()`.
+    fn rs_value(name: &str) -> Option<u64> {
+        let r = rs();
+        match name {
+            "beanstalkd_pending_connections" => Some(r.pending_connections),
+            "beanstalkd_pending_rejected_total" => Some(r.pending_rejected),
+            "beanstalkd_auth_timeouts_total" => Some(r.auth_timeouts),
+            "beanstalkd_auth_failures_total" => Some(r.auth_failures),
+            _ => None,
+        }
+    }
+
     // -----------------------------------------------------------------
     // Prometheus tests
     // -----------------------------------------------------------------
@@ -1108,7 +1231,7 @@ mod tests {
 
     #[test]
     fn prometheus_types() {
-        let fams = parse(&render_prometheus(&snapshot(), 10));
+        let fams = parse(&render_prometheus(&snapshot(), 10, &rs()));
         let counters: Vec<&str> = fams
             .iter()
             .filter(|(_, f)| f.kind == "counter")
@@ -1117,6 +1240,8 @@ mod tests {
         assert_eq!(
             counters,
             [
+                "beanstalkd_auth_failures_total",
+                "beanstalkd_auth_timeouts_total",
                 "beanstalkd_binlog_records_migrated_total",
                 "beanstalkd_binlog_records_written_total",
                 "beanstalkd_commands_total",
@@ -1124,6 +1249,7 @@ mod tests {
                 "beanstalkd_cpu_seconds_total",
                 "beanstalkd_job_timeouts_total",
                 "beanstalkd_jobs_total",
+                "beanstalkd_pending_rejected_total",
                 "beanstalkd_tube_commands_total",
                 "beanstalkd_tube_jobs_total",
             ]
@@ -1137,7 +1263,7 @@ mod tests {
 
     #[test]
     fn prometheus_golden_lines() {
-        let text = render_prometheus(&snapshot(), 2);
+        let text = render_prometheus(&snapshot(), 2, &rs());
         for line in [
             "# HELP beanstalkd_current_jobs Jobs by state (stats current-jobs-*); urgent jobs are also counted as ready.",
             "# TYPE beanstalkd_current_jobs gauge",
@@ -1158,6 +1284,12 @@ mod tests {
             "beanstalkd_cpu_seconds_total{mode=\"user\"} 37.000038",
             "beanstalkd_cpu_seconds_total{mode=\"system\"} 39.400000",
             "beanstalkd_build_info{version=\"1.13\"} 1",
+            "# TYPE beanstalkd_pending_connections gauge",
+            "beanstalkd_pending_connections 901",
+            "# TYPE beanstalkd_pending_rejected_total counter",
+            "beanstalkd_pending_rejected_total 902",
+            "beanstalkd_auth_timeouts_total 903",
+            "beanstalkd_auth_failures_total 904",
             "beanstalkd_tube_series_limit 2",
             "beanstalkd_tube_series_truncated 1",
             "beanstalkd_tube_current_jobs{tube=\"default\",state=\"ready\"} 102",
@@ -1171,10 +1303,10 @@ mod tests {
             );
         }
         assert!(!text.contains("a-b_c+d"));
-        // 22 server families (incl. the two cap gauges) + 8 tube families,
-        // two header lines each; 5 + 22 + 16 + 2 + 1 + 2 server samples;
-        // 13 samples per shown tube.
-        assert_eq!(text.lines().count(), 2 * (22 + 8) + 48 + 2 * 13);
+        // 22 server families (incl. the two cap gauges) + 4 server-side
+        // ones + 8 tube families, two header lines each; 5 + 22 + 16 + 2 +
+        // 1 + 4 + 2 server samples; 13 samples per shown tube.
+        assert_eq!(text.lines().count(), 2 * (22 + 4 + 8) + 52 + 2 * 13);
     }
 
     #[test]
@@ -1183,10 +1315,10 @@ mod tests {
         for limit in [0, 1, 2, 3, 4, usize::MAX] {
             check_values(&s, limit);
         }
-        let text = render_prometheus(&s, 0);
+        let text = render_prometheus(&s, 0, &rs());
         assert!(!text.contains("tube=\""));
         assert!(text.contains("\nbeanstalkd_tube_series_truncated 1\n"));
-        let text = render_prometheus(&s, 3);
+        let text = render_prometheus(&s, 3, &rs());
         assert!(text.contains("\nbeanstalkd_tube_series_truncated 0\n"));
         assert!(text.contains("tube=\"a-b_c+d;e$f(g)/h.i\""));
 
@@ -1194,7 +1326,7 @@ mod tests {
             server: server(),
             tubes: Vec::new(),
         };
-        let text = render_prometheus(&empty, 0);
+        let text = render_prometheus(&empty, 0, &rs());
         parse(&text);
         assert!(text.contains("\nbeanstalkd_tube_series_truncated 0\n"));
     }
@@ -1203,7 +1335,7 @@ mod tests {
     fn prometheus_label_values_are_escaped() {
         let mut s = snapshot();
         s.server.version = "a\\b\"c\nd".into();
-        let text = render_prometheus(&s, 10);
+        let text = render_prometheus(&s, 10, &rs());
         assert!(
             text.contains("beanstalkd_build_info{version=\"a\\\\b\\\"c\\nd\"} 1\n"),
             "{text}"
@@ -1249,10 +1381,24 @@ mod tests {
     }
 
     fn check_json(s: &Snapshot) {
-        let text = render_admin_json(s);
+        let text = render_admin_json(s, usize::MAX, &rs());
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let top: Vec<&String> = v.as_object().unwrap().keys().collect();
-        assert_eq!(top, ["server", "tubes"]);
+        let top: BTreeSet<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            top,
+            BTreeSet::from([
+                "server",
+                "server_rs",
+                "tube_limit",
+                "tubes_truncated",
+                "tubes"
+            ])
+        );
+        assert_eq!(v["tubes_truncated"], false);
+        assert_eq!(v["server_rs"]["pending-connections"], 901);
+        assert_eq!(v["server_rs"]["pending-rejected"], 902);
+        assert_eq!(v["server_rs"]["auth-timeouts"], 903);
+        assert_eq!(v["server_rs"]["auth-failures"], 904);
         json_matches_yaml(
             &v["server"],
             &s.server.to_yaml(),
@@ -1266,7 +1412,18 @@ mod tests {
         // Textual key order equals the YAML order.
         let mut expected = vec!["server".to_string()];
         expected.extend(yaml_map(&s.server.to_yaml()).into_iter().map(|(k, _)| k));
-        expected.push("tubes".into());
+        for k in [
+            "server_rs",
+            "pending-connections",
+            "pending-rejected",
+            "auth-timeouts",
+            "auth-failures",
+            "tube_limit",
+            "tubes_truncated",
+            "tubes",
+        ] {
+            expected.push(k.into());
+        }
         for t in &s.tubes {
             expected.extend(yaml_map(&t.to_yaml()).into_iter().map(|(k, _)| k));
         }
@@ -1310,12 +1467,17 @@ mod tests {
             r#""binlog-oldest-index":0,"binlog-current-index":0,"binlog-records-migrated":0,"#,
             r#""binlog-records-written":0,"binlog-max-size":0,"draining":false,"id":"abc","#,
             r#""hostname":"","os":"","platform":""},"#,
+            r#""server_rs":{"pending-connections":0,"pending-rejected":0,"auth-timeouts":0,"#,
+            r#""auth-failures":0},"tube_limit":1000,"tubes_truncated":false,"#,
             r#""tubes":[{"name":"default","current-jobs-urgent":1,"current-jobs-ready":2,"#,
             r#""current-jobs-reserved":3,"current-jobs-delayed":4,"current-jobs-buried":5,"#,
             r#""total-jobs":6,"current-using":7,"current-watching":8,"current-waiting":9,"#,
             r#""cmd-delete":10,"cmd-pause-tube":11,"pause":12,"pause-time-left":13}]}"#,
         );
-        assert_eq!(render_admin_json(&s), expected);
+        assert_eq!(
+            render_admin_json(&s, 1000, &ServerRsStats::default()),
+            expected
+        );
     }
 
     #[test]
@@ -1323,10 +1485,36 @@ mod tests {
         let mut s = snapshot();
         s.server.version = "q\"b\\n\nt\tc\u{1}é".into();
         s.server.hostname = "</script>".into();
-        let text = render_admin_json(&s);
+        let text = render_admin_json(&s, 10, &rs());
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["server"]["version"], s.server.version.as_str());
         assert_eq!(v["server"]["hostname"], "</script>");
         assert!(text.contains(r#""version":"q\"b\\n\nt\tc\u0001é""#));
+    }
+
+    #[test]
+    fn admin_json_caps_tubes() {
+        let s = snapshot();
+        for (limit, shown, truncated) in [
+            (0, 0, true),
+            (1, 1, true),
+            (2, 2, true),
+            (3, 3, false),
+            (4, 3, false),
+            (usize::MAX, 3, false),
+        ] {
+            let text = render_admin_json(&s, limit, &rs());
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let tubes = v["tubes"].as_array().unwrap();
+            assert_eq!(tubes.len(), shown, "limit {limit}");
+            assert_eq!(v["tubes_truncated"], truncated, "limit {limit}");
+            assert_eq!(v["tube_limit"].as_u64(), u64::try_from(limit).ok());
+            // The first ones, in list-tubes order.
+            for (j, t) in tubes.iter().zip(&s.tubes) {
+                assert_eq!(j["name"], t.name.as_str());
+            }
+            // The server object is unaffected by the cap.
+            assert_eq!(v["server"]["current-tubes"], 3);
+        }
     }
 }

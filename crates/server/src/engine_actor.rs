@@ -77,10 +77,15 @@ pub enum EngineMsg {
     Disconnect { conn: ConnId },
     /// SIGUSR1: enter (or, in principle, leave) drain mode.
     SetDraining(bool),
-    /// The HTTP listener wants a monitoring snapshot (`Engine::snapshot`,
-    /// which changes no state). Like every message it is followed by a
-    /// tick, which is harmless: `tick` only does what is already due.
-    Snapshot { reply: oneshot::Sender<Snapshot> },
+    /// The HTTP listener wants a monitoring snapshot with at most
+    /// `max_tubes` tubes (`Engine::snapshot_limited`, which changes no
+    /// state and does work bounded by `max_tubes`). Like every message it
+    /// is followed by a tick, which is harmless: `tick` only does what is
+    /// already due.
+    Snapshot {
+        max_tubes: usize,
+        reply: oneshot::Sender<Snapshot>,
+    },
     /// SIGINT / SIGTERM: sync the WAL (unless `-F`), acknowledge on `done`
     /// and stop. Messages queued behind it are never processed.
     Shutdown { done: oneshot::Sender<()> },
@@ -371,9 +376,9 @@ impl<L: Log> Actor<L> {
                 self.draining = on;
                 self.engine.set_draining(on);
             }
-            EngineMsg::Snapshot { reply } => {
+            EngineMsg::Snapshot { max_tubes, reply } => {
                 // The requester may have given up (timeout); that's fine.
-                let _ = reply.send(self.engine.snapshot(now));
+                let _ = reply.send(self.engine.snapshot_limited(now, max_tubes));
             }
             // Handled by `run`; kept total so a stray one is harmless.
             EngineMsg::Shutdown { done } => {
@@ -653,7 +658,12 @@ mod tests {
         let _ = events(&h);
         let _ = h.rx.try_recv();
         let (reply, mut rx) = oneshot::channel();
-        h.actor.on_message(EngineMsg::Snapshot { reply }).unwrap();
+        h.actor
+            .on_message(EngineMsg::Snapshot {
+                max_tubes: usize::MAX,
+                reply,
+            })
+            .unwrap();
         let snap = rx.try_recv().unwrap();
         assert_eq!(snap.server.current_jobs_ready, 1);
         assert_eq!(snap.server.cmd_put, 1);
@@ -664,14 +674,38 @@ mod tests {
         assert!(h.rx.try_recv().is_err(), "a snapshot sends no reply");
         // A second snapshot sees exactly the same counters.
         let (reply, mut rx) = oneshot::channel();
-        h.actor.on_message(EngineMsg::Snapshot { reply }).unwrap();
+        h.actor
+            .on_message(EngineMsg::Snapshot {
+                max_tubes: usize::MAX,
+                reply,
+            })
+            .unwrap();
         let again = rx.try_recv().unwrap();
         assert_eq!(again.server.cmd_stats, 0);
         assert_eq!(again.tubes, snap.tubes);
+        // A limited one has the same server stats and at most that many
+        // tubes.
+        let (reply, mut rx) = oneshot::channel();
+        h.actor
+            .on_message(EngineMsg::Snapshot {
+                max_tubes: 0,
+                reply,
+            })
+            .unwrap();
+        let limited = rx.try_recv().unwrap();
+        assert_eq!(limited.server.current_tubes, 1);
+        assert_eq!(limited.server.cmd_put, 1);
+        assert_eq!(limited.server.cmd_stats, 0);
+        assert!(limited.tubes.is_empty());
         // A requester that gave up is harmless.
         let (reply, rx) = oneshot::channel();
         drop(rx);
-        h.actor.on_message(EngineMsg::Snapshot { reply }).unwrap();
+        h.actor
+            .on_message(EngineMsg::Snapshot {
+                max_tubes: usize::MAX,
+                reply,
+            })
+            .unwrap();
     }
 
     #[test]

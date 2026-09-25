@@ -526,12 +526,21 @@ impl Engine {
     /// for every tube, in `list-tubes` order. Read-only: no counter moves
     /// and no journal entry is produced.
     pub fn snapshot(&self, now: Nanos) -> crate::Snapshot {
+        self.snapshot_limited(now, usize::MAX)
+    }
+
+    /// Like [`Engine::snapshot`], but `tubes` holds only the first
+    /// `max_tubes` tubes in `list-tubes` order, so the work done is
+    /// bounded by `max_tubes` rather than by the number of tubes.
+    /// `server` is complete (`current_tubes` is still the full count).
+    pub fn snapshot_limited(&self, now: Nanos, max_tubes: usize) -> crate::Snapshot {
         crate::Snapshot {
             server: self.build_stats_server(now),
             tubes: self
                 .tube_order
                 .items
                 .iter()
+                .take(max_tubes)
                 .filter_map(|&tid| self.tube(tid))
                 .map(|t| Self::stats_tube_of(t, now))
                 .collect(),
@@ -3734,6 +3743,88 @@ mod snapshot_tests {
             }
             check_snapshot(&mut e, 201 * SEC);
         }
+    }
+
+    /// `snapshot_limited` is a prefix of `snapshot` (in `list-tubes`
+    /// order) with the same, complete server stats, and is just as pure.
+    fn check_snapshot_limited(e: &mut Engine, now: Nanos) {
+        let full = e.snapshot(now);
+        let before = e.build_stats_server(now);
+        for k in 0..=full.tubes.len() + 2 {
+            let lim = e.snapshot_limited(now, k);
+            assert_eq!(lim.server, full.server, "server stats with limit {k}");
+            assert_eq!(
+                lim.server.current_tubes,
+                full.tubes.len() as u64,
+                "current_tubes stays the full count"
+            );
+            let n = k.min(full.tubes.len());
+            assert_eq!(lim.tubes, full.tubes[..n], "tubes with limit {k}");
+        }
+        assert_eq!(e.snapshot_limited(now, usize::MAX), full);
+        assert_eq!(
+            e.build_stats_server(now),
+            before,
+            "snapshot_limited changed stats"
+        );
+        let mut journal = Vec::new();
+        e.take_journal(&mut journal);
+        assert!(journal.is_empty(), "snapshot_limited journaled {journal:?}");
+    }
+
+    #[test]
+    fn snapshot_limited_of_fresh_engine() {
+        for journal in [false, true] {
+            let mut e = engine(journal);
+            let snap = e.snapshot_limited(0, 0);
+            assert!(snap.tubes.is_empty());
+            assert_eq!(snap.server.current_tubes, 1);
+            assert_eq!(snap.server.pid, 4242);
+            check_snapshot_limited(&mut e, 0);
+        }
+    }
+
+    #[test]
+    fn snapshot_limited_is_a_prefix_across_states_and_times() {
+        for journal in [false, true] {
+            let mut e = busy_state(journal);
+            let mut drained = Vec::new();
+            e.take_journal(&mut drained);
+            let names: Vec<String> = e
+                .snapshot_limited(0, 2)
+                .tubes
+                .iter()
+                .map(|t| t.name.as_str().to_owned())
+                .collect();
+            // List order, not creation order (see `busy_state`).
+            assert_eq!(names, ["default", "c"]);
+            let mut out = Outbox::new();
+            for now in [0, SEC / 2, 11 * SEC, 25 * SEC, 200 * SEC] {
+                e.tick(now, &mut out);
+                e.take_journal(&mut drained);
+                check_snapshot_limited(&mut e, now);
+                check_snapshot(&mut e, now);
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_limited_bounds_many_tubes() {
+        let mut e = engine(false);
+        e.connect(0, 1);
+        for i in 0..50 {
+            run(&mut e, 0, 1, Command::Watch(tube(&format!("t{i}"))));
+        }
+        let full = e.snapshot(SEC);
+        assert_eq!(full.tubes.len(), 51);
+        let lim = e.snapshot_limited(SEC, 5);
+        assert_eq!(lim.tubes.len(), 5);
+        assert_eq!(lim.server.current_tubes, 51);
+        assert_eq!(lim.tubes, full.tubes[..5]);
+        check_snapshot_limited(&mut e, SEC);
+        // Taking it counts as nothing either.
+        let s = e.build_stats_server(SEC);
+        assert_eq!((s.cmd_stats, s.cmd_stats_tube, s.cmd_list_tubes), (0, 0, 0));
     }
 
     #[test]

@@ -20,6 +20,12 @@
 //!
 //! [`ConnGuard`] sends the matching `Disconnect` on every exit path, and
 //! only if `Connect` was sent.
+//!
+//! TLS connections are *pending* (see `pending`) from the accept until the
+//! handshake completes (`auth = "none"` / `"mtls"`) or the client has
+//! authenticated (`auth = "token"`), and a token connection that has not
+//! authenticated within `auth.timeout` of its handshake is closed without
+//! a reply.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,6 +44,7 @@ use bstk_proto::{Command, Frame, Response, ServerCodec};
 
 use crate::auth::TokenSet;
 use crate::engine_actor::{EngineGone, EngineHandle, EngineMsg};
+use crate::pending::{PendingGuard, ServerCounters};
 
 /// Initial read-buffer capacity; grown by the codec itself for large put
 /// bodies (see `ServerCodec`'s `PutBody` state).
@@ -111,6 +118,7 @@ impl Drop for ConnGuard {
 struct TokenAuth<'a> {
     tokens: &'a TokenSet,
     peer: SocketAddr,
+    counters: &'a ServerCounters,
 }
 
 /// Drives one plaintext client connection until it closes (EOF, `quit`,
@@ -155,19 +163,42 @@ pub enum TlsAuth {
     Token(Arc<TokenSet>),
 }
 
+/// What every connection of one TLS listener shares.
+pub struct TlsListener {
+    pub acceptor: TlsAcceptor,
+    pub auth: TlsAuth,
+    /// Connection ids, unique across all listeners.
+    pub next_id: Arc<AtomicU64>,
+    pub engine_tx: EngineHandle,
+    pub max_job_size: u32,
+    /// Pending-connection accounting and the authentication counters.
+    pub counters: Arc<ServerCounters>,
+    /// `auth.timeout` (used by `auth = "token"` listeners only).
+    pub auth_timeout: Duration,
+}
+
 /// Drives one TLS client connection: handshake (bounded by
-/// [`HANDSHAKE_TIMEOUT`]), token authentication if configured, then the
-/// same protocol loop as plaintext. The connection id is allocated from
-/// `next_id` only once the engine is told about the connection.
+/// [`HANDSHAKE_TIMEOUT`]), token authentication if configured (bounded by
+/// `auth.timeout`), then the same protocol loop as plaintext. `pending`
+/// counts the connection as pending until the handshake, or the
+/// authentication, succeeds (or the connection is closed). The connection
+/// id is allocated from `next_id` only once the engine is told about the
+/// connection.
 pub async fn handle_tls(
     tcp: TcpStream,
     peer: SocketAddr,
-    acceptor: TlsAcceptor,
-    auth: TlsAuth,
-    next_id: Arc<AtomicU64>,
-    engine_tx: EngineHandle,
-    max_job_size: u32,
+    listener: Arc<TlsListener>,
+    pending: PendingGuard,
 ) {
+    let TlsListener {
+        acceptor,
+        auth,
+        next_id,
+        engine_tx,
+        max_job_size,
+        counters,
+        auth_timeout,
+    } = &*listener;
     let mut stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
@@ -181,19 +212,42 @@ pub async fn handle_tls(
     };
 
     let mut guard = ConnGuard::pending(engine_tx.clone());
-    let mut codec = ServerCodec::new(max_job_size).emit_put_started();
+    let mut codec = ServerCodec::new(*max_job_size).emit_put_started();
     let mut rbuf = BytesMut::with_capacity(INITIAL_BUF_CAPACITY);
     let mut wbuf = BytesMut::with_capacity(256);
 
-    let token_auth = match &auth {
-        TlsAuth::Handshake => None,
+    let token_auth = match auth {
+        TlsAuth::Handshake => {
+            drop(pending);
+            None
+        }
         TlsAuth::Token(tokens) => {
             codec = codec.recognize_auth();
-            let ta = TokenAuth { tokens, peer };
-            if !authenticate(&mut stream, &mut codec, &mut rbuf, &mut wbuf, ta).await {
-                close_tls(&mut stream).await;
-                return;
+            let ta = TokenAuth {
+                tokens,
+                peer,
+                counters,
+            };
+            let authenticated = tokio::time::timeout(
+                *auth_timeout,
+                authenticate(&mut stream, &mut codec, &mut rbuf, &mut wbuf, ta),
+            )
+            .await;
+            match authenticated {
+                Ok(true) => {}
+                Ok(false) => {
+                    close_tls(&mut stream).await;
+                    return;
+                }
+                Err(_) => {
+                    // Closed without a reply, like a handshake timeout.
+                    counters.auth_timed_out();
+                    tracing::debug!(%peer, "authentication timed out");
+                    close_tls(&mut stream).await;
+                    return;
+                }
             }
+            drop(pending);
             Some(ta)
         }
     };
@@ -212,7 +266,7 @@ pub async fn handle_tls(
         &mut rbuf,
         &mut wbuf,
         conn,
-        &engine_tx,
+        engine_tx,
         &mut reply_rx,
         token_auth,
     )
@@ -257,6 +311,7 @@ async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
                     return true;
                 }
                 tracing::info!(peer = %auth.peer, "authentication failed: wrong token");
+                auth.counters.auth_failed();
                 Response::Unauthorized.encode(wbuf);
                 let _ = flush(wbuf, stream).await;
                 return false;
@@ -267,6 +322,7 @@ async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
                     peer = %auth.peer,
                     "authentication failed: command before authentication"
                 );
+                auth.counters.auth_failed();
                 Response::Unauthorized.encode(wbuf);
                 let _ = flush(wbuf, stream).await;
                 return false;
@@ -376,6 +432,7 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     Response::Authenticated.encode(wbuf);
                 } else {
                     tracing::info!(peer = %auth.peer, "re-authentication failed: wrong token");
+                    auth.counters.auth_failed();
                     Response::Unauthorized.encode(wbuf);
                     let _ = flush(wbuf, stream).await;
                     return;

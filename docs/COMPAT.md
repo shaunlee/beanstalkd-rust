@@ -68,3 +68,12 @@ Reference: beanstalkd commit `25085c5`. Each entry states the observed behavior,
 8. The reference has no SIGTERM handler (unless it is pid 1), so SIGTERM is an abrupt exit. beanstalkd-rs shuts down gracefully and fsyncs the binlog unless `-F`.
 9. A second instance on the same binlog directory exits with status 10. `-s` is reported unrounded in `binlog-max-size`; files are preallocated to a multiple of 4096.
 10. fsync uses `fdatasync`, like the reference; on macOS this is weaker than `F_FULLFSYNC`.
+
+## beanstalkd-rs extensions (off by default)
+
+None of these change behavior unless enabled in the configuration file; with no config file the server is byte-identical to the reference as described above.
+
+1. **TLS / mTLS listeners**: the protocol is unchanged over TLS. The differential suites run every case over TLS against beanstalkd-rs.
+2. **Token authentication** (`auth = "token"` listeners only): `auth <token>\r\n` replies `AUTHENTICATED\r\n` or `UNAUTHORIZED\r\n` (then close). Before authentication any other input gets `UNAUTHORIZED` and a close. Unauthenticated connections are not counted in `stats`. On other listeners `auth` stays `UNKNOWN_COMMAND`.
+3. **Pending-connection limits** (TLS listeners): handshake timeout 10 s, `auth.timeout`, and `server.max_pending_connections`; excess connections are closed at accept.
+4. **HTTP monitoring**: `/healthz`, `/readyz`, `/metrics`, `/admin`; values match `stats` / `stats-tube`, and fetching them never changes counters such as `cmd-stats`.

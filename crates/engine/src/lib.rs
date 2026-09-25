@@ -168,7 +168,8 @@ pub struct BinlogStats {
     pub records_migrated: u64,
 }
 
-/// Point-in-time view for monitoring (`Engine::snapshot`). Taking it has no
+/// Point-in-time view for monitoring (`Engine::snapshot`,
+/// `Engine::snapshot_limited`). Taking it has no
 /// side effects: no counter (e.g. `cmd-stats`) changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -223,6 +224,9 @@ pub struct Snapshot {
 ///     pub fn set_binlog_stats(&mut self, stats: BinlogStats);
 ///     /// Monitoring view; see `Snapshot`. Never changes engine state.
 ///     pub fn snapshot(&self, now: Nanos) -> Snapshot;
+///     /// Same, with only the first `max_tubes` tubes (in `list-tubes`
+///     /// order); the server stats are complete. Bounds the work per call.
+///     pub fn snapshot_limited(&self, now: Nanos, max_tubes: usize) -> Snapshot;
 ///     /// SIGUSR1 drain mode (put -> DRAINING).
 ///     pub fn set_draining(&mut self, on: bool);
 /// }

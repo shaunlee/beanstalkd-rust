@@ -256,8 +256,15 @@ fn admin_json_matches_stats() {
         assert_eq!(got, want, "{key}");
     }
 
+    // Tubes are capped at max_tube_series (2), first ones in list order.
     let json_tubes = doc["tubes"].as_array().unwrap();
-    assert_eq!(json_tubes.len(), per_tube.len(), "tubes are never capped");
+    assert!(
+        per_tube.len() > 2,
+        "populate() makes more tubes than the cap"
+    );
+    assert_eq!(json_tubes.len(), 2, "tubes are capped");
+    assert_eq!(doc["tube_limit"], 2);
+    assert_eq!(doc["tubes_truncated"], true);
     for (t, (name, yaml)) in json_tubes.iter().zip(&per_tube) {
         assert_eq!(t["name"], serde_json::Value::String(name.clone()));
         for (key, value) in yaml_pairs(yaml) {

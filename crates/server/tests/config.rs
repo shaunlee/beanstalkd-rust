@@ -159,3 +159,51 @@ fn json_log_format() {
     }
     assert!(log.contains("beanstalkd-rs listening"), "{log}");
 }
+
+/// F5 (P2 security review): a tokens file readable by group or others is
+/// reported by `--check-config` and logged at startup, but still used.
+#[test]
+fn loose_tokens_file_permissions_warn() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    Certs::generate(dir.path());
+    let tokens = dir.path().join("tokens.txt");
+    std::fs::write(&tokens, format!("{TOKEN}\n")).unwrap();
+    std::fs::set_permissions(&tokens, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let text = "[[listener]]\naddr = \"127.0.0.1:{port0}\"\ntls = true\nauth = \"token\"\n\
+                [tls]\ncert = \"server.pem\"\nkey = \"server.key\"\n\
+                [auth]\ntokens_file = \"tokens.txt\"\n";
+    let path = write(dir.path(), &text.replace("{port0}", "0"));
+
+    let (status, out, err) = run(&["--config", &path, "--check-config"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(out.contains("auth: 1 token(s)"), "{out}");
+    assert!(
+        err.contains("warning: auth.tokens_file") && err.contains("0644"),
+        "{err}"
+    );
+    assert!(!out.contains(TOKEN) && !err.contains(TOKEN));
+
+    // The server starts anyway, logs the warning, and accepts the token.
+    // (The certificates are already in `dir`; `start_in` rewrites
+    // config.toml with a real port.)
+    let server = ConfigServer::start_in(dir, text, 1, &[]);
+    let log = server.stderr();
+    assert!(
+        log.contains("auth.tokens_file") && log.contains("chmod 600"),
+        "{log}"
+    );
+    assert!(!log.contains(TOKEN), "{log}");
+
+    // 0600 is quiet.
+    let dir = tempfile::tempdir().unwrap();
+    Certs::generate(dir.path());
+    let tokens = dir.path().join("tokens.txt");
+    std::fs::write(&tokens, format!("{TOKEN}\n")).unwrap();
+    std::fs::set_permissions(&tokens, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let path = write(dir.path(), &text.replace("{port0}", "0"));
+    let (status, _, err) = run(&["--config", &path, "--check-config"]);
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert_eq!(err, "");
+}

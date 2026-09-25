@@ -1,6 +1,6 @@
 # beanstalkd-rust Design
 
-> Status: v0.3 (matches P0 and P1 as shipped). Reference implementation: C beanstalkd commit `25085c5` (built into `.ref/` by `scripts/build-ref.sh`). See the [changelog](#10-changelog) for what changed since v0.1 and why.
+> Status: v0.4 (matches P0–P2 as shipped). Reference implementation: C beanstalkd commit `25085c5` (built into `.ref/` by `scripts/build-ref.sh`). See the [changelog](#10-changelog) for what changed since v0.1 and why.
 
 ## 1. Goals and Non-goals
 
@@ -43,7 +43,7 @@
 | `bstk-proto` | Command parsing, response encoding, stats YAML, `ServerCodec`. No I/O, fuzzable (`crates/proto/fuzz`). | bytes, tokio-util |
 | `bstk-engine` | Deterministic state machine: jobs, tubes, connection state, queues, timers | bstk-proto |
 | `bstk-engine-oracle` | Dev-only frozen copy of the engine before the T6b index refactor; used by an equivalence proptest | bstk-proto |
-| `bstk-server` | Binary `beanstalkd-rs`: listener, connection tasks, engine actor, CLI, system info | tokio, clap, nix, getrandom, tracing |
+| `bstk-server` | Binary `beanstalkd-rs`: listeners (plain / TLS), connection tasks, engine actor, CLI and config, auth, HTTP monitoring, system info | tokio, tokio-rustls, hyper, clap, toml, nix, getrandom, tracing |
 | `bstk-compat` (`tests/compat`) | Differential harness and `.bt` case corpus against the reference | — |
 | `bstk-bench` (`bench/`) | Load generator and benchmark matrix | tokio |
 | `bstk-store` | Write-ahead log: segments, CRC records, reservation, compaction, replay | bstk-engine (types), crc32c, nix |
@@ -82,6 +82,8 @@ impl Engine {
     pub fn recover(now: Nanos, cfg: EngineConfig, sys: Box<dyn SysInfo>, recovery: Recovery) -> Self;
     pub fn take_journal(&mut self, buf: &mut Vec<JournalEntry>);
     pub fn set_binlog_stats(&mut self, stats: BinlogStats);
+    pub fn snapshot(&self, now: Nanos) -> Snapshot;                       // no side effects
+    pub fn snapshot_limited(&self, now: Nanos, max_tubes: usize) -> Snapshot;
 }
 // Outbox = Vec<(ConnId, Response)>: one call may answer several connections.
 // EngineConfig { max_job_size, binlog_max_size, journal }.
@@ -157,6 +159,17 @@ Tube creation and destruction follow the reference's refcounting (use + watch + 
 - With `-b`, for every message the actor runs the engine call and `tick`, appends the drained journal to the WAL (fsync first with `-f0`), compacts, pushes binlog stats, and only then releases the replies, so no reply is sent for a change that has not reached the OS. A completed put first reserves WAL space; if that fails it completes as `PutRejection::OutOfMemory`. Any WAL error exits with status 20 (fail-stop). Startup replays the binlog before accepting connections; a locked directory exits with status 10.
 - SIGUSR1 enters drain mode; SIGINT / SIGTERM exit gracefully. The soft `RLIMIT_NOFILE` is raised to the hard limit at startup (best effort).
 
+### 6.1 Operability (P2)
+
+- **Configuration**: `--config FILE` (TOML, unknown keys rejected) and `--check-config`; CLI flags override file values; `-l` / `-p` cannot be combined with `[[listener]]`. See `docs/beanstalkd-rs.example.toml`.
+- **Startup order**: parse and validate config (including TLS files), bind every listener, start HTTP, replay the binlog, then accept.
+- **Listeners**: any number of `[[listener]]` entries, each plaintext or TLS (tokio-rustls, aws-lc-rs) with `auth = "none" | "token" | "mtls"`. The connection task is generic over the stream type, so plaintext pays nothing. TLS `close_notify` or EOF maps onto the sticky half-close path; per-connection buffering is bounded by the 64 KiB cap plus one 16 KiB TLS record.
+- **When the engine sees a connection**: plaintext at accept; TLS after the handshake; token auth only after `AUTHENTICATED`. Failed handshakes and unauthenticated connections never reach the engine or `stats`.
+- **Token auth** (extension): the codec recognizes `auth <token>` only on token listeners (`ServerCodec::recognize_auth`, `Frame::Auth`). Before authentication only `auth` and `quit` are accepted; anything else gets `UNAUTHORIZED` and a close, with no engine message. Tokens are compared in constant time (padded to a fixed width, all tokens checked) and never logged.
+- **Pending connections**: TLS connections still in the handshake (10 s limit) or awaiting auth (`auth.timeout`, default 10 s) count against `server.max_pending_connections` (default 1024, shared by all TLS listeners); beyond it new TLS connections are closed at accept.
+- **HTTP** (off by default; binds 127.0.0.1 unless configured): `/healthz`, `/readyz` (503 until recovery completes), `/metrics` (Prometheus), `/admin` (read-only JSON). Snapshots come from the engine via `EngineMsg::Snapshot` → `Engine::snapshot_limited` (at most `max_tube_series + 1` tubes) and are cached for `http.snapshot_min_interval` (default 1 s). Up to 256 connections, 2 s header timeout, health endpoints never wait behind the 4-request limit on `/metrics` / `/admin`.
+- **Server-side counters** outside `stats` (which stays byte-identical to the reference): pending connections, pending rejections, auth timeouts, auth failures (in `/metrics` and `/admin` `server_rs`).
+
 ## 7. Write-Ahead Log (P1, `bstk-store`)
 
 - Segment files `binlog.N`, preallocated to `-s` rounded up to 4096 (at most 4 GiB), and a `lock` file held for the process lifetime.
@@ -168,7 +181,6 @@ Tube creation and destruction follow the reference's refcounting (use + watch + 
 
 ## 8. Later Phases (summary)
 
-- **P2 Operability**: TLS / mTLS via rustls; optional `auth <token>` extension; HTTP `/metrics`, `/healthz`, `/admin`; TOML config.
 - **P3 Raft (openraft)**: messages are log entries; the leader proposes `Tick{now}` for time-driven transitions; reservations are replicated; followers proxy to the leader.
 - **P4 Performance**: reduce the per-command cross-thread hop (ops per CPU-second is about 0.4× the reference), O(1) buried-job removal, profiling-driven work.
 
@@ -179,6 +191,9 @@ Tube creation and destruction follow the reference's refcounting (use + watch + 
 - Every known difference is recorded in `docs/COMPAT.md` with its reason.
 
 ## 10. Changelog
+
+**v0.4 (P2 shipped)**
+- TOML config, TLS / mTLS listeners, token auth extension (`Frame::Auth`, `AUTHENTICATED` / `UNAUTHORIZED`), HTTP monitoring (`Engine::snapshot`, `snapshot_limited`), pending-connection limits and auth timeout from the security review.
 
 **v0.3 (P1 shipped)**
 - Write-ahead log (`bstk-store`), engine journal and recovery, `Recovery::tube_order` (COMPAT Binlog item 4), `PutRejection::OutOfMemory`.

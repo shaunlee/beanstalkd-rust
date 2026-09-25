@@ -20,6 +20,13 @@
 # 1073741824 (unlike -z, which clamps larger values, this is an error).
 # Default: 65535.
 max_job_size = 65535
+# Maximum number of pending connections: TLS connections (on any TLS
+# listener) that are still in their handshake or, on auth = "token"
+# listeners, have not authenticated yet. When the limit is reached, new TLS
+# connections are closed as soon as they are accepted, so unauthenticated
+# clients cannot use up the process's file descriptors. Plaintext listeners
+# are not limited. Must be at least 1. Default: 1024.
+max_pending_connections = 1024
 
 # Listening sockets. Zero or more [[listener]] entries; with none, a single
 # plaintext listener on -l / -p (default 0.0.0.0:11300) is used.
@@ -72,8 +79,15 @@ client_ca = "ca.pem"
 # tokens = ["replace-with-a-long-random-token"]
 #
 # And/or a file with one token per line; blank lines and lines starting with
-# '#' are ignored, and surrounding whitespace is trimmed.
+# '#' are ignored, and surrounding whitespace is trimmed. A warning is logged
+# (and printed by --check-config) if the file is readable by its group or by
+# others; chmod 600 it.
 tokens_file = "tokens.txt"
+# Time a client of an auth = "token" listener has, once its TLS handshake is
+# done, to send a correct `auth <token>`; after that the connection is closed
+# without a reply. An interval such as "500ms" or "10s" (greater than zero).
+# Default: "10s".
+timeout = "10s"
 
 [binlog]
 # Write-ahead log directory (like -b). Without it, jobs are kept in memory
@@ -95,8 +109,15 @@ file_size = 10485760
 # Without an [http] table there is no HTTP listener; with one, addr is
 # required as a full IP:port and must not conflict with any listener.
 addr = "127.0.0.1:9180"
-# Maximum number of tubes exported as per-tube metric series. Default: 1000.
+# Maximum number of tubes exported as per-tube metric series, and listed by
+# /admin (the first ones in list-tubes order; /admin reports
+# "tubes_truncated" and "tube_limit"). Default: 1000.
 max_tube_series = 1000
+# /metrics and /admin reuse an engine snapshot for up to this long, so the
+# engine takes at most one snapshot per interval however often they are
+# requested. An interval such as "500ms" or "1s"; "0s" disables the cache.
+# Default: "1s".
+snapshot_min_interval = "1s"
 
 [log]
 # "error", "warn", "info", "debug" or "trace". Default: "warn" (each -V on

@@ -27,6 +27,7 @@
 use std::fmt;
 use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -40,6 +41,18 @@ use crate::cli::Cli;
 
 /// Default cap on the number of per-tube metric series (`http.max_tube_series`).
 pub const DEFAULT_MAX_TUBE_SERIES: usize = 1000;
+
+/// Default `auth.timeout`: time an `auth = "token"` connection has, after
+/// its TLS handshake, to authenticate.
+pub const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default `server.max_pending_connections`: connections still in their
+/// TLS handshake or awaiting token authentication, across all listeners.
+pub const DEFAULT_MAX_PENDING_CONNECTIONS: usize = 1024;
+
+/// Default `http.snapshot_min_interval`: how old a cached engine snapshot
+/// served by `/metrics` and `/admin` may be.
+pub const DEFAULT_SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Longest token that fits a protocol line: `auth <token>\r\n` must fit in
 /// `LINE_BUF_SIZE` (224) bytes, so 224 - 5 - 2 = 217.
@@ -68,12 +81,21 @@ pub struct ResolvedConfig {
     /// Accepted tokens for `auth = "token"` listeners (deduplicated, in
     /// configuration order: `auth.tokens` first, then `auth.tokens_file`).
     pub tokens: Tokens,
+    /// `auth.timeout`: an `auth = "token"` connection that has not
+    /// authenticated this long after its TLS handshake is closed.
+    pub auth_timeout: Duration,
     /// `-z` / `server.max_job_size`.
     pub max_job_size: u32,
+    /// `server.max_pending_connections`: cap on TLS connections still in
+    /// their handshake or awaiting token authentication (at least 1).
+    pub max_pending_connections: usize,
     pub binlog: BinlogSettings,
     /// `None`: no HTTP listener.
     pub http: Option<HttpSettings>,
     pub log: LogSettings,
+    /// Non-fatal problems found while loading (e.g. a tokens file readable
+    /// by other users); logged at startup and printed by `--check-config`.
+    pub warnings: Vec<String>,
 }
 
 /// One listening socket.
@@ -146,8 +168,11 @@ impl BinlogSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpSettings {
     pub addr: SocketAddr,
-    /// Cap on per-tube metric series.
+    /// Cap on per-tube metric series (and on the tubes `/admin` lists).
     pub max_tube_series: usize,
+    /// Longest time a snapshot is reused by `/metrics` and `/admin`
+    /// (zero: never reused).
+    pub snapshot_min_interval: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,6 +373,7 @@ struct RawFile {
 #[serde(deny_unknown_fields)]
 struct RawServer {
     max_job_size: Option<i64>,
+    max_pending_connections: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -373,6 +399,7 @@ struct RawTls {
 struct RawAuth {
     tokens: Option<Tokens>,
     tokens_file: Option<PathBuf>,
+    timeout: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -388,6 +415,7 @@ struct RawBinlog {
 struct RawHttp {
     addr: Option<String>,
     max_tube_series: Option<i64>,
+    snapshot_min_interval: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,6 +429,8 @@ struct RawLog {
 struct TokensFile {
     path: PathBuf,
     contents: String,
+    /// Why its permissions are too open, if they are.
+    mode_warning: Option<String>,
 }
 
 impl fmt::Debug for TokensFile {
@@ -408,6 +438,7 @@ impl fmt::Debug for TokensFile {
         f.debug_struct("TokensFile")
             .field("path", &self.path)
             .field("contents", &"<redacted>")
+            .field("mode_warning", &self.mode_warning)
             .finish()
     }
 }
@@ -437,9 +468,13 @@ impl FileConfig {
                     path: tokens_path.clone(),
                     source,
                 })?;
+            let mode_warning = std::fs::metadata(&tokens_path)
+                .ok()
+                .and_then(|m| tokens_file_mode_warning(&tokens_path, m.permissions().mode()));
             file.tokens_file = Some(TokensFile {
                 path: tokens_path,
                 contents,
+                mode_warning,
             });
         }
         Ok(file)
@@ -473,6 +508,20 @@ impl FileConfig {
     fn relative(&self, name: &Path) -> PathBuf {
         self.path.parent().unwrap_or(Path::new("")).join(name)
     }
+}
+
+/// A warning if a tokens file with Unix permission bits `mode` is
+/// accessible to its group or to others (like sshd's check of private
+/// keys). Only a warning: the file is still used.
+pub fn tokens_file_mode_warning(path: &Path, mode: u32) -> Option<String> {
+    let mode = mode & 0o7777;
+    (mode & 0o077 != 0).then(|| {
+        format!(
+            "auth.tokens_file {} is accessible by group or others (mode {mode:04o}); \
+             restrict it with chmod 600",
+            path.display()
+        )
+    })
 }
 
 /// 1-based line and column (in characters) of byte `offset` in `text`.
@@ -522,6 +571,15 @@ pub fn resolve(cli: &Cli, file: Option<FileConfig>) -> Result<ResolvedConfig, Co
     let max_job_size = match file_max_job_size {
         Some(v) if !cli.given.max_job_size => v,
         _ => cli.max_job_size,
+    };
+    let max_pending_connections = match raw.server.as_ref().and_then(|s| s.max_pending_connections)
+    {
+        None => DEFAULT_MAX_PENDING_CONNECTIONS,
+        Some(v) => usize::try_from(v).ok().filter(|&v| v >= 1).ok_or_else(|| {
+            invalid(format!(
+                "server.max_pending_connections = {v}: must be at least 1"
+            ))
+        })?,
     };
 
     // [binlog]
@@ -670,6 +728,20 @@ pub fn resolve(cli: &Cli, file: Option<FileConfig>) -> Result<ResolvedConfig, Co
         }
     }
     let tokens = Tokens(tokens);
+    let auth_timeout = match raw.auth.as_ref().and_then(|a| a.timeout.as_deref()) {
+        None => DEFAULT_AUTH_TIMEOUT,
+        Some(s) => parse_duration(s).filter(|d| !d.is_zero()).ok_or_else(|| {
+            invalid(format!(
+                "auth.timeout = {s:?}: expected a positive interval such as \"500ms\" or \"10s\""
+            ))
+        })?,
+    };
+    let warnings: Vec<String> = file
+        .tokens_file
+        .as_ref()
+        .and_then(|tf| tf.mode_warning.clone())
+        .into_iter()
+        .collect();
 
     // Per-listener requirements.
     for (i, l) in listeners.iter().enumerate() {
@@ -738,9 +810,19 @@ pub fn resolve(cli: &Cli, file: Option<FileConfig>) -> Result<ResolvedConfig, Co
                     invalid(format!("http.max_tube_series = {v}: must not be negative"))
                 })?,
             };
+            let snapshot_min_interval = match &h.snapshot_min_interval {
+                None => DEFAULT_SNAPSHOT_MIN_INTERVAL,
+                Some(s) => parse_duration(s).ok_or_else(|| {
+                    invalid(format!(
+                        "http.snapshot_min_interval = {s:?}: expected an interval such as \
+                         \"1s\" or \"500ms\" (\"0s\": no caching)"
+                    ))
+                })?,
+            };
             Some(HttpSettings {
                 addr,
                 max_tube_series,
+                snapshot_min_interval,
             })
         }
     };
@@ -750,10 +832,13 @@ pub fn resolve(cli: &Cli, file: Option<FileConfig>) -> Result<ResolvedConfig, Co
         listeners,
         tls,
         tokens,
+        auth_timeout,
         max_job_size,
+        max_pending_connections,
         binlog,
         http,
         log,
+        warnings,
     })
 }
 
@@ -764,7 +849,9 @@ fn from_cli(cli: &Cli) -> ResolvedConfig {
         listeners: vec![cli_listener(cli)],
         tls: None,
         tokens: Tokens::default(),
+        auth_timeout: DEFAULT_AUTH_TIMEOUT,
         max_job_size: cli.max_job_size,
+        max_pending_connections: DEFAULT_MAX_PENDING_CONNECTIONS,
         binlog: BinlogSettings {
             dir: cli.binlog_dir.clone(),
             file_size: cli.binlog_file_size,
@@ -775,6 +862,7 @@ fn from_cli(cli: &Cli) -> ResolvedConfig {
             level: LogLevel::from_verbosity(cli.verbose),
             format: LogFormat::Text,
         },
+        warnings: Vec::new(),
     }
 }
 
@@ -807,13 +895,24 @@ fn overlaps(a: SocketAddr, b: SocketAddr) -> bool {
 /// `binlog.fsync`: `"always"` (`-f0`), `"never"` (`-F`), or `<N>ms` /
 /// `<N>s` (`-f MS`; zero means always, like `-f0`).
 fn parse_fsync(s: &str) -> Option<SyncPolicy> {
-    // `-f`'s rate becomes signed nanoseconds in the reference.
-    const MAX_NANOS: u64 = i64::MAX as u64;
     match s {
         "always" => return Some(SyncPolicy::Always),
         "never" => return Some(SyncPolicy::Never),
         _ => {}
     }
+    let d = parse_duration(s)?;
+    Some(if d.is_zero() {
+        SyncPolicy::Always
+    } else {
+        SyncPolicy::Interval(d)
+    })
+}
+
+/// An interval written `<N>ms` or `<N>s` (decimal digits only), as in
+/// `binlog.fsync`; at most `i64::MAX` nanoseconds (`-f`'s rate becomes
+/// signed nanoseconds in the reference). Zero is returned as is.
+fn parse_duration(s: &str) -> Option<Duration> {
+    const MAX_NANOS: u64 = i64::MAX as u64;
     let (digits, ms_per_unit) = match s.strip_suffix("ms") {
         Some(d) => (d, 1),
         None => (s.strip_suffix('s')?, 1000),
@@ -827,11 +926,7 @@ fn parse_fsync(s: &str) -> Option<SyncPolicy> {
         .checked_mul(ms_per_unit)?
         .checked_mul(1_000_000)
         .filter(|&n| n <= MAX_NANOS)?;
-    Some(if nanos == 0 {
-        SyncPolicy::Always
-    } else {
-        SyncPolicy::Interval(Duration::from_nanos(nanos))
-    })
+    Some(Duration::from_nanos(nanos))
 }
 
 /// A token must fit `auth <token>\r\n` in one protocol line and contain no
@@ -858,18 +953,21 @@ fn check_token(token: &str) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 /// `--check-config`: loads and resolves the configuration and returns a
-/// short summary (no secrets).
-pub fn check(cli: &Cli) -> Result<String, ConfigError> {
-    load(cli).map(|config| summary(&config))
+/// short summary (no secrets) and the warnings.
+pub fn check(cli: &Cli) -> Result<(String, Vec<String>), ConfigError> {
+    load(cli).map(|config| (summary(&config), config.warnings))
 }
 
 /// `--check-config` as a whole: prints the summary to `out` and returns
 /// exit status 0, or prints the error to `err` and returns `EXIT_CONFIG`.
 pub fn run_check(cli: &Cli, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
     match check(cli) {
-        Ok(text) => {
+        Ok((text, warnings)) => {
             // Nothing sensible to do if stdout is gone; the status says OK.
             let _ = out.write_all(text.as_bytes());
+            for w in warnings {
+                let _ = writeln!(err, "beanstalkd-rs: warning: {w}");
+            }
             0
         }
         Err(e) => {
@@ -911,7 +1009,19 @@ pub fn summary(config: &ResolvedConfig) -> String {
         };
     }
     if !config.tokens.is_empty() {
-        let _ = writeln!(s, "auth: {} token(s)", config.tokens.len());
+        let _ = writeln!(
+            s,
+            "auth: {} token(s), timeout {:?}",
+            config.tokens.len(),
+            config.auth_timeout
+        );
+    }
+    if config.listeners.iter().any(|l| l.tls) {
+        let _ = writeln!(
+            s,
+            "max pending connections: {}",
+            config.max_pending_connections
+        );
     }
     let _ = writeln!(s, "max job size: {}", config.max_job_size);
     let sync = match config.binlog.sync {
@@ -931,8 +1041,8 @@ pub fn summary(config: &ResolvedConfig) -> String {
     let _ = match &config.http {
         Some(h) => writeln!(
             s,
-            "http: {} (max tube series {})",
-            h.addr, h.max_tube_series
+            "http: {} (max tube series {}, snapshot min interval {:?})",
+            h.addr, h.max_tube_series, h.snapshot_min_interval
         ),
         None => writeln!(s, "http: disabled"),
     };

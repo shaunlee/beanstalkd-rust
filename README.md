@@ -2,7 +2,7 @@
 
 A Rust reimplementation of [beanstalkd](https://github.com/beanstalkd/beanstalkd), the simple work queue, that is byte-for-byte compatible with the original protocol so existing clients work unmodified.
 
-Status: **P1 complete**: a server compatible with the reference, with an optional write-ahead log (`-b`) that survives crashes and restarts. TLS/auth/metrics (P2) and Raft replication (P3) are planned; see `docs/PLAN.md`.
+Status: **P2 complete**: a server compatible with the reference, with an optional write-ahead log (`-b`), TLS / mTLS, optional token authentication and Prometheus metrics. Raft replication (P3) is planned; see `docs/PLAN.md`.
 
 ## Build and run
 
@@ -20,7 +20,16 @@ Persistence, as in the reference:
 - `-F`: never fsync
 - `-s BYTES`: binlog file size (default 10 MiB)
 
-Behavior across restarts and the intentional differences from the reference are listed in `docs/COMPAT.md` (section "Binlog" and D5–D12).
+Behavior across restarts and the intentional differences from the reference are listed in `docs/COMPAT.md` (section "Binlog" and the D list).
+
+## Configuration, TLS and monitoring
+
+```sh
+beanstalkd-rs --config /etc/beanstalkd-rs.toml
+beanstalkd-rs --config /etc/beanstalkd-rs.toml --check-config
+```
+
+The TOML file (fully commented example: `docs/beanstalkd-rs.example.toml`) can define several listeners, each plaintext or TLS with `auth = "none"`, `"token"` or `"mtls"`, plus binlog, logging and an HTTP listener serving `/healthz`, `/readyz`, `/metrics` (Prometheus) and `/admin` (JSON). Everything is off by default; without a config file the server behaves exactly like the reference. Token authentication is a beanstalkd-rs extension (`auth <token>`), so it needs client support; mTLS works with any client that can use TLS.
 
 ## Test
 
