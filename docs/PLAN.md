@@ -199,7 +199,7 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 | Phase | Main tasks | Acceptance focus |
 |---|---|---|
 | P1 | Write-ahead log; see §4 | see §4.5 |
-| P2 | TLS / mTLS, auth extension, HTTP metrics / healthz / admin, TOML config | differential tests 100% with default config; real clients connect over TLS |
+| P2 | Operability; see §5 | see §5.5 |
 | P3 | openraft, Tick proposals, replicated reservations, follower proxy | on a 3-node cluster, random kills / partitions lose no acknowledged job and never double-deliver a reserved job (Jepsen-style tests) |
 | P4 | Profiling and optimization (incl. compaction write amplification: about one extra record per operation under churn with small `-s`) | throughput ≥ 1× reference; multi-core scaling curve |
 
@@ -262,3 +262,56 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 - [x] Engine oracle and invariant proptests still pass; throughput without `-b` not regressed (±5%)
 - [x] Throughput with `-b` ≥ 0.8× the reference in every fsync mode (lowest cell 0.98×, `-f0` with 4 KiB bodies, fsync-bound on both)
 - [x] `docs/COMPAT.md`, `docs/DESIGN.md` and `docs/BENCH.md` updated
+
+## 5. P2: Operability (detailed plan)
+
+### 5.1 Scope
+
+- **TLS**, optionally with client certificates (mTLS), on listeners of its own; the protocol is unchanged over TLS.
+- **Token authentication** as an opt-in protocol extension (`auth <token>`), accepted only on TLS listeners.
+- **HTTP endpoints** on a separate, opt-in listener: `/metrics` (Prometheus), `/healthz`, `/readyz`, and a read-only `/admin` JSON view.
+- **TOML configuration file** covering all of the above plus the existing flags.
+- **Invariant**: with no configuration file and no new flags, behavior is byte-identical to P1 (all differential suites unchanged), and plaintext throughput stays within ±5%.
+
+### 5.2 Facts checked before planning
+
+- Real clients over TLS need no changes: go-beanstalk has `NewConn(io.ReadWriteCloser)` (accepts a `tls.Conn`); greenstalk accepts a ready `socket.socket` (Python's `ssl.SSLSocket` is one).
+- rustls (default aws-lc-rs provider) builds and completes a handshake on this machine.
+- No existing beanstalkd client library sends an `auth` command; mTLS gives client identity with no protocol change.
+- stunnel is not installed (available via Homebrew), so there is no TLS baseline for the reference yet.
+
+### 5.3 Design decisions
+
+1. **Listeners**: `[[listener]]` entries in the config, each with `addr`, `tls` (bool) and `auth` (`none`, `token` or `mtls`). Without a config file, `-l` / `-p` define one plaintext listener as today. New CLI flags are long-only (`--config`, …) and never reuse a reference short flag (including the removed `-c` / `-n`). CLI values override the file; unknown TOML keys are errors.
+2. **TLS**: rustls via tokio-rustls, certificate and key from PEM files; `client_ca` enables mTLS (client certificate required). The connection task becomes generic over the stream type (monomorphized, no `Box<dyn>`), so plaintext pays nothing. A TLS close_notify or TCP shutdown maps onto the existing sticky half-close; the 64 KiB read cap still bounds memory.
+3. **Token auth**: the codec recognizes `auth <token>` only when the listener uses token auth (`ServerCodec` option, new `Frame::Auth`), so it never reaches the engine and default parsing is unchanged. Before authentication, only `auth` and `quit` are accepted; any other input (including `put`, `stats`, `list-tubes`) gets one `UNAUTHORIZED` reply and the connection is closed, before any engine message (so no counters change and no job id is consumed). A wrong token gets `UNAUTHORIZED` and a close. Tokens come from the config (or a file it names), are compared in constant time and never logged. Token auth on a plaintext listener is a configuration error.
+4. **Engine snapshot**: new `Engine::snapshot(now)` returning server stats and per-tube stats, without touching any counter (`cmd-stats` stays unchanged) and without job bodies.
+5. **HTTP**: off by default; when enabled binds 127.0.0.1 unless an address is given. Started before binlog replay: `/healthz` = process alive, `/readyz` = 503 until recovery completes. `/metrics` renders the snapshot (server gauges and counters, per-tube series up to a configurable cap, binlog fields). `/admin` is read-only JSON of the same data. No admin actions in P2.
+6. **Logging**: level and text/JSON format configurable.
+
+### 5.4 Tasks
+
+| ID | Task | Owner | Depends on | Wave |
+|---|---|---|---|---|
+| P2-T0 | Contracts: `Frame::Auth` + codec option, `Engine::snapshot`, config schema | lead | — | 0 |
+| P2-T1 | Config parsing and validation module (standalone, not wired) | subagent | T0 | 1 |
+| P2-T2 | `Engine::snapshot` + metrics / admin rendering from snapshots (standalone) | subagent | T0 | 1 |
+| P2-T3 | Harness TLS mode: every case over TLS to ours vs plaintext to the reference | subagent | T0 | 1 |
+| P2-T4 | Server wiring: config, listeners, TLS / mTLS, token auth, HTTP endpoints | subagent | T1, T2 | 2 |
+| P2-T5 | Tests and benchmarks: TLS differential, real clients over TLS, auth bypass tests, metrics vs `stats`, performance | subagent | T3, T4 | 3 |
+| P2-T6 | Adversarial security review of TLS, auth and HTTP code | subagent | T4 | 3 |
+| P2-T7 | P2 acceptance | lead | all | 4 |
+
+Only one agent at a time edits the server's wiring (T4); T1–T3 work in separate modules or crates.
+
+### 5.5 Acceptance
+
+- [ ] Default configuration: all four differential suites pass unchanged; plaintext throughput within ±5% of P1
+- [ ] TLS differential mode passes for every case, including the half-close cases
+- [ ] Real clients (Python greenstalk, Go go-beanstalk) pass the smoke tests over TLS, and with mTLS
+- [ ] Auth tests: pipelined `auth wrong` followed by a command, `put` before auth, `stats` before auth; none reaches the engine (counters unchanged); constant-time comparison; tokens never logged
+- [ ] `/metrics` values equal what `stats` / `stats-tube` report; `/readyz` is 503 during binlog replay
+- [ ] Config: precedence (CLI over file), unknown keys rejected, invalid combinations rejected (token auth without TLS)
+- [ ] TLS throughput recorded in `docs/BENCH.md`
+- [ ] Security review findings resolved or documented
+- [ ] `docs/DESIGN.md`, `docs/COMPAT.md`, README updated

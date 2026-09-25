@@ -40,6 +40,8 @@ pub struct ServerCodec {
     state: State,
     /// Whether to emit `Frame::PutStarted` when a put header is accepted.
     emit_put_started: bool,
+    /// Whether `auth <token>` lines decode to `Frame::Auth`.
+    recognize_auth: bool,
 }
 
 impl ServerCodec {
@@ -48,7 +50,16 @@ impl ServerCodec {
             max_job_size,
             state: State::Line { overflowed: false },
             emit_put_started: false,
+            recognize_auth: false,
         }
+    }
+
+    /// Decode `auth <token>` lines as `Frame::Auth` (token authentication,
+    /// a beanstalkd-rs extension). Off by default, so `auth` is an unknown
+    /// command exactly as in the reference.
+    pub fn recognize_auth(mut self) -> Self {
+        self.recognize_auth = true;
+        self
     }
 
     /// Also emit `Frame::PutStarted` as soon as a put command line is
@@ -120,6 +131,13 @@ impl Decoder for ServerCodec {
                         if was_overflowed {
                             self.state = State::Line { overflowed: false };
                             return Ok(Some(Frame::Error(Response::BadFormat)));
+                        }
+
+                        if self.recognize_auth
+                            && let Some(token) = line.strip_prefix(b"auth ")
+                        {
+                            self.state = State::Line { overflowed: false };
+                            return Ok(Some(Frame::Auth(Bytes::copy_from_slice(token))));
                         }
 
                         match parse_line_raw(line) {

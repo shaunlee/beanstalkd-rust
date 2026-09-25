@@ -52,6 +52,8 @@ impl Response {
             Response::InternalError => push(dst, "INTERNAL_ERROR\r\n"),
             Response::BadFormat => push(dst, "BAD_FORMAT\r\n"),
             Response::UnknownCommand => push(dst, "UNKNOWN_COMMAND\r\n"),
+            Response::Authenticated => push(dst, "AUTHENTICATED\r\n"),
+            Response::Unauthorized => push(dst, "UNAUTHORIZED\r\n"),
         }
     }
 }

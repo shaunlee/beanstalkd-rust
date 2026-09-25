@@ -370,3 +370,26 @@ fn default_codec_never_emits_put_started() {
     let mut buf = BytesMut::from(&b"put 0 0 1 1\r\nx"[..]);
     assert!(decode_all(&mut codec, &mut buf).is_empty());
 }
+
+#[test]
+fn auth_is_an_unknown_command_unless_recognized() {
+    let mut codec = ServerCodec::new(DEFAULT_MAX_JOB_SIZE);
+    let mut buf = BytesMut::from(&b"auth secret\r\n"[..]);
+    assert_eq!(
+        decode_all(&mut codec, &mut buf),
+        vec![Frame::Error(Response::UnknownCommand)]
+    );
+}
+
+#[test]
+fn auth_frame_when_recognized() {
+    let mut codec = ServerCodec::new(DEFAULT_MAX_JOB_SIZE).recognize_auth();
+    let mut buf = BytesMut::from(&b"auth s3 cr\xfft\r\nstats\r\n"[..]);
+    assert_eq!(
+        decode_all(&mut codec, &mut buf),
+        vec![
+            Frame::Auth(bytes::Bytes::from_static(b"s3 cr\xfft")),
+            Frame::Command(Command::Stats),
+        ]
+    );
+}

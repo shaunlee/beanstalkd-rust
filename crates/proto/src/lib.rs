@@ -153,6 +153,11 @@ pub enum Response {
     InternalError,
     BadFormat,
     UnknownCommand,
+    /// `AUTHENTICATED` — token accepted (beanstalkd-rs extension).
+    Authenticated,
+    /// `UNAUTHORIZED` — wrong token, or a command before authentication
+    /// (beanstalkd-rs extension); the connection is then closed.
+    Unauthorized,
 }
 
 /// Output of `ServerCodec` decoding.
@@ -175,6 +180,10 @@ pub enum Frame {
     /// `PutRejected(ExpectedCrlf)` or `PutRejected(JobTooBig)`), unless the
     /// connection closes first. No reply.
     PutStarted { too_big: bool },
+    /// `auth <token>` (everything after the single space, verbatim). Only
+    /// produced by a codec built with [`ServerCodec::recognize_auth`]; never
+    /// sent to the engine. Tokens are limited by the 224-byte line length.
+    Auth(Bytes),
     /// A protocol-level error with no engine side effects (BAD_FORMAT,
     /// UNKNOWN_COMMAND, ...). The connection replies with it directly and
     /// stays open.

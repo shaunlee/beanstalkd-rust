@@ -153,6 +153,9 @@ pub async fn handle_connection(
                     return;
                 }
             }
+            // Only produced when the codec is built with `recognize_auth`,
+            // which this connection task does not use yet (P2-T4).
+            Ok(Some(Frame::Auth(_))) => return,
             Ok(Some(Frame::Error(resp))) => {
                 // No engine round trip needed; batch consecutive
                 // decode-time errors into one write, flushed the next time

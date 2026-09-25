@@ -168,6 +168,16 @@ pub struct BinlogStats {
     pub records_migrated: u64,
 }
 
+/// Point-in-time view for monitoring (`Engine::snapshot`). Taking it has no
+/// side effects: no counter (e.g. `cmd-stats`) changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Exactly what `stats` would report at the same `now`.
+    pub server: bstk_proto::StatsServer,
+    /// What `stats-tube` would report for every tube, in `list-tubes` order.
+    pub tubes: Vec<bstk_proto::StatsTube>,
+}
+
 /// Public API surface (implemented in `engine.rs`):
 ///
 /// ```ignore
@@ -211,6 +221,8 @@ pub struct BinlogStats {
 ///     /// Binlog fields reported by `stats`, pushed by the server after
 ///     /// every binlog write.
 ///     pub fn set_binlog_stats(&mut self, stats: BinlogStats);
+///     /// Monitoring view; see `Snapshot`. Never changes engine state.
+///     pub fn snapshot(&self, now: Nanos) -> Snapshot;
 ///     /// SIGUSR1 drain mode (put -> DRAINING).
 ///     pub fn set_draining(&mut self, on: bool);
 /// }

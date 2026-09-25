@@ -158,3 +158,9 @@ fn bad_format() {
 fn unknown_command() {
     assert_eq!(encode(&Response::UnknownCommand), b"UNKNOWN_COMMAND\r\n");
 }
+
+#[test]
+fn auth_extension_replies() {
+    assert_eq!(encode(&Response::Authenticated), b"AUTHENTICATED\r\n");
+    assert_eq!(encode(&Response::Unauthorized), b"UNAUTHORIZED\r\n");
+}

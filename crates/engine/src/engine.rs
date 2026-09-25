@@ -519,6 +519,11 @@ impl Engine {
     pub fn set_binlog_stats(&mut self, stats: BinlogStats) {
         self.binlog = stats;
     }
+
+    pub fn snapshot(&self, now: Nanos) -> crate::Snapshot {
+        let _ = now;
+        todo!("P2-T2")
+    }
 }
 
 // ---------------------------------------------------------------------
