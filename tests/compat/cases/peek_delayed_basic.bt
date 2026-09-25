@@ -1,0 +1,5 @@
+# peek-delayed: returns the delayed job with the shortest delay left.
+@c1 send "put 0 100 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "peek-delayed\r\n"
+@c1 recv

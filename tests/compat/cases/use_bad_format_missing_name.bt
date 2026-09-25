@@ -1,0 +1,3 @@
+# use: BAD_FORMAT when no tube name is given (whitespace only).
+@c1 send "use   \r\n"
+@c1 recv

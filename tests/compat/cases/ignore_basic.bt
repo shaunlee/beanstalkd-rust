@@ -1,0 +1,7 @@
+# ignore: removes a tube from the watch list; reply is the new count.
+@c1 send "watch foo\r\n"
+@c1 recv
+@c1 send "ignore default\r\n"
+@c1 recv
+@c1 send "list-tubes-watched\r\n"
+@c1 recv

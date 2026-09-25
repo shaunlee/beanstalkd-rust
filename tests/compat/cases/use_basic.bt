@@ -1,0 +1,5 @@
+# use: switches the producer's tube; reply echoes the tube name.
+@c1 send "use mytube\r\n"
+@c1 recv
+@c1 send "list-tube-used\r\n"
+@c1 recv

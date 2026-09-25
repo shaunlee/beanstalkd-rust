@@ -1,0 +1,11 @@
+# TTR: a reserved job whose time-to-run elapses is put back into the ready
+# queue and its timeout counter is incremented.
+@c1 send "put 0 0 1 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+sleep 1500ms
+@c1 send "peek-ready\r\n"
+@c1 recv
+@c1 send "stats-job 1\r\n"
+@c1 recv

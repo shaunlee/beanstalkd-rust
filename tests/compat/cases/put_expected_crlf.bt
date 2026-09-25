@@ -1,0 +1,3 @@
+# put: EXPECTED_CRLF when the body is not followed by a CRLF pair.
+@c1 send "put 0 0 60 5\r\nhelloXX"
+@c1 recv

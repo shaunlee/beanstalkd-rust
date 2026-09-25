@@ -1,0 +1,4 @@
+# put: the reference server's integer parser skips leading spaces, so an
+# extra space between "put" and its arguments is tolerated (not BAD_FORMAT).
+@c1 send "put  0 0 60 5\r\nhello\r\n"
+@c1 recv

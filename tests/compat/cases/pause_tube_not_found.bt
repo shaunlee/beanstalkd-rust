@@ -1,0 +1,3 @@
+# pause-tube: NOT_FOUND when the tube does not exist.
+@c1 send "pause-tube nosuchtube 1\r\n"
+@c1 recv

@@ -1,0 +1,10 @@
+# reserve: if the reserving connection disconnects, its job is released back
+# to the ready queue and delivered to another waiting connection.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c2 send "reserve\r\n"
+sleep 150ms
+@c1 close
+@c2 recv

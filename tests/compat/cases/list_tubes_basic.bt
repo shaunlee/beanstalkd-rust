@@ -1,0 +1,7 @@
+# list-tubes: lists every tube that currently exists.
+@c1 send "use foo\r\n"
+@c1 recv
+@c2 send "watch bar\r\n"
+@c2 recv
+@c1 send "list-tubes\r\n"
+@c1 recv

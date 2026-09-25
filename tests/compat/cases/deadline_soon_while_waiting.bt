@@ -1,0 +1,9 @@
+# DEADLINE_SOON: if a connection is blocked waiting on a reserve and one of
+# its already-held jobs enters its last-second safety margin while waiting,
+# the server asynchronously replies DEADLINE_SOON to the blocked reserve.
+@c1 send "put 0 0 2 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "reserve-with-timeout 5\r\n"
+@c1 recv

@@ -1,0 +1,5 @@
+# reserve: a ready job is reserved immediately, returning its id and body.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv

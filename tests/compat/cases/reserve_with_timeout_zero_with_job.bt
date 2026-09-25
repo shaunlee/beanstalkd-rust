@@ -1,0 +1,5 @@
+# reserve-with-timeout 0: still reserves a job immediately if one is ready.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve-with-timeout 0\r\n"
+@c1 recv

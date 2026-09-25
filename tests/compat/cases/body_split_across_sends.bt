@@ -1,0 +1,4 @@
+# Protocol: a job body split across multiple writes is reassembled correctly.
+@c1 send "put 0 0 60 5\r\nhel"
+@c1 send "lo\r\n"
+@c1 recv

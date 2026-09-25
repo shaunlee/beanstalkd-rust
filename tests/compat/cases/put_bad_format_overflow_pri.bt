@@ -1,0 +1,6 @@
+# put: BAD_FORMAT when the priority overflows a u32.
+# Note: on failure the command line's would-be body ("hello\r\n") is left
+# in the input stream and gets parsed as a separate command (UNKNOWN_COMMAND).
+@c1 send "put 4294967296 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 recv

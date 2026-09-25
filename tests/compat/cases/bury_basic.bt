@@ -1,0 +1,9 @@
+# bury: moves a reserved job into the buried state.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "bury 1 0\r\n"
+@c1 recv
+@c1 send "peek-buried\r\n"
+@c1 recv

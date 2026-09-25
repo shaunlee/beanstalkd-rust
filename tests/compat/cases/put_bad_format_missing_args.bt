@@ -1,0 +1,3 @@
+# put: BAD_FORMAT when a required argument is missing.
+@c1 send "put 0 0 60\r\n"
+@c1 recv

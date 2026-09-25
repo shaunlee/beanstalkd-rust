@@ -1,0 +1,3 @@
+# reserve-with-timeout 0: returns TIMED_OUT immediately when nothing is ready.
+@c1 send "reserve-with-timeout 0\r\n"
+@c1 recv

@@ -1,0 +1,7 @@
+# put: JOB_TOO_BIG when the body exceeds max-job-size (-z 10 here), and the
+# thrown-away body does not confuse parsing of the next command.
+!args -z 10
+@c1 send "put 0 0 60 20\r\n01234567890123456789\r\n"
+@c1 recv
+@c1 send "stats-tube default\r\n"
+@c1 recv

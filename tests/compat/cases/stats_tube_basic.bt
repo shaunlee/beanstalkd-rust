@@ -1,0 +1,7 @@
+# stats-tube: reports per-tube counters.
+@c1 send "use mytube\r\n"
+@c1 recv
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "stats-tube mytube\r\n"
+@c1 recv

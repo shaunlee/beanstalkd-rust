@@ -1,0 +1,6 @@
+# Protocol: a command line longer than 224 bytes (including CRLF) gets
+# BAD_FORMAT, and the server recovers cleanly to parse the next command.
+@c1 send "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n"
+@c1 recv
+@c1 send "stats-tube default\r\n"
+@c1 recv

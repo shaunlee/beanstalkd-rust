@@ -1,0 +1,5 @@
+# watch: adds a tube to the connection's watch list; reply is the new count.
+@c1 send "watch foo\r\n"
+@c1 recv
+@c1 send "list-tubes-watched\r\n"
+@c1 recv

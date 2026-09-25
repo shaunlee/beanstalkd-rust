@@ -1,0 +1,9 @@
+# DEADLINE_SOON: reserving again while already holding a job that is within
+# its last-second safety margin (here, its entire 1s ttr) replies
+# immediately with DEADLINE_SOON instead of blocking.
+@c1 send "put 0 0 1 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv

@@ -1,0 +1,7 @@
+# bury: BAD_FORMAT when the priority is negative.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "bury 1 -5\r\n"
+@c1 recv

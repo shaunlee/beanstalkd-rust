@@ -1,0 +1,3 @@
+# release: NOT_FOUND when the job is not reserved by this connection.
+@c1 send "release 999 0 0\r\n"
+@c1 recv

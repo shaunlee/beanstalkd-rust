@@ -1,0 +1,16 @@
+# list-tubes: an empty tube that no connection uses or watches any more is
+# removed from the list.
+@c1 send "use foo\r\n"
+@c1 recv
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "delete 1\r\n"
+@c1 recv
+@c1 send "list-tubes\r\n"
+@c1 recv
+@c1 send "use default\r\n"
+@c1 recv
+@c1 send "list-tubes\r\n"
+@c1 recv

@@ -1,0 +1,3 @@
+# ignore: NOT_IGNORED when trying to ignore the only tube in the watch list.
+@c1 send "ignore default\r\n"
+@c1 recv

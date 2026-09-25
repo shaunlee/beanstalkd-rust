@@ -1,0 +1,3 @@
+# kick-job: NOT_FOUND when the job does not exist or is not kickable.
+@c1 send "kick-job 999\r\n"
+@c1 recv

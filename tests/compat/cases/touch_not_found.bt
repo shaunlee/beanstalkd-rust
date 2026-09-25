@@ -1,0 +1,3 @@
+# touch: NOT_FOUND when the job is not reserved by this connection.
+@c1 send "touch 999\r\n"
+@c1 recv

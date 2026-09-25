@@ -1,0 +1,3 @@
+# put: BAD_FORMAT when a numeric argument contains non-digit characters.
+@c1 send "put abc 0 60 5\r\n"
+@c1 recv

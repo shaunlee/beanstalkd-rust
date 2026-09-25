@@ -1,0 +1,3 @@
+# stats-job: NOT_FOUND when the job does not exist.
+@c1 send "stats-job 999\r\n"
+@c1 recv

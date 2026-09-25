@@ -1,0 +1,6 @@
+# Protocol: several commands sent in a single write are each answered in
+# the order they were received.
+@c1 send "use foo\r\nwatch bar\r\nlist-tube-used\r\n"
+@c1 recv
+@c1 recv
+@c1 recv

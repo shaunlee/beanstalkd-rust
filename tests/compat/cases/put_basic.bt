@@ -1,0 +1,3 @@
+# put: basic success path returns INSERTED <id>.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv

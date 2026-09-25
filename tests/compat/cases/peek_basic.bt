@@ -1,0 +1,5 @@
+# peek <id>: returns the job's body regardless of its state or tube.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "peek 1\r\n"
+@c1 recv

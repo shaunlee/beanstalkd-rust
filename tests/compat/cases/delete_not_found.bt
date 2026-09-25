@@ -1,0 +1,3 @@
+# delete: NOT_FOUND when the job does not exist.
+@c1 send "delete 999\r\n"
+@c1 recv

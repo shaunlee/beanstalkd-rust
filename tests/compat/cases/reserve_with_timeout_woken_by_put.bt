@@ -1,0 +1,7 @@
+# reserve-with-timeout: woken by another connection's put well before the
+# timeout expires.
+@c1 send "reserve-with-timeout 5\r\n"
+sleep 150ms
+@c2 send "put 0 0 60 5\r\nhello\r\n"
+@c2 recv
+@c1 recv

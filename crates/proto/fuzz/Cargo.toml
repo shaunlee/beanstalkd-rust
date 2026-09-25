@@ -1,0 +1,28 @@
+[package]
+name = "bstk-proto-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Deliberately its own workspace: excluded from the top-level
+# beanstalkd-rust workspace (see docs/PLAN.md T1) and from
+# `scripts/check.sh`. Requires nightly + cargo-fuzz; not run in CI.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+
+[dependencies.bstk-proto]
+path = ".."
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,6 @@
+# Half-close: shutting down the write side while blocked on reserve makes
+# the server reply TIMED_OUT (equivalent to the client giving up).
+@c1 send "reserve-with-timeout 5\r\n"
+sleep 150ms
+@c1 shutdown_write
+@c1 recv

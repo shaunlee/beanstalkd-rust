@@ -1,0 +1,13 @@
+# touch: postpones a job's TTR expiry, measured from the moment touch runs.
+# Without the touch at t=1.2s, a ttr=2s job reserved at t=0 would already be
+# back in the ready queue by t=2.4s; touch resets the deadline to t=3.2s.
+@c1 send "put 0 0 2 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+sleep 1200ms
+@c1 send "touch 1\r\n"
+@c1 recv
+sleep 1200ms
+@c1 send "stats-job 1\r\n"
+@c1 recv

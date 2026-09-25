@@ -1,0 +1,14 @@
+# release: releasing with a delay puts the job into the delayed state first.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "release 1 0 1\r\n"
+@c1 recv
+@c1 send "peek-ready\r\n"
+@c1 recv
+@c1 send "peek-delayed\r\n"
+@c1 recv
+sleep 1500ms
+@c1 send "peek-ready\r\n"
+@c1 recv

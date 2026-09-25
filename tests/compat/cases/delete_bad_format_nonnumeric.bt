@@ -1,0 +1,3 @@
+# delete: BAD_FORMAT when the id is not numeric.
+@c1 send "delete abc\r\n"
+@c1 recv

@@ -1,0 +1,11 @@
+# stats: cumulative cmd-* counters increase as commands are issued.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "put 0 0 60 5\r\nworld\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "delete 1\r\n"
+@c1 recv
+@c1 send "stats\r\n"
+@c1 recv

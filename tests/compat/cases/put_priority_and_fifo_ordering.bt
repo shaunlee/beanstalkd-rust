@@ -1,0 +1,18 @@
+# put: jobs are reserved in priority order (smaller value = more urgent),
+# and in FIFO order among jobs that share the same priority.
+@c1 send "put 5 0 60 3\r\nfoo\r\n"
+@c1 recv
+@c1 send "put 1 0 60 3\r\nbar\r\n"
+@c1 recv
+@c1 send "put 5 0 60 3\r\nbaz\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "delete 2\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "delete 1\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv

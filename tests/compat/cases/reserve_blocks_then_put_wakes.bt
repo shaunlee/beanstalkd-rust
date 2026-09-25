@@ -1,0 +1,6 @@
+# reserve: blocks with no ready job, and is woken by another connection's put.
+@c1 send "reserve\r\n"
+sleep 150ms
+@c2 send "put 0 0 60 5\r\nhello\r\n"
+@c2 recv
+@c1 recv

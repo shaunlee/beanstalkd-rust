@@ -1,0 +1,3 @@
+# stats-tube: NOT_FOUND when the tube does not exist.
+@c1 send "stats-tube nosuchtube\r\n"
+@c1 recv

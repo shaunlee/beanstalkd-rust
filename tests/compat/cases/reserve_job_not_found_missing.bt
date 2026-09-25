@@ -1,0 +1,3 @@
+# reserve-job: NOT_FOUND when the job id does not exist.
+@c1 send "reserve-job 999\r\n"
+@c1 recv

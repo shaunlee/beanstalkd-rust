@@ -1,0 +1,10 @@
+# reserve: multiple blocked waiters are served in the order they arrived.
+@c1 send "reserve\r\n"
+@c2 send "reserve\r\n"
+sleep 200ms
+@c3 send "put 0 0 60 5\r\nfirst\r\n"
+@c3 recv
+@c1 recv
+@c3 send "put 0 0 60 6\r\nsecond\r\n"
+@c3 recv
+@c2 recv

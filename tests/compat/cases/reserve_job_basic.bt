@@ -1,0 +1,5 @@
+# reserve-job: reserves a specific job by id, regardless of priority order.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve-job 1\r\n"
+@c1 recv

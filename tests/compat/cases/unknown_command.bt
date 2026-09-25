@@ -1,0 +1,3 @@
+# UNKNOWN_COMMAND when the server does not recognize the command name.
+@c1 send "frobnicate\r\n"
+@c1 recv

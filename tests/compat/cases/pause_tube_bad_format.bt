@@ -1,0 +1,3 @@
+# pause-tube: BAD_FORMAT when the delay argument is missing.
+@c1 send "pause-tube default\r\n"
+@c1 recv

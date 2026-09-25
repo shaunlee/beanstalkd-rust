@@ -1,0 +1,5 @@
+# peek-ready: returns the next ready job in the currently used tube.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "peek-ready\r\n"
+@c1 recv

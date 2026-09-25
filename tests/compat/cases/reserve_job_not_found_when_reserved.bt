@@ -1,0 +1,7 @@
+# reserve-job: NOT_FOUND when the job is already reserved by another client.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c2 send "reserve-job 1\r\n"
+@c2 recv

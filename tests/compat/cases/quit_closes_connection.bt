@@ -1,0 +1,3 @@
+# quit: closes the connection without a reply.
+@c1 send "quit\r\n"
+@c1 recv_closed 500ms

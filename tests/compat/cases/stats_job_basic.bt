@@ -1,0 +1,9 @@
+# stats-job: reports id, tube, state, and counters for a specific job.
+@c1 send "put 5 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "stats-job 1\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "stats-job 1\r\n"
+@c1 recv

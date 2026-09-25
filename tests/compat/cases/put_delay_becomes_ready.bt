@@ -1,0 +1,12 @@
+# put: a delayed job stays out of the ready queue until the delay elapses.
+@c1 send "put 0 2 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "peek-ready\r\n"
+@c1 recv
+@c1 send "peek-delayed\r\n"
+@c1 recv
+sleep 2500ms
+@c1 send "peek-ready\r\n"
+@c1 recv
+@c1 send "peek-delayed\r\n"
+@c1 recv

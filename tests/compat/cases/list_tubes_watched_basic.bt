@@ -1,0 +1,7 @@
+# list-tubes-watched: reports every tube in this connection's watch list.
+@c1 send "watch foo\r\n"
+@c1 recv
+@c1 send "watch bar\r\n"
+@c1 recv
+@c1 send "list-tubes-watched\r\n"
+@c1 recv

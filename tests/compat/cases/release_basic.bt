@@ -1,0 +1,9 @@
+# release: puts a reserved job back into the ready queue.
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "release 1 0 0\r\n"
+@c1 recv
+@c1 send "peek-ready\r\n"
+@c1 recv

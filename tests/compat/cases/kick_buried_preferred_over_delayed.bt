@@ -1,0 +1,15 @@
+# kick: when buried jobs exist, kick only touches buried jobs (not delayed).
+@c1 send "put 0 100 60 5\r\ndelay\r\n"
+@c1 recv
+@c1 send "put 0 0 60 5\r\nready\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv
+@c1 send "bury 2 0\r\n"
+@c1 recv
+@c1 send "kick 10\r\n"
+@c1 recv
+@c1 send "peek-delayed\r\n"
+@c1 recv
+@c1 send "peek-buried\r\n"
+@c1 recv

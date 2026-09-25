@@ -1,0 +1,10 @@
+# pause-tube: a waiting reserver on a paused tube is only served after the
+# pause delay elapses.
+@c1 send "pause-tube default 2\r\n"
+@c1 recv
+@c2 send "reserve\r\n"
+sleep 200ms
+@c1 send "put 0 0 60 5\r\nhello\r\n"
+@c1 recv
+@c2 recv_none 800ms
+@c2 recv

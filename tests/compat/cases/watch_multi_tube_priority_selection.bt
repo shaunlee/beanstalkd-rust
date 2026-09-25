@@ -1,0 +1,18 @@
+# reserve: when watching multiple tubes, the globally most urgent job wins,
+# regardless of which tube it is in.
+@c1 send "use tubeA\r\n"
+@c1 recv
+@c1 send "put 100 0 60 5\r\nAAAAA\r\n"
+@c1 recv
+@c1 send "use tubeB\r\n"
+@c1 recv
+@c1 send "put 1 0 60 5\r\nBBBBB\r\n"
+@c1 recv
+@c1 send "watch tubeA\r\n"
+@c1 recv
+@c1 send "watch tubeB\r\n"
+@c1 recv
+@c1 send "ignore default\r\n"
+@c1 recv
+@c1 send "reserve\r\n"
+@c1 recv

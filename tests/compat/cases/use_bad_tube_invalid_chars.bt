@@ -1,0 +1,4 @@
+# use: BAD_FORMAT when the tube name contains a character outside the
+# allowed set (letters, digits, and -+/;.$_()).
+@c1 send "use ab*c\r\n"
+@c1 recv

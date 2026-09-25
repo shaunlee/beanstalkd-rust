@@ -1,0 +1,3 @@
+# peek <id>: NOT_FOUND when the job does not exist.
+@c1 send "peek 999\r\n"
+@c1 recv

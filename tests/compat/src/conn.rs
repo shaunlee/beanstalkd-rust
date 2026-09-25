@@ -1,0 +1,297 @@
+//! Connection handling and step execution: turns a parsed [`crate::dsl::Step`]
+//! sequence into a recorded sequence of [`Outcome`]s against one live server.
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::time::{Duration, Instant};
+
+use crate::dsl::{Step, StepKind};
+
+/// The observable result of executing one DSL step against one server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// `send`: number of bytes written.
+    Sent(usize),
+    /// `recv`: the full raw response (status line + any body), unmasked.
+    Received(Vec<u8>),
+    /// `recv`: no complete response arrived within the timeout.
+    Timeout,
+    /// `recv_none`: nothing arrived within the window.
+    NoBytes,
+    /// `recv_none`: some bytes did arrive within the window (captured raw).
+    SomeBytes(Vec<u8>),
+    /// `recv_closed`: the peer closed the connection within the window.
+    Closed,
+    /// `recv_closed`: the connection was still open at the end of the window.
+    StillOpen,
+    /// `sleep` completed.
+    Slept,
+    /// `shutdown_write` completed.
+    ShutdownDone,
+    /// `close` completed.
+    ClosedDone,
+    /// An unexpected I/O error occurred while performing the step (e.g. the
+    /// connection could not be opened, or a write failed). Compared only by
+    /// category, not by the OS-specific message text, to avoid flakiness.
+    IoError(String),
+}
+
+const RECV_TIMEOUT: Duration = Duration::from_secs(3);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct ConnHandle {
+    stream: TcpStream,
+    buf: Vec<u8>,
+    closed_seen: bool,
+}
+
+impl ConnHandle {
+    fn connect(addr: SocketAddr) -> std::io::Result<Self> {
+        let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+        stream.set_nodelay(true).ok();
+        Ok(ConnHandle {
+            stream,
+            buf: Vec::new(),
+            closed_seen: false,
+        })
+    }
+
+    fn send(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.stream.write_all(data)?;
+        Ok(data.len())
+    }
+
+    /// Try to read more bytes into `self.buf`, blocking at most until
+    /// `deadline`. Returns the number of bytes read (0 on timeout or EOF;
+    /// check `self.closed_seen` to tell them apart).
+    fn fill(&mut self, deadline: Instant) -> std::io::Result<usize> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(0);
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        let mut tmp = [0u8; 4096];
+        match self.stream.read(&mut tmp) {
+            Ok(0) => {
+                self.closed_seen = true;
+                Ok(0)
+            }
+            Ok(n) => {
+                self.buf.extend_from_slice(&tmp[..n]);
+                Ok(n)
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Ok(0)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn recv_response(&mut self) -> Outcome {
+        let deadline = Instant::now() + RECV_TIMEOUT;
+        loop {
+            if let Some(pos) = find(&self.buf, b"\r\n") {
+                let extra = extra_body_len(&self.buf[..pos]);
+                let total_needed = pos + 2 + extra.unwrap_or(0);
+                if self.buf.len() >= total_needed {
+                    let resp: Vec<u8> = self.buf.drain(..total_needed).collect();
+                    return Outcome::Received(resp);
+                }
+            }
+            if self.closed_seen {
+                return Outcome::Timeout;
+            }
+            if Instant::now() >= deadline {
+                return Outcome::Timeout;
+            }
+            match self.fill(deadline) {
+                Ok(_) => {}
+                Err(_) => return Outcome::Timeout,
+            }
+        }
+    }
+
+    fn recv_none(&mut self, dur: Duration) -> Outcome {
+        if !self.buf.is_empty() {
+            return Outcome::SomeBytes(self.buf.clone());
+        }
+        let deadline = Instant::now() + dur;
+        match self.fill(deadline) {
+            Ok(0) => Outcome::NoBytes,
+            Ok(_) => Outcome::SomeBytes(self.buf.clone()),
+            Err(_) => Outcome::NoBytes,
+        }
+    }
+
+    fn recv_closed(&mut self, dur: Duration) -> Outcome {
+        if self.closed_seen {
+            return Outcome::Closed;
+        }
+        let deadline = Instant::now() + dur;
+        loop {
+            match self.fill(deadline) {
+                Ok(0) => {
+                    return if self.closed_seen {
+                        Outcome::Closed
+                    } else {
+                        Outcome::StillOpen
+                    };
+                }
+                Ok(_) => {
+                    if Instant::now() >= deadline {
+                        return Outcome::StillOpen;
+                    }
+                }
+                Err(_) => return Outcome::StillOpen,
+            }
+        }
+    }
+
+    fn shutdown_write(&mut self) -> Outcome {
+        match self.stream.shutdown(Shutdown::Write) {
+            Ok(()) => Outcome::ShutdownDone,
+            Err(e) => Outcome::IoError(e.to_string()),
+        }
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// If `line` is a status line that is followed by a data chunk
+/// (`RESERVED <id> <n>`, `FOUND <id> <n>`, `OK <n>`), return `n + 2` (the
+/// body plus its trailing CRLF). Otherwise, `None`.
+fn extra_body_len(line: &[u8]) -> Option<usize> {
+    let s = std::str::from_utf8(line).ok()?;
+    let mut it = s.split(' ').filter(|tok| !tok.is_empty());
+    let head = it.next()?;
+    let n: usize = match head {
+        "RESERVED" | "FOUND" => {
+            it.next()?;
+            it.next()?.parse().ok()?
+        }
+        "OK" => it.next()?.parse().ok()?,
+        _ => return None,
+    };
+    Some(n + 2)
+}
+
+/// Execute a whole case's steps against one server address, returning one
+/// [`Outcome`] per step (same length and order as `steps`).
+pub fn execute(steps: &[Step], addr: SocketAddr) -> Vec<Outcome> {
+    let mut conns: HashMap<String, ConnHandle> = HashMap::new();
+    let mut out = Vec::with_capacity(steps.len());
+
+    for step in steps {
+        let outcome = run_step(&mut conns, addr, &step.kind);
+        out.push(outcome);
+    }
+    out
+}
+
+fn get_or_open<'a>(
+    conns: &'a mut HashMap<String, ConnHandle>,
+    name: &str,
+    addr: SocketAddr,
+) -> Result<&'a mut ConnHandle, std::io::Error> {
+    if !conns.contains_key(name) {
+        let handle = ConnHandle::connect(addr)?;
+        conns.insert(name.to_string(), handle);
+    }
+    Ok(conns
+        .get_mut(name)
+        .expect("connection was just inserted above"))
+}
+
+fn run_step(conns: &mut HashMap<String, ConnHandle>, addr: SocketAddr, kind: &StepKind) -> Outcome {
+    match kind {
+        StepKind::Send { conn, data } => match get_or_open(conns, conn, addr) {
+            Ok(c) => match c.send(data) {
+                Ok(n) => Outcome::Sent(n),
+                Err(e) => Outcome::IoError(e.to_string()),
+            },
+            Err(e) => Outcome::IoError(e.to_string()),
+        },
+        StepKind::Recv { conn } => match get_or_open(conns, conn, addr) {
+            Ok(c) => c.recv_response(),
+            Err(e) => Outcome::IoError(e.to_string()),
+        },
+        StepKind::RecvNone { conn, dur } => match get_or_open(conns, conn, addr) {
+            Ok(c) => c.recv_none(*dur),
+            Err(e) => Outcome::IoError(e.to_string()),
+        },
+        StepKind::RecvClosed { conn, dur } => match get_or_open(conns, conn, addr) {
+            Ok(c) => c.recv_closed(*dur),
+            Err(e) => Outcome::IoError(e.to_string()),
+        },
+        StepKind::Sleep(dur) => {
+            std::thread::sleep(*dur);
+            Outcome::Slept
+        }
+        StepKind::ShutdownWrite { conn } => match get_or_open(conns, conn, addr) {
+            Ok(c) => c.shutdown_write(),
+            Err(e) => Outcome::IoError(e.to_string()),
+        },
+        StepKind::Close { conn } => {
+            conns.remove(conn);
+            Outcome::ClosedDone
+        }
+    }
+}
+
+/// Equality for comparing two outcomes across two independent server
+/// processes: bodies of `Received`/`SomeBytes` responses are masked first,
+/// and `IoError` is compared only by category (not by exact message) since
+/// OS-level error text can vary in irrelevant ways between processes.
+pub fn outcomes_equal(a: &Outcome, b: &Outcome) -> bool {
+    match (a, b) {
+        (Outcome::Received(x), Outcome::Received(y)) => {
+            crate::mask::mask_response(x) == crate::mask::mask_response(y)
+        }
+        (Outcome::IoError(_), Outcome::IoError(_)) => true,
+        _ => a == b,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extra_body_len_parses_reserved_found_ok() {
+        assert_eq!(extra_body_len(b"RESERVED 1 5"), Some(7));
+        assert_eq!(extra_body_len(b"FOUND 42 3"), Some(5));
+        assert_eq!(extra_body_len(b"OK 100"), Some(102));
+        assert_eq!(extra_body_len(b"DELETED"), None);
+        assert_eq!(extra_body_len(b"NOT_FOUND"), None);
+    }
+
+    #[test]
+    fn outcomes_equal_masks_received_bodies() {
+        let a = Outcome::Received(b"OK 9\r\npid: 111\n\r\n".to_vec());
+        let b = Outcome::Received(b"OK 9\r\npid: 222\n\r\n".to_vec());
+        assert!(outcomes_equal(&a, &b));
+    }
+
+    #[test]
+    fn outcomes_equal_ignores_io_error_message_text() {
+        let a = Outcome::IoError("connection refused".to_string());
+        let b = Outcome::IoError("broken pipe".to_string());
+        assert!(outcomes_equal(&a, &b));
+    }
+
+    #[test]
+    fn outcomes_not_equal_for_different_variants() {
+        assert!(!outcomes_equal(&Outcome::Timeout, &Outcome::NoBytes));
+    }
+}
