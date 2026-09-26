@@ -247,6 +247,17 @@ impl Node {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
+    /// Whether the data directory holds a Raft vote or log segment (the
+    /// node initialized, or took part in a cluster).
+    fn has_raft_state(&self) -> bool {
+        std::fs::read_dir(self.data_dir.join("log")).is_ok_and(|rd| {
+            rd.filter_map(Result::ok).any(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n == "vote" || n.ends_with(".seg")
+            })
+        })
+    }
+
     /// Removes the Raft state (the node must be stopped).
     fn wipe(&self) {
         assert!(self.child.is_none());
@@ -398,6 +409,27 @@ impl Cluster {
                 })
             })
         })
+    }
+
+    /// Cuts every proxied link to and from node `id` (`Opts::proxied`).
+    fn cut_node(&self, id: u64) {
+        for (&(a, b), p) in &self.proxies {
+            if a == id || b == id {
+                p.cut();
+            }
+        }
+    }
+
+    /// Heals the proxied links between nodes `a` and `b`, both ways.
+    fn heal_pair(&self, a: u64, b: u64) {
+        self.proxies[&(a, b)].heal();
+        self.proxies[&(b, a)].heal();
+    }
+
+    fn heal_all(&self) {
+        for p in self.proxies.values() {
+            p.heal();
+        }
     }
 
     /// Indexes of the running nodes other than `leader`.
@@ -816,10 +848,12 @@ fn readyz_follows_leader_and_catch_up() {
 
 #[test]
 fn mismatched_max_job_size_is_rejected() {
-    let mut c = Cluster::configure(3, &Opts::default());
-    c.nodes[0].start(&["--cluster-init"]);
-    c.nodes[1].start(&["--cluster-init"]);
-    c.nodes[2].start(&["--cluster-init", "-z", "1000"]);
+    // (Bootstrapping needs the status of a majority of the other nodes, so
+    // for 3 nodes all of them: node 3 joins with the right -z first, then
+    // restarts with another.)
+    let mut c = Cluster::start(3, &Opts::default());
+    c.nodes[2].kill9();
+    c.nodes[2].start(&["-z", "1000"]);
     assert!(c.nodes[0].wait_ready(Duration::from_secs(20)));
     assert!(c.nodes[1].wait_ready(Duration::from_secs(20)));
     std::thread::sleep(Duration::from_secs(2));
@@ -981,8 +1015,6 @@ fn connection_ids_are_fresh_after_a_restart_without_committed_connects() {
         restarted >= used,
         "connection numbers reused: {restarted} after {used}"
     );
-    // The reserved block, not a 2^20 gap.
-    assert!(restarted < 1 << 20, "{restarted}");
     let mut cl = c.nodes[f].connect();
     assert_eq!(cl.cmd("use t"), "USING t");
     assert_eq!(next(&c.nodes[f]), restarted + 1);
@@ -1405,4 +1437,276 @@ fn cluster_init_refuses_existing_state_and_the_data_dir_is_locked() {
     let (st, _, err) = run(&["--config", &cfg, "--cluster-init"]);
     assert_eq!(st.code(), Some(1), "{err}");
     assert!(err.contains("already holds Raft state"), "{err}");
+}
+
+/// Seconds since the Unix epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Waits until one of the nodes at `among` reports itself leader in
+/// `/admin`; returns its index.
+fn leader_among(c: &Cluster, among: &[usize]) -> usize {
+    wait_for(Duration::from_secs(15), || {
+        among.iter().copied().find(|&i| {
+            c.nodes[i]
+                .admin()
+                .is_some_and(|a| a["cluster"]["role"] == "leader")
+        })
+    })
+    .expect("no leader among the given nodes")
+}
+
+/// Chaos finding 6 at process level: a leader of an old term, cut off
+/// while the others elected a new leader and committed a job, must not
+/// commit anything through a node that lost its data and rejoins. The
+/// rejoining node adopts the highest vote of the other nodes before it
+/// starts Raft, so it rejects the stale leader.
+#[test]
+fn stale_leader_is_rejected_by_a_rejoined_node() {
+    let opts = Opts {
+        // No isolation of the stale leader's clients during the test.
+        node_timeout: "30s",
+        proxied: true,
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(3, &opts);
+    let old = c.leader();
+    let rest = c.followers(old);
+    let old_id = c.nodes[old].id;
+    let mut on_old = c.nodes[old].connect();
+    inserted(&on_old.put(b"before"));
+
+    // The old leader is cut off; the others elect a leader and commit X.
+    c.cut_node(old_id);
+    let new = leader_among(&c, &rest);
+    let acker = rest.iter().copied().find(|&i| i != new).unwrap();
+    let (new_id, acker_id) = (c.nodes[new].id, c.nodes[acker].id);
+    let mut on_new = c.nodes[new].connect();
+    let x = inserted(&on_new.put(b"X, committed in the newer term"));
+    drop(on_new);
+    let a = c.nodes[old].admin().unwrap();
+    assert_eq!(
+        a["cluster"]["role"], "leader",
+        "the old leader stepped down: {a}"
+    );
+
+    // The acker loses its data and rejoins; it reaches both others (the
+    // old leader still cannot reach the new one). Then the new leader is
+    // cut off: the stale leader and the rejoined node are alone.
+    c.nodes[acker].kill9();
+    c.nodes[acker].wipe();
+    c.heal_pair(old_id, acker_id);
+    c.nodes[acker].start(&[]);
+    wait_for(Duration::from_secs(20), || {
+        c.nodes[acker]
+            .log_text()
+            .contains("rejoin: adopted the highest vote")
+            .then_some(())
+    })
+    .expect("the rejoining node never adopted a vote");
+    c.cut_node(new_id);
+    c.heal_pair(old_id, acker_id);
+
+    // Nothing commits through the stale leader.
+    on_old
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    on_old.send(b"put 0 0 60 5\r\nstale\r\n");
+    let (got, _) = on_old.read_to_end(Duration::from_secs(4));
+    let got = String::from_utf8_lossy(&got).into_owned();
+    assert!(
+        !got.contains("INSERTED"),
+        "the stale leader committed a put through the rejoined node: {got:?}"
+    );
+    // It learned the newer vote from the rejoined node and stepped down.
+    wait_for(Duration::from_secs(5), || {
+        (c.nodes[old].admin()?["cluster"]["role"] != "leader").then_some(())
+    })
+    .expect("the stale leader still leads");
+
+    // Everything heals: X is on every node.
+    c.heal_all();
+    c.wait_all_ready();
+    for n in &c.nodes {
+        let mut cl = n.connect();
+        let (hdr, _) = cl.body_reply(&format!("peek {x}"));
+        assert!(
+            hdr.starts_with(&format!("FOUND {x} ")),
+            "node {}: {hdr}",
+            n.id
+        );
+    }
+    let log = c.nodes[acker].log_text();
+    assert!(log.contains("rejoin complete"), "{log}");
+}
+
+/// `--cluster-init` on a wiped node while the other nodes are down: it
+/// must not bootstrap a new cluster; it waits, and rejoins once they are
+/// back.
+#[test]
+fn cluster_init_on_a_wiped_node_waits_for_the_survivors_and_rejoins() {
+    let mut c = Cluster::start(3, &Opts::default());
+    let l = c.leader();
+    let mut on_leader = c.nodes[l].connect();
+    let job = inserted(&on_leader.put(b"survives"));
+    drop(on_leader);
+    let f = c.followers(l)[0];
+    for i in 0..3 {
+        c.nodes[i].kill9();
+    }
+    c.nodes[f].wipe();
+    c.nodes[f].start(&["--cluster-init"]);
+    std::thread::sleep(Duration::from_secs(3));
+    let log = c.nodes[f].log_text();
+    assert!(
+        log.contains("--cluster-init: waiting for the other nodes' status"),
+        "{log}"
+    );
+    // Neither initialized nor voted.
+    assert!(!c.nodes[f].has_raft_state());
+    assert_ne!(c.nodes[f].readyz(), 200);
+    assert!(c.nodes[f].running());
+
+    for i in (0..3).filter(|&i| i != f) {
+        c.nodes[i].start(&[]);
+    }
+    c.wait_all_ready();
+    let log = c.nodes[f].log_text();
+    assert!(
+        log.contains("already belongs to a running cluster"),
+        "{log}"
+    );
+    assert!(log.contains("rejoin complete"), "{log}");
+    for n in &c.nodes {
+        let mut cl = n.connect();
+        let (hdr, body) = cl.body_reply(&format!("peek {job}"));
+        assert_eq!(hdr, format!("FOUND {job} 8"), "node {}", n.id);
+        assert_eq!(body, b"survives");
+    }
+}
+
+/// Bootstrap with `--cluster-init` on every node, in the orders the race
+/// can take: (1) node 1 initializes before the others can ask anyone (the
+/// others then see its bootstrap-only state and initialize too); (2)
+/// nodes 1 and 2 form the cluster and elect a leader before node 3 can ask
+/// (node 3 then rejoins). Both converge to one working cluster. (Starting
+/// every node at once, the common case, is what every other test does.)
+#[test]
+fn cluster_init_on_every_node_converges_in_any_order() {
+    let opts = Opts {
+        proxied: true,
+        ..Opts::default()
+    };
+
+    // (1) Node 1 sees 2 and 3; they see nobody.
+    let mut c = Cluster::configure(3, &opts);
+    for (a, b) in [(2, 1), (2, 3), (3, 1), (3, 2)] {
+        c.proxies[&(a, b)].cut();
+    }
+    for n in &mut c.nodes {
+        n.start(&["--cluster-init"]);
+    }
+    wait_for(Duration::from_secs(20), || {
+        c.nodes[0].has_raft_state().then_some(())
+    })
+    .expect("node 1 never initialized");
+    std::thread::sleep(Duration::from_millis(500));
+    for i in [1, 2] {
+        assert!(
+            !c.nodes[i].has_raft_state(),
+            "node {} initialized without answers",
+            i + 1
+        );
+    }
+    c.heal_all();
+    c.wait_all_ready();
+    let l = c.leader();
+    let mut cl = c.nodes[l].connect();
+    let job = inserted(&cl.put(b"one"));
+    for n in &c.nodes {
+        let mut cl = n.connect();
+        assert!(cl.body_reply(&format!("peek {job}")).0.starts_with("FOUND"));
+        assert!(!n.log_text().contains("panicked"));
+    }
+    drop(c);
+
+    // (2) Nodes 1 and 2 see everyone; node 3 answers but cannot ask.
+    let mut c = Cluster::configure(3, &opts);
+    for (a, b) in [(3, 1), (3, 2)] {
+        c.proxies[&(a, b)].cut();
+    }
+    for n in &mut c.nodes {
+        n.start(&["--cluster-init"]);
+    }
+    let l = leader_among(&c, &[0, 1]);
+    let mut cl = c.nodes[l].connect();
+    let job = inserted(&cl.put(b"two"));
+    drop(cl);
+    assert!(!c.nodes[2].has_raft_state());
+    c.heal_all();
+    c.wait_all_ready();
+    let log = c.nodes[2].log_text();
+    assert!(
+        log.contains("already belongs to a running cluster"),
+        "{log}"
+    );
+    assert!(log.contains("rejoin complete"), "{log}");
+    let mut on3 = c.nodes[2].connect();
+    assert!(
+        on3.body_reply(&format!("peek {job}"))
+            .0
+            .starts_with("FOUND")
+    );
+}
+
+/// A wiped node's first connection number is above the time floor, so
+/// above anything its lost process could have handed out.
+#[test]
+fn wiped_node_numbers_connections_above_the_time_floor() {
+    let mut c = Cluster::start(3, &Opts::default());
+    let l = c.leader();
+    let f = c.followers(l)[0];
+    let next = |n: &Node| {
+        n.admin().unwrap()["cluster"]["next_local_conn"]
+            .as_u64()
+            .unwrap()
+    };
+    let before = next(&c.nodes[f]);
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        let mut cl = c.nodes[f].connect();
+        assert_eq!(cl.cmd("use t"), "USING t");
+        held.push(cl);
+    }
+    let used = next(&c.nodes[f]);
+    assert_eq!(used, before + 5);
+    c.nodes[f].kill9();
+    drop(held);
+    c.nodes[f].wipe();
+    std::thread::sleep(Duration::from_millis(1100));
+    let floor = unix_now() << 16;
+    c.nodes[f].start(&[]);
+    assert!(c.nodes[f].wait_ready(Duration::from_secs(20)));
+    let after = next(&c.nodes[f]);
+    assert!(after > used, "{after} <= {used}");
+    assert!(after >= floor, "{after} below the time floor {floor}");
+    let mut cl = c.nodes[f].connect();
+    assert_eq!(cl.cmd("use t"), "USING t");
+}
+
+/// A single-node cluster whose data directory is empty cannot rejoin (it
+/// has nobody to learn its state from): a clear error, not a hang.
+#[test]
+fn single_node_cannot_rejoin() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = single_node_config(dir.path(), "insecure_plaintext = true", None);
+    let (st, _, err) = run(&["--config", &cfg]);
+    assert_eq!(st.code(), Some(1), "{err}");
+    assert!(err.contains("cannot rejoin"), "{err}");
 }

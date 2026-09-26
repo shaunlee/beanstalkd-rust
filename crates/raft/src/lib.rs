@@ -20,6 +20,7 @@ mod net_tests;
 pub mod sim;
 #[cfg(test)]
 mod sim_tests;
+pub mod status;
 #[cfg(test)]
 mod test_store;
 pub mod tls;

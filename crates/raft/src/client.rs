@@ -70,6 +70,7 @@ use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 
 use crate::forward::{ControlRequest, ControlResponse, ForwardError, ForwardTransport};
+use crate::status::{NodeStatus, StatusTransport};
 use crate::wire::{
     self, ClientMsg, FrameError, Hello, PROTOCOL_VERSION, RpcRequest, RpcResponse, ServerHello,
     ServerMsg, WireError, WireFatal,
@@ -634,6 +635,42 @@ async fn run_conn(
         r = reader => r,
         r = writer => r,
         () = kill.notified() => "closed: stalled".to_string(),
+    }
+}
+
+impl Network {
+    /// Asks `target` for its durable Raft state (a status probe, answered
+    /// even before its Raft runs). Uses the forward timeout.
+    pub async fn status(&self, target: NodeId) -> Result<NodeStatus, ForwardError> {
+        let Some(peer) = self.peer(target, None) else {
+            return Err(ForwardError::Unreachable(format!(
+                "node {target} has no configured address"
+            )));
+        };
+        let t = self.inner.cfg.forward_timeout;
+        match self
+            .call(&peer, RpcRequest::Status, t, self.inner.cfg.max_frame)
+            .await
+        {
+            Ok(RpcResponse::Control(Err(e))) => {
+                Err(ForwardError::Rejected(wire::sanitize(&e.to_string())))
+            }
+            Ok(r) => r
+                .into_status()
+                .ok_or_else(|| ForwardError::Network("unexpected response kind".into())),
+            Err(CallError::Unreachable(m)) => Err(ForwardError::Unreachable(m)),
+            Err(CallError::Timeout(_)) => Err(ForwardError::Timeout),
+            Err(CallError::Network(m)) => Err(ForwardError::Network(m)),
+            Err(CallError::TooLarge { .. }) => Err(ForwardError::Rejected(
+                "request exceeds the maximum frame size".into(),
+            )),
+        }
+    }
+}
+
+impl StatusTransport for Network {
+    async fn status(&self, target: NodeId) -> Result<NodeStatus, ForwardError> {
+        Network::status(self, target).await
     }
 }
 

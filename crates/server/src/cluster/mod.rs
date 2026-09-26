@@ -36,34 +36,46 @@
 //! # Startup ([`start`])
 //!
 //! Open the storage (a locked data directory exits with status 10) and
-//! start Raft with the TCP/TLS network. Then pick the startup mode:
+//! start the cluster listener *before* Raft: until Raft runs it answers
+//! only status probes (from the log store, `bstk_raft::status`), which
+//! other nodes deciding how to start need. Then pick the startup mode:
 //!
-//! - **Bootstrap** (`--cluster-init`, empty data directory): first ask
-//!   every reachable peer whether it already belongs to a running cluster
-//!   (an empty `ForwardRequest`, see [`handler`]); if none does, initialize
-//!   the membership from `[[cluster.peer]]` (every initial node is started
-//!   this way, with the same peer list). If one does, bootstrapping would
-//!   be wrong: the node joins in rejoin mode instead (with a warning).
+//! - **Restart** (the data directory holds state, no rejoin marker):
+//!   start Raft as it is.
+//! - **Bootstrap** (`--cluster-init`, empty data directory): ask the other
+//!   nodes for their status until the answers decide it
+//!   (`bstk_raft::status::bootstrap_decision`): initialize the membership
+//!   from `[[cluster.peer]]` once a majority of the other nodes answered
+//!   without any state (or every other node answered and none belongs to
+//!   a cluster that has had a leader: some initial nodes initialized
+//!   first); rejoin, with a warning, as soon as one belongs to a running
+//!   cluster (a wiped node started with `--cluster-init` by mistake); keep
+//!   asking otherwise (logged). Every initial node is started this way,
+//!   with the same peer list, in any order.
 //! - **Rejoin** (an empty data directory without `--cluster-init`, or the
 //!   rejoin marker [`durable::REJOIN_FILE`] left by an unfinished rejoin):
-//!   the node may have acknowledged entries in a previous life that it no
-//!   longer has, so it must not help elect a leader until it has them
-//!   again. It persists the marker, disables its elections and closes the
-//!   vote gate of its cluster listener (inbound votes are refused), and
-//!   serves no clients. It asks the leader to propose `DropNode(self)` and
-//!   leaves rejoin mode once it has applied that entry: its index was
-//!   learned from a leader after this process started, so everything
-//!   committed before is now in this node's log. Leaving removes the
-//!   marker durably, re-enables elections and opens the gate. A crash
-//!   before that keeps the marker, so the node stays in rejoin mode.
-//! - **Restart** (the data directory holds state): nothing special.
+//!   the node may have acknowledged entries, and granted votes, in a
+//!   previous life that it no longer remembers. It writes the marker, then
+//!   asks the other nodes for their status until a majority of the cluster
+//!   (`⌊n/2⌋ + 1`) of *other* nodes answered, persists the highest vote
+//!   among them and its own (openraft's order; never lower than its own)
+//!   with the log store's `save_vote`, and only then starts Raft (which
+//!   loads that vote), with elections disabled and the vote gate of its
+//!   listener closed, and serves no clients. So it rejects every leader
+//!   older than one it may have followed before (docs/DESIGN.md §8 has the
+//!   argument). It asks the leader to propose `DropNode(self)` and leaves
+//!   rejoin mode once it has applied that entry: its index was learned
+//!   from a leader after this process started, so everything committed
+//!   before is now in this node's log. Leaving removes the marker durably,
+//!   re-enables elections and opens the gate. A crash before that keeps
+//!   the marker, so the node rejoins again (probing again).
 //!
-//! Then start the cluster listener, wait until a leader is known and this
-//! node has applied everything it knows to be committed, close out the
-//! connections of this node's previous process with `DropNode(self)` and
-//! wait until that is applied here. Only then are clients accepted, with
-//! connection numbers from durably reserved blocks
-//! ([`durable::ConnIdBlocks`]).
+//! Then wait until a leader is known and this node has applied everything
+//! it knows to be committed, close out the connections of this node's
+//! previous process with `DropNode(self)` and wait until that is applied
+//! here. Only then are clients accepted, with connection numbers from
+//! durably reserved blocks ([`durable::ConnIdBlocks`], starting at
+//! [`durable::first_local`]).
 
 pub mod actor;
 pub mod durable;
@@ -76,7 +88,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use openraft::{BasicNode, Raft, RaftMetrics, ServerState, SnapshotPolicy};
+use openraft::storage::RaftLogStorage;
+use openraft::{BasicNode, Raft, RaftMetrics, ServerState, SnapshotPolicy, Vote};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use bstk_engine::{ConnId, EngineConfig, Nanos};
@@ -84,27 +97,15 @@ use bstk_proto::Response;
 use bstk_raft::client::{Network, NetworkConfig};
 use bstk_raft::forward::{ControlRequest, ControlResponse, ForwardError};
 use bstk_raft::listener::{ClusterListener, ListenerConfig, VoteGate};
+use bstk_raft::status::{self, Adopt, Bootstrap, StatusSource};
 use bstk_raft::storage::{self, LogOptions, LogStore, ReplySink, SmOptions, StateHandle};
 use bstk_raft::tls::ClusterTls;
-use bstk_raft::{
-    CONN_SEQ_BITS, ForwardRequest, ForwardResponse, NodeId, Op, Request, TypeConfig, owner_of,
-};
+use bstk_raft::{CONN_SEQ_BITS, NodeId, Op, Request, TypeConfig, owner_of};
 
 use crate::config::{ClusterSettings, SNAPSHOT_CHUNK};
 use crate::engine_actor::{Clock, EngineHandle};
 use crate::metrics::{ClusterInfo, ClusterStats};
 use crate::sysinfo::{ProcessSysInfo, SharedSysInfo};
-
-/// Used only when the data directory has no connection-number file
-/// ([`durable::CONN_IDS_FILE`]) although the replicated state has seen
-/// connections of this node (a node whose data directory was wiped): the
-/// numbers its lost process handed out are unknown, so new ones start this
-/// far above the highest one the state has seen, so that a `Connect` of
-/// the lost process that commits late cannot make new connections look
-/// old (the state machine accepts a `Connect` only above every earlier one
-/// of the same node). With the file, new numbers start above everything
-/// any earlier process may have used, and no gap is needed.
-pub const CONN_ID_GAP: u64 = 1 << 20;
 
 /// How long a leader waits for a control proposal to be applied before
 /// answering without its index (the requester's timeout is longer).
@@ -564,30 +565,10 @@ impl Core {
         lock(&self.heard).get(&peer).copied()
     }
 
-    /// Whether this node belongs to a running cluster: it has applied (or
-    /// learned the commit of) an entry beyond the bootstrap membership.
-    /// Answered to `--cluster-init` probes ([`handler`]).
-    async fn established(&self) -> bool {
-        if self.applied_index().is_some_and(|a| a >= 1) {
-            return true;
-        }
-        self.raft
-            .with_raft_state(|st| st.committed.map(|c| c.index))
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|c| c >= 1)
-    }
-
     /// Rejoin mode (see the module docs): returns once this node has
     /// applied an entry the leader proposed for it after this process
     /// started, then leaves rejoin mode.
     async fn rejoin(&self) -> Result<(), StartError> {
-        tracing::warn!(
-            "rejoin mode: this node started without Raft state (or did not finish rejoining); \
-             it does not vote or stand for election, and serves no clients, until it has \
-             caught up with a leader"
-        );
         loop {
             match self.leader() {
                 Some(l) if l != self.id => {
@@ -627,34 +608,104 @@ impl Core {
     }
 }
 
-/// `--cluster-init`: asks every other peer whether it already belongs to a
-/// running cluster (an empty forward, answered as described in
-/// [`handler`]). Returns the first one that does. Peers that cannot be
-/// reached, or refuse the connection, are skipped.
-async fn established_peer(net: &Network, id: NodeId, peers: &BTreeSet<NodeId>) -> Option<NodeId> {
-    let probes = peers.iter().filter(|&&p| p != id).map(|&p| {
-        let net = net.clone();
-        async move {
-            let req = ForwardRequest {
-                from: id,
-                items: Vec::new(),
-            };
-            (p, net.forward(p, req).await)
-        }
-    });
-    let mut found = None;
-    for (p, r) in futures::future::join_all(probes).await {
-        match r {
-            Ok(ForwardResponse::Accepted | ForwardResponse::NotLeader { leader: Some(_) }) => {
-                found.get_or_insert(p);
-            }
-            Ok(ForwardResponse::NotLeader { leader: None }) => {
-                tracing::info!(peer = p, "--cluster-init: peer has no cluster state yet");
-            }
-            Err(e) => tracing::info!(peer = p, "--cluster-init: peer not reachable ({e})"),
-        }
+/// How long a startup probe loop waits between rounds at most, and how
+/// often it logs that it is still waiting.
+const PROBE_BACKOFF_MAX: Duration = Duration::from_secs(2);
+const PROBE_LOG_EVERY: Duration = Duration::from_secs(5);
+
+/// Rejoin: asks the other nodes for their status until the answers of a
+/// majority of the cluster among them give the vote to persist before
+/// Raft starts (see the module docs and [`status::adopt_vote`]). `local` is
+/// this node's own persisted vote (a restart with the rejoin marker).
+async fn probe_rejoin_vote(
+    net: &Network,
+    id: NodeId,
+    peers: &BTreeSet<NodeId>,
+    local: Option<Vote<NodeId>>,
+) -> Result<Option<Vote<NodeId>>, StartError> {
+    let n = peers.len();
+    if n <= 1 {
+        return Err(StartError::Other(
+            "rejoin: a single-node cluster cannot rejoin (it has no other node to learn its \
+             state from); restore the data directory, or start it with --cluster-init to \
+             create a new cluster"
+                .into(),
+        ));
     }
-    found
+    let need = status::quorum(n);
+    let mut answers = BTreeMap::new();
+    let mut delay = Duration::from_millis(50);
+    let mut logged: Option<Instant> = None;
+    loop {
+        answers.extend(status::probe(net, id, peers).await);
+        let why = match status::adopt_vote(n, &answers, local) {
+            Adopt::Vote(Some(v)) if v.is_committed() && v.leader_id().voted_for() == Some(id) => {
+                // The others still follow this node's previous life as
+                // their leader: wait until they elect another one (never
+                // start with a committed vote naming this node).
+                answers.clear();
+                format!("the highest vote ({v}) is this node's own leadership")
+            }
+            Adopt::Vote(v) => {
+                tracing::warn!(
+                    answered = answers.len(),
+                    of = n - 1,
+                    vote = %v.map_or_else(|| "none".to_string(), |v| v.to_string()),
+                    "rejoin: adopted the highest vote of the other nodes"
+                );
+                return Ok(v);
+            }
+            Adopt::TooFew => format!("{} of the {need} answers needed", answers.len()),
+            Adopt::Incomparable => {
+                answers.clear();
+                "the highest votes are incomparable".to_string()
+            }
+        };
+        if logged.is_none_or(|t| t.elapsed() >= PROBE_LOG_EVERY) {
+            tracing::warn!("rejoin: waiting for the other nodes' status ({why})");
+            logged = Some(Instant::now());
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(PROBE_BACKOFF_MAX);
+    }
+}
+
+/// `--cluster-init` on an empty data directory: asks the other nodes for
+/// their status until [`status::bootstrap_decision`] decides (each round
+/// on that round's answers only). `None`: initialize; `Some(peer)`: `peer`
+/// belongs to a running cluster, rejoin it.
+async fn probe_bootstrap(net: &Network, id: NodeId, peers: &BTreeSet<NodeId>) -> Option<NodeId> {
+    let n = peers.len();
+    let mut delay = Duration::from_millis(50);
+    let mut logged: Option<Instant> = None;
+    loop {
+        let answers = status::probe(net, id, peers).await;
+        match status::bootstrap_decision(n, &answers) {
+            Bootstrap::Wait => {
+                if logged.is_none_or(|t| t.elapsed() >= PROBE_LOG_EVERY) {
+                    tracing::warn!(
+                        answered = answers.len(),
+                        of = n - 1,
+                        "--cluster-init: waiting for the other nodes' status before \
+                         initializing (a majority of them without any state, or all of them)"
+                    );
+                    logged = Some(Instant::now());
+                }
+            }
+            Bootstrap::Initialize => return None,
+            Bootstrap::Rejoin(peer) => return Some(peer),
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(PROBE_BACKOFF_MAX);
+    }
+}
+
+fn announce_rejoin() {
+    tracing::warn!(
+        "rejoin mode: this node started without Raft state (or did not finish rejoining); \
+         it adopts the highest vote of the other nodes before it starts Raft, does not vote \
+         or stand for election, and serves no clients, until it has caught up with a leader"
+    );
 }
 
 impl ClusterInfo for Core {
@@ -767,7 +818,7 @@ impl ClusterNode {
 }
 
 /// The openraft configuration for `c`.
-fn raft_config(c: &ClusterSettings) -> Result<Arc<openraft::Config>, String> {
+fn raft_config(c: &ClusterSettings, elect: bool) -> Result<Arc<openraft::Config>, String> {
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     let config = openraft::Config {
         cluster_name: "beanstalkd-rs".to_string(),
@@ -781,6 +832,7 @@ fn raft_config(c: &ClusterSettings) -> Result<Arc<openraft::Config>, String> {
         snapshot_max_chunk_size: SNAPSHOT_CHUNK as u64,
         // Keep at most one snapshot interval of log behind a snapshot.
         max_in_snapshot_log_to_keep: c.snapshot_every.min(1000),
+        enable_elect: elect,
         ..Default::default()
     };
     config
@@ -810,6 +862,7 @@ enum Mode {
 /// module docs). Runs until then even without a leader: a node without
 /// state waits to be contacted.
 pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
+    let process_started = Instant::now();
     let c = args.settings;
     let id = c.node_id;
     let clock = Clock::start();
@@ -854,11 +907,6 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
     net_cfg.backoff_max = Duration::from_millis(500);
     let net = Network::new(net_cfg);
 
-    let config = raft_config(c).map_err(StartError::Other)?;
-    let raft = Raft::new(id, config, net.clone(), log.clone(), sm)
-        .await
-        .map_err(|e| StartError::Other(format!("cannot start raft: {e}")))?;
-
     let peers: BTreeSet<NodeId> = c.peers.keys().copied().collect();
     let mut mode = match (marked, c.init, had_state) {
         (true, true, _) => {
@@ -872,8 +920,39 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         (false, true, _) => Mode::Bootstrap,
         (false, false, true) => Mode::Restart,
     };
+
+    // The listener runs from now on; until Raft is installed it answers
+    // status probes only. Its vote gate stays closed unless the mode says
+    // otherwise.
+    let gate = Arc::new(VoteGate::new(false));
+    let mut lcfg = ListenerConfig::new(
+        id,
+        peers.clone(),
+        args.tls.as_ref().map(|t| t.server.clone()),
+    );
+    lcfg.max_job_size = args.engine.max_job_size;
+    lcfg.vote_gate = Some(gate.clone());
+    lcfg.status = Some(Arc::new(log.clone()));
+    let (listener, service) =
+        ClusterListener::spawn_deferred::<handler::Handler>(args.listener, lcfg)
+            .map_err(|e| StartError::Other(format!("cluster listener: {e}")))?;
+    tracing::info!(node = id, addr = %listener.local_addr(), ?mode, "cluster listener started");
+
+    let enter_rejoin = |marked: bool| -> Result<(), StartError> {
+        announce_rejoin();
+        // Durable before a vote is saved: a vote file without the marker
+        // would make a restart look like an ordinary one.
+        if !marked {
+            durable::mark_rejoin(&c.data_dir)
+                .map_err(|e| other("cannot write the rejoin marker in", &e))?;
+        }
+        Ok(())
+    };
+    if mode == Mode::Rejoin {
+        enter_rejoin(marked)?;
+    }
     if mode == Mode::Bootstrap
-        && let Some(peer) = established_peer(&net, id, &peers).await
+        && let Some(peer) = probe_bootstrap(&net, id, &peers).await
     {
         tracing::warn!(
             peer,
@@ -881,16 +960,24 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
              must not bootstrap one; joining it in rejoin mode instead"
         );
         mode = Mode::Rejoin;
+        enter_rejoin(false)?;
     }
-    let gate = Arc::new(VoteGate::new(mode != Mode::Rejoin));
     if mode == Mode::Rejoin {
-        // Before anything can reach Raft through the listener.
-        raft.runtime_config().elect(false);
-        if !marked {
-            durable::mark_rejoin(&c.data_dir)
-                .map_err(|e| other("cannot write the rejoin marker in", &e))?;
+        let local = log.status().vote;
+        if let Some(v) = probe_rejoin_vote(&net, id, &peers, local).await? {
+            // openraft loads the vote in `Raft::new`.
+            let mut store = log.clone();
+            RaftLogStorage::save_vote(&mut store, &v)
+                .await
+                .map_err(|e| StartError::Other(format!("rejoin: cannot save the vote: {e}")))?;
         }
     }
+
+    // Elections are off from the start in rejoin mode.
+    let config = raft_config(c, mode != Mode::Rejoin).map_err(StartError::Other)?;
+    let raft = Raft::new(id, config, net.clone(), log.clone(), sm)
+        .await
+        .map_err(|e| StartError::Other(format!("cannot start raft: {e}")))?;
 
     let (reaper, reaper_rx) = mpsc::unbounded_channel();
     let reaper_task = tokio::spawn(reap(reaper_rx));
@@ -931,21 +1018,10 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         tracing::info!(peers = c.peers.len(), "cluster membership initialized");
     }
 
-    let mut lcfg = ListenerConfig::new(
-        id,
-        core.peers.clone(),
-        args.tls.as_ref().map(|t| t.server.clone()),
-    );
-    lcfg.max_job_size = args.engine.max_job_size;
-    lcfg.vote_gate = Some(gate);
-    let listener = ClusterListener::spawn(
-        args.listener,
-        lcfg,
-        raft.clone(),
-        Arc::new(handler::Handler::new(core.clone())),
-    )
-    .map_err(|e| StartError::Other(format!("cluster listener: {e}")))?;
-    tracing::info!(node = id, addr = %listener.local_addr(), ?mode, "cluster listener started");
+    if mode != Mode::Rejoin {
+        gate.open();
+    }
+    service.set(raft.clone(), Arc::new(handler::Handler::new(core.clone())));
 
     // The actor and the background duties run from now on (the actor
     // serves nothing until clients connect, but it pings the leader, and
@@ -976,13 +1052,21 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
     core.drop_previous_connections().await;
 
     // Connection numbers: above everything an earlier process may have
-    // handed out (the persisted block end) and everything the replicated
-    // state has seen for this node.
+    // handed out (the persisted block end, the replicated state, and the
+    // time floor for a wiped node's lost block; see `durable::first_local`).
     let highest = core.state.highest_local(id);
-    let first_local = match persisted_ids {
-        Some(p) => p.max(highest.saturating_add(1)),
-        None if highest > 0 => highest.saturating_add(CONN_ID_GAP + 1),
-        None => highest.saturating_add(1),
+    if persisted_ids.is_none() {
+        // The floor is taken at least a second after this process started,
+        // so its second is past every second the lost process could have
+        // handed numbers in (see `durable::first_local`).
+        tokio::time::sleep(durable::FLOOR_DELAY.saturating_sub(process_started.elapsed())).await;
+    }
+    let first_local = match durable::first_local(persisted_ids, highest, durable::unix_seconds()) {
+        Ok(f) => f,
+        Err(e) => {
+            abort_all(&mut tasks);
+            return Err(StartError::Other(format!("connection numbers: {e}")));
+        }
     };
     let conn_ids =
         match durable::ConnIdBlocks::open(&c.data_dir, id, first_local, durable::CONN_ID_BLOCK) {

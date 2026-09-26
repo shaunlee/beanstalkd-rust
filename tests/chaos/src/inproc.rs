@@ -31,7 +31,22 @@
 //! applied now, last stamped)` and proposes `Tick` at `next_deadline()`.
 //! A (re)started node waits until it has caught up, has `DropNode(self,
 //! highest_local)` committed through the current leader, and only then
-//! accepts connections.
+//! accepts connections, numbered above an emulated durable reservation
+//! (the server's `conn-ids` file, lost with a wipe) and above everything
+//! the state has seen for the node.
+//!
+//! A wiped node (and one restarted while its emulated rejoin marker is
+//! still set) runs in **rejoin mode**, as the server does. Before it starts
+//! Raft it asks the other nodes for their status over the simulated
+//! network (`bstk_raft::status::probe`, answered from each running node's
+//! log store) until a majority of the cluster among them answered, which
+//! needs that many of them reachable (it waits otherwise, in the
+//! background: the fault schedule goes on), and persists the highest vote
+//! with the log store's `save_vote`. Then it starts Raft with elections off
+//! (`runtime_config().elect(false)`) and its vote gate closed
+//! (`SimNetwork::set_vote_gate`) until it has applied the `DropNode(self)`
+//! a leader proposed for it after it started; then it clears the marker,
+//! re-enables elections and opens the gate.
 //!
 //! # Faults
 //!
@@ -40,7 +55,9 @@
 //! clock skew per node, crash (all `Raft` handles and the storage dropped
 //! without `shutdown`) and restart from the same directory, crash of the
 //! current leader, crash of every node, and a wiped node rejoining (its
-//! directory emptied; it catches up through a snapshot install).
+//! directory emptied; it catches up through a snapshot install) in rejoin
+//! mode. A wipe is skipped when it would leave fewer nodes with their data
+//! than a quorum (at most 1 rejoining node of 3, 2 of 5).
 //!
 //! # Checks
 //!
@@ -66,7 +83,9 @@ use std::time::Duration;
 use bstk_engine::{ConnId, EngineConfig, EngineInput, Nanos, StaticSysInfo};
 use bstk_proto::{Command, Response};
 use bstk_raft::forward::{ForwardError, ForwardHandler, ForwardTransport};
+use bstk_raft::listener::VoteGate;
 use bstk_raft::sim::{FaultAction, SimConfig, SimNetwork, SimRng};
+use bstk_raft::status::{self, Adopt, StatusSource};
 use bstk_raft::storage::{
     self, ClusterStateMachine, LogOptions, OpenError, ReplySink, SmOptions, StateHandle,
 };
@@ -74,7 +93,7 @@ use bstk_raft::{
     Applied, CONN_SEQ_BITS, ForwardRequest, ForwardResponse, NodeId, Op, Request, TypeConfig,
     conn_id, owner_of,
 };
-use openraft::storage::RaftStateMachine;
+use openraft::storage::{RaftLogStorage, RaftStateMachine};
 use openraft::{
     BasicNode, Entry, LogId, Raft, ServerState, Snapshot, SnapshotMeta, SnapshotPolicy,
     StorageError, StoredMembership,
@@ -89,8 +108,10 @@ use crate::workload::{ClientState, Known, WorkloadConfig};
 
 /// Engine time at the start of a run (any wall-like value).
 const ANCHOR: Nanos = 1_700_000_000_000_000_000;
-/// New connections of an incarnation start this far above the highest
-/// local number the state has seen for the node (as the server does).
+/// A wiped incarnation (no emulated `conn-ids` reservation) starts its
+/// connection numbers this far above the highest local number the state
+/// has seen for the node: a stand-in for the server's time floor
+/// (`unix_seconds << 16`), which needs wall-clock seconds.
 const GAP: u64 = 1 << 20;
 /// Resend everything unapplied if the front item waits this long.
 const STALL: Duration = Duration::from_secs(1);
@@ -110,11 +131,9 @@ pub struct RunConfig {
     pub fault_steps: usize,
     /// Largest absolute clock skew injected (ms).
     pub max_skew_ms: u64,
-    /// Include wiped-node rejoins in the schedule. Off by default: a node
-    /// rejoining with an empty directory under the same id is not safe in
-    /// Raft (it forgets its vote and the entries it acknowledged), and
-    /// openraft 0.9 panics on the leader when it happens (see the report
-    /// and `tests/findings.rs`).
+    /// Include wiped-node rejoins in the schedule (on unless
+    /// `BSTK_CHAOS_NO_WIPE` is set). A wiped node restarts in rejoin mode
+    /// (see the module docs).
     pub wipe: bool,
     pub work: WorkloadConfig,
 }
@@ -133,7 +152,7 @@ impl RunConfig {
             } else {
                 r.range(50, 400)
             },
-            wipe: std::env::var("BSTK_CHAOS_WIPE").is_ok(),
+            wipe: std::env::var("BSTK_CHAOS_NO_WIPE").is_err(),
             work: WorkloadConfig::default(),
         }
     }
@@ -404,6 +423,8 @@ struct NodeInc {
     queue_len: AtomicU64,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     run: Arc<RunShared>,
+    /// In rejoin mode: the closed vote gate, opened when it ends.
+    rejoin: Option<Arc<VoteGate>>,
 }
 
 impl NodeInc {
@@ -617,11 +638,22 @@ struct RunShared {
     delivered: Arc<Mutex<BTreeMap<ConnId, Vec<Response>>>>,
     dirs: BTreeMap<NodeId, PathBuf>,
     nodes: Mutex<BTreeMap<NodeId, Arc<NodeInc>>>,
+    /// Rejoining nodes still probing their peers before they start Raft:
+    /// start generation and task.
+    starting: Mutex<BTreeMap<NodeId, (u64, JoinHandle<()>)>>,
+    next_start: AtomicU64,
     problems: Mutex<Vec<String>>,
     events: Mutex<Vec<String>>,
     faults: Mutex<BTreeMap<String, u64>>,
     /// Every connection id handed out (ids must never be reused).
     used_conns: Mutex<BTreeSet<ConnId>>,
+    /// Nodes whose (emulated) rejoin marker is set: wiped, and not yet
+    /// done rejoining. Survives crashes; cleared when the rejoin ends.
+    rejoin_marker: Mutex<BTreeSet<NodeId>>,
+    /// Emulated durable connection-number reservation per node (the
+    /// server's `conn-ids` file): above every local number handed out.
+    /// Lost with a wipe.
+    conn_ids: Mutex<BTreeMap<NodeId, u64>>,
     /// History keys of client connections.
     next_key: AtomicU64,
 }
@@ -642,8 +674,11 @@ impl RunShared {
         lock(&self.nodes).get(&id).cloned()
     }
 
+    /// Nodes running, or still probing their peers before they start Raft.
     fn running(&self) -> Vec<NodeId> {
-        lock(&self.nodes).keys().copied().collect()
+        let mut ids: BTreeSet<NodeId> = lock(&self.nodes).keys().copied().collect();
+        ids.extend(lock(&self.starting).keys().copied());
+        ids.into_iter().collect()
     }
 
     fn leader(&self) -> Option<Arc<NodeInc>> {
@@ -661,6 +696,11 @@ impl RunShared {
 
     /// Crashes node `id`: drops every handle without `shutdown`.
     fn crash(&self, id: NodeId) {
+        if let Some((_, task)) = lock(&self.starting).remove(&id) {
+            task.abort();
+            self.net.unregister(id);
+            self.event(format!("crash node {id} (still probing)"));
+        }
         let Some(inc) = lock(&self.nodes).remove(&id) else {
             return;
         };
@@ -699,9 +739,10 @@ impl RunShared {
         ))
     }
 
-    /// Starts node `id` (fresh, restarted or wiped).
+    /// Starts node `id` (fresh, restarted or wiped). A node in rejoin mode
+    /// first probes its peers in a background task (see the module docs).
     async fn start(self: &Arc<Self>, id: NodeId, wipe: bool) -> Result<(), String> {
-        if lock(&self.nodes).contains_key(&id) {
+        if lock(&self.nodes).contains_key(&id) || lock(&self.starting).contains_key(&id) {
             return Ok(());
         }
         let clients: Arc<Mutex<HashMap<ConnId, ReplyTx>>> = Arc::default();
@@ -717,9 +758,82 @@ impl RunShared {
             drop(s);
             let dir = self.dirs.get(&id).ok_or("no data dir")?;
             wipe_dir(dir).map_err(|e| format!("wipe node {id}: {e}"))?;
+            lock(&self.conn_ids).remove(&id);
+            lock(&self.rejoin_marker).insert(id);
             self.event(format!("wiped node {id}"));
         }
+        let rejoin = lock(&self.rejoin_marker).contains(&id);
         let (log, sm) = self.open_storage(id, sink).await?;
+        self.net.set_status_source(id, Some(Arc::new(log.clone())));
+        let parts = Parts {
+            log,
+            sm,
+            clients,
+            applied_rx,
+        };
+        if !rejoin {
+            return self.launch(id, parts, None).await;
+        }
+        let generation = self.next_start.fetch_add(1, Ordering::Relaxed);
+        let mut starting = lock(&self.starting);
+        let run = self.clone();
+        let task = tokio::spawn(async move {
+            if let Err(e) = run.rejoin(id, generation, parts).await {
+                run.problem(e);
+            }
+        });
+        starting.insert(id, (generation, task));
+        drop(starting);
+        self.event(format!("node {id} probes its peers before rejoining"));
+        Ok(())
+    }
+
+    /// Rejoin: the probe-and-adopt step of the server, then `launch`.
+    async fn rejoin(
+        self: &Arc<Self>,
+        id: NodeId,
+        generation: u64,
+        mut parts: Parts,
+    ) -> Result<(), String> {
+        let peers: BTreeSet<NodeId> = self.ids.iter().copied().collect();
+        let node = self.net.node(id);
+        let local = parts.log.status().vote;
+        let vote = loop {
+            let answers = status::probe(&node, id, &peers).await;
+            match status::adopt_vote(self.ids.len(), &answers, local) {
+                Adopt::Vote(Some(v))
+                    if v.is_committed() && v.leader_id().voted_for() == Some(id) => {}
+                Adopt::Vote(v) => break v,
+                Adopt::TooFew | Adopt::Incomparable => {}
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        if let Some(v) = &vote {
+            parts
+                .log
+                .save_vote(v)
+                .await
+                .map_err(|e| format!("node {id}: save vote: {e}"))?;
+        }
+        self.event(format!("node {id} adopted vote {vote:?}"));
+        self.launch(id, parts, Some(generation)).await
+    }
+
+    /// Starts Raft on opened storage and registers the node. `rejoin`: the
+    /// generation of the rejoin start (from `starting`), `None` otherwise.
+    async fn launch(
+        self: &Arc<Self>,
+        id: NodeId,
+        parts: Parts,
+        rejoin_start: Option<u64>,
+    ) -> Result<(), String> {
+        let Parts {
+            log,
+            sm,
+            clients,
+            applied_rx,
+        } = parts;
+        let rejoin = rejoin_start.is_some();
         let handle = sm.handle();
         let rec = RecSm {
             inner: sm,
@@ -727,9 +841,29 @@ impl RunShared {
             node: id,
             ledger: self.ledger.clone(),
         };
-        let raft = Raft::new(id, self.raft_cfg.clone(), self.net.node(id), log, rec)
+        // Rejoin mode, as the server: no elections from the start, inbound
+        // votes refused.
+        let cfg = if rejoin {
+            let mut c = (*self.raft_cfg).clone();
+            c.enable_elect = false;
+            Arc::new(c)
+        } else {
+            self.raft_cfg.clone()
+        };
+        let raft = Raft::new(id, cfg, self.net.node(id), log, rec)
             .await
             .map_err(|e| format!("node {id}: raft: {e}"))?;
+        // A rejoin start registers while holding `starting`, so a crash
+        // either aborted it before this point or finds the node running.
+        let mut starting = lock(&self.starting);
+        if let Some(generation) = rejoin_start {
+            if starting.get(&id).map(|e| e.0) != Some(generation) {
+                return Ok(());
+            }
+            starting.remove(&id);
+        }
+        let gate = rejoin.then(|| Arc::new(VoteGate::new(false)));
+        self.net.set_vote_gate(id, gate.clone());
         let (owner_tx, owner_rx) = mpsc::unbounded_channel();
         let inc = Arc::new(NodeInc {
             id,
@@ -743,6 +877,7 @@ impl RunShared {
             queue_len: AtomicU64::new(0),
             tasks: Mutex::new(Vec::new()),
             run: self.clone(),
+            rejoin: gate,
         });
         self.net
             .register(id, raft, Some(Arc::new(Fwd(inc.clone()))));
@@ -750,9 +885,21 @@ impl RunShared {
         let startup = tokio::spawn(startup(inc.clone()));
         lock(&inc.tasks).extend([owner_task, startup]);
         lock(&self.nodes).insert(id, inc);
-        self.event(format!("start node {id}"));
+        drop(starting);
+        self.event(format!(
+            "start node {id}{}",
+            if rejoin { " in rejoin mode" } else { "" }
+        ));
         Ok(())
     }
+}
+
+/// A node's opened storage and client plumbing, before Raft starts.
+struct Parts {
+    log: storage::LogStore,
+    sm: ClusterStateMachine,
+    clients: Arc<Mutex<HashMap<ConnId, ReplyTx>>>,
+    applied_rx: mpsc::UnboundedReceiver<(ConnId, u64)>,
 }
 
 fn wipe_dir(dir: &Path) -> std::io::Result<()> {
@@ -805,7 +952,24 @@ async fn startup(inc: Arc<NodeInc>) {
                 })
                 .await;
                 if done.is_ok() && inc.state.last_applied().is_some_and(|l| l.index >= want) {
-                    let first = inc.state.highest_local(id) + GAP + 1;
+                    if let Some(gate) = &inc.rejoin {
+                        // An index learned from a leader after this
+                        // incarnation started is applied: leave rejoin mode.
+                        lock(&inc.run.rejoin_marker).remove(&id);
+                        inc.raft.runtime_config().elect(true);
+                        gate.open();
+                        inc.run
+                            .event(format!("node {id} left rejoin mode at index {want}"));
+                    }
+                    // As the server: above the durable reservation and
+                    // everything the state has seen for this node (a wiped
+                    // node: `GAP` instead of the time floor).
+                    let highest = inc.state.highest_local(id);
+                    let first = match lock(&inc.run.conn_ids).get(&id) {
+                        Some(&p) => p.max(highest + 1),
+                        None if highest > 0 => highest + GAP + 1,
+                        None => highest + 1,
+                    };
                     inc.next_local.store(first, Ordering::Release);
                     inc.accepting.store(true, Ordering::Release);
                     return;
@@ -831,6 +995,11 @@ impl SimConn {
         }
         let local = inc.next_local.fetch_add(1, Ordering::AcqRel);
         let conn = conn_id(inc.id, local);
+        {
+            let mut ids = lock(&inc.run.conn_ids);
+            let e = ids.entry(inc.id).or_insert(0);
+            *e = (*e).max(local + 1);
+        }
         if !lock(&inc.run.used_conns).insert(conn) {
             inc.run.problem(format!(
                 "connection id {conn} (node {}, local {local}) reused by a new incarnation of \
@@ -1045,6 +1214,19 @@ async fn apply_fault(run: &Arc<RunShared>, f: &Fault) {
             }
         }
         Fault::Wipe(id) => {
+            // Never more rejoining nodes than a majority can spare: the
+            // nodes with their data must still form a quorum.
+            let n = run.ids.len();
+            let spare = n - (n / 2 + 1);
+            let others = lock(&run.rejoin_marker)
+                .iter()
+                .filter(|&&x| x != *id)
+                .count();
+            if others + 1 > spare {
+                run.event(format!("wipe of node {id} skipped (others rejoining)"));
+                *lock(&run.faults).entry("WipeSkipped".into()).or_default() += 1;
+                return;
+            }
             run.crash(*id);
             if let Err(e) = run.start(*id, true).await {
                 run.problem(e);
@@ -1169,10 +1351,14 @@ pub async fn run(cfg: RunConfig) -> Outcome {
             .map(|&i| (i, tmp.path().join(format!("node{i}"))))
             .collect(),
         nodes: Mutex::new(BTreeMap::new()),
+        starting: Mutex::new(BTreeMap::new()),
+        next_start: AtomicU64::new(1),
         problems: Mutex::new(Vec::new()),
         events: Mutex::new(Vec::new()),
         faults: Mutex::new(BTreeMap::new()),
         used_conns: Mutex::new(BTreeSet::new()),
+        rejoin_marker: Mutex::new(BTreeSet::new()),
+        conn_ids: Mutex::new(BTreeMap::new()),
         next_key: AtomicU64::new(1),
     });
     let rec = Recorder::new();

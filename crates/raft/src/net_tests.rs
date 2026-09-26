@@ -1150,6 +1150,9 @@ async fn assert_rejected(server_tls: ClusterTls, client_tls: ClusterTls, why: &s
     }
     let e = net.forward(1, forward_from(2)).await.expect_err("rejected");
     assert!(matches!(e, ForwardError::Unreachable(_)), "{e:?}");
+    // Status probes need the same authentication.
+    let e = net.status(1).await.expect_err("rejected");
+    assert!(matches!(e, ForwardError::Unreachable(_)), "{e:?}");
     assert_eq!(node.handler.calls(), 0);
     assert_eq!(node.raft.metrics().borrow().vote, Vote::default());
     shutdown(vec![node]).await;
@@ -1632,4 +1635,93 @@ async fn snapshot_chunks_cannot_leave_gaps() {
         .expect("installed");
     assert_eq!(node.sm.applied(), vec![req(1), req(2), req(3)]);
     shutdown(vec![node]).await;
+}
+
+struct FixedStatus(crate::status::NodeStatus);
+
+impl crate::status::StatusSource for FixedStatus {
+    fn status(&self) -> crate::status::NodeStatus {
+        self.0
+    }
+}
+
+/// P3-FC: a listener started before Raft answers status probes from its
+/// status source, refuses everything else until the service is installed
+/// (votes through the gate first, so they are counted), and serves
+/// normally afterwards. Probes need an accepted hello like any request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_probes_are_answered_before_raft_runs() {
+    use crate::status::NodeStatus;
+    let tcp = bind().await;
+    let addr = tcp.local_addr().expect("addr").to_string();
+    let status = NodeStatus {
+        vote: Some(Vote::new_committed(4, 3)),
+        last_log_id: Some(LogId::new(CommittedLeaderId::new(4, 3), 17)),
+        committed: Some(LogId::new(CommittedLeaderId::new(4, 3), 15)),
+        has_state: true,
+    };
+    let gate = Arc::new(VoteGate::new(false));
+    let mut cfg = listener_config(1, &[1, 2, 3], None);
+    cfg.status = Some(Arc::new(FixedStatus(status)));
+    cfg.vote_gate = Some(gate.clone());
+    let (listener, slot) =
+        ClusterListener::spawn_deferred::<CountingHandler>(tcp, cfg).expect("listener");
+    let net = Network::new(net_config(2, [(1, addr.clone())].into(), None));
+
+    assert_eq!(net.status(1).await.expect("status"), status);
+    let e = net
+        .forward(1, forward_from(2))
+        .await
+        .expect_err("not started");
+    assert!(
+        matches!(&e, ForwardError::Rejected(m) if m.contains("not running")),
+        "{e:?}"
+    );
+    let mut c = client_to(&net, 1, &addr).await;
+    assert!(c.vote(vote_req(1, 2), option()).await.is_err());
+    assert_eq!(gate.refused(), 1);
+    gate.open();
+    assert!(c.vote(vote_req(1, 2), option()).await.is_err());
+    assert_eq!(gate.refused(), 1);
+    assert!(c.append_entries(heartbeat(), option()).await.is_err());
+
+    // An unknown node gets no answer.
+    let stranger = Network::new(net_config(9, [(1, addr.clone())].into(), None));
+    let e = stranger.status(1).await.expect_err("unknown peer");
+    assert!(matches!(e, ForwardError::Unreachable(_)), "{e:?}");
+
+    // Installing the service: forwards reach the handler; status probes
+    // are still answered from the source.
+    let raft_net = Network::new(net_config(1, [(1, addr.clone())].into(), None));
+    let raft = Raft::new(
+        1,
+        raft_config(),
+        raft_net,
+        MemLog::default(),
+        MemSm::default(),
+    )
+    .await
+    .expect("raft");
+    let handler = Arc::new(CountingHandler::default());
+    assert!(slot.set(raft.clone(), handler.clone()));
+    assert!(!slot.set(raft.clone(), handler.clone()));
+    assert_eq!(
+        net.forward(1, forward_from(2)).await.expect("forward"),
+        ForwardResponse::NotLeader { leader: Some(3) }
+    );
+    assert_eq!(handler.calls(), 1);
+    assert_eq!(net.status(1).await.expect("status"), status);
+    listener.shutdown().await;
+    let _ = raft.shutdown().await;
+
+    // Without a status source, probes are refused.
+    let (l, raft, addr) = lone_listener(|_| {}).await;
+    let net = Network::new(net_config(2, [(1, addr.to_string())].into(), None));
+    let e = net.status(1).await.expect_err("no source");
+    assert!(
+        matches!(&e, ForwardError::Rejected(m) if m.contains("not served")),
+        "{e:?}"
+    );
+    l.shutdown().await;
+    let _ = raft.shutdown().await;
 }

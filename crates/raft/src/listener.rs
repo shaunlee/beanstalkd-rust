@@ -30,6 +30,18 @@
 //!   closes that peer's older connection (the dialer keeps one connection
 //!   per target and only dials again once it gave the old one up).
 //!
+//! # Service
+//!
+//! Status probes ([`RpcRequest::Status`]) are answered from
+//! [`ListenerConfig::status`] (the log store) at any time. Everything else
+//! needs the node's Raft and forward handler: with [`ClusterListener::spawn`]
+//! they are there from the start; with [`ClusterListener::spawn_deferred`]
+//! they are installed later through the returned [`ServiceSlot`] (a node
+//! that probes its peers before it starts Raft must answer their probes
+//! meanwhile). Until then Raft RPCs, forwards and control requests are
+//! refused ([`NOT_STARTED`]); a Vote RPC is checked against the vote gate
+//! first, so it is counted as refused by a closed gate.
+//!
 //! Rejections (at accept, failed handshakes and hellos) are logged at most
 //! about once a second, with a count of the ones not logged. A rejected
 //! hello is answered with a generic reason ([`REJECT_HELLO`],
@@ -40,7 +52,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use openraft::Raft;
@@ -52,6 +64,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
 use crate::forward::{ForwardHandler, check_control, check_forward};
+use crate::status::StatusSource;
 use crate::wire::{
     self, ClientMsg, FrameError, PROTOCOL_VERSION, RpcRequest, RpcResponse, ServerHello, ServerMsg,
     WireError,
@@ -141,6 +154,9 @@ pub struct ListenerConfig {
     /// When present and closed, inbound Vote RPCs are refused (see
     /// [`VoteGate`]). `None` (the default) serves every vote.
     pub vote_gate: Option<Arc<VoteGate>>,
+    /// Answers status probes (the node's log store). `None` (the default):
+    /// probes are refused.
+    pub status: Option<Arc<dyn StatusSource>>,
 }
 
 impl ListenerConfig {
@@ -160,6 +176,7 @@ impl ListenerConfig {
             handshake_timeout: Duration::from_secs(2),
             max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
             vote_gate: None,
+            status: None,
         }
     }
 }
@@ -173,6 +190,34 @@ pub struct ClusterListener {
     task: Option<JoinHandle<()>>,
 }
 
+/// The Raft node and forward handler a listener serves requests with.
+struct Service<H> {
+    raft: Raft<TypeConfig>,
+    handler: Arc<H>,
+}
+
+/// Installs the service of a listener started with
+/// [`ClusterListener::spawn_deferred`].
+pub struct ServiceSlot<H> {
+    slot: Arc<OnceLock<Service<H>>>,
+}
+
+impl<H: ForwardHandler> ServiceSlot<H> {
+    /// From now on Raft RPCs go to `raft`, forwards and control requests to
+    /// `handler`. Only the first call has an effect (returns `false`
+    /// otherwise).
+    pub fn set(&self, raft: Raft<TypeConfig>, handler: Arc<H>) -> bool {
+        self.slot.set(Service { raft, handler }).is_ok()
+    }
+}
+
+/// The reason sent for a request that needs Raft before it runs.
+pub const NOT_STARTED: &str = "raft is not running on this node yet";
+
+/// The reason sent for a status probe to a listener without a status
+/// source.
+pub const NO_STATUS: &str = "status probes are not served by this node";
+
 impl ClusterListener {
     /// Serves `listener`: Raft RPCs go to `raft`, forwards to `handler`.
     pub fn spawn<H: ForwardHandler>(
@@ -181,12 +226,28 @@ impl ClusterListener {
         raft: Raft<TypeConfig>,
         handler: Arc<H>,
     ) -> io::Result<Self> {
+        let (l, slot) = Self::spawn_deferred(listener, cfg)?;
+        slot.set(raft, handler);
+        Ok(l)
+    }
+
+    /// Serves `listener` before Raft runs: status probes are answered at
+    /// once, everything else once the service is installed through the
+    /// returned slot (see the module docs).
+    pub fn spawn_deferred<H: ForwardHandler>(
+        listener: TcpListener,
+        cfg: ListenerConfig,
+    ) -> io::Result<(Self, ServiceSlot<H>)> {
         let local_addr = listener.local_addr()?;
-        let task = tokio::spawn(accept_loop(listener, cfg, raft, handler));
-        Ok(ClusterListener {
-            local_addr,
-            task: Some(task),
-        })
+        let slot = Arc::new(OnceLock::new());
+        let task = tokio::spawn(accept_loop(listener, cfg, slot.clone()));
+        Ok((
+            ClusterListener {
+                local_addr,
+                task: Some(task),
+            },
+            ServiceSlot { slot },
+        ))
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -334,8 +395,7 @@ impl Drop for HandshakeSlot {
 async fn accept_loop<H: ForwardHandler>(
     listener: TcpListener,
     cfg: ListenerConfig,
-    raft: Raft<TypeConfig>,
-    handler: Arc<H>,
+    service: Arc<OnceLock<Service<H>>>,
 ) {
     let shared = Arc::new(Shared {
         handshakes: Arc::new(Semaphore::new(cfg.max_handshakes)),
@@ -369,10 +429,9 @@ async fn accept_loop<H: ForwardHandler>(
             }
         };
         let shared = shared.clone();
-        let raft = raft.clone();
-        let handler = handler.clone();
+        let service = service.clone();
         conns.spawn(async move {
-            serve_tcp(tcp, addr, slot, &shared, &raft, &*handler).await;
+            serve_tcp(tcp, addr, slot, &shared, &service).await;
         });
     }
 }
@@ -384,8 +443,7 @@ async fn serve_tcp<H: ForwardHandler>(
     addr: SocketAddr,
     slot: HandshakeSlot,
     shared: &Shared,
-    raft: &Raft<TypeConfig>,
-    handler: &H,
+    service: &OnceLock<Service<H>>,
 ) {
     let cfg = &shared.cfg;
     let _ = tcp.set_nodelay(true);
@@ -399,7 +457,7 @@ async fn serve_tcp<H: ForwardHandler>(
             match tokio::time::timeout(cfg.handshake_timeout, handshake).await {
                 Ok(Ok((io, peer))) => {
                     drop(slot);
-                    serve_peer(io, peer, shared, raft, handler).await
+                    serve_peer(io, peer, shared, service).await
                 }
                 Ok(Err(e)) => Err(Phase::Handshake(e)),
                 Err(_) => Err(Phase::Handshake("handshake timed out".into())),
@@ -422,7 +480,7 @@ async fn serve_tcp<H: ForwardHandler>(
             match tokio::time::timeout(cfg.handshake_timeout, handshake).await {
                 Ok(Ok((io, peer))) => {
                     drop(slot);
-                    serve_peer(io, peer, shared, raft, handler).await
+                    serve_peer(io, peer, shared, service).await
                 }
                 Ok(Err(e)) => Err(Phase::Handshake(e)),
                 Err(_) => Err(Phase::Handshake("handshake timed out".into())),
@@ -447,8 +505,7 @@ async fn serve_peer<S, H>(
     io: S,
     peer: NodeId,
     shared: &Shared,
-    raft: &Raft<TypeConfig>,
-    handler: &H,
+    service: &OnceLock<Service<H>>,
 ) -> Result<(), Phase>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -456,7 +513,7 @@ where
 {
     let (generation, close) = shared.register(peer);
     let r = tokio::select! {
-        r = serve(io, peer, &shared.cfg, raft, handler) => r,
+        r = serve(io, peer, &shared.cfg, service) => r,
         () = close.notified() => Err("replaced by a newer connection of the same peer".into()),
     };
     shared.unregister(peer, generation);
@@ -534,8 +591,7 @@ async fn serve<S, H>(
     mut io: S,
     peer: NodeId,
     cfg: &ListenerConfig,
-    raft: &Raft<TypeConfig>,
-    handler: &H,
+    service: &OnceLock<Service<H>>,
 ) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -548,7 +604,15 @@ where
             Ok(None) => return Ok(()),
             Err(e) => return Err(e.to_string()),
         };
-        let resp = dispatch(peer, body, raft, handler, cfg.vote_gate.as_deref()).await;
+        let svc = service.get().map(|s| (&s.raft, &*s.handler));
+        let resp = dispatch(
+            peer,
+            body,
+            svc,
+            cfg.vote_gate.as_deref(),
+            cfg.status.as_deref(),
+        )
+        .await;
         let frame = match wire::encode(&ServerMsg::Response { id, body: resp }, cfg.max_frame) {
             Ok(f) => f,
             Err(FrameError::TooLarge { len, max }) => {
@@ -562,39 +626,56 @@ where
     }
 }
 
-/// Serves one request (shared with the simulated network).
+/// Serves one request (shared with the simulated network). `service` is
+/// `None` until Raft runs.
 pub(crate) async fn dispatch<H: ForwardHandler>(
     peer: NodeId,
     body: RpcRequest,
-    raft: &Raft<TypeConfig>,
-    handler: &H,
+    service: Option<(&Raft<TypeConfig>, &H)>,
     vote_gate: Option<&VoteGate>,
+    status: Option<&dyn StatusSource>,
 ) -> RpcResponse {
+    let not_started = || WireError::Rejected(NOT_STARTED.into());
     match body {
-        RpcRequest::AppendEntries(r) => RpcResponse::AppendEntries(
-            raft.append_entries(r)
+        RpcRequest::Status => match status {
+            Some(s) => RpcResponse::status(s.status()),
+            // (A status answer cannot carry an error; any other kind is a
+            // failed probe for the dialer.)
+            None => RpcResponse::Control(Err(WireError::Rejected(NO_STATUS.into()))),
+        },
+        RpcRequest::AppendEntries(r) => RpcResponse::AppendEntries(match service {
+            Some((raft, _)) => raft
+                .append_entries(r)
                 .await
                 .map_err(|e| WireError::from_raft(&e)),
-        ),
+            None => Err(not_started()),
+        }),
         RpcRequest::Vote(r) => {
             if vote_gate.is_some_and(|g| !g.admit()) {
                 tracing::debug!(from = peer, "vote refused: the vote gate is closed");
                 return RpcResponse::Vote(Err(WireError::Rejected(VOTE_GATE_CLOSED.into())));
             }
-            RpcResponse::Vote(raft.vote(r).await.map_err(|e| WireError::from_raft(&e)))
+            RpcResponse::Vote(match service {
+                Some((raft, _)) => raft.vote(r).await.map_err(|e| WireError::from_raft(&e)),
+                None => Err(not_started()),
+            })
         }
-        RpcRequest::InstallSnapshot(r) => RpcResponse::InstallSnapshot(
-            raft.install_snapshot(r)
+        RpcRequest::InstallSnapshot(r) => RpcResponse::InstallSnapshot(match service {
+            Some((raft, _)) => raft
+                .install_snapshot(r)
                 .await
                 .map_err(|e| WireError::from_snapshot(&e)),
-        ),
-        RpcRequest::Forward(r) => RpcResponse::Forward(match check_forward(peer, &r) {
-            Ok(()) => Ok(handler.forward(r).await),
-            Err(reason) => Err(WireError::Rejected(reason)),
+            None => Err(not_started()),
         }),
-        RpcRequest::Control(r) => RpcResponse::Control(match check_control(peer, &r) {
-            Ok(()) => Ok(handler.control(r).await),
-            Err(reason) => Err(WireError::Rejected(reason)),
+        RpcRequest::Forward(r) => RpcResponse::Forward(match (check_forward(peer, &r), service) {
+            (Err(reason), _) => Err(WireError::Rejected(reason)),
+            (Ok(()), Some((_, handler))) => Ok(handler.forward(r).await),
+            (Ok(()), None) => Err(not_started()),
+        }),
+        RpcRequest::Control(r) => RpcResponse::Control(match (check_control(peer, &r), service) {
+            (Err(reason), _) => Err(WireError::Rejected(reason)),
+            (Ok(()), Some((_, handler))) => Ok(handler.control(r).await),
+            (Ok(()), None) => Err(not_started()),
         }),
     }
 }

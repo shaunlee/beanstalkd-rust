@@ -3,7 +3,8 @@
 //! - `cargo test -p bstk-chaos --test inprocess`: a few seeds (fast);
 //! - full run: `BSTK_CHAOS_SEEDS=1000 cargo test --release -p bstk-chaos
 //!   --test inprocess full -- --ignored --nocapture` (optionally
-//!   `BSTK_CHAOS_FIRST`, `BSTK_CHAOS_JOBS`);
+//!   `BSTK_CHAOS_FIRST`, `BSTK_CHAOS_JOBS`, `BSTK_CHAOS_NO_WIPE=1` to leave
+//!   wipes out);
 //! - replay one seed: `BSTK_CHAOS_SEED=<seed> cargo test -p bstk-chaos
 //!   --test inprocess replay -- --ignored --nocapture`.
 

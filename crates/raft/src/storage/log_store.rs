@@ -756,6 +756,22 @@ impl Inner {
     }
 }
 
+impl crate::status::StatusSource for LogStore {
+    /// Answered from memory (the vote, log bounds and commit hint mirror
+    /// what is on disk).
+    fn status(&self) -> crate::status::NodeStatus {
+        // A poisoned lock still holds the last state (never report "no
+        // state" for a node that has some).
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        crate::status::NodeStatus {
+            vote: g.vote,
+            last_log_id: g.last_entry.or(g.purged),
+            committed: g.committed,
+            has_state: g.vote.is_some() || g.last_entry.is_some() || g.purged.is_some(),
+        }
+    }
+}
+
 impl RaftLogReader<TypeConfig> for LogStore {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,

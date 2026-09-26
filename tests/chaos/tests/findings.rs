@@ -1,18 +1,19 @@
 //! Minimal reproductions of the problems the chaos runs found, on the
-//! real storage over the simulated network (`SimCluster`). Those that
-//! still fail are ignored; run them with
-//! `cargo test -p bstk-chaos --test findings -- --ignored --nocapture`.
+//! real storage over the simulated network (`SimCluster`), kept as
+//! regression tests now that they are fixed.
 
 #![allow(clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bstk_engine::{ConnId, EngineConfig, EngineInput, StaticSysInfo};
 use bstk_proto::Response;
+use bstk_raft::listener::VoteGate;
 use bstk_raft::sim::{SimCluster, SimConfig, SimNetwork};
+use bstk_raft::status::{self, Adopt};
 use bstk_raft::storage::{
     self, ClusterStateMachine, LogOptions, LogStore, ReplySink, SmOptions, StateHandle,
 };
@@ -63,6 +64,9 @@ async fn start3() -> Fixture {
     let mut opened = BTreeMap::new();
     for (&id, d) in &dirs {
         let (log, sm) = open(d, id);
+        // Status probes are answered from the log store (until the node is
+        // stopped: `unregister` drops it, releasing the directory lock).
+        net.set_status_source(id, Some(Arc::new(log.clone())));
         handles.insert(id, sm.handle());
         opened.insert(id, (log, sm));
     }
@@ -144,15 +148,18 @@ async fn wiped_follower_rejoining_panics_the_leader() {
     );
 }
 
-/// Finding 2: a committed entry is lost when a node that acknowledged it
-/// rejoins with an empty data directory and then votes. The entry (a
-/// `Connect` of connection X) is committed on the leader and one follower
-/// while the third node is partitioned away; that follower is wiped and
-/// restarted, the leader dies, the partition heals, and the two remaining
-/// nodes elect the node that never had the entry.
+/// Finding 2 (fixed by rejoin mode): a committed entry was lost when a
+/// node that acknowledged it rejoined with an empty data directory and
+/// then voted. The entry (a `Connect` of connection X) is committed on the
+/// leader and one follower (the "acker") while the third node is
+/// partitioned away; the acker is wiped and restarted, the leader dies and
+/// the partition heals. Without rejoin mode the two remaining nodes elected
+/// the node that never had the entry. With it (as the server does: elections
+/// off and the vote gate closed until the node has applied an index learned
+/// from a leader), no leader can be elected until the old leader is back,
+/// and the entry survives on every node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "finding: fails until the lead decides on a fix"]
-async fn wiped_voter_loses_a_committed_entry() {
+async fn wiped_voter_in_rejoin_mode_keeps_committed_entries() {
     let mut f = start3().await;
     let all = [1, 2, 3];
     for _ in 0..5 {
@@ -178,24 +185,212 @@ async fn wiped_voter_loses_a_committed_entry() {
     .await;
     eprintln!("connect of {x} committed at index {idx} on nodes {leader} and {acker}");
 
+    // The acker loses its data and restarts in rejoin mode.
     f.cluster.stop_node(acker).await;
     wipe(&f.dirs[&acker]);
+    let gate = Arc::new(VoteGate::new(false));
+    f.net.set_vote_gate(acker, Some(gate.clone()));
     let (log, sm) = open(&f.dirs[&acker], acker);
     f.handles.insert(acker, sm.handle());
     f.cluster.start_node(acker, log, sm).await.unwrap();
+    f.cluster.raft(acker).unwrap().runtime_config().elect(false);
     f.cluster.stop_node(leader).await;
     f.net.heal();
 
+    // Without the old leader, nobody may lead: the node lacking the entry
+    // gets no vote from the rejoining acker, which does not stand itself.
     let rest = [behind, acker];
-    let idx = write(&f.cluster, &rest, Op::Tick).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        for id in rest {
+            let m = f.cluster.raft(id).unwrap().metrics().borrow().clone();
+            assert!(
+                !m.state.is_leader(),
+                "node {id} became leader while node {acker} was rejoining (term {})",
+                m.current_term
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The old leader comes back; a leader is elected among the nodes with
+    // data, and the acker catches up through an index learned from it.
+    let (log, sm) = open(&f.dirs[&leader], leader);
+    f.handles.insert(leader, sm.handle());
+    f.cluster.start_node(leader, log, sm).await.unwrap();
+    let idx = write(&f.cluster, &all, Op::Tick).await;
     f.cluster
-        .wait_applied(&rest, idx, Duration::from_secs(10))
+        .wait_applied(&all, idx, Duration::from_secs(20))
         .await
         .unwrap();
-    for id in rest {
+    for id in all {
         assert!(
             f.handles[&id].conn_ids().contains(&x),
             "node {id} lost the committed Connect of {x}"
+        );
+    }
+
+    // Leave rejoin mode; the cluster keeps working.
+    gate.open();
+    f.cluster.raft(acker).unwrap().runtime_config().elect(true);
+    let idx = write(&f.cluster, &all, Op::Tick).await;
+    f.cluster
+        .wait_applied(&all, idx, Duration::from_secs(20))
+        .await
+        .unwrap();
+}
+
+/// The server's safe rejoin, on the simulated network: ask the other nodes
+/// for their status until a majority of the cluster among them answered,
+/// persist the highest vote with the log store's `save_vote`, then start
+/// Raft in rejoin mode (elections off, vote gate closed).
+async fn rejoin(
+    f: &mut Fixture,
+    id: NodeId,
+    all: &[NodeId],
+) -> (Arc<VoteGate>, Option<openraft::Vote<NodeId>>) {
+    use openraft::storage::RaftLogStorage;
+    let (mut log, sm) = open(&f.dirs[&id], id);
+    f.net.set_status_source(id, Some(Arc::new(log.clone())));
+    let peers: BTreeSet<NodeId> = all.iter().copied().collect();
+    let node = f.net.node(id);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let vote = loop {
+        let answers = status::probe(&node, id, &peers).await;
+        if let Adopt::Vote(v) = status::adopt_vote(all.len(), &answers, None) {
+            break v;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no quorum of status answers"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    if let Some(v) = &vote {
+        log.save_vote(v).await.unwrap();
+    }
+    let gate = Arc::new(VoteGate::new(false));
+    f.net.set_vote_gate(id, Some(gate.clone()));
+    f.handles.insert(id, sm.handle());
+    f.cluster.start_node(id, log.clone(), sm).await.unwrap();
+    f.net.set_status_source(id, Some(Arc::new(log)));
+    f.cluster.raft(id).unwrap().runtime_config().elect(false);
+    (gate, vote)
+}
+
+/// Finding 6 (fixed by safe rejoin): rejoin mode kept a wiped node from
+/// voting, but not from acknowledging entries. A leader of an old term
+/// that never learned of the newer term (here the first leader, cut off
+/// while the others elected a new leader and committed X) could still
+/// replicate to the rejoining node, which had forgotten every term, and
+/// commit with it as a majority: entries committed in the newer term were
+/// overwritten. Now the rejoining node adopts the highest vote of a
+/// majority of the other nodes before it starts Raft, so it rejects the
+/// old leader (whose vote is lower), and the old leader steps down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_leader_commits_through_a_rejoining_node() {
+    let mut f = start3().await;
+    let all = [1, 2, 3];
+    for _ in 0..5 {
+        write(&f.cluster, &all, Op::Tick).await;
+    }
+    let old = f
+        .cluster
+        .wait_for_leader(&all, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let old_term = f.cluster.raft(old).unwrap().metrics().borrow().current_term;
+    let rest: Vec<NodeId> = all.into_iter().filter(|&i| i != old).collect();
+    f.net.isolate(old, &all);
+    let x = conn_id(1, 777);
+    let idx = write(
+        &f.cluster,
+        &rest,
+        Op::Conn {
+            seq: 1,
+            input: EngineInput::Connect(x),
+        },
+    )
+    .await;
+    let new = f
+        .cluster
+        .wait_for_leader(&rest, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let acker = rest.iter().copied().find(|&i| i != new).unwrap();
+    f.cluster
+        .wait_applied(&[acker], idx, Duration::from_secs(5))
+        .await
+        .unwrap();
+    eprintln!("X committed at {idx} by leader {new} with {acker}; old leader {old} cut off");
+    let m = f.cluster.raft(old).unwrap().metrics().borrow().clone();
+    assert!(
+        m.state.is_leader() && m.current_term == old_term,
+        "the old leader must still believe it leads: {:?} term {}",
+        m.state,
+        m.current_term
+    );
+
+    // The acker is wiped and rejoins: it can reach the old leader and the
+    // new one (the old leader still cannot reach the new one), adopts the
+    // highest vote, starts in rejoin mode; then the new leader is cut off.
+    f.cluster.stop_node(acker).await;
+    wipe(&f.dirs[&acker]);
+    f.net.unblock(old, acker);
+    f.net.unblock(acker, old);
+    let (_gate, vote) = rejoin(&mut f, acker, &all).await;
+    eprintln!("node {acker} adopted {vote:?}");
+    let adopted = vote.unwrap();
+    assert!(adopted.leader_id().term > old_term, "{adopted}");
+    f.net.isolate(new, &all);
+
+    let r = tokio::time::timeout(
+        Duration::from_secs(3),
+        f.cluster.raft(old).unwrap().client_write(Request {
+            now: 1,
+            op: Op::Tick,
+        }),
+    )
+    .await;
+    if let Ok(Ok(resp)) = &r {
+        f.cluster
+            .wait_applied(&[acker], resp.log_id.index, Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+    assert!(
+        !matches!(r, Ok(Ok(_))) || f.handles[&acker].conn_ids().contains(&x),
+        "old leader {old} committed {r:?} through rejoining node {acker}, which lacks X \
+         (committed in the newer term by {new})"
+    );
+    // The acker told the old leader about the newer vote: it no longer
+    // leads in its old term.
+    let stepped_down = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let m = f.cluster.raft(old).unwrap().metrics().borrow().clone();
+            if !(m.state.is_leader() && m.current_term == old_term) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        stepped_down.is_ok(),
+        "old leader {old} still leads in term {old_term}"
+    );
+
+    // Everyone reconnects: the cluster converges with X everywhere.
+    f.net.heal();
+    let idx = write(&f.cluster, &all, Op::Tick).await;
+    f.cluster
+        .wait_applied(&all, idx, Duration::from_secs(20))
+        .await
+        .unwrap();
+    for id in all {
+        assert!(
+            f.handles[&id].conn_ids().contains(&x),
+            "node {id} lacks the committed Connect of {x}"
         );
     }
 }

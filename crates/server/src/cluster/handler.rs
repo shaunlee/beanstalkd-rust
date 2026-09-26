@@ -8,14 +8,10 @@
 //!   behind them). Elsewhere the answer is `NotLeader` with the leader this
 //!   node knows of.
 //! - A forward without items is a *ping* (an owner checking that the
-//!   leader hears it, see [`super::actor`]) or a *probe* (a node started
-//!   with `--cluster-init` asking whether this node already belongs to a
-//!   running cluster, see [`super::start`]). The answer is `Accepted` on
-//!   the leader; elsewhere `NotLeader { leader: Some(l) }` if this node
-//!   belongs to a running cluster (`l` is the leader it knows, or its own
-//!   id when it knows none), and `NotLeader { leader: None }` if it has no
-//!   cluster state beyond the bootstrap membership. (An owner ignores a
-//!   `NotLeader` hint that names the node it asked.)
+//!   leader hears it, see [`super::actor`]): `Accepted` on the leader,
+//!   elsewhere `NotLeader` with the leader this node knows. (Nodes deciding
+//!   how to start ask with status probes instead, which the listener
+//!   answers from the log store.)
 //! - A control request (`SetDraining`, or `DropNode` of the sender, checked
 //!   by the listener): on the leader it is proposed and the answer waits,
 //!   at most one second, for it to be applied, so that the requester knows
@@ -48,17 +44,6 @@ impl Handler {
 impl ForwardHandler for Handler {
     async fn forward(&self, req: ForwardRequest) -> ForwardResponse {
         self.core.heard_from(req.from);
-        if req.items.is_empty() {
-            return if self.core.is_leader() {
-                ForwardResponse::Accepted
-            } else if self.core.established().await {
-                ForwardResponse::NotLeader {
-                    leader: Some(self.core.leader().unwrap_or(self.core.id)),
-                }
-            } else {
-                ForwardResponse::NotLeader { leader: None }
-            };
-        }
         if !self.core.is_leader() {
             return ForwardResponse::NotLeader {
                 leader: self.not_leader(),

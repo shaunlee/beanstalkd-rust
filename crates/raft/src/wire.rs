@@ -21,7 +21,9 @@
 //! AppendEntries entries ([`MAX_APPEND_ENTRIES`]), forward items
 //! ([`MAX_FORWARD_ITEMS`]), and the node sets of memberships
 //! ([`MAX_MEMBERS`], [`MAX_JOINT_CONFIGS`]). A request beyond a limit is a
-//! decode error, which closes the connection.
+//! decode error, which closes the connection. A status probe and its
+//! answer ([`RpcRequest::Status`], [`RpcResponse::Status`]) have a fixed
+//! size (no collections), so they need no bound of their own.
 
 use std::fmt;
 use std::io;
@@ -31,12 +33,13 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::{ErrorSubject, ErrorVerb, StorageError, StorageIOError};
+use openraft::{ErrorSubject, ErrorVerb, LogId, StorageError, StorageIOError, Vote};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::forward::{ControlRequest, ControlResponse};
+use crate::status::NodeStatus;
 use crate::{ForwardRequest, ForwardResponse, NodeId, TypeConfig};
 
 /// Version of this wire protocol, carried in the hellos.
@@ -44,7 +47,9 @@ use crate::{ForwardRequest, ForwardResponse, NodeId, TypeConfig};
 /// - 1: P3-T3 (Raft RPCs and input forwarding).
 /// - 2: P3-T4: the hellos carry `max_job_size` (peers with a different
 ///   `-z` are rejected), and control requests ([`RpcRequest::Control`]).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// - 3: P3-FC: status probes ([`RpcRequest::Status`]), answered from the
+///   log store even before Raft runs (safe rejoin, `--cluster-init`).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Bytes of the length prefix.
 pub const HEADER_LEN: usize = 4;
@@ -124,6 +129,9 @@ pub enum RpcRequest {
     Forward(#[serde(deserialize_with = "bounded::forward")] ForwardRequest),
     /// A cluster-wide operation requested by a non-leader (version 2).
     Control(ControlRequest),
+    /// The peer's durable Raft state (version 3), answered from its log
+    /// store whether or not its Raft is running (see [`crate::status`]).
+    Status,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,6 +141,44 @@ pub enum RpcResponse {
     InstallSnapshot(Result<InstallSnapshotResponse<NodeId>, WireError>),
     Forward(Result<ForwardResponse, WireError>),
     Control(Result<ControlResponse, WireError>),
+    /// The answer to [`RpcRequest::Status`] (see
+    /// [`crate::status::NodeStatus`] for the fields).
+    Status {
+        vote: Option<Vote<NodeId>>,
+        last_log_id: Option<LogId<NodeId>>,
+        committed: Option<LogId<NodeId>>,
+        has_state: bool,
+    },
+}
+
+impl RpcResponse {
+    /// The status answer for `s`.
+    pub fn status(s: NodeStatus) -> RpcResponse {
+        RpcResponse::Status {
+            vote: s.vote,
+            last_log_id: s.last_log_id,
+            committed: s.committed,
+            has_state: s.has_state,
+        }
+    }
+
+    /// The status carried by a [`RpcResponse::Status`].
+    pub fn into_status(self) -> Option<NodeStatus> {
+        match self {
+            RpcResponse::Status {
+                vote,
+                last_log_id,
+                committed,
+                has_state,
+            } => Some(NodeStatus {
+                vote,
+                last_log_id,
+                committed,
+                has_state,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// A remote failure, transported as a value.
@@ -608,7 +654,7 @@ mod tests {
     use super::*;
     use crate::{Op, Request};
     use bstk_engine::EngineInput;
-    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, SnapshotMeta, Vote};
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, SnapshotMeta};
 
     fn sample_append() -> ClientMsg {
         let leader = CommittedLeaderId::new(3, 1);
@@ -684,6 +730,10 @@ mod tests {
                     op: Op::SetDraining(true),
                 }),
             },
+            ClientMsg::Request {
+                id: 13,
+                body: RpcRequest::Status,
+            },
         ];
         let mut stream = Vec::new();
         for m in &msgs {
@@ -751,6 +801,19 @@ mod tests {
                 id: 7,
                 body: RpcResponse::Control(Err(WireError::Rejected("no".into()))),
             },
+            ServerMsg::Response {
+                id: 8,
+                body: RpcResponse::status(NodeStatus {
+                    vote: Some(Vote::new_committed(7, 2)),
+                    last_log_id: Some(LogId::new(CommittedLeaderId::new(7, 2), 40)),
+                    committed: Some(LogId::new(CommittedLeaderId::new(6, 1), 30)),
+                    has_state: true,
+                }),
+            },
+            ServerMsg::Response {
+                id: 9,
+                body: RpcResponse::status(NodeStatus::default()),
+            },
         ];
         for m in &responses {
             let frame = encode(m, DEFAULT_MAX_FRAME).expect("encode");
@@ -760,6 +823,28 @@ mod tests {
             assert_eq!(format!("{got:?}"), format!("{m:?}"));
             assert_eq!(used, frame.len());
         }
+        // The status fields survive the round trip.
+        let s = NodeStatus {
+            vote: Some(Vote::new(3, 1)),
+            last_log_id: None,
+            committed: None,
+            has_state: true,
+        };
+        let frame = encode(
+            &ServerMsg::Response {
+                id: 1,
+                body: RpcResponse::status(s),
+            },
+            DEFAULT_MAX_FRAME,
+        )
+        .expect("encode");
+        let (got, _): (ServerMsg, usize) = decode(&frame, DEFAULT_MAX_FRAME)
+            .expect("decode")
+            .expect("complete");
+        let ServerMsg::Response { body, .. } = got else {
+            panic!("response expected")
+        };
+        assert_eq!(body.into_status(), Some(s));
     }
 
     #[test]

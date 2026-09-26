@@ -27,6 +27,12 @@
 //! ([`SimNetwork::fault_log`]). [`FaultSchedule::generate`] derives a timed
 //! sequence of partitions, pauses and heals from a seed.
 //!
+//! Status probes ([`SimNode`]'s [`StatusTransport`]) are answered by the
+//! node's status source ([`SimNetwork::set_status_source`]), which may be
+//! set before the node's Raft is registered (a node probing its peers
+//! before it starts Raft); links, pauses and faults apply as to any
+//! request.
+//!
 //! [`SimCluster`] starts N nodes over one `SimNetwork`, generic over the
 //! storage via a builder closure.
 
@@ -50,6 +56,7 @@ use openraft::{BasicNode, Raft};
 use tokio::sync::Notify;
 
 use crate::forward::{ForwardError, ForwardHandler, ForwardTransport};
+use crate::status::{NodeStatus, StatusSource, StatusTransport};
 use crate::wire::{RpcRequest, RpcResponse, WireError};
 use crate::{ForwardRequest, ForwardResponse, NodeId, TypeConfig};
 
@@ -200,6 +207,8 @@ struct SimInner {
     endpoints: RwLock<HashMap<NodeId, Endpoint>>,
     /// Vote gates by node (kept across re-registration and restarts).
     vote_gates: RwLock<HashMap<NodeId, Arc<crate::listener::VoteGate>>>,
+    /// Status sources by node (removed by `unregister`).
+    status: RwLock<HashMap<NodeId, Arc<dyn StatusSource>>>,
     /// Woken whenever a node is resumed.
     resumed: Notify,
 }
@@ -257,6 +266,7 @@ impl SimNetwork {
                 }),
                 endpoints: RwLock::new(HashMap::new()),
                 vote_gates: RwLock::new(HashMap::new()),
+                status: RwLock::new(HashMap::new()),
                 resumed: Notify::new(),
             }),
         }
@@ -320,13 +330,34 @@ impl SimNetwork {
             .cloned()
     }
 
-    /// Makes node `id` unreachable (for example before restarting it).
+    /// Makes node `id` unreachable (for example before restarting it),
+    /// status probes included.
     pub fn unregister(&self, id: NodeId) {
         self.inner
             .endpoints
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
+        self.set_status_source(id, None);
+    }
+
+    /// Makes node `id` answer status probes from `source` (`None`: not at
+    /// all), independently of whether its Raft is registered.
+    pub fn set_status_source(&self, id: NodeId, source: Option<Arc<dyn StatusSource>>) {
+        let mut st = self.inner.status.write().unwrap_or_else(|e| e.into_inner());
+        match source {
+            Some(s) => st.insert(id, s),
+            None => st.remove(&id),
+        };
+    }
+
+    fn status_source(&self, id: NodeId) -> Option<Arc<dyn StatusSource>> {
+        self.inner
+            .status
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
     }
 
     fn endpoint(&self, id: NodeId) -> Option<Endpoint> {
@@ -505,6 +536,17 @@ impl SimNetwork {
             if d.drop_request {
                 std::future::pending::<()>().await;
             }
+            if matches!(body, RpcRequest::Status) {
+                let Some(src) = self.status_source(to) else {
+                    return Err(SimError::Unreachable(format!("node {to} is not running")));
+                };
+                let resp = RpcResponse::status(src.status());
+                if d.drop_response || self.is_blocked(to, from) {
+                    std::future::pending::<()>().await;
+                }
+                self.wait_unpaused(from, to).await;
+                return Ok(resp);
+            }
             let Some(ep) = self.endpoint(to) else {
                 return Err(SimError::Unreachable(format!("node {to} is not running")));
             };
@@ -517,16 +559,21 @@ impl SimNetwork {
                     let _ = crate::listener::dispatch(
                         from,
                         body2,
-                        &ep2.raft,
-                        &*ep2.handler,
+                        Some((&ep2.raft, &*ep2.handler)),
                         gate2.as_deref(),
+                        None,
                     )
                     .await;
                 });
             }
-            let resp =
-                crate::listener::dispatch(from, body, &ep.raft, &*ep.handler, gate.as_deref())
-                    .await;
+            let resp = crate::listener::dispatch(
+                from,
+                body,
+                Some((&ep.raft, &*ep.handler)),
+                gate.as_deref(),
+                None,
+            )
+            .await;
             if d.drop_response || self.is_blocked(to, from) {
                 std::future::pending::<()>().await;
             }
@@ -580,6 +627,19 @@ impl ForwardTransport for SimNode {
             Ok(RpcResponse::Forward(Ok(r))) => Ok(r),
             Ok(RpcResponse::Forward(Err(e))) => Err(ForwardError::Rejected(e.to_string())),
             Ok(_) => Err(ForwardError::Network("unexpected response kind".into())),
+            Err(SimError::Unreachable(m)) => Err(ForwardError::Unreachable(m)),
+            Err(SimError::Timeout(_)) => Err(ForwardError::Timeout),
+        }
+    }
+}
+
+impl StatusTransport for SimNode {
+    async fn status(&self, target: NodeId) -> Result<NodeStatus, ForwardError> {
+        let t = self.net.inner.cfg.forward_timeout;
+        match self.net.call(self.id, target, RpcRequest::Status, t).await {
+            Ok(r) => r
+                .into_status()
+                .ok_or_else(|| ForwardError::Network("unexpected response kind".into())),
             Err(SimError::Unreachable(m)) => Err(ForwardError::Unreachable(m)),
             Err(SimError::Timeout(_)) => Err(ForwardError::Timeout),
         }

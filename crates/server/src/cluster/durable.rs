@@ -94,6 +94,56 @@ pub fn read_conn_ids(data_dir: &Path) -> Result<Option<u64>, String> {
     }
 }
 
+/// Bits of a local connection number below the seconds of the time floor
+/// ([`first_local`]).
+pub const TIME_FLOOR_SHIFT: u32 = 16;
+
+/// Without a persisted block (a wiped or new node), the time floor is taken
+/// at least this long after the process started ([`first_local`]).
+pub const FLOOR_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Seconds since the Unix epoch (0 if the clock is before it).
+pub fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The first local connection number of a new process:
+/// `max(persisted block end, highest number the replicated state has seen
+/// for this node + 1, time floor)` with `time floor = unix_seconds << 16`.
+///
+/// The persisted block end ([`CONN_IDS_FILE`]) covers every number an
+/// earlier process may have handed out, but a wiped data directory loses
+/// it, and the replicated state only knows the numbers whose `Connect` was
+/// committed. The time floor covers the rest: a process that took its
+/// floor at `t0` starts at or above `⌊t0⌋ << 16`, so by time `t` it has
+/// handed out numbers below `t << 16` as long as the node consumes fewer
+/// than 65,536 numbers per second on average (connections, plus one
+/// 65,536 block per restart with the file present). A process from a wiped
+/// directory takes its floor at `t1` at least [`FLOOR_DELAY`] after it
+/// started, hence after the lost process died (at `tc`): `⌊t1⌋ > t1 - 1 >=
+/// tc`, so it starts above all of them. Assumptions (docs/DESIGN.md §8):
+/// that rate, and a wall clock that is not set back across the restart.
+/// The floor must fit in the 48 bits of a local number (until 2106);
+/// otherwise this is an error.
+pub fn first_local(persisted: Option<u64>, highest: u64, unix_secs: u64) -> Result<u64, String> {
+    let floor = unix_secs
+        .checked_shl(TIME_FLOOR_SHIFT)
+        .filter(|f| f >> TIME_FLOOR_SHIFT == unix_secs && *f < 1 << CONN_SEQ_BITS)
+        .ok_or_else(|| {
+            format!("the clock ({unix_secs} s since the epoch) does not fit the connection-number time floor")
+        })?;
+    let first = persisted
+        .unwrap_or(0)
+        .max(highest.saturating_add(1))
+        .max(floor);
+    if first >= 1 << CONN_SEQ_BITS {
+        return Err("connection numbers of this node are exhausted".into());
+    }
+    Ok(first)
+}
+
 struct Block {
     /// Next local number to hand out.
     next: u64,
@@ -197,6 +247,45 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, [CONN_IDS_FILE]);
+    }
+
+    /// P3-FC: a wiped node loses its persisted block; the time floor still
+    /// starts it above every number its lost process could have handed out.
+    #[test]
+    fn wiped_node_starts_above_the_lost_process() {
+        let t0: u64 = 1_790_000_000;
+        // First process: empty directory, nothing in the state.
+        let dir = tempfile::tempdir().unwrap();
+        let first = first_local(None, 0, t0).unwrap();
+        assert_eq!(first, t0 << 16);
+        let a = ConnIdBlocks::open(dir.path(), 2, first, CONN_ID_BLOCK).unwrap();
+        // 10 s at 5,000 connections per second, most of whose `Connect`s
+        // never reached the log (the state saw only the first 1,000).
+        let mut handed = 0;
+        for _ in 0..50_000 {
+            handed = local_of(a.next().unwrap());
+        }
+        let highest_seen = first + 999;
+        drop(a);
+        // Wiped: the file is gone; the restart 10 s later starts above
+        // everything the lost process handed out.
+        let wiped = tempfile::tempdir().unwrap();
+        let persisted = read_conn_ids(wiped.path()).unwrap();
+        assert_eq!(persisted, None);
+        let again = first_local(persisted, highest_seen, t0 + 10).unwrap();
+        assert!(again > handed, "{again} <= {handed}");
+        let b = ConnIdBlocks::open(wiped.path(), 2, again, CONN_ID_BLOCK).unwrap();
+        assert!(local_of(b.next().unwrap()) > handed);
+
+        // An ordinary restart keeps the persisted end when it is higher.
+        let p = read_conn_ids(dir.path()).unwrap().unwrap();
+        assert_eq!(first_local(Some(p), highest_seen, t0 + 1).unwrap(), p);
+        // And the state's highest number when that is.
+        assert_eq!(first_local(Some(5), 1 << 47, 1).unwrap(), (1 << 47) + 1);
+        // The floor must fit 48 bits.
+        assert!(first_local(None, 0, 1 << 32).is_err());
+        assert!(first_local(None, 0, u64::MAX).is_err());
+        assert!(first_local(None, 0, (1 << 32) - 1).is_ok());
     }
 
     #[test]

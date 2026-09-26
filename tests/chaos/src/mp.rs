@@ -10,10 +10,13 @@
 //!
 //! Faults: kill -9 (a node, the leader, all), SIGSTOP / SIGCONT (a node or
 //! the leader), proxy partitions (isolate a node, cut a pair, one-way cut,
-//! stall either direction of a link), added latency, and optionally wiping
-//! a node's data directory before a restart (off by default: see
-//! `tests/findings.rs`). Clock skew is not injected: the server anchors its
-//! engine clock to `SystemTime` at start with no way to offset it.
+//! stall either direction of a link), added latency, and wiping a node's
+//! data directory before a restart (off with `BSTK_CHAOS_NO_WIPE`). Every
+//! initial node starts with `--cluster-init`; a wiped node restarts without
+//! it and rejoins in the server's rejoin mode. A wipe is skipped when it
+//! would leave fewer nodes with their data than a quorum. Clock skew is not
+//! injected: the server anchors its engine clock to `SystemTime` at start
+//! with no way to offset it.
 //!
 //! After the schedule: heal every link, SIGCONT and restart every node,
 //! wait until all are ready, let the workload finish, wait for every TTR
@@ -93,7 +96,7 @@ impl MpConfig {
             duration,
             node_timeout: "1s",
             snapshot_every: 150,
-            wipe: std::env::var("BSTK_CHAOS_WIPE").is_ok(),
+            wipe: std::env::var("BSTK_CHAOS_NO_WIPE").is_err(),
             work: WorkloadConfig {
                 max_puts: 150,
                 ..WorkloadConfig::default()
@@ -160,7 +163,7 @@ pub fn generate(seed: u64, nodes: u64, duration: Duration, wipe: bool) -> Vec<(D
                 MpFault::Stall(a, a % nodes + 1, up, !up || r.range(0, 1) == 0)
             }
             15 => MpFault::Latency(r.range(1, 40)),
-            16 if wipe => MpFault::Wipe(pick(&mut r)),
+            16 | 20 if wipe => MpFault::Wipe(pick(&mut r)),
             16..=19 => MpFault::Heal(r.range(0, 1) == 0),
             _ => MpFault::Cont(pick(&mut r)),
         };
@@ -662,6 +665,20 @@ async fn apply(c: &mut Cluster, f: &MpFault, sh: &Shared) {
             }
         }
         MpFault::Wipe(id) => {
+            // Never more rejoining nodes than a majority can spare: the
+            // nodes with their data must still form a quorum.
+            let n = c.nodes.len();
+            let spare = n - (n / 2 + 1);
+            let others = c
+                .nodes
+                .iter()
+                .filter(|m| m.id != *id && rejoin_pending(&m.data_dir))
+                .count();
+            if others + 1 > spare {
+                sh.event(format!("wipe of node {id} skipped (others rejoining)"));
+                sh.count("WipeSkipped");
+                return;
+            }
             kill(c, *id, sh);
             restart(c, &bin, *id, true, sh);
         }
@@ -747,6 +764,13 @@ fn isolate(c: &mut Cluster, id: u64, sh: &Shared) {
         p.sever();
     }
     sh.event(format!("isolate node {id}"));
+}
+
+/// Whether a node has not finished rejoining: its data directory was
+/// wiped (the restarted server has not recreated its log yet) or holds the
+/// server's rejoin marker.
+fn rejoin_pending(data_dir: &Path) -> bool {
+    !data_dir.join("log").exists() || data_dir.join("rejoin").exists()
 }
 
 fn restart(c: &mut Cluster, bin: &Path, id: u64, wipe: bool, sh: &Shared) {

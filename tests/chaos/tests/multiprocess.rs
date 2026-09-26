@@ -5,7 +5,7 @@
 //! - full run: `BSTK_CHAOS_MP_RUNS=100 cargo test -p bstk-chaos --test
 //!   multiprocess full -- --ignored --nocapture` (optionally
 //!   `BSTK_CHAOS_MP_FIRST`, `BSTK_CHAOS_MP_JOBS`, `BSTK_CHAOS_DIR` to keep
-//!   the logs of failed runs there, `BSTK_CHAOS_WIPE=1` to add wipes);
+//!   the logs of failed runs there, `BSTK_CHAOS_NO_WIPE=1` to leave wipes out);
 //! - replay: `BSTK_CHAOS_MP_SEED=<seed> cargo test -p bstk-chaos --test
 //!   multiprocess replay -- --ignored --nocapture`.
 
