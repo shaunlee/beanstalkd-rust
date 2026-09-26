@@ -2,7 +2,7 @@
 
 A Rust reimplementation of [beanstalkd](https://github.com/beanstalkd/beanstalkd), the simple work queue, that is byte-for-byte compatible with the original protocol so existing clients work unmodified.
 
-Status: **P2 complete**: a server compatible with the reference, with an optional write-ahead log (`-b`), TLS / mTLS, optional token authentication and Prometheus metrics. Raft replication (P3) is planned; see `docs/PLAN.md`.
+Status: **P3 complete**: a server compatible with the reference, with an optional write-ahead log (`-b`), TLS / mTLS, optional token authentication, Prometheus metrics, and an optional Raft cluster mode (3 or 5 nodes) that keeps serving through the loss of a minority of nodes. Performance work (P4) is next; see `docs/PLAN.md`.
 
 ## Build and run
 

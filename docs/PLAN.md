@@ -200,7 +200,7 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 |---|---|---|
 | P1 | Write-ahead log; see §4 | see §4.5 |
 | P2 | Operability; see §5 | see §5.5 |
-| P3 | Raft replication; see §6 | see §6.6 |
+| P3 | Raft replication; see §6 (done) | see §6.6 |
 | P4 | Profiling and optimization (incl. compaction write amplification: about one extra record per operation under churn with small `-s`) | throughput ≥ 1× reference; multi-core scaling curve |
 
 ## 4. P1: Write-Ahead Log (detailed plan)
@@ -385,13 +385,13 @@ Only one agent at a time edits the server's wiring (T4); T1–T3 work in separat
 
 ### 6.6 Acceptance
 
-- [ ] Standalone mode unchanged: all 7 differential suites pass, plaintext throughput within ±5% of P2
-- [ ] The whole differential corpus passes against a 3-node cluster, through the leader and through a follower
-- [ ] Real clients (Python, Go) pass the smoke tests against a cluster, including a leader kill mid-run
-- [ ] Chaos: ≥ 1,000 seeded in-process fault schedules and ≥ 100 multi-process fault runs with zero checker violations
-- [ ] Failover: after a leader kill, a new leader serves within 2 s; connections and reservations on surviving nodes are kept; connections on the lost node are closed
-- [ ] A wiped node rejoins from a snapshot and converges; a full-cluster kill -9 and restart loses no committed change
-- [ ] Engine determinism and state export/import proptests pass; openraft storage conformance suite passes
-- [ ] Cluster throughput and latency recorded in `docs/BENCH.md`; target ≥ 50k ops/s for put-reserve-delete with 100 connections on a 3-node cluster on one machine
-- [ ] Security review of the cluster port resolved or documented
-- [ ] `docs/DESIGN.md`, `docs/COMPAT.md`, README updated
+- [x] Standalone mode unchanged: all 7 differential suites pass, plaintext throughput within ±5% of P2
+- [x] The whole differential corpus passes against a 3-node cluster, through the leader and through a follower
+- [x] Real clients (Python, Go) pass the smoke tests against a cluster, including a leader kill mid-run
+- [x] Chaos: ≥ 1,000 seeded in-process fault schedules and ≥ 100 multi-process fault runs with zero checker violations (final run with data wipes on: 2,000 in-process seeds, 500 of them 5-node, and 100 multi-process runs, 0 failures; six bugs found and fixed on the way, see the P3 commits and DESIGN §8)
+- [x] Failover: after a leader kill, a new leader serves within 2 s (1.3–1.5 s measured); connections and reservations on surviving nodes are kept; connections on the lost node are closed
+- [x] A wiped node rejoins from a snapshot and converges; a full-cluster kill -9 and restart loses no committed change
+- [x] Engine determinism and state export/import proptests pass; openraft storage conformance suite passes
+- [x] Cluster throughput and latency recorded in `docs/BENCH.md`; target ≥ 50k ops/s for put-reserve-delete with 100 connections on a 3-node cluster on one machine (135k via the leader, 108k via a follower)
+- [x] Security review of the cluster port resolved or documented
+- [x] `docs/DESIGN.md`, `docs/COMPAT.md`, README updated
