@@ -20,7 +20,8 @@
 //!
 //! # Owner emulation (test code, deliberately minimal)
 //!
-//! Per node incarnation: connection ids above `highest_local + GAP`, one
+//! Per node incarnation: connection ids above the durable reservation,
+//! `highest_local` and a time floor (as the server), one
 //! ordered queue of `(conn, seq, input)` (`Connect` at seq 1, a put as
 //! `PutStarted` then `Command::Put`, `Disconnect` on close); the leader
 //! proposes queued items with `client_write_ff`, a follower forwards them
@@ -112,7 +113,11 @@ const ANCHOR: Nanos = 1_700_000_000_000_000_000;
 /// connection numbers this far above the highest local number the state
 /// has seen for the node: a stand-in for the server's time floor
 /// (`unix_seconds << 16`), which needs wall-clock seconds.
-const GAP: u64 = 1 << 20;
+/// The simulated wall clock's value when a run starts (seconds since the
+/// Unix epoch).
+const SIM_EPOCH_SECS: u64 = 1_800_000_000;
+/// As the server's `durable::FLOOR_DELAY`.
+const FLOOR_DELAY: Duration = Duration::from_secs(1);
 /// Resend everything unapplied if the front item waits this long.
 const STALL: Duration = Duration::from_secs(1);
 
@@ -689,6 +694,12 @@ impl RunShared {
         lock(&self.problems).push(p);
     }
 
+    /// `unix_seconds << 16` on the simulated clock (virtual time since the
+    /// run started, on top of a fixed epoch), as the server's time floor.
+    fn time_floor(&self) -> u64 {
+        (SIM_EPOCH_SECS + self.t0.elapsed().as_secs()) << 16
+    }
+
     fn event(&self, e: String) {
         let t = self.elapsed();
         lock(&self.events).push(format!("{t:?} {e}"));
@@ -918,6 +929,7 @@ fn wipe_dir(dir: &Path) -> std::io::Result<()> {
 /// connections, then accept clients.
 async fn startup(inc: Arc<NodeInc>) {
     let id = inc.id;
+    let started = Instant::now();
     loop {
         // Caught up: a leader is known and everything known committed is
         // applied.
@@ -961,15 +973,20 @@ async fn startup(inc: Arc<NodeInc>) {
                         inc.run
                             .event(format!("node {id} left rejoin mode at index {want}"));
                     }
-                    // As the server: above the durable reservation and
-                    // everything the state has seen for this node (a wiped
-                    // node: `GAP` instead of the time floor).
+                    // As the server (`durable::first_local`): above the
+                    // durable reservation, everything the state has seen
+                    // for this node, and the time floor, which a node
+                    // without a reservation (a wiped one) takes at least
+                    // `FLOOR_DELAY` after it started.
                     let highest = inc.state.highest_local(id);
-                    let first = match lock(&inc.run.conn_ids).get(&id) {
-                        Some(&p) => p.max(highest + 1),
-                        None if highest > 0 => highest + GAP + 1,
-                        None => highest + 1,
-                    };
+                    let persisted = lock(&inc.run.conn_ids).get(&id).copied();
+                    if persisted.is_none() {
+                        tokio::time::sleep_until(started + FLOOR_DELAY).await;
+                    }
+                    let first = persisted
+                        .unwrap_or(0)
+                        .max(highest + 1)
+                        .max(inc.run.time_floor());
                     inc.next_local.store(first, Ordering::Release);
                     inc.accepting.store(true, Ordering::Release);
                     return;
