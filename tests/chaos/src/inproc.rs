@@ -24,9 +24,10 @@
 //! `highest_local` and a time floor (as the server), one
 //! ordered queue of `(conn, seq, input)` (`Connect` at seq 1, a put as
 //! `PutStarted` then `Command::Put`, `Disconnect` on close); the leader
-//! proposes queued items with `client_write_ff`, a follower forwards them
-//! in batches to the leader over the simulated network (one batch in
-//! flight); an item leaves the queue when the state machine reports it
+//! proposes all its unsent queued items, and every forward it receives,
+//! as `Op::Batch` entries (`bstk_raft::split_batches`) with
+//! `client_write_ff`, a follower forwards them in batches to the leader
+//! over the simulated network (one batch in flight); an item leaves the queue when the state machine reports it
 //! applied; everything unapplied is resent after a leader or term change,
 //! a failed forward, or a stall. The leader stamps `now = max(clock, last
 //! applied now, last stamped)` and proposes `Tick` at `next_deadline()`.
@@ -462,8 +463,13 @@ impl ForwardHandler for Fwd {
             let leader = inc.raft.metrics().borrow().current_leader;
             return ForwardResponse::NotLeader { leader };
         }
-        for (_, seq, input) in req.items {
-            if !inc.propose(Op::Conn { seq, input }).await {
+        let items = req
+            .items
+            .into_iter()
+            .map(|(_, seq, input)| (seq, input))
+            .collect();
+        for batch in bstk_raft::split_batches(items) {
+            if !inc.propose(Op::Batch(batch)).await {
                 return ForwardResponse::NotLeader { leader: None };
             }
         }
@@ -593,15 +599,16 @@ async fn owner(
             front_since = Instant::now();
         }
         if inc.is_leader() {
-            while let Some(item) = queue.get(cursor) {
-                let op = Op::Conn {
-                    seq: item.seq,
-                    input: item.input.clone(),
-                };
-                if !inc.propose(op).await {
+            let items: Vec<(u64, EngineInput)> = queue
+                .iter()
+                .skip(cursor)
+                .map(|i| (i.seq, i.input.clone()))
+                .collect();
+            cursor = queue.len();
+            for batch in bstk_raft::split_batches(items) {
+                if !inc.propose(Op::Batch(batch)).await {
                     return;
                 }
-                cursor += 1;
             }
             continue;
         }

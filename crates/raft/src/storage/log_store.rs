@@ -28,10 +28,21 @@
 //!
 //! # Operations
 //!
-//! - `append`: one positioned write per segment touched, then one
-//!   `fdatasync` (outside the lock), then the callback. Indexes must continue the log;
+//! - `append`: one positioned write per segment touched (under the lock),
+//!   then the callback is handed to the flusher (group commit, see
+//!   `flusher`), which `fdatasync`s every segment written since its last
+//!   sync in one call per file and then invokes all the callbacks it
+//!   covered, in order; `append` itself never syncs the current segment.
+//!   A segment that is rolled over is synced inline before the next one is
+//!   created (once per `segment_size`), so only the last segment can have
+//!   an unsynced, possibly torn, tail. Indexes must continue the log;
 //!   entries at or below the purge marker are skipped (a snapshot already
-//!   covers them).
+//!   covers them). Entries are readable as soon as `append` returns,
+//!   before they are durable (openraft reads its own log).
+//! - `truncate`, `purge` and `save_vote` first wait for the flusher to
+//!   finish every queued sync (a barrier), so no acknowledgement is
+//!   pending for data they cut off, and nothing they remove is synced
+//!   later; then they run synchronously and are durable when they return.
 //! - `truncate(i)`: remove later segments (newest first), then cut the
 //!   segment holding `i` at its record; sync.
 //! - `purge(id)`: persist the purge marker first, then delete the segments
@@ -57,6 +68,7 @@ use openraft::{
 };
 
 use super::OpenError;
+use super::flusher::Flusher;
 use super::fsutil::{self, REC_HEADER_LEN};
 use crate::{NodeId, TypeConfig};
 
@@ -109,7 +121,7 @@ type SResult<T> = Result<T, StorageError<NodeId>>;
 struct Segment {
     first: u64,
     path: PathBuf,
-    /// Shared so that `append` can sync it after releasing the lock.
+    /// Shared so that the flusher can sync it without the lock.
     file: Arc<File>,
     /// Offset of each record; record `k` holds index `first + k`.
     offsets: Vec<u64>,
@@ -149,6 +161,7 @@ struct Inner {
 #[derive(Debug, Clone)]
 pub struct LogStore {
     inner: Arc<Mutex<Inner>>,
+    flusher: Flusher,
 }
 
 fn seg_name(first: u64) -> String {
@@ -408,6 +421,7 @@ impl LogStore {
                 committed,
                 committed_file,
             })),
+            flusher: Flusher::default(),
         })
     }
 
@@ -418,6 +432,12 @@ impl LogStore {
                 &io::Error::other("log store mutex poisoned"),
             )
         })
+    }
+
+    /// The flush queue (tests).
+    #[cfg(test)]
+    pub(crate) fn flusher(&self) -> &Flusher {
+        &self.flusher
     }
 
     /// Current log figures (for `/metrics`).
@@ -571,8 +591,8 @@ impl Inner {
     }
 
     /// Write `entries`; returns the segment file that still needs an
-    /// `fdatasync` (done by the caller after releasing the lock). Segments
-    /// that are rolled over are synced here.
+    /// `fdatasync` (by the flusher). Segments that are rolled over are
+    /// synced here.
     fn append(&mut self, entries: Vec<Ent>) -> io::Result<Option<Arc<File>>> {
         let mut buf = Vec::new();
         let mut offs = Vec::new();
@@ -609,8 +629,12 @@ impl Inner {
             };
             if need_new {
                 self.flush(&mut buf, &mut offs)?;
-                if let Some(si) = unsynced.take() {
-                    fsutil::sync_data(&self.segs[si].file)?;
+                // Only the last segment may have an unsynced tail: sync
+                // the current one before starting the next, whether this
+                // call or an earlier append (whose sync may still be
+                // queued at the flusher) wrote to it.
+                if let Some(s) = self.segs.last() {
+                    fsutil::sync_data(&s.file)?;
                 }
                 if let Some(s) = self.segs.last()
                     && s.next() != idx
@@ -813,6 +837,7 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> SResult<()> {
+        self.flusher.barrier().await;
         let mut g = self.lock()?;
         g.save_vote(vote)
             .map_err(|e| sto_err(ErrorSubject::Vote, ErrorVerb::Write, &e))
@@ -838,9 +863,11 @@ impl RaftLogStorage<TypeConfig> for LogStore {
         I::IntoIter: OptionalSend,
     {
         let entries: Vec<Ent> = entries.into_iter().collect();
-        // Readers (replication) are not blocked by the sync: the lock is
-        // released first. openraft serializes writes, so nothing can
-        // truncate the file in between.
+        if let Some(e) = self.flusher.failed() {
+            let err = logs_err(ErrorVerb::Write, &e);
+            callback.log_io_completed(Err(e));
+            return Err(err);
+        }
         let res = match self.lock() {
             Ok(mut g) => g.append(entries),
             Err(e) => {
@@ -848,10 +875,10 @@ impl RaftLogStorage<TypeConfig> for LogStore {
                 return Err(e);
             }
         };
-        let res = res.and_then(|f| f.map_or(Ok(()), |f| fsutil::sync_data(&f)));
         match res {
-            Ok(()) => {
-                callback.log_io_completed(Ok(()));
+            Ok(file) => {
+                // Group commit: the flusher syncs and then calls back.
+                self.flusher.submit(file, callback);
                 Ok(())
             }
             Err(e) => {
@@ -863,12 +890,14 @@ impl RaftLogStorage<TypeConfig> for LogStore {
     }
 
     async fn truncate(&mut self, log_id: Sid) -> SResult<()> {
+        self.flusher.barrier().await;
         let mut g = self.lock()?;
         g.truncate(log_id.index)
             .map_err(|e| logs_err(ErrorVerb::Delete, &e))
     }
 
     async fn purge(&mut self, log_id: Sid) -> SResult<()> {
+        self.flusher.barrier().await;
         let mut g = self.lock()?;
         g.purge(log_id).map_err(|e| logs_err(ErrorVerb::Delete, &e))
     }

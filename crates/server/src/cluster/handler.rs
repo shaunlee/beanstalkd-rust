@@ -2,8 +2,10 @@
 //! (`bstk_raft::forward::ForwardHandler`).
 //!
 //! - A forward (another node's connection inputs, in order): on the leader,
-//!   each item is proposed with `client_write_ff`, in order, and the
-//!   answer is `Accepted` without waiting for the commit (requests of one
+//!   the items are handed, in order, to the proposer ([`super::proposer`]),
+//!   which proposes them with the leader's other queued inputs in
+//!   `Op::Batch` entries, and the answer is `Accepted` without waiting for
+//!   the proposal or its commit (requests of one
 //!   peer connection are served one at a time, and Raft RPCs on it wait
 //!   behind them). Elsewhere the answer is `NotLeader` with the leader this
 //!   node knows of.
@@ -23,7 +25,7 @@
 use std::sync::Arc;
 
 use bstk_raft::forward::{ControlRequest, ControlResponse, ForwardHandler};
-use bstk_raft::{ForwardRequest, ForwardResponse, Op};
+use bstk_raft::{ForwardRequest, ForwardResponse};
 
 use super::{ControlOutcome, Core};
 
@@ -49,10 +51,13 @@ impl ForwardHandler for Handler {
                 leader: self.not_leader(),
             };
         }
-        for (_conn, seq, input) in req.items {
-            if self.core.propose(Op::Conn { seq, input }).await.is_err() {
-                return ForwardResponse::NotLeader { leader: None };
-            }
+        let items = req
+            .items
+            .into_iter()
+            .map(|(_conn, seq, input)| (seq, input))
+            .collect();
+        if self.core.submit(items).is_err() {
+            return ForwardResponse::NotLeader { leader: None };
         }
         ForwardResponse::Accepted
     }

@@ -14,6 +14,9 @@
 //!   any other input only if `seq` is the connection's next one. Anything
 //!   else is ignored (`Applied { duplicate: true }`). `Disconnect` forgets
 //!   the connection.
+//! - `Op::Batch(items)`: each `(seq, input)` item in order, exactly as an
+//!   `Op::Conn { seq, input }` at the entry's `now`; the entry counts as
+//!   ignored only if every item was.
 //! - `Op::Tick`, `Op::SetDraining` map to the engine inputs;
 //!   `Op::DropNode { node, up_to_local }` disconnects every connection
 //!   owned by `node` with a local number `<= up_to_local`, in
@@ -351,6 +354,61 @@ impl Core {
         }
     }
 
+    /// Apply one connection input (`Op::Conn`, or an item of `Op::Batch`)
+    /// at `now`; returns whether it was applied (not a duplicate).
+    fn apply_conn(
+        &mut self,
+        node: NodeId,
+        now: Nanos,
+        seq: u64,
+        input: EngineInput,
+        out: &mut Outbox,
+        events: &mut Vec<Event>,
+    ) -> bool {
+        let Some(conn) = input.conn() else {
+            tracing::warn!("ignoring a connection entry without a connection: {input:?}");
+            return false;
+        };
+        let owner = owner_of(conn);
+        let ok = match input {
+            EngineInput::Connect(_) => {
+                seq == 1
+                    && !self.meta.next_seq.contains_key(&conn)
+                    && self
+                        .meta
+                        .highest_local
+                        .get(&owner)
+                        .is_none_or(|&h| local_of(conn) > h)
+            }
+            _ => self.meta.next_seq.get(&conn) == Some(&seq),
+        };
+        if !ok {
+            return false;
+        }
+        let disconnect = matches!(input, EngineInput::Disconnect(_));
+        match input {
+            EngineInput::Connect(_) => {
+                self.meta.highest_local.insert(owner, local_of(conn));
+                self.meta.next_seq.insert(conn, 2);
+            }
+            EngineInput::Disconnect(_) => {
+                self.meta.next_seq.remove(&conn);
+            }
+            _ => {
+                self.meta.next_seq.insert(conn, seq + 1);
+            }
+        }
+        if owner == node {
+            events.push(Event::Applied(conn, seq));
+        }
+        self.engine.apply_input(now, input, out);
+        self.route(node, out, events);
+        if disconnect && owner == node {
+            events.push(Event::Closed(conn));
+        }
+        true
+    }
+
     /// Apply one normal entry; returns whether it was ignored.
     fn apply_request(&mut self, sh: &Shared, req: Request, events: &mut Vec<Event>) -> bool {
         let now = req.now.max(self.meta.last_now);
@@ -363,47 +421,14 @@ impl Core {
         let mut out = Outbox::new();
         match req.op {
             Op::Conn { seq, input } => {
-                let Some(conn) = input.conn() else {
-                    tracing::warn!("ignoring a connection entry without a connection: {input:?}");
-                    return true;
-                };
-                let owner = owner_of(conn);
-                let ok = match input {
-                    EngineInput::Connect(_) => {
-                        seq == 1
-                            && !self.meta.next_seq.contains_key(&conn)
-                            && self
-                                .meta
-                                .highest_local
-                                .get(&owner)
-                                .is_none_or(|&h| local_of(conn) > h)
-                    }
-                    _ => self.meta.next_seq.get(&conn) == Some(&seq),
-                };
-                if !ok {
-                    return true;
+                return !self.apply_conn(node, now, seq, input, &mut out, events);
+            }
+            Op::Batch(items) => {
+                let mut any = false;
+                for (seq, input) in items {
+                    any |= self.apply_conn(node, now, seq, input, &mut out, events);
                 }
-                let disconnect = matches!(input, EngineInput::Disconnect(_));
-                match input {
-                    EngineInput::Connect(_) => {
-                        self.meta.highest_local.insert(owner, local_of(conn));
-                        self.meta.next_seq.insert(conn, 2);
-                    }
-                    EngineInput::Disconnect(_) => {
-                        self.meta.next_seq.remove(&conn);
-                    }
-                    _ => {
-                        self.meta.next_seq.insert(conn, seq + 1);
-                    }
-                }
-                if owner == node {
-                    events.push(Event::Applied(conn, seq));
-                }
-                self.engine.apply_input(now, input, &mut out);
-                self.route(node, &mut out, events);
-                if disconnect && owner == node {
-                    events.push(Event::Closed(conn));
-                }
+                return !any;
             }
             Op::Tick => {
                 self.engine.apply_input(now, EngineInput::Tick, &mut out);

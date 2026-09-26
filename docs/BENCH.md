@@ -2,10 +2,239 @@
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`). The newest numbers
-are from task P2-T5 (TLS / mTLS, and the plaintext regression check),
-first below. P1-T5 (write-ahead log, `-b`) follows, then the T6b section
-(engine performance fix); the T6 first pass, whose profile motivated T6b,
-is kept at the end.
+are from task P3-FD (Raft cluster mode after batched proposals and
+group commit, and the standalone regression check), first below. P2-T5
+(TLS / mTLS) follows, then P1-T5 (write-ahead log, `-b`), then the T6b section (engine performance fix); the T6 first
+pass, whose profile motivated T6b, is kept at the end.
+
+## P3: cluster mode
+
+### Summary (P3-FD)
+
+- **Target met: 135k ops/s, ≥ 50k.** put-reserve-delete with 100
+  connections via the leader of a 3-node cluster on one machine runs at
+  135,256 ops/s (median of 5; 16-byte bodies; 2.7x the target, 4.8x
+  P3-T7b's 28.4k), 115,007 ops/s with 4 KiB bodies (was 20.4k). Through a
+  follower: 108,313 and 94,904 ops/s (were 21.1k and 18.0k). That is
+  0.47x to 0.66x of standalone in the same session (200k to 206k ops/s).
+  With 10 connections: 34.8k / 22.4k via the leader and 28.8k / 18.1k via
+  a follower (were 22.2k / 10.8k and 18.2k / 11.2k).
+- **What changed (P3-FD):** (1) the leader proposes connection inputs in
+  `Op::Batch` entries: its own and forwarded inputs go through one
+  proposer that turns everything queued into one entry (at most 1,024
+  items and 1 MiB), with one batch outstanding at a time, so one log
+  write, one `fdatasync` and one replication round cover many inputs;
+  (2) the log store's `fdatasync` moved to a flush worker with group
+  commit (the Raft core no longer blocks a runtime thread on the disk,
+  but openraft 0.9 still awaits every append's flush, see "Anomalies");
+  (3) timing defaults `heartbeat` 100 ms and `election_timeout` 500 to
+  700 ms (were 50 ms and 150 to 300 ms).
+- **No elections, no resends.** In all 135 cluster runs (matrix and
+  1-connection) `term_changes`, `leader_changes`, `resent_inputs`,
+  `forward_rewinds`, `drop_node_proposals`, `refused_connections` and
+  `rejected_puts` were 0 and no node reported `isolated`; before, 16 of
+  80 4-KiB runs had an election.
+- **Latency:** put p50 / p99 at 100x16 via the leader 734 / 982 µs (was
+  3,579 / 4,579 µs); with one connection 148 µs via the leader and
+  170 µs via a follower (were 252 and 308 µs), against 17 µs standalone.
+- **Standalone mode is unchanged**: 0.99x to 1.01x against the P3-T7b
+  binary (commit `5534189`) in all eight cells, 3 alternating runs each.
+- mTLS on the cluster port and 5 nodes were not re-measured (their
+  P3-T7b numbers are kept below).
+
+### Before P3-FD (P3-T7b)
+
+The first measurement (same matrix, commit `5534189`) gave 28.4k ops/s at
+100x16 via the leader (20.4k with 4 KiB bodies, 21.1k and 18.0k via a
+follower), with elections in 16 of 80 4-KiB runs. A `sample` of the
+leader showed its Raft core task busy 80% of the wall time, 77% of that
+inside `LogStore::append` (`fdatasync` 50%, `pwrite` 24%): openraft 0.9
+runs its engine commands after every API message
+(`RaftCore::process_raft_msg`, `raft_core.rs:990-1013`), so every
+`client_write_ff` was appended and synced on its own (about 26 µs per
+entry, a ceiling of about 38k entries/s), and every put was two entries.
+`fdatasync` stalls of 50 to 800 ms on this machine's APFS volume
+(reproduced without beanstalkd-rs) blocked the Raft core, and with it the
+heartbeats, past the 150 to 300 ms election timeout. The P3-T7b raw CSVs
+are kept (see "Commands").
+
+### Environment (P3-FD)
+
+| | |
+|---|---|
+| Machine | Apple M6, 12 cores, 32 GB RAM; APFS on the internal SSD (cluster data directories under `/private/tmp`) |
+| OS | macOS 27.0 (Darwin 27.0.0, arm64) |
+| Rust | rustc 1.98.1; release build (opt-level 3, `debug = 1`) |
+| beanstalkd-rs | commit `5534189` plus the P3-FD changes (uncommitted at measurement time); openraft 0.9.25 |
+| Cluster | 3 nodes, one process each, on one machine, loopback only; every node started with `--cluster-init`; generated `--config` per node: a plaintext client `[[listener]]`, `[http]` (for `/readyz` and `/admin`), `[cluster]` with defaults (P3-FD: `heartbeat` 100 ms, `election_timeout` 500 to 700 ms, `node_timeout` 5 s, `snapshot_every` 100,000) and `insecure_plaintext = true`, or `[cluster.tls]` with per-node certificates for the mTLS rows. A fresh cluster with empty data directories for every run. |
+| fsync | The Raft log uses plain `fdatasync`, not `F_FULLFSYNC` (like `-b`); on macOS this reaches the drive cache, not stable storage. All three nodes write to the same SSD. |
+| Load generator | `bstk-bench` (unchanged since P2), same machine, loopback, 5 s per run; it starts once every node answers `/admin` with `ready: true` and a leader is known; connections are set up before the clock starts |
+| Background load | **Not idle**, as in P3-T7b (an OrbStack VM of another user and system services). The 1-minute load average was 4.7 at the start; across runs it was 4.0 to 10.1 in the cluster matrix (median 5.6), 4.9 to 8.4 in the 1-connection runs and about 6 in the regression check. Runs alternate between modes, so drift affects them alike. |
+
+### Commands (P3-FD)
+
+```sh
+cargo build --release -p bstk-server -p bstk-bench
+# SERVER_MODES: cluster-leader | cluster-follower | cluster-mtls-leader |
+#   cluster-mtls-follower (ours only; SERVERS=rs skips the reference).
+#   CLUSTER_NODES (default 3); KEEP_LOGS=DIR keeps each run's node logs.
+SERVERS=rs OUT_CSV=p3-fd-cluster.csv SCENARIOS="put-reserve-delete producers-consumers" \
+  CONNS="10 100" BODIES="16 4096" RUNS=5 DURATION=5 \
+  SERVER_MODES="none cluster-leader cluster-follower" bench/run-matrix.sh
+SERVERS=rs OUT_CSV=p3-fd-cluster-1conn.csv SCENARIOS=put-reserve-delete CONNS=1 BODIES=16 \
+  RUNS=5 SERVER_MODES="none cluster-leader cluster-follower" bench/run-matrix.sh
+bench/summarize.py --baseline none p3-fd-cluster.csv
+# Standalone regression check: the P3-T7b binary (HEAD 5534189) as the
+# reference.
+mkdir p3 && git archive 5534189 | tar -x -C p3 && \
+  (cd p3 && CARGO_TARGET_DIR=p3/target cargo build --release -p bstk-server)
+REF_BIN=p3/target/release/beanstalkd-rs OUT_CSV=p3-fd-regress.csv \
+  SCENARIOS="put-reserve-delete producers-consumers" CONNS="10 100" \
+  BODIES="16 4096" RUNS=3 DURATION=5 SERVER_MODES=none bench/run-matrix.sh
+```
+
+New CSV columns (empty in standalone rows): `nodes`, `target_role`
+(the node bstk-bench talks to), `cluster_cpu_pct` (all nodes together),
+`node_cpu` (`id:role:pct` per node, `L` leader, `F` follower, `*` the
+target), and per-run deltas over all nodes from `/admin`:
+`resent_inputs`, `forward_rewinds` (all causes), `drop_node_proposals`,
+`refused_connections`, `rejected_puts`, `term_changes` (the leader's term
+after minus before), `leader_changes` (1 if the leader moved) and
+`isolated_after` (nodes reporting `isolated` after the run). Per-node CPU
+is the `ps` cputime delta over the whole `bstk-bench` run (setup
+included, so slightly diluted); for the target node it agrees with the
+`stats` rusage over the measured window (`server_cpu_pct`) within about
+1%. `/admin` counters are read before and after each run, so a transient
+`isolated` state in between would be missed (`refused_connections` would
+show its effect). Raw data (P3-FD): `bench/results/2026-09-26-p3-fd-cluster.csv`,
+`…-p3-fd-cluster-1conn.csv` and `…-p3-fd-regress.csv`; the P3-T7b
+files (`…-p3-cluster.csv`, `…-p3-cluster-mtls.csv`,
+`…-p3-cluster-1conn.csv`, `…-p3-cluster-5node.csv`, `…-p3-regress.csv`)
+are kept.
+
+### Results (P3-FD)
+
+Medians of 5 runs (`*` = runs spread by more than 20%). "vs standalone" is
+ops/s divided by the `none` row of the same cell (same session). "target
+CPU %" is the node bstk-bench talks to (from `stats`); "leader CPU %" the
+leader, "follower CPU %" the mean of the followers (in follower mode
+including the target), "all nodes CPU %" the sum (`ps`); "anomalies"
+sums resent inputs / forward-queue rewinds / term changes over the 5
+runs.
+
+| mode | scenario | conns | body | ops/s | vs standalone | put p50 µs | put p99 µs | reserve p50 µs | reserve p99 µs | target CPU % | leader CPU % | follower CPU % | all nodes CPU % | anomalies |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| none | put-reserve-delete | 10 | 16 | 180,456 | - | 53 | 104 | 53 | 104 | 131 | - | - | - | - |
+| cluster-leader | put-reserve-delete | 10 | 16 | 34,838 | 0.19 | 284 | 380 | 284 | 379 | 109 | 108 | 51 | 210 | 0/0/0 |
+| cluster-follower | put-reserve-delete | 10 | 16 | 28,806 | 0.16 | 328 | 513 | 327 | 512 | 92 | 89 | 72 | 233 | 0/0/0 |
+| none | put-reserve-delete | 10 | 4096 | 175,771 | - | 55 | 109 | 55 | 108 | 138 | - | - | - | - |
+| cluster-leader | put-reserve-delete | 10 | 4096 | 22,361* | 0.13 | 318 | 1,120 | 308 | 1,124 | 75 | 74 | 35 | 144 | 0/0/0 |
+| cluster-follower | put-reserve-delete | 10 | 4096 | 18,098* | 0.10 | 356 | 856 | 349 | 832 | 61 | 60 | 47 | 155 | 0/0/0 |
+| none | put-reserve-delete | 100 | 16 | 206,390 | - | 478 | 652 | 478 | 653 | 200 | - | - | - | - |
+| cluster-leader | put-reserve-delete | 100 | 16 | 135,256 | 0.66 | 734 | 982 | 734 | 984 | 212 | 210 | 33 | 276 | 0/0/0 |
+| cluster-follower | put-reserve-delete | 100 | 16 | 108,313 | 0.52 | 920 | 1,226 | 920 | 1,224 | 189 | 52 | 109 | 270 | 0/0/0 |
+| none | put-reserve-delete | 100 | 4096 | 199,966 | - | 495 | 669 | 494 | 670 | 211 | - | - | - | - |
+| cluster-leader | put-reserve-delete | 100 | 4096 | 115,007 | 0.58 | 866 | 1,136 | 862 | 1,125 | 200 | 197 | 34 | 266 | 0/0/0 |
+| cluster-follower | put-reserve-delete | 100 | 4096 | 94,904 | 0.47 | 1,050 | 1,418 | 1,044 | 1,411 | 176 | 64 | 104 | 271 | 0/0/0 |
+| none | producers-consumers | 10 | 16 | 179,569 | - | 53 | 105 | 54 | 105 | 134 | - | - | - | - |
+| cluster-leader | producers-consumers | 10 | 16 | 34,343 | 0.19 | 287 | 383 | 288 | 384 | 109 | 93 | 47 | 187 | 0/0/0 |
+| cluster-follower | producers-consumers | 10 | 16 | 28,652 | 0.16 | 329 | 516 | 329 | 516 | 93 | 81 | 63 | 207 | 0/0/0 |
+| none | producers-consumers | 10 | 4096 | 169,219 | - | 57 | 116 | 57 | 115 | 149 | - | - | - | - |
+| cluster-leader | producers-consumers | 10 | 4096 | 22,832* | 0.13 | 333 | 2,848 | 334 | 2,857 | 82 | 78 | 39 | 156 | 0/0/0 |
+| cluster-follower | producers-consumers | 10 | 4096 | 18,556* | 0.11 | 377 | 6,849 | 375 | 6,961 | 65 | 60 | 46 | 152 | 0/0/0 |
+| none | producers-consumers | 100 | 16 | 197,298 | - | 494 | 771 | 494 | 773 | 212 | - | - | - | - |
+| cluster-leader | producers-consumers | 100 | 16 | 128,286 | 0.65 | 768 | 1,092 | 769 | 1,092 | 211 | 172 | 33 | 238 | 0/0/0 |
+| cluster-follower | producers-consumers | 100 | 16 | 101,023* | 0.51 | 968 | 1,568 | 969 | 1,564 | 189 | 55 | 93 | 240 | 0/0/0 |
+| none | producers-consumers | 100 | 4096 | 182,626 | - | 526 | 860 | 527 | 860 | 241 | - | - | - | - |
+| cluster-leader | producers-consumers | 100 | 4096 | 101,082 | 0.55 | 968 | 1,394 | 969 | 1,402 | 196 | 165 | 34 | 232 | 0/0/0 |
+| cluster-follower | producers-consumers | 100 | 4096 | 84,074* | 0.46 | 1,157 | 1,812 | 1,158 | 1,807 | 170 | 63 | 90 | 243 | 0/0/0 |
+
+One connection (put-reserve-delete, 16-byte bodies):
+
+| mode | scenario | conns | body | ops/s | vs standalone | put p50 µs | put p99 µs | reserve p50 µs | reserve p99 µs | target CPU % | leader CPU % | follower CPU % | all nodes CPU % | anomalies |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| none | put-reserve-delete | 1 | 16 | 57,683 | - | 17 | 34 | 17 | 34 | 38 | - | - | - | - |
+| cluster-leader | put-reserve-delete | 1 | 16 | 6,494 | 0.11 | 148 | 249 | 148 | 249 | 80 | 80 | 44 | 167 | 0/0/0 |
+| cluster-follower | put-reserve-delete | 1 | 16 | 5,691 | 0.10 | 170 | 281 | 170 | 278 | 48 | 67 | 42 | 152 | 0/0/0 |
+
+mTLS on the cluster port and 5 nodes, **P3-T7b numbers (before P3-FD,
+not re-measured)**; put-reserve-delete, 100 connections:
+
+| mode | nodes | body | ops/s | put p50 µs | put p99 µs | target CPU % | leader CPU % | follower CPU % | all nodes CPU % | anomalies |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| cluster-leader | 3 | 16 | 28,080 | 3,619 | 4,626 | 99 | 98 | 7 | 113 | 0/0/0 |
+| cluster-mtls-leader | 3 | 16 | 28,542 | 3,532 | 4,598 | 98 | 97 | 7 | 112 | 0/0/0 |
+| cluster-mtls-follower | 3 | 16 | 21,115 | 4,732 | 6,081 | 42 | 38 | 24 | 87 | 0/0/0 |
+| cluster-leader | 3 | 4096 | 23,098* | 3,838 | 11,100 | 89 | 89 | 8 | 104 | 0/0/0 |
+| cluster-mtls-leader | 3 | 4096 | 22,820 | 3,850 | 8,480 | 87 | 86 | 8 | 102 | 0/0/0 |
+| cluster-mtls-follower | 3 | 4096 | 19,536 | 5,090 | 6,734 | 43 | 42 | 26 | 94 | 0/0/0 |
+| cluster-leader | 5 | 16 | 27,325 | 3,717 | 4,716 | 105 | 105 | 8 | 138 | 0/0/0 |
+| cluster-follower | 5 | 16 | 20,786 | 4,789 | 6,155 | 44 | 45 | 16 | 111 | 0/0/0 |
+
+### CPU (P3-FD)
+
+- **The target node is now the busiest process, as in standalone mode.**
+  At 100x16 via the leader, the leader uses 2.1 cores (standalone: 2.0
+  cores at 206k ops/s) and each follower 0.33 cores; the whole cluster
+  2.8 cores for 135k ops/s, about 20 µs of CPU per operation in total
+  (P3-T7b: 40 µs; standalone: 10 µs). Via a follower, the target
+  (follower) uses 1.9 cores, the leader 0.5, the other follower 0.3.
+- Per operation the cluster costs roughly 2x standalone CPU at 100
+  connections, and much more at low load (1 connection: 1.7 cores for
+  6.5k ops/s, about 260 µs per operation, mostly waking parked threads on
+  every node for every entry).
+- The remaining gap to standalone at 100 connections (0.66x) is latency
+  along the commit path (leader append and sync, one replication round
+  trip, follower append and sync, apply) with one batch outstanding, not
+  a saturated core: the leader is at 2.1 of 12 cores. Allowing more
+  batches outstanding was slower on this machine (2: about 120k, 4: 90k
+  to 120k, unbounded: 35k ops/s in a 2-run tuning pass), because the
+  Raft core then appends several small entries instead of one large one.
+
+### Anomalies (P3-FD)
+
+- **None of the P3-T7b anomalies recurred**: no term change, resend,
+  rewind, `DropNode`, refused connection, rejected put or `isolated`
+  node in any of the 135 cluster runs, including every 4 KiB run (16 of
+  80 had elections before). Two changes contribute: an entry now covers
+  up to 1,024 inputs, so the log does about 1/100th of the syncs, and the
+  timing defaults tolerate 1.0 to 1.2 s without a heartbeat (openraft
+  0.9 waits `election_timeout_max` plus the node's random election
+  timeout; it was 450 to 600 ms). The disk stalls themselves are
+  unchanged: the 10-connection 4 KiB cells still show put p99 of 0.9 to
+  7 ms and spreads over 20% (`*`).
+- **The Raft core still waits for each log flush.** openraft 0.9.25's
+  `RaftCore::append_to_log` (`core/raft_core.rs:713-731`) awaits the
+  append's `LogFlushed` callback before running its next command, so the
+  flush worker only stops the sync from blocking a runtime thread; at
+  most one core append is outstanding, and its group commit (tested with
+  concurrent appends in `appends_coalesce_into_few_syncs`) does not
+  combine appends in practice. A long stall still delays heartbeats; the
+  longer election timeout absorbs about a second of it.
+- Via a follower is 0.80x to 0.83x of via the leader at 100 connections
+  (was 0.74x to 0.88x): one forward in flight per node adds a round trip
+  per forward batch.
+
+### Standalone regression check (P3-FD)
+
+"ref" is `beanstalkd-rs` built from commit `5534189` (P3-T7b), "rs" the
+P3-FD build, both started with `-l 127.0.0.1 -p PORT`, alternating, a
+fresh process per run, medians of 3 runs:
+
+| scenario | conns | body | pipe | ref ops/s | rs ops/s | rs/ref | ref CPU % | rs CPU % | ref put p99 µs | rs put p99 µs | ref reserve p99 µs | rs reserve p99 µs |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| put-reserve-delete | 10 | 16 | 1 | 174,816 | 176,232 | 1.01 | 134 | 134 | 116 | 116 | 118 | 116 |
+| put-reserve-delete | 10 | 4096 | 1 | 172,082 | 170,359 | 0.99 | 140 | 140 | 118 | 120 | 117 | 119 |
+| put-reserve-delete | 100 | 16 | 1 | 201,457 | 203,590 | 1.01 | 206 | 202 | 736 | 675 | 736 | 675 |
+| put-reserve-delete | 100 | 4096 | 1 | 191,139* | 192,205* | 1.01 | 220 | 220 | 809 | 790 | 808 | 788 |
+| producers-consumers | 10 | 16 | 1 | 174,598 | 175,261 | 1.00 | 136 | 136 | 115 | 114 | 116 | 115 |
+| producers-consumers | 10 | 4096 | 1 | 169,304 | 168,941 | 1.00 | 148 | 148 | 113 | 114 | 113 | 113 |
+| producers-consumers | 100 | 16 | 1 | 204,119 | 204,548 | 1.00 | 202 | 203 | 655 | 656 | 657 | 657 |
+| producers-consumers | 100 | 4096 | 1 | 194,417 | 195,571 | 1.01 | 233 | 233 | 699 | 694 | 698 | 694 |
+
+**Conclusion: standalone throughput, CPU and latency are unchanged
+(0.99x to 1.01x).**
+
 
 ## P2: TLS, mTLS and the plaintext regression check
 

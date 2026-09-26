@@ -39,10 +39,15 @@ pub const DEFAULT_NODE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default `cluster.snapshot_every`.
 pub const DEFAULT_SNAPSHOT_EVERY: u64 = 100_000;
 /// Default `cluster.heartbeat`.
-pub const DEFAULT_HEARTBEAT: Duration = Duration::from_millis(50);
-/// Default `cluster.election_timeout`.
+pub const DEFAULT_HEARTBEAT: Duration = Duration::from_millis(100);
+/// Default `cluster.election_timeout`. openraft 0.9 starts an election
+/// only after `max + (a random value in [min, max], fixed per process)`
+/// without a heartbeat (the leader lease is `max`), so a follower waits
+/// 1.0 to 1.2 s (with a heartbeat every 100 ms, a leader's log sync may
+/// stall its heartbeats for about a second before a spurious election),
+/// and a failover takes about 1.3 to 1.5 s.
 pub const DEFAULT_ELECTION_TIMEOUT: (Duration, Duration) =
-    (Duration::from_millis(150), Duration::from_millis(300));
+    (Duration::from_millis(500), Duration::from_millis(700));
 
 /// Largest payload of one cluster-port frame (both directions).
 pub const MAX_FRAME: usize = bstk_raft::wire::DEFAULT_MAX_FRAME;
@@ -235,7 +240,7 @@ fn resolve_cluster(
             _ => {
                 return Err(invalid(
                     "cluster.election_timeout: expected two intervals [min, max], such as \
-                     [\"150ms\", \"300ms\"]",
+                     [\"500ms\", \"700ms\"]",
                 ));
             }
         },
@@ -648,7 +653,7 @@ mod tests {
             &[],
             &config(TLS, PEERS3).replace(
                 "data_dir = \"raft\"\n",
-                "data_dir = \"raft\"\nheartbeat = \"150ms\"\n",
+                "data_dir = \"raft\"\nheartbeat = \"500ms\"\n",
             ),
         );
         assert!(e.contains("must be shorter"), "{e}");

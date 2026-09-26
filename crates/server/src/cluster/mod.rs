@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! conn tasks ──EngineMsg──▶ cluster actor ──ordered queue──▶ leader
-//!                              │  (Op::Conn {seq, input})       │ client_write_ff
+//!                              │  (seq, input)                  │ proposer: Op::Batch
 //!                              │                                ▼
 //!                              │                        Raft log (majority)
 //!                              │                                │ apply, on every node
@@ -20,9 +20,10 @@
 //!
 //! - The actor numbers each connection's inputs (`seq`, from 1 with
 //!   `Connect`) and appends them to one ordered queue. A single sender
-//!   drains the queue to the current leader: directly with
-//!   `client_write_ff` when this node leads, otherwise as batched
-//!   `ForwardRequest`s, one in flight at a time. See [`actor`] for the
+//!   drains the queue to the current leader: to the [`proposer`] when
+//!   this node leads, otherwise as batched `ForwardRequest`s, one in
+//!   flight at a time. The leader's proposer turns all the inputs it has
+//!   queued (its own and forwarded ones) into `Op::Batch` entries. See [`actor`] for the
 //!   ordering and resend rules.
 //! - Every node applies every committed entry to its own engine
 //!   (`ClusterStateMachine`), and [`Clients`] (the `ReplySink`) hands the
@@ -81,6 +82,7 @@ pub mod actor;
 pub mod durable;
 pub mod duties;
 pub mod handler;
+pub mod proposer;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -283,6 +285,9 @@ pub struct Core {
     /// Keeps `client_write_ff` receivers until they resolve (openraft
     /// logs a warning for every result it cannot deliver).
     reaper: mpsc::UnboundedSender<Pending>,
+    /// Connection inputs to propose as `Op::Batch` entries (leader only,
+    /// see [`proposer`]).
+    proposer: mpsc::UnboundedSender<proposer::Items>,
     /// Refuses inbound votes while in rejoin mode.
     gate: Arc<VoteGate>,
     /// When each peer last sent this node a forward, ping or control
@@ -383,6 +388,37 @@ impl Core {
                 Err(RaftStopped)
             }
         }
+    }
+
+    /// Proposes `op` like [`Core::propose`]; the returned future resolves
+    /// once the result is known (applied here, or refused).
+    async fn propose_tracked(
+        &self,
+        op: Op,
+    ) -> Result<impl std::future::Future<Output = ()> + Send + 'static, RaftStopped> {
+        let req = Request {
+            now: self.stamp(),
+            op,
+        };
+        match self.raft.client_write_ff(req).await {
+            Ok(rx) => Ok(async move {
+                let _ = rx.await;
+            }),
+            Err(e) => {
+                tracing::debug!("proposal refused: {e}");
+                Err(RaftStopped)
+            }
+        }
+    }
+
+    /// Hands connection inputs `(seq, input)` to the proposer, which
+    /// proposes them in order as `Op::Batch` entries. `Err` means the
+    /// proposer has stopped (Raft has stopped).
+    fn submit(&self, items: proposer::Items) -> Result<(), RaftStopped> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.proposer.send(items).map_err(|_| RaftStopped)
     }
 
     /// Proposes `op` on this node (the leader) and waits, at most
@@ -981,8 +1017,10 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
 
     let (reaper, reaper_rx) = mpsc::unbounded_channel();
     let reaper_task = tokio::spawn(reap(reaper_rx));
+    let (proposer_tx, proposer_rx) = mpsc::unbounded_channel();
     let core = Arc::new(Core {
         reaper,
+        proposer: proposer_tx,
         id,
         metrics: raft.metrics(),
         raft: raft.clone(),
@@ -1029,6 +1067,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
     // node catches up).
     let (engine_tx, engine_rx) = mpsc::unbounded_channel();
     let mut tasks = vec![
+        tokio::spawn(proposer::run(core.clone(), proposer_rx)),
         tokio::spawn(actor::Actor::new(core.clone()).run(engine_rx, events_rx)),
         tokio::spawn(duties::leader_duties(core.clone())),
         tokio::spawn(duties::readiness(core.clone())),

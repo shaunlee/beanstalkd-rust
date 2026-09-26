@@ -364,6 +364,7 @@ fn workload(len: usize, seed: u64) -> Vec<Request> {
                     }
                     conns.retain(|&(c, _)| !hit(c));
                 }
+                Op::Batch(_) => unreachable!("the workload generates no batches"),
             }
         }
         for (c, _) in &o {
@@ -454,6 +455,7 @@ fn nodes_fed_the_same_entries_agree() {
                         e.apply_input(now, EngineInput::Disconnect(c), &mut expect);
                     }
                 }
+                Op::Batch(_) => unreachable!("the workload generates no batches"),
             }
         }
         let engine = engine.unwrap();
@@ -475,6 +477,191 @@ fn nodes_fed_the_same_entries_agree() {
         assert_eq!(total, expect.len(), "every reply delivered once");
         assert!(total > 100, "workload too trivial: {total}");
     }
+}
+
+/// Groups runs of consecutive `Op::Conn` requests of `reqs` into
+/// `Op::Batch` entries (sizes cycled from `sizes`; other ops stay alone).
+/// Returns the batched requests and the same items as one `Op::Conn`
+/// entry each, stamped with their batch's `now`.
+fn batch_workload(reqs: &[Request], sizes: &[usize]) -> (Vec<Request>, Vec<Request>) {
+    let mut batched = Vec::new();
+    let mut expanded = Vec::new();
+    let mut i = 0;
+    let mut k = 0;
+    while i < reqs.len() {
+        let Op::Conn { .. } = reqs[i].op else {
+            batched.push(reqs[i].clone());
+            expanded.push(reqs[i].clone());
+            i += 1;
+            continue;
+        };
+        let want = sizes[k % sizes.len()];
+        k += 1;
+        let now = reqs[i].now;
+        let mut items = Vec::new();
+        while i < reqs.len() && items.len() < want {
+            let Op::Conn { seq, input } = &reqs[i].op else {
+                break;
+            };
+            items.push((*seq, input.clone()));
+            expanded.push(req(now, c_in(*seq, input.clone())));
+            i += 1;
+        }
+        batched.push(req(now, Op::Batch(items)));
+    }
+    (batched, expanded)
+}
+
+/// P3-FD: a log of `Op::Batch` entries (items of several owners, with
+/// resent duplicates inside batches) applies exactly like the same items
+/// as consecutive `Op::Conn` entries with the batch's `now`: the same
+/// state on every node, and the same events (applied inputs, replies,
+/// closes) per node, whatever openraft's apply batching.
+#[test]
+fn batches_apply_like_consecutive_conn_entries_on_every_node() {
+    for seed in [3u64, 11, 99, 2024] {
+        let reqs = workload(800, seed);
+        let (batched, expanded) = batch_workload(&reqs, &[5, 1, 17, 3, 64]);
+        assert!(batched.len() < expanded.len() / 2, "batches are formed");
+        let mixed = batched.iter().any(|r| match &r.op {
+            Op::Batch(items) => {
+                let owners: std::collections::BTreeSet<NodeId> = items
+                    .iter()
+                    .filter_map(|(_, i)| i.conn().map(owner_of))
+                    .collect();
+                owners.len() > 1
+            }
+            _ => false,
+        });
+        assert!(mixed, "a batch mixes several owners");
+        let mut ns: Vec<Node> = (1..=3).map(node).collect();
+        let mut singles: Vec<Node> = (1..=3).map(node).collect();
+        for (i, n) in ns.iter_mut().enumerate() {
+            apply_batched(&mut n.sm, 1, &batched, &[1 + i, 4, 9]);
+        }
+        for n in &mut singles {
+            apply_batched(&mut n.sm, 1, &expanded, &[13]);
+        }
+        let s0 = state_bytes(&singles[0].sm);
+        for (b, e) in ns.iter().zip(&singles) {
+            assert_eq!(state_bytes(&b.sm), s0, "seed {seed}");
+            assert_eq!(state_bytes(&e.sm), s0, "seed {seed}");
+            let (hb, he) = (b.sm.handle(), e.sm.handle());
+            assert_eq!(hb.meta(), he.meta(), "seed {seed}");
+            let evb = b.sink.take();
+            assert!(!evb.is_empty());
+            assert_eq!(evb, e.sink.take(), "seed {seed} node {}", hb.node_id());
+        }
+    }
+}
+
+/// Dedup inside one batch: resends, a stale `Connect` and a gap are
+/// ignored item by item; the entry is a duplicate only if every item is.
+#[test]
+fn dedup_inside_a_batch() {
+    let mut ns: Vec<Node> = (1..=2).map(node).collect();
+    let a = conn_id(1, 1);
+    let b = conn_id(2, 4);
+    let old = conn_id(2, 3);
+    let first = Op::Batch(vec![
+        (1, EngineInput::Connect(a)),
+        (1, EngineInput::Connect(b)),
+        (2, cmd(a, Command::Use(tube("x")))),
+        (2, cmd(a, Command::Use(tube("y")))), // resend of seq 2: dup
+        (1, EngineInput::Connect(a)),         // dup connect
+        (1, EngineInput::Connect(old)),       // local 3 <= 4: dup
+        (4, cmd(b, Command::ListTubeUsed)),   // gap: ignored
+        (2, cmd(b, Command::ListTubeUsed)),
+        (3, cmd(a, Command::ListTubeUsed)),
+        (9, EngineInput::Tick), // no connection: ignored
+    ]);
+    // Every item already applied: a duplicate entry.
+    let second = Op::Batch(vec![
+        (2, cmd(a, Command::Use(tube("z")))),
+        (1, EngineInput::Connect(b)),
+    ]);
+    let third = Op::Batch(vec![
+        (3, cmd(a, Command::ListTubeUsed)),
+        (3, EngineInput::Disconnect(b)),
+    ]);
+    for n in &mut ns {
+        let res = apply(
+            &mut n.sm,
+            entries(
+                1,
+                &[
+                    req(S, first.clone()),
+                    req(S, second.clone()),
+                    req(S, third.clone()),
+                ],
+            ),
+        );
+        assert_eq!(dups(&res), vec![false, true, false]);
+        let h = n.sm.handle();
+        assert_eq!(h.applied_seq(a), Some(3));
+        assert_eq!(h.applied_seq(b), None);
+        assert_eq!(h.highest_local(2), 4);
+    }
+    assert_eq!(
+        ns[0].sink.take(),
+        vec![
+            Ev::Applied(a, 1),
+            Ev::Applied(a, 2),
+            Ev::Deliver(a, Response::Using(tube("x"))),
+            Ev::Applied(a, 3),
+            Ev::Deliver(a, Response::Using(tube("x"))),
+        ]
+    );
+    assert_eq!(
+        ns[1].sink.take(),
+        vec![
+            Ev::Applied(b, 1),
+            Ev::Applied(b, 2),
+            Ev::Deliver(b, Response::Using(tube("default"))),
+            Ev::Applied(b, 3),
+            Ev::Closed(b),
+        ]
+    );
+    assert_eq!(state_bytes(&ns[0].sm), state_bytes(&ns[1].sm));
+}
+
+/// Items of one batch run at the entry's (clamped) `now`, each followed
+/// by the timer pass: a reserve-with-timeout 0 inside a batch times out at
+/// once, before the next item.
+#[test]
+fn batch_items_run_at_the_entry_now_with_timers() {
+    let mut n = node(1);
+    let c = conn_id(1, 1);
+    let d = conn_id(1, 2);
+    apply(&mut n.sm, entries(1, &[req(5 * S, Op::Tick)]));
+    let res = apply(
+        &mut n.sm,
+        entries(
+            2,
+            &[req(
+                2 * S, // clamped to 5 s
+                Op::Batch(vec![
+                    (1, EngineInput::Connect(c)),
+                    (2, cmd(c, Command::ReserveWithTimeout(0))),
+                    (1, EngineInput::Connect(d)),
+                    (2, put(d, "j")),
+                ]),
+            )],
+        ),
+    );
+    assert_eq!(dups(&res), vec![false]);
+    assert_eq!(n.sm.handle().last_now(), 5 * S);
+    assert_eq!(
+        n.sink.take(),
+        vec![
+            Ev::Applied(c, 1),
+            Ev::Applied(c, 2),
+            Ev::Deliver(c, Response::TimedOut),
+            Ev::Applied(d, 1),
+            Ev::Applied(d, 2),
+            Ev::Deliver(d, Response::Inserted(1)),
+        ]
+    );
 }
 
 #[test]

@@ -159,9 +159,14 @@ format = "text"
 # # Log entries between snapshots. Default: 100000.
 # snapshot_every = 100000
 # # Raft heartbeat interval and election timeout range (whole milliseconds;
-# # heartbeat < minimum <= maximum). Defaults: "50ms", ["150ms", "300ms"].
-# heartbeat = "50ms"
-# election_timeout = ["150ms", "300ms"]
+# # heartbeat < minimum <= maximum). Defaults: "100ms", ["500ms", "700ms"].
+# # A follower starts an election after maximum + (a random value between
+# # minimum and maximum) without a heartbeat (openraft's leader lease is the
+# # maximum): 1.0 to 1.2 s by default. A log fsync can stall for hundreds of
+# # milliseconds under heavy write load, and the leader sends no heartbeat
+# # meanwhile.
+# heartbeat = "100ms"
+# election_timeout = ["500ms", "700ms"]
 # # true only for tests: cluster traffic in clear text, without
 # # [cluster.tls]. Allowed only when listen and every peer address are
 # # loopback, unless insecure_plaintext_allow_remote = true as well (anyone

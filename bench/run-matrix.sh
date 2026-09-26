@@ -46,6 +46,35 @@
 #                  setup and drain included, so slightly diluted); the
 #                  reference's own CPU (server_cpu_pct, from `stats`)
 #                  excludes it, ours includes the TLS work.
+#                  Cluster modes (P3; ours only, the reference is skipped):
+#                  a fresh CLUSTER_NODES-node Raft cluster per run on
+#                  loopback, every node started with --cluster-init from a
+#                  generated --config (plaintext client listener, [http] for
+#                  /readyz and /admin, default [cluster] settings otherwise);
+#                  bstk-bench starts once every node is ready and a leader
+#                  is known:
+#                  cluster-leader         cluster traffic in plaintext
+#                                         (insecure_plaintext), bstk-bench
+#                                         connects to the leader
+#                  cluster-follower       same, bstk-bench connects to a
+#                                         follower (inputs are forwarded)
+#                  cluster-mtls-leader    cluster traffic over mTLS
+#                                         ([cluster.tls], per-node
+#                                         certificates), via the leader
+#                  cluster-mtls-follower  same, via a follower
+#                  Extra CSV columns: nodes, target_role, cluster_cpu_pct
+#                  (ps cputime delta of all nodes over the bstk-bench wall
+#                  time, setup included), node_cpu (id:role:pct per node),
+#                  and per-run deltas summed over all nodes from /admin:
+#                  resent_inputs, forward_rewinds (all causes),
+#                  drop_node_proposals, refused_connections, rejected_puts;
+#                  term_changes (leader term after - before) and
+#                  leader_changes (1 if the leader id differs afterwards),
+#                  isolated_after (nodes reporting isolated after the run).
+#   CLUSTER_NODES  nodes per cluster in cluster modes [3]
+#   KEEP_LOGS      if set, a directory that receives each cluster run's node
+#                  logs and configurations (one run.XXXXXX subdirectory each)
+#   SERVERS        servers to run, in order ["ref rs"]
 #   STUNNEL     stunnel binary [stunnel from PATH, else /opt/homebrew/bin/stunnel]
 #   BINLOG_ROOT    parent of the per-run binlog directories [a mktemp -d dir]
 #   SERVER_ARGS    extra arguments for both servers (e.g. "-s 1048576")
@@ -68,16 +97,24 @@ IDLE_CONNS="${IDLE_CONNS:-0}"
 DELAYED_TUBES="${DELAYED_TUBES:-0}"
 SERVER_MODES="${SERVER_MODES:-none}"
 SERVER_ARGS="${SERVER_ARGS:-}"
+CLUSTER_NODES="${CLUSTER_NODES:-3}"
+SERVERS="${SERVERS:-ref rs}"
+KEEP_LOGS="${KEEP_LOGS:-}"
+[ -z "$KEEP_LOGS" ] || mkdir -p "$KEEP_LOGS"
 need_tls=0
+need_ref=0
 for m in $SERVER_MODES; do
   case "$m" in
-    none|F|default|f0) ;;
-    tls|mtls|tls-default) need_tls=1 ;;
+    none|F|default|f0) need_ref=1 ;;
+    tls|mtls|tls-default) need_ref=1; need_tls=1 ;;
+    cluster-leader|cluster-follower) ;;
+    cluster-mtls-leader|cluster-mtls-follower) need_tls=1 ;;
     *) echo "run-matrix: unknown server mode $m" >&2; exit 1 ;;
   esac
 done
 STUNNEL="${STUNNEL:-$(command -v stunnel || echo /opt/homebrew/bin/stunnel)}"
-if [ "$need_tls" = 1 ]; then
+case " $SERVERS " in *" ref "*) ;; *) need_ref=0 ;; esac
+if [ "$need_tls" = 1 ] && [ "$need_ref" = 1 ]; then
   [ -x "$STUNNEL" ] || { echo "run-matrix: stunnel not found (brew install stunnel, or set STUNNEL)" >&2; exit 1; }
 fi
 BINLOG_ROOT="${BINLOG_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/bstk-bench-binlog.XXXXXX")}"
@@ -87,7 +124,9 @@ read -r -a delayed_list <<<"$DELAYED_TUBES"
 [ "${#idle_list[@]}" -eq "${#delayed_list[@]}" ] || {
   echo "run-matrix: IDLE_CONNS and DELAYED_TUBES need the same number of values" >&2; exit 1; }
 
-for b in "$REF_BIN" "$RS_BIN" "$BENCH_BIN"; do
+bins=("$RS_BIN" "$BENCH_BIN")
+[ "$need_ref" = 1 ] && bins+=("$REF_BIN")
+for b in "${bins[@]}"; do
   [ -x "$b" ] || { echo "run-matrix: missing binary $b (reference: scripts/build-ref.sh --optimized; ours: cargo build --release -p bstk-server -p bstk-bench)" >&2; exit 1; }
 done
 
@@ -109,7 +148,12 @@ SERVER_PID=""
 PROXY_PID=""
 BINLOG_DIR=""
 CERT_DIR=""
+CLUSTER_PIDS=()
+CLUSTER_DIR=""
 cleanup() {
+  local p
+  for p in ${CLUSTER_PIDS[@]+"${CLUSTER_PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done
+  [ -n "$CLUSTER_DIR" ] && rm -rf "$CLUSTER_DIR" || true
   [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
   [ -n "$PROXY_PID" ] && kill "$PROXY_PID" 2>/dev/null || true
   [ -n "$BINLOG_DIR" ] && rm -rf "$BINLOG_DIR" || true
@@ -120,7 +164,129 @@ trap cleanup EXIT
 if [ "$need_tls" = 1 ]; then
   CERT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bstk-bench-certs.XXXXXX")"
   "$ROOT/clients/mkcerts.sh" "$CERT_DIR"
+  # Cluster node certificates (SAN DNS bstk-node-N, server and client
+  # authentication), signed by the same test CA.
+  for id in $(seq 1 "$CLUSTER_NODES"); do
+    openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$CERT_DIR/node$id.key" 2>/dev/null
+    openssl req -new -key "$CERT_DIR/node$id.key" -subj "/CN=bstk-node-$id" -out "$CERT_DIR/node$id.csr" 2>/dev/null
+    openssl x509 -req -in "$CERT_DIR/node$id.csr" -CA "$CERT_DIR/ca.pem" -CAkey "$CERT_DIR/ca.key" \
+      -CAcreateserial -days 2 -sha256 -out "$CERT_DIR/node$id.pem" \
+      -extfile <(printf '%s\n' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' \
+        'extendedKeyUsage=serverAuth,clientAuth' "subjectAltName=DNS:bstk-node-$id") 2>/dev/null
+    rm -f "$CERT_DIR/node$id.csr"
+  done
+  rm -f "$CERT_DIR"/*.srl
 fi
+
+# GET http://127.0.0.1:PORT/admin, or "" if not served.
+admin_json() {
+  curl -sf --max-time 2 "http://127.0.0.1:$1/admin" 2>/dev/null || true
+}
+
+# start_cluster MODE BIN: starts CLUSTER_NODES nodes with --cluster-init,
+# waits until every node is ready and a leader is known, and sets
+# CLUSTER_PIDS, CLUSTER_HTTP (per node), CLUSTER_CLIENT (per node),
+# LEADER_IDX, TARGET_IDX, TARGET_ROLE and CLIENT_PORT.
+start_cluster() {
+  local mode="$1" bin="$2" n="$CLUSTER_NODES" i id peers="" conf
+  CLUSTER_DIR="$(mktemp -d "$BINLOG_ROOT/cluster.XXXXXX")"
+  CLUSTER_PIDS=(); CLUSTER_HTTP=(); CLUSTER_CLIENT=(); local cports=()
+  for i in $(seq 0 $((n - 1))); do
+    CLUSTER_CLIENT[i]="$(free_port)"; CLUSTER_HTTP[i]="$(free_port)"; cports[i]="$(free_port)"
+    peers="$peers[[cluster.peer]]
+id = $((i + 1))
+addr = \"127.0.0.1:${cports[i]}\"
+"
+  done
+  for i in $(seq 0 $((n - 1))); do
+    id=$((i + 1))
+    conf="$CLUSTER_DIR/node$id.toml"
+    {
+      printf '[[listener]]\naddr = "127.0.0.1:%s"\n' "${CLUSTER_CLIENT[i]}"
+      printf '[http]\naddr = "127.0.0.1:%s"\n' "${CLUSTER_HTTP[i]}"
+      printf '[cluster]\nnode_id = %s\nlisten = "127.0.0.1:%s"\ndata_dir = "%s"\n' \
+        "$id" "${cports[i]}" "$CLUSTER_DIR/data$id"
+      case "$mode" in
+        cluster-mtls-*)
+          printf '[cluster.tls]\ncert = "%s"\nkey = "%s"\nca = "%s"\n' \
+            "$CERT_DIR/node$id.pem" "$CERT_DIR/node$id.key" "$CERT_DIR/ca.pem" ;;
+        *) printf 'insecure_plaintext = true\n' ;;
+      esac
+      printf '%s' "$peers"
+    } >"$conf"
+  done
+  for i in $(seq 0 $((n - 1))); do
+    # shellcheck disable=SC2086
+    "$bin" --config "$CLUSTER_DIR/node$((i + 1)).toml" --cluster-init $SERVER_ARGS \
+      >/dev/null 2>"$CLUSTER_DIR/node$((i + 1)).log" &
+    CLUSTER_PIDS[i]=$!
+  done
+  local want=follower
+  case "$mode" in *-leader) want=leader ;; esac
+  LEADER_IDX=""; TARGET_IDX=""
+  for _ in $(seq 1 300); do
+    local ready=0 roles=()
+    for i in $(seq 0 $((n - 1))); do
+      roles[i]="$(admin_json "${CLUSTER_HTTP[i]}" | python3 -c 'import json,sys
+try:
+    c=json.load(sys.stdin)["cluster"]; print(c["role"] if c["ready"] else "-")
+except Exception: print("-")')"
+      [ "${roles[i]}" != "-" ] && ready=$((ready + 1))
+    done
+    if [ "$ready" -eq "$n" ]; then
+      for i in $(seq 0 $((n - 1))); do
+        [ "${roles[i]}" = leader ] && LEADER_IDX=$i
+        [ -z "$TARGET_IDX" ] && [ "${roles[i]}" = "$want" ] && TARGET_IDX=$i
+      done
+      [ -n "$LEADER_IDX" ] && [ -n "$TARGET_IDX" ] && break
+      LEADER_IDX=""; TARGET_IDX=""
+    fi
+    sleep 0.1
+  done
+  if [ -z "$TARGET_IDX" ]; then
+    echo "run-matrix: cluster did not become ready (see $CLUSTER_DIR/*.log)" >&2
+    return 1
+  fi
+  TARGET_ROLE="$want"
+  CLIENT_PORT="${CLUSTER_CLIENT[TARGET_IDX]}"
+}
+
+stop_cluster() {
+  local p
+  for p in ${CLUSTER_PIDS[@]+"${CLUSTER_PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done
+  for p in ${CLUSTER_PIDS[@]+"${CLUSTER_PIDS[@]}"}; do wait "$p" 2>/dev/null || true; done
+  CLUSTER_PIDS=()
+  if [ -n "$KEEP_LOGS" ] && [ -n "$CLUSTER_DIR" ]; then
+    local keep
+    keep="$(mktemp -d "$KEEP_LOGS/run.XXXXXX")"
+    cp "$CLUSTER_DIR"/*.log "$CLUSTER_DIR"/*.toml "$keep"/ 2>/dev/null || true
+  fi
+  [ -n "$CLUSTER_DIR" ] && rm -rf "$CLUSTER_DIR"
+  CLUSTER_DIR=""
+}
+
+# Sum over nodes of cluster counters from /admin, as one line:
+# "resent rewinds drops refused rejected leader_term leader_id isolated".
+cluster_counters() {
+  local docs=() i
+  for i in "${!CLUSTER_HTTP[@]}"; do docs+=("$(admin_json "${CLUSTER_HTTP[i]}")"); done
+  python3 -c '
+import json, sys
+t = dict(resent=0, rewinds=0, drops=0, refused=0, rejected=0)
+term = leader = ""; isolated = 0
+for d in sys.argv[1:]:
+    try:
+        c = json.loads(d)["cluster"]
+    except Exception:
+        continue
+    t["resent"] += c["resent_inputs"]; t["rewinds"] += sum(c["forward_rewinds"].values())
+    t["drops"] += c["drop_node_proposals"]; t["refused"] += c["refused_connections"]
+    t["rejected"] += c["rejected_puts"]; isolated += bool(c["isolated"])
+    if c["role"] == "leader":
+        term, leader = c["term"], c["node_id"]
+print(t["resent"], t["rewinds"], t["drops"], t["refused"], t["rejected"], term or -1, leader or -1, isolated)
+' ${docs[@]+"${docs[@]}"}
+}
 
 # Server arguments for a mode; creates a fresh binlog directory (BINLOG_DIR).
 # Sets TLS_AUTH to "" (plaintext), "none" or "mtls".
@@ -189,7 +355,7 @@ cpu_secs() {
     awk '{ n = split($1, a, ":"); t = 0; for (i = 1; i <= n; i++) t = t * 60 + a[i]; print t }'
 }
 
-[ -s "$OUT_CSV" ] || echo "server,scenario,conns,body_size,pipeline,run,ops_per_sec,server_cpu_pct,put_p50_us,put_p99_us,put_p999_us,reserve_p50_us,reserve_p99_us,reserve_p999_us,delete_p50_us,delete_p99_us,delete_p999_us,load_avg,idle_conns,delayed_tubes,server_mode,proxy_cpu_pct" >"$OUT_CSV"
+[ -s "$OUT_CSV" ] || echo "server,scenario,conns,body_size,pipeline,run,ops_per_sec,server_cpu_pct,put_p50_us,put_p99_us,put_p999_us,reserve_p50_us,reserve_p99_us,reserve_p999_us,delete_p50_us,delete_p99_us,delete_p999_us,load_avg,idle_conns,delayed_tubes,server_mode,proxy_cpu_pct,nodes,target_role,cluster_cpu_pct,node_cpu,resent_inputs,forward_rewinds,drop_node_proposals,refused_connections,rejected_puts,term_changes,leader_changes,isolated_after" >"$OUT_CSV"
 
 # Extracts a numeric field from the bench's JSON line ("" if absent).
 field() {
@@ -207,10 +373,23 @@ for scenario in $SCENARIOS; do
         delayed="${delayed_list[$li]}"
         for run in $(seq 1 "$RUNS"); do
          for mode in $SERVER_MODES; do
-          for server in ref rs; do
+          for server in $SERVERS; do
             if [ "$server" = ref ]; then bin="$REF_BIN"; else bin="$RS_BIN"; fi
-            mode_args "$mode"
-            start_server "$server" "$bin"
+            cluster=0
+            case "$mode" in cluster-*) cluster=1 ;; esac
+            if [ "$cluster" = 1 ] && [ "$server" = ref ]; then continue; fi
+            if [ "$cluster" = 1 ]; then
+              TLS_AUTH=""; BINLOG_DIR=""
+              if ! start_cluster "$mode" "$bin"; then
+                failures=$((failures + 1)); stop_cluster; continue
+              fi
+              read -r c_resent0 c_rewinds0 c_drops0 c_refused0 c_rejected0 c_term0 c_leader0 _ <<<"$(cluster_counters)"
+              node_cpu0=()
+              for p in "${CLUSTER_PIDS[@]}"; do node_cpu0+=("$(cpu_secs "$p")"); done
+            else
+              mode_args "$mode"
+              start_server "$server" "$bin"
+            fi
             tls_args=()
             if [ -n "$TLS_AUTH" ]; then
               tls_args=(--tls --ca "$CERT_DIR/ca.pem")
@@ -230,16 +409,34 @@ for scenario in $SCENARIOS; do
                 proxy_cpu="$(python3 -c 'import sys, time; print(f"{100 * (float(sys.argv[2]) - float(sys.argv[1])) / (time.time() - float(sys.argv[3])):.1f}")' \
                   "$proxy_cpu0" "$(cpu_secs "$PROXY_PID")" "$t0")"
               fi
+              cluster_cols=",,,,,,,,,,,,"
+              cluster_note=""
+              if [ "$cluster" = 1 ]; then
+                wall="$(python3 -c 'import sys, time; print(time.time() - float(sys.argv[1]))' "$t0")"
+                node_cpu=""; total_cpu=0
+                for i in "${!CLUSTER_PIDS[@]}"; do
+                  pct="$(python3 -c 'import sys; print(f"{100 * (float(sys.argv[2]) - float(sys.argv[1])) / float(sys.argv[3]):.1f}")' \
+                    "${node_cpu0[i]}" "$(cpu_secs "${CLUSTER_PIDS[i]}")" "$wall")"
+                  role=F; [ "$i" = "$LEADER_IDX" ] && role=L
+                  [ "$i" = "$TARGET_IDX" ] && role="${role}*"
+                  node_cpu="$node_cpu${node_cpu:+;}$((i + 1)):$role:$pct"
+                  total_cpu="$(python3 -c 'import sys; print(f"{float(sys.argv[1]) + float(sys.argv[2]):.1f}")' "$total_cpu" "$pct")"
+                done
+                read -r c_resent c_rewinds c_drops c_refused c_rejected c_term c_leader c_isolated <<<"$(cluster_counters)"
+                leader_changed=0; [ "$c_leader" != "$c_leader0" ] && leader_changed=1
+                cluster_cols=",$CLUSTER_NODES,$TARGET_ROLE,$total_cpu,$node_cpu,$((c_resent - c_resent0)),$((c_rewinds - c_rewinds0)),$((c_drops - c_drops0)),$((c_refused - c_refused0)),$((c_rejected - c_rejected0)),$((c_term - c_term0)),$leader_changed,$c_isolated"
+                cluster_note="  nodes cpu=$total_cpu% [$node_cpu] resent=$((c_resent - c_resent0)) rewinds=$((c_rewinds - c_rewinds0)) terms+=$((c_term - c_term0))"
+              fi
               json="$(printf '%s\n' "$out" | sed -n 's/^JSON //p')"
               row="$server,$scenario,$conns,$body,$pipeline,$run"
               for f in ops_per_sec server_cpu_pct put_p50_us put_p99_us put_p999_us \
                        reserve_p50_us reserve_p99_us reserve_p999_us delete_p50_us delete_p99_us delete_p999_us; do
                 row="$row,$(field "$json" "$f")"
               done
-              echo "$row,$load,$idle,$delayed,$mode,$proxy_cpu" >>"$OUT_CSV"
-              printf '%-4s %-11s %-20s conns=%-3s body=%-5s pipe=%-3s idle=%-5s delayed=%-5s run=%s  %s ops/s  cpu=%s%%%s\n' \
+              echo "$row,$load,$idle,$delayed,$mode,$proxy_cpu$cluster_cols" >>"$OUT_CSV"
+              printf '%-4s %-11s %-20s conns=%-3s body=%-5s pipe=%-3s idle=%-5s delayed=%-5s run=%s  %s ops/s  cpu=%s%%%s%s\n' \
                 "$server" "$mode" "$scenario" "$conns" "$body" "$pipeline" "$idle" "$delayed" "$run" \
-                "$(field "$json" ops_per_sec)" "$(field "$json" server_cpu_pct)" "${proxy_cpu:+  stunnel cpu=$proxy_cpu%}"
+                "$(field "$json" ops_per_sec)" "$(field "$json" server_cpu_pct)" "${proxy_cpu:+  stunnel cpu=$proxy_cpu%}" "$cluster_note"
             else
               echo "FAILED: $server mode=$mode $scenario conns=$conns body=$body pipeline=$pipeline idle=$idle delayed=$delayed run=$run" >&2
               printf '%s\n' "$out" >&2
@@ -249,6 +446,10 @@ for scenario in $SCENARIOS; do
               kill "$PROXY_PID" 2>/dev/null || true
               wait "$PROXY_PID" 2>/dev/null || true
               PROXY_PID=""
+            fi
+            if [ "$cluster" = 1 ]; then
+              stop_cluster
+              continue
             fi
             kill "$SERVER_PID" 2>/dev/null || true
             wait "$SERVER_PID" 2>/dev/null || true

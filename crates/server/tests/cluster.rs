@@ -1341,7 +1341,7 @@ fn cluster_configuration_errors() {
         ),
         // Timing.
         (
-            single_node_config(dir.path(), &format!("{plain}\nheartbeat = \"200ms\""), None),
+            single_node_config(dir.path(), &format!("{plain}\nheartbeat = \"500ms\""), None),
             vec![],
             "must be shorter than the minimum election timeout",
         ),

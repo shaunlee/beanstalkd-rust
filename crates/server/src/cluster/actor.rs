@@ -12,11 +12,12 @@
 //! - every message becomes an item `(conn, seq, input)` appended to the
 //!   queue in arrival order (`seq` from a per-connection counter, 1 for
 //!   `Connect`);
-//! - one sender drains the queue from a cursor: as the leader, with
-//!   `client_write_ff` per item (each call hands the entry to the Raft core
-//!   before the next); otherwise as `ForwardRequest` batches to the leader,
-//!   one in flight at a time (the leader proposes each batch in order
-//!   before answering);
+//! - one sender drains the queue from a cursor: as the leader, by handing
+//!   every unsent item, in order, to the proposer ([`super::proposer`],
+//!   which proposes them in `Op::Batch` entries together with the inputs
+//!   other owners forwarded, keeping the order of each); otherwise as
+//!   `ForwardRequest` batches to the leader, one in flight at a time (the
+//!   leader hands each batch to its proposer, in order, before answering);
 //! - an item leaves the queue only when the state machine reports it
 //!   applied (`ReplySink::applied`); being accepted by the leader is not
 //!   enough, as a leader can lose uncommitted entries.
@@ -578,17 +579,12 @@ impl Actor {
             self.front_since = Instant::now();
         }
         if core.is_leader() {
-            while let Some(item) = self.queue.peek_unsent() {
-                let op = Op::Conn {
-                    seq: item.seq,
-                    input: item.input.clone(),
-                };
-                if core.propose(op).await.is_err() {
-                    // Raft has stopped.
-                    return None;
-                }
-                self.queue.send_next();
+            let mut items = Vec::new();
+            while let Some(item) = self.queue.send_next() {
+                items.push((item.seq, item.input.clone()));
             }
+            // An error means Raft has stopped: nothing can be sent anymore.
+            let _ = core.submit(items);
             return None;
         }
         let target = self

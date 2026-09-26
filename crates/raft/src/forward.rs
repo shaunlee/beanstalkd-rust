@@ -39,8 +39,9 @@ pub enum ControlResponse {
 /// peer (`owner_of(conn) == req.from`). Requests of one peer connection are
 /// served one at a time, in arrival order, and Raft RPCs on the same
 /// connection wait behind it: the implementation must return once the
-/// inputs are proposed (for example with `client_write_ff`), never wait for
-/// their commit. A call may be dropped at any await point (the connection
+/// inputs are proposed (for example with `client_write_ff`), or queued, in
+/// order, for a proposal (the server's batching proposer, P3-FD), never
+/// wait for their commit. A call may be dropped at any await point (the connection
 /// closed, or replaced by a newer connection of the same peer), so an
 /// implementation must not leave shared state inconsistent across an
 /// await.
@@ -140,7 +141,7 @@ pub(crate) fn check_control(peer: NodeId, req: &ControlRequest) -> Result<(), St
         Op::SetDraining(_) => Ok(()),
         Op::DropNode { node, .. } if node == peer => Ok(()),
         Op::DropNode { node, .. } => Err(format!("node {peer} may not drop node {node}")),
-        Op::Conn { .. } | Op::Tick => {
+        Op::Conn { .. } | Op::Tick | Op::Batch(_) => {
             Err(format!("operation {:?} is not a control operation", req.op))
         }
     }

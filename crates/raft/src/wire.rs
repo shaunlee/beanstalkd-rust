@@ -19,7 +19,8 @@
 //! collections in requests that a few bytes each could expand into large
 //! allocations are limited while decoding (before they are built):
 //! AppendEntries entries ([`MAX_APPEND_ENTRIES`]), forward items
-//! ([`MAX_FORWARD_ITEMS`]), and the node sets of memberships
+//! ([`MAX_FORWARD_ITEMS`]), the items of an `Op::Batch` in a log entry or
+//! a control request ([`MAX_BATCH_ITEMS`]), and the node sets of memberships
 //! ([`MAX_MEMBERS`], [`MAX_JOINT_CONFIGS`]). A request beyond a limit is a
 //! decode error, which closes the connection. A status probe and its
 //! answer ([`RpcRequest::Status`], [`RpcResponse::Status`]) have a fixed
@@ -67,6 +68,12 @@ pub const MAX_APPEND_ENTRIES: usize = 4096;
 /// Most items accepted in one forward request (the server batches at most
 /// 1024).
 pub const MAX_FORWARD_ITEMS: usize = 4096;
+
+/// Most items accepted in one `Op::Batch` (in an AppendEntries entry or
+/// a control request): exactly what the server proposes at most
+/// ([`crate::MAX_PROPOSAL_ITEMS`]), so one AppendEntries holds at most
+/// [`MAX_APPEND_ENTRIES`] × this many inputs.
+pub const MAX_BATCH_ITEMS: usize = crate::MAX_PROPOSAL_ITEMS;
 
 /// Most node ids in one membership config, and nodes in one membership
 /// (clusters have 1, 3 or 5 nodes).
@@ -128,7 +135,7 @@ pub enum RpcRequest {
     ),
     Forward(#[serde(deserialize_with = "bounded::forward")] ForwardRequest),
     /// A cluster-wide operation requested by a non-leader (version 2).
-    Control(ControlRequest),
+    Control(#[serde(deserialize_with = "bounded::control")] ControlRequest),
     /// The peer's durable Raft state (version 3), answered from its log
     /// store whether or not its Raft is running (see [`crate::status`]).
     Status,
@@ -266,7 +273,7 @@ mod bounded {
     use std::fmt;
     use std::marker::PhantomData;
 
-    use bstk_engine::{ConnId, EngineInput};
+    use bstk_engine::{ConnId, EngineInput, Nanos};
     use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest};
     use openraft::{
         BasicNode, Entry, EntryPayload, LogId, Membership, SnapshotMeta, StoredMembership, Vote,
@@ -274,8 +281,11 @@ mod bounded {
     use serde::Deserialize;
     use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
-    use super::{MAX_APPEND_ENTRIES, MAX_FORWARD_ITEMS, MAX_JOINT_CONFIGS, MAX_MEMBERS};
-    use crate::{ForwardRequest, NodeId, Request, TypeConfig};
+    use super::{
+        MAX_APPEND_ENTRIES, MAX_BATCH_ITEMS, MAX_FORWARD_ITEMS, MAX_JOINT_CONFIGS, MAX_MEMBERS,
+    };
+    use crate::forward::ControlRequest;
+    use crate::{ForwardRequest, NodeId, Op, Request, TypeConfig};
 
     /// A sequence of at most `max` elements, rejected as soon as its
     /// announced length (or its actual one) exceeds `max`.
@@ -356,6 +366,61 @@ mod bounded {
         seq(d, MAX_FORWARD_ITEMS)
     }
 
+    fn batch<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<(u64, EngineInput)>, D::Error> {
+        seq(d, MAX_BATCH_ITEMS)
+    }
+
+    /// Mirror of [`Op`] (same variants in the same order).
+    #[derive(Deserialize)]
+    enum OpWire {
+        Conn { seq: u64, input: EngineInput },
+        Tick,
+        SetDraining(bool),
+        DropNode { node: NodeId, up_to_local: u64 },
+        Batch(#[serde(deserialize_with = "batch")] Vec<(u64, EngineInput)>),
+    }
+
+    impl From<OpWire> for Op {
+        fn from(o: OpWire) -> Self {
+            match o {
+                OpWire::Conn { seq, input } => Op::Conn { seq, input },
+                OpWire::Tick => Op::Tick,
+                OpWire::SetDraining(on) => Op::SetDraining(on),
+                OpWire::DropNode { node, up_to_local } => Op::DropNode { node, up_to_local },
+                OpWire::Batch(items) => Op::Batch(items),
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct RequestWire {
+        now: Nanos,
+        op: OpWire,
+    }
+
+    impl From<RequestWire> for Request {
+        fn from(r: RequestWire) -> Self {
+            Request {
+                now: r.now,
+                op: r.op.into(),
+            }
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct ControlWire {
+        from: NodeId,
+        op: OpWire,
+    }
+
+    pub(super) fn control<'de, D: Deserializer<'de>>(d: D) -> Result<ControlRequest, D::Error> {
+        let c = ControlWire::deserialize(d)?;
+        Ok(ControlRequest {
+            from: c.from,
+            op: c.op.into(),
+        })
+    }
+
     /// A membership config (a set of node ids).
     struct Config(BTreeSet<NodeId>);
 
@@ -394,7 +459,7 @@ mod bounded {
     #[derive(Deserialize)]
     enum PayloadWire {
         Blank,
-        Normal(Request),
+        Normal(RequestWire),
         Membership(MembershipWire),
     }
 
@@ -410,7 +475,7 @@ mod bounded {
                 log_id: e.log_id,
                 payload: match e.payload {
                     PayloadWire::Blank => EntryPayload::Blank,
-                    PayloadWire::Normal(r) => EntryPayload::Normal(r),
+                    PayloadWire::Normal(r) => EntryPayload::Normal(r.into()),
                     PayloadWire::Membership(m) => EntryPayload::Membership(m.into()),
                 },
             }
@@ -1046,6 +1111,76 @@ mod tests {
             decode_msg(&snap(MAX_MEMBERS as u64 + 1)),
             Err(FrameError::Decode(_))
         ));
+    }
+
+    /// P3-FD: `Op::Batch` items are bounded in log entries and control
+    /// requests, and every older `Op` variant keeps its encoding.
+    #[test]
+    fn decoding_bounds_batches() {
+        let batch = |n: u64| {
+            Op::Batch(
+                (1..=n)
+                    .map(|i| (1, EngineInput::Connect(2 << 48 | i)))
+                    .collect(),
+            )
+        };
+        let entry = |op: Op| Entry {
+            log_id: LogId::new(CommittedLeaderId::new(3, 1), 1),
+            payload: EntryPayload::Normal(Request { now: 5, op }),
+        };
+        let ok = append_with(vec![entry(batch(MAX_BATCH_ITEMS as u64))]);
+        assert_eq!(
+            format!("{:?}", decode_msg(&ok).expect("at the limit")),
+            format!("{ok:?}")
+        );
+        let over = append_with(vec![entry(batch(MAX_BATCH_ITEMS as u64 + 1))]);
+        assert!(matches!(decode_msg(&over), Err(FrameError::Decode(_))));
+
+        let ctl = |op: Op| ClientMsg::Request {
+            id: 4,
+            body: RpcRequest::Control(ControlRequest { from: 2, op }),
+        };
+        let ok = ctl(batch(3));
+        assert_eq!(
+            format!("{:?}", decode_msg(&ok).expect("control")),
+            format!("{ok:?}")
+        );
+        assert!(matches!(
+            decode_msg(&ctl(batch(MAX_BATCH_ITEMS as u64 + 1))),
+            Err(FrameError::Decode(_))
+        ));
+
+        // The older variants round-trip through the mirror, and their
+        // encoding is the derived one (old logs and peers stay readable).
+        for op in [
+            Op::Conn {
+                seq: 3,
+                input: EngineInput::HalfClose(2 << 48 | 1),
+            },
+            Op::Tick,
+            Op::SetDraining(true),
+            Op::DropNode {
+                node: 2,
+                up_to_local: 9,
+            },
+            batch(2),
+        ] {
+            let m = append_with(vec![entry(op.clone())]);
+            assert_eq!(
+                format!("{:?}", decode_msg(&m).expect("round trip")),
+                format!("{m:?}")
+            );
+            let bytes = postcard::to_allocvec(&op).expect("encode");
+            let back: Op = postcard::from_bytes(&bytes).expect("decode");
+            assert_eq!(back, op);
+        }
+        // Variant indexes of the pre-P3-FD variants are unchanged.
+        assert_eq!(postcard::to_allocvec(&Op::Tick).expect("encode"), [1]);
+        assert_eq!(
+            postcard::to_allocvec(&Op::SetDraining(false)).expect("encode"),
+            [2, 0]
+        );
+        assert_eq!(postcard::to_allocvec(&batch(0)).expect("encode"), [4, 0]);
     }
 
     #[test]

@@ -90,13 +90,79 @@ pub enum Op {
     /// node accepted afterwards: a restarted node numbers its new
     /// connections above every local number the state has seen for it.
     DropNode { node: NodeId, up_to_local: u64 },
+    /// Several connection inputs in one log entry (P3-FD: the leader
+    /// proposes everything it has queued or received in one entry, so one
+    /// log write and one `fdatasync` cover many inputs). Items are
+    /// `(seq, input)` exactly as in [`Op::Conn`]; they may belong to
+    /// connections of several owners, in the proposer's order (each
+    /// owner's items in that owner's order). The state machine applies
+    /// them one by one, in order, each with the dedup rules of `Op::Conn`
+    /// and at the entry's `now` (every applied input is followed by the
+    /// engine's timer pass at that `now`, as for `Op::Conn`), so a batch
+    /// applies exactly like the same items proposed as consecutive
+    /// `Op::Conn` entries with the same `now`. An item that is not a
+    /// connection input (`Tick`, `SetDraining`) is ignored. The applied
+    /// result's `duplicate` is true when every item was ignored.
+    /// Decoding from the cluster port is bounded by
+    /// [`wire::MAX_BATCH_ITEMS`]; the server proposes at most
+    /// [`MAX_PROPOSAL_ITEMS`] items and, unless the batch is a single
+    /// item, at most [`MAX_PROPOSAL_BYTES`] of job bodies per entry.
+    /// `Op::Conn` stays valid (logs written before P3-FD replay as they
+    /// are). Declared last so that the encoding of the older variants is
+    /// unchanged.
+    Batch(Vec<(u64, EngineInput)>),
+}
+
+/// Most items the server puts in one [`Op::Batch`].
+pub const MAX_PROPOSAL_ITEMS: usize = 1024;
+
+/// Most bytes of job bodies (plus a fixed overhead per item, see
+/// [`proposal_item_size`]) the server puts in one [`Op::Batch`], unless
+/// the batch is a single item (a job body may be up to the frame size
+/// alone).
+pub const MAX_PROPOSAL_BYTES: usize = 1 << 20;
+
+/// The size an input counts for in [`MAX_PROPOSAL_BYTES`]: 64 bytes plus
+/// its job body, if any.
+pub fn proposal_item_size(input: &EngineInput) -> usize {
+    64 + match input {
+        EngineInput::Command {
+            cmd: bstk_proto::Command::Put { body, .. },
+            ..
+        } => body.len(),
+        _ => 0,
+    }
+}
+
+/// Splits `items` into batches of at most [`MAX_PROPOSAL_ITEMS`] items
+/// and [`MAX_PROPOSAL_BYTES`] (a single larger item forms a batch of its
+/// own), keeping their order.
+pub fn split_batches(items: Vec<(u64, EngineInput)>) -> Vec<Vec<(u64, EngineInput)>> {
+    let mut out = Vec::new();
+    let mut cur: Vec<(u64, EngineInput)> = Vec::new();
+    let mut bytes = 0;
+    for (seq, input) in items {
+        let size = proposal_item_size(&input);
+        if !cur.is_empty() && (cur.len() >= MAX_PROPOSAL_ITEMS || bytes + size > MAX_PROPOSAL_BYTES)
+        {
+            out.push(std::mem::take(&mut cur));
+            bytes = 0;
+        }
+        bytes += size;
+        cur.push((seq, input));
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 /// The apply result returned to the proposer (openraft `R`). Replies to
 /// clients never travel here; owners compute them from their own apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Applied {
-    /// The entry was a duplicate `Op::Conn` and was ignored.
+    /// The entry was a duplicate `Op::Conn` and was ignored (for an
+    /// `Op::Batch`: every item was ignored).
     pub duplicate: bool,
 }
 
@@ -125,4 +191,41 @@ pub enum ForwardResponse {
     Accepted,
     /// Not the leader; resend to `leader` if known.
     NotLeader { leader: Option<NodeId> },
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn put(len: usize) -> EngineInput {
+        EngineInput::Command {
+            conn: 1,
+            cmd: bstk_proto::Command::Put {
+                pri: 0,
+                delay: 0,
+                ttr: 1,
+                body: vec![b'x'; len].into(),
+            },
+        }
+    }
+
+    #[test]
+    fn split_batches_respects_the_bounds_in_order() {
+        let items: Vec<(u64, EngineInput)> =
+            (1..=2500).map(|i| (i, EngineInput::Connect(i))).collect();
+        let sizes: Vec<usize> = split_batches(items).iter().map(Vec::len).collect();
+        assert_eq!(sizes, [1024, 1024, 452]);
+
+        // 300 KiB bodies: three per MiB; a 3 MiB body goes alone.
+        let mut items: Vec<(u64, EngineInput)> = (1..=4).map(|i| (i, put(300 << 10))).collect();
+        items.push((5, put(3 << 20)));
+        items.push((6, put(10)));
+        let seqs: Vec<Vec<u64>> = split_batches(items)
+            .iter()
+            .map(|b| b.iter().map(|(s, _)| *s).collect())
+            .collect();
+        assert_eq!(seqs, [vec![1, 2, 3], vec![4], vec![5], vec![6]]);
+        assert!(split_batches(Vec::new()).is_empty());
+    }
 }

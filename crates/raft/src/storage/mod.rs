@@ -22,9 +22,13 @@
 //!
 //! # Durability
 //!
-//! - `append` writes the whole batch and `fdatasync`s once before calling
-//!   the openraft callback (group commit: openraft hands over every entry
-//!   queued since the previous call).
+//! - `append` writes the whole batch and hands the openraft callback to
+//!   the flusher (group commit, P3-FD): a worker off the caller's task
+//!   `fdatasync`s every segment written since its last sync once, then
+//!   invokes every callback it covered, in order. A callback is invoked
+//!   only after its entries are durable. (openraft 0.9 itself still waits
+//!   for each append's callback before its next command; see
+//!   docs/DESIGN.md §8.)
 //! - `vote`, `purged` and snapshots are written to a temporary file,
 //!   `fdatasync`ed, renamed over the old file, and the directory is
 //!   `fsync`ed.
@@ -37,6 +41,7 @@
 // openraft's `StorageError` (fixed by its storage traits) is large.
 #![allow(clippy::result_large_err)]
 
+mod flusher;
 mod fsutil;
 pub mod log_store;
 mod snapshot;

@@ -492,3 +492,217 @@ fn log_ids_keep_leader_and_term() {
     let mut log = open_log(d.path());
     assert_eq!(read_all(&mut log), vec![e]);
 }
+
+// ------------------------------------------------------ group commit (P3-FD)
+
+fn big_segments(dir: &Path) -> LogStore {
+    LogStore::open(
+        dir,
+        LogOptions {
+            segment_size: 64 << 20,
+            max_read_bytes: 1 << 20,
+        },
+    )
+    .unwrap()
+}
+
+/// Spawns one `blocking_append` task per index of `range` (in order, so
+/// the indexes reach the store consecutively) and waits until all of them
+/// are queued at the (paused) flusher.
+async fn queue_appends(
+    log: &LogStore,
+    range: std::ops::RangeInclusive<u64>,
+) -> Vec<tokio::task::JoinHandle<Result<(), openraft::StorageError<NodeId>>>> {
+    let before = log.flusher().queued();
+    let n = range.clone().count();
+    let hs: Vec<_> = range
+        .map(|i| {
+            let mut l = log.clone();
+            tokio::spawn(async move { l.blocking_append([filler(1, i)]).await })
+        })
+        .collect();
+    while log.flusher().queued() < before + n {
+        assert!(
+            !hs.iter().any(|h| h.is_finished()),
+            "an append finished without waiting for its sync"
+        );
+        tokio::task::yield_now().await;
+    }
+    hs
+}
+
+/// Appends queued while a sync is pending are covered by one `fdatasync`,
+/// and are readable before it.
+#[test]
+fn appends_coalesce_into_few_syncs() {
+    let d = tempfile::tempdir().unwrap();
+    let mut log = big_segments(d.path());
+    // Without contention: one sync per append.
+    let s0 = log.flusher().syncs();
+    for i in 1..=20 {
+        append(&mut log, [filler(1, i)]);
+    }
+    assert_eq!(log.flusher().syncs() - s0, 20);
+
+    block_on(async {
+        log.flusher().set_paused(true);
+        let hs = queue_appends(&log, 21..=520).await;
+        // Written, not yet durable: already readable, not acknowledged.
+        let mut r = log.clone();
+        let all = r.try_get_log_entries(..).await.unwrap();
+        assert_eq!(indexes(&all), (1..=520).collect::<Vec<_>>());
+        assert!(hs.iter().all(|h| !h.is_finished()));
+        let s1 = log.flusher().syncs();
+        log.flusher().set_paused(false);
+        for h in hs {
+            h.await.unwrap().unwrap();
+        }
+        assert_eq!(log.flusher().syncs() - s1, 1, "500 appends, one sync");
+    });
+    drop(log);
+    let mut log = big_segments(d.path());
+    assert_eq!(state(&mut log), (None, Some(520)));
+}
+
+/// A crash after appends were written but before their sync: whatever
+/// the file system kept of the unsynced tail (any prefix, or zeros in
+/// place of the lost pages), the reopened log holds every acknowledged
+/// entry and is consecutive.
+#[test]
+fn crash_between_write_and_sync() {
+    let base = tempfile::tempdir().unwrap();
+    let acked_end;
+    {
+        let mut log = big_segments(base.path());
+        append(&mut log, (1..=10).map(|i| filler(1, i)));
+        acked_end = std::fs::metadata(segments(base.path())[0].clone())
+            .unwrap()
+            .len();
+        block_on(async {
+            log.flusher().set_paused(true);
+            let hs = queue_appends(&log, 11..=16).await;
+            // The crash: the queued syncs never happen, nothing more is
+            // acknowledged.
+            log.flusher().crash();
+            for h in hs {
+                assert!(h.await.unwrap().is_err(), "never acknowledged");
+            }
+        });
+    }
+    let segs = segments(base.path());
+    assert_eq!(segs.len(), 1);
+    let name = segs[0].file_name().unwrap().to_owned();
+    let full = std::fs::read(&segs[0]).unwrap();
+    assert!(
+        full.len() as u64 > acked_end,
+        "unsynced records were written"
+    );
+    let check = |d: &Path, what: &str| {
+        let mut log = big_segments(d);
+        let (_, last) = state(&mut log);
+        let last = last.unwrap();
+        assert!((10..=16).contains(&last), "{what}: last {last}");
+        let all = read_all(&mut log);
+        assert_eq!(indexes(&all), (1..=last).collect::<Vec<_>>(), "{what}");
+        assert_eq!(all[9], filler(1, 10), "{what}");
+        // The log keeps working after the recovery.
+        append(&mut log, [filler(2, last + 1)]);
+    };
+    for cut in acked_end..=full.len() as u64 {
+        // A prefix of the unsynced bytes survived.
+        let d = tempfile::tempdir().unwrap();
+        copy_dir(base.path(), d.path());
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(d.path().join(&name))
+            .unwrap();
+        f.set_len(cut).unwrap();
+        drop(f);
+        check(d.path(), &format!("cut at {cut}"));
+
+        // The size survived but the data from `cut` on did not.
+        let d = tempfile::tempdir().unwrap();
+        copy_dir(base.path(), d.path());
+        let mut bytes = full.clone();
+        bytes[cut as usize..].fill(0);
+        std::fs::write(d.path().join(&name), &bytes).unwrap();
+        check(d.path(), &format!("zeros from {cut}"));
+    }
+}
+
+/// `truncate`, `purge` and `save_vote` wait until every pending sync is
+/// done (and acknowledged) before they touch the files.
+#[test]
+fn truncate_purge_and_vote_wait_for_pending_syncs() {
+    let d = tempfile::tempdir().unwrap();
+    let mut log = big_segments(d.path());
+    append(&mut log, (1..=5).map(|i| filler(1, i)));
+    let order = Arc::new(Mutex::new(Vec::new()));
+    block_on(async {
+        for (what, first) in [("truncate", 6u64), ("purge", 7), ("vote", 9)] {
+            log.flusher().set_paused(true);
+            let hs = queue_appends(&log, first..=first + 1).await;
+            let mut l = log.clone();
+            let o = order.clone();
+            let op = tokio::spawn(async move {
+                match what {
+                    "truncate" => l.truncate(lid(1, 7)).await.unwrap(),
+                    "purge" => l.purge(lid(1, 3)).await.unwrap(),
+                    _ => l.save_vote(&Vote::new(4, 1)).await.unwrap(),
+                }
+                o.lock().unwrap().push(what);
+            });
+            let o = order.clone();
+            let appends = tokio::spawn(async move {
+                for h in hs {
+                    h.await.unwrap().unwrap();
+                }
+                o.lock().unwrap().push("appends");
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(!op.is_finished(), "{what} must wait for the pending sync");
+            log.flusher().set_paused(false);
+            op.await.unwrap();
+            appends.await.unwrap();
+        }
+    });
+    assert_eq!(
+        *order.lock().unwrap(),
+        ["appends", "truncate", "appends", "purge", "appends", "vote"]
+    );
+    // Truncated at 7 (6 survives), then 7..=10 appended, purged up to 3.
+    assert_eq!(state(&mut log), (Some(3), Some(10)));
+    drop(log);
+    let mut log = big_segments(d.path());
+    assert_eq!(state(&mut log), (Some(3), Some(10)));
+    assert_eq!(indexes(&read_all(&mut log)), (4..=10).collect::<Vec<_>>());
+    assert_eq!(block_on(log.read_vote()).unwrap(), Some(Vote::new(4, 1)));
+}
+
+/// A crash with appends queued at the flusher that rolled over to new
+/// segments: the rolled-over segments were synced when the next one was
+/// started, so the log reopens (an unsynced tail can only be in the last
+/// segment) with every acknowledged entry.
+#[test]
+fn crash_with_pending_syncs_across_a_rollover() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut log = open_log(d.path());
+        append(&mut log, (1..=3).map(|i| filler(1, i)));
+        let before = segments(d.path()).len();
+        block_on(async {
+            log.flusher().set_paused(true);
+            let hs = queue_appends(&log, 4..=40).await;
+            assert!(segments(d.path()).len() > before + 2, "must roll over");
+            log.flusher().crash();
+            for h in hs {
+                assert!(h.await.unwrap().is_err());
+            }
+        });
+    }
+    let mut log = open_log(d.path());
+    let (_, last) = state(&mut log);
+    let last = last.unwrap();
+    assert!((3..=40).contains(&last));
+    assert_eq!(indexes(&read_all(&mut log)), (1..=last).collect::<Vec<_>>());
+}
