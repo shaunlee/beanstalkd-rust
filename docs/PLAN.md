@@ -201,7 +201,7 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 | P1 | Write-ahead log; see §4 | see §4.5 |
 | P2 | Operability; see §5 | see §5.5 |
 | P3 | Raft replication; see §6 (done) | see §6.6 |
-| P4 | Profiling and optimization (incl. compaction write amplification: about one extra record per operation under churn with small `-s`) | throughput ≥ 1× reference; multi-core scaling curve |
+| P4 | Performance; see §7 | see §7.5 |
 
 ## 4. P1: Write-Ahead Log (detailed plan)
 
@@ -395,3 +395,59 @@ Only one agent at a time edits the server's wiring (T4); T1–T3 work in separat
 - [x] Cluster throughput and latency recorded in `docs/BENCH.md`; target ≥ 50k ops/s for put-reserve-delete with 100 connections on a 3-node cluster on one machine (135k via the leader, 108k via a follower)
 - [x] Security review of the cluster port resolved or documented
 - [x] `docs/DESIGN.md`, `docs/COMPAT.md`, README updated
+
+## 7. P4: Performance (detailed plan)
+
+### 7.1 Scope
+
+- **Standalone efficiency**: close the CPU-efficiency gap to the reference without losing throughput or multi-core use for TLS and many connections.
+- **Complexity**: no per-operation cost that grows with a count a client controls (buried jobs, reservations held by one connection).
+- **Footprint**: memory per job and binlog bytes written per operation, measured against the reference.
+- **Cluster efficiency**: CPU per operation in cluster mode, especially at low load, and snapshot memory (security review M5).
+- **Invariants**: all differential suites, chaos acceptance and smoke tests stay green; no protocol-visible change.
+- **Out of scope**: openraft 0.10 (still alpha), dynamic membership.
+
+### 7.2 Facts checked before planning
+
+- **Throughput vs the reference** (T6b, P2, P3 benchmarks): every non-pipelined standalone cell is at 0.88x to 1.13x of the reference, and pipelined cells at 1.40x to 1.60x.
+- **CPU efficiency** is the real gap: at 100 connections we do about 52k operations per CPU-second, against about 124k for the reference (0.42x); we use 1.8 to 4.2 cores where the reference uses one.
+- **Where our time goes**: the T6b profile after the index work shows the engine actor on-CPU about 7% of the time. Most process time is tokio worker park/unpark and socket syscalls: every command crosses threads twice (connection task → engine actor → connection task).
+- **Linear-time removals**: removing a buried job (`TubeState::buried`, a `VecDeque`, `engine.rs` ~1129) and removing a job from a connection's reservations (`ConnState::reserved_fifo`, a `Vec`, ~1188) are O(n). The reference uses intrusive linked lists (`dat.h` `Job *prev, *next`), so both are O(1) there. A client can make them quadratic, e.g. by deleting 1M buried jobs, or by releasing jobs out of order on a connection holding 100k.
+- **Cluster CPU**: about 20 µs per operation at 100 connections (standalone about 10 µs). At one connection it is about 260 µs, mostly waking parked threads on every node for every entry. Every node builds every reply, including `stats` YAML, even for connections it does not own.
+
+### 7.3 Design decisions
+
+1. **Standalone hand-off**: decided by measurement. A spike (P4-T1) builds two prototypes outside the main tree:
+   - (a) the engine actor drains many messages per wake-up (still ticking between messages), and connection tasks batch their reply writes, to cut wake-ups;
+   - (b) an opt-in single-threaded mode (`server.threads = 1`: tokio current-thread runtime, engine called inline by connection tasks, no channels), like the reference's event loop.
+
+   The lead picks by the numbers: adopt what reaches the targets in 7.5. If both help, (a) becomes the default and (b) the opt-in. The multi-threaded runtime stays the default either way, because TLS and many connections need several cores.
+2. **O(1) removals**: buried lists and per-connection reservations become order-preserving structures with O(1) or O(log n) removal (e.g. an index-linked list in a slab, or a `BTreeMap` keyed by insertion sequence). The observable order stays exactly the reference's (buried FIFO for kick and peek-buried, reservation order for DEADLINE_SOON and disconnect release). The engine oracle proptest guards equivalence, as in T6b.
+3. **Footprint**: measure first (1M jobs of 16 B and 1 KiB; bytes per job, RSS after a delete-all), then fix only what is clearly above the reference. The same goes for binlog bytes written per operation under churn with default and small `-s`.
+4. **Cluster**:
+   - `Engine::apply_input` gains a way to skip building replies for connections the node does not own. State and timers are unaffected, since replies are pure. Determinism tests compare state, and replies only where they are built.
+   - Fewer wake-ups at low load (coalescing notifications between the Raft core, the state machine and the actors).
+   - Snapshots are streamed to and from files rather than held as several in-memory copies.
+
+### 7.4 Tasks (sequential: one subagent at a time; the lead picks each subagent's model)
+
+| ID | Task | Owner |
+|---|---|---|
+| P4-T0 | Plan; bench additions for ops per CPU-second, memory and bytes written | lead |
+| P4-T1 | Spike: prototypes (a) and (b), profile both, report numbers; no merge | subagent |
+| P4-T2 | Implement the chosen hand-off design in the server | subagent |
+| P4-T3 | Engine: O(1) buried and reservation removal; 1M-scale tests; oracle equivalence | subagent |
+| P4-T4 | Footprint measurement (memory per job, binlog bytes per op) vs reference, and fixes if needed | subagent |
+| P4-T5 | Cluster efficiency: owner-only replies, fewer wake-ups, streamed snapshots | subagent |
+| P4-T6 | Full benchmark matrix (standalone, `-b`, TLS, cluster), chaos acceptance re-run, smoke tests | subagent |
+| P4-T7 | P4 acceptance | lead |
+
+### 7.5 Acceptance
+
+- [ ] Standalone plaintext: ops per CPU-second ≥ 0.8x the reference at 10 and 100 connections, and throughput ≥ 1.0x the reference in every non-pipelined matrix cell (was 0.88x at worst)
+- [ ] TLS, `-b` and cluster throughput not below their P3 numbers (±5%)
+- [ ] Deleting or kicking 1M buried jobs, and releasing 100k reservations of one connection in random order, run in time linear in the count; the oracle proptest still passes
+- [ ] Memory per job ≤ 1.5x the reference and binlog bytes written per operation ≤ 1.2x the reference (or a documented reason)
+- [ ] Cluster: CPU per operation at 100 connections ≤ 15 µs (was 20); one-connection CPU per operation at least halved; snapshot peak memory ≤ 1.5x the state size
+- [ ] All differential suites, chaos acceptance (≥ 1,000 in-process seeds, ≥ 100 multi-process runs) and smoke tests green
+- [ ] `docs/BENCH.md`, `docs/DESIGN.md` updated

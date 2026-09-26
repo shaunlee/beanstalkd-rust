@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarizes bench/run-matrix.sh CSV output as a Markdown table.
 
-Usage: summarize.py [--baseline MODE] results.csv [more.csv ...]
+Usage: summarize.py [--baseline MODE] [--efficiency] results.csv [more.csv ...]
 
 For every (server mode, scenario, conns, body size, pipeline, idle conns,
 delayed tubes) cell it prints the median
@@ -18,6 +18,10 @@ sums over the cell's runs the resent inputs, forward queue rewinds and
 leader term changes ("resent/rewinds/terms").
 --baseline MODE adds a column with rs ops/s divided by rs ops/s of the same
 cell in server mode MODE (e.g. `--baseline none`: TLS cost for ours).
+--efficiency adds operations per CPU-second for both servers (per run
+ops/s divided by server CPU as a fraction of one core, then the median)
+and their ratio rs / ref; for the reference behind stunnel this counts the
+reference's own CPU only.
 """
 
 from __future__ import annotations
@@ -40,6 +44,15 @@ def spread(rows: list[dict[str, str]], key: str) -> float:
     return (max(vals) - min(vals)) / statistics.median(vals)
 
 
+def med_eff(rows: list[dict[str, str]]) -> float | None:
+    vals = [
+        float(r["ops_per_sec"]) / (float(r["server_cpu_pct"]) / 100.0)
+        for r in rows
+        if r.get("ops_per_sec") and r.get("server_cpu_pct") and float(r["server_cpu_pct"]) > 0
+    ]
+    return statistics.median(vals) if vals else None
+
+
 def fmt(v: float | None, digits: int = 0) -> str:
     return "-" if v is None else f"{v:,.{digits}f}"
 
@@ -47,8 +60,14 @@ def fmt(v: float | None, digits: int = 0) -> str:
 def main() -> int:
     args = sys.argv[1:]
     baseline = None
-    if len(args) >= 2 and args[0] == "--baseline":
-        baseline, args = args[1], args[2:]
+    efficiency = False
+    while args and args[0] in ("--baseline", "--efficiency"):
+        if args[0] == "--efficiency":
+            efficiency, args = True, args[1:]
+        elif len(args) >= 2:
+            baseline, args = args[1], args[2:]
+        else:
+            break
     cells: dict[tuple, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     order: list[tuple] = []
     for path in args:
@@ -81,6 +100,9 @@ def main() -> int:
     clus_rule = "---:|---:|" if clus else ""
     base_head = f" rs/rs[{baseline}] |" if baseline else ""
     base_rule = "---:|" if baseline else ""
+    if efficiency:
+        base_head += " ref ops/CPU-s | rs ops/CPU-s | eff rs/ref |"
+        base_rule += "---:|---:|---:|"
     print(
         f"|{mode_head} scenario | conns | body | pipe |{extra_head} ref ops/s | rs ops/s | rs/ref |{base_head}"
         f" ref CPU % |{proxy_head} rs CPU % |{clus_head} ref put p99 µs | rs put p99 µs "
@@ -103,6 +125,10 @@ def main() -> int:
         if baseline:
             b_ops = med(cells.get((baseline,) + key[1:], {}).get("rs", []), "ops_per_sec")
             base_col = f" {fmt(s_ops / b_ops if b_ops and s_ops else None, 2)} |"
+        if efficiency:
+            r_eff, s_eff = med_eff(ref), med_eff(rs)
+            eff_ratio = s_eff / r_eff if r_eff and s_eff else None
+            base_col += f" {fmt(r_eff)} | {fmt(s_eff)} | {fmt(eff_ratio, 2)} |"
         proxy_col = f" {fmt(med(ref, 'proxy_cpu_pct'))} |" if proxy else ""
         clus_col = ""
         if clus:
