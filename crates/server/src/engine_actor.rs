@@ -50,6 +50,15 @@ pub const EXIT_WAL_FAILURE: i32 = 20;
 /// early is harmless: `tick` returns at once when nothing is due.
 const MAX_WAIT: Duration = Duration::from_secs(3600);
 
+/// P4-T2: upper bound on how many already-queued messages `run_task`
+/// drains with `try_recv` per wake-up before delivering. Only reachable
+/// without a WAL (`spawn` picks the dedicated-OS-thread path whenever one
+/// is configured), so `-b`'s per-message persist-before-reply order is
+/// unaffected. The P4-T1 spike found this has no measured effect on its
+/// own (the lever was the tokio worker-thread count) but is harmless, so
+/// it is kept.
+const ACTOR_BATCH_LIMIT: usize = 64;
+
 /// A message sent by a connection task (or the signal handler) to the
 /// engine actor.
 pub enum EngineMsg {
@@ -260,7 +269,12 @@ impl<L: Log> Actor<L> {
 
     /// The task loop (no WAL). The timer is re-armed only when the
     /// engine's next deadline changes (most messages leave it unchanged).
+    ///
+    /// Drains up to `ACTOR_BATCH_LIMIT` queued messages per wake-up
+    /// (DESIGN.md §3: still ticking after each), delivering once per
+    /// batch rather than once per message.
     async fn run_task(mut self, mut rx: tokio_mpsc::UnboundedReceiver<EngineMsg>) {
+        debug_assert!(self.binlog.is_none());
         let sleep = tokio::time::sleep(Duration::ZERO);
         tokio::pin!(sleep);
         let mut armed: Option<Nanos> = None;
@@ -274,7 +288,7 @@ impl<L: Log> Actor<L> {
                 }
                 armed = deadline;
             }
-            let res = tokio::select! {
+            let first = tokio::select! {
                 msg = rx.recv() => match msg {
                     Some(EngineMsg::Shutdown { done }) => {
                         if let Err(e) = self.shutdown() {
@@ -283,7 +297,7 @@ impl<L: Log> Actor<L> {
                         let _ = done.send(());
                         return;
                     }
-                    Some(msg) => self.on_message(msg),
+                    Some(msg) => msg,
                     // Every sender is gone: nothing left to serve.
                     None => return,
                 },
@@ -291,12 +305,40 @@ impl<L: Log> Actor<L> {
                     // Re-arm on the next iteration even if the deadline
                     // is unchanged (it may have been capped).
                     armed = None;
-                    self.on_timer()
+                    if let Err(e) = self.on_timer() {
+                        fail_stop(&e);
+                    }
+                    continue;
                 }
             };
-            if let Err(e) = res {
-                fail_stop(&e);
+            self.outbox.clear();
+            let now = self.clock.now();
+            self.apply_engine_msg(now, first);
+            self.engine.tick(now, &mut self.outbox);
+            let mut n = 1;
+            while n < ACTOR_BATCH_LIMIT {
+                match rx.try_recv() {
+                    Ok(EngineMsg::Shutdown { done }) => {
+                        // Deliver what we already have, then stop;
+                        // nothing queued behind Shutdown is processed
+                        // (same contract as the unbatched loop).
+                        deliver(&self.conns, &mut self.outbox);
+                        if let Err(e) = self.shutdown() {
+                            fail_stop(&e);
+                        }
+                        let _ = done.send(());
+                        return;
+                    }
+                    Ok(msg) => {
+                        let now = self.clock.now();
+                        self.apply_engine_msg(now, msg);
+                        self.engine.tick(now, &mut self.outbox);
+                        n += 1;
+                    }
+                    Err(_) => break,
+                }
             }
+            deliver(&self.conns, &mut self.outbox);
         }
     }
 
@@ -355,6 +397,15 @@ impl<L: Log> Actor<L> {
     pub fn on_message(&mut self, msg: EngineMsg) -> Result<(), WalError> {
         let now = self.clock.now();
         self.outbox.clear();
+        self.apply_engine_msg(now, msg);
+        self.finish(now)
+    }
+
+    /// The engine side effects of one message, with no tick, persist or
+    /// delivery: shared by `on_message` (one message, then
+    /// `finish`) and `run_task`'s batched loop (several messages, each
+    /// still ticked, before one `persist` + `deliver`).
+    fn apply_engine_msg(&mut self, now: Nanos, msg: EngineMsg) {
         match msg {
             EngineMsg::Connect { conn, reply_tx } => {
                 self.conns.insert(conn, reply_tx);
@@ -380,12 +431,12 @@ impl<L: Log> Actor<L> {
                 // The requester may have given up (timeout); that's fine.
                 let _ = reply.send(self.engine.snapshot_limited(now, max_tubes));
             }
-            // Handled by `run`; kept total so a stray one is harmless.
+            // Handled by the caller (`run` / `run_task`) before reaching
+            // here; kept total so a stray one is harmless.
             EngineMsg::Shutdown { done } => {
                 let _ = done.send(());
             }
         }
-        self.finish(now)
     }
 
     fn command(&mut self, now: Nanos, conn: ConnId, cmd: Command) {

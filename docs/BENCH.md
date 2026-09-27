@@ -2,10 +2,199 @@
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`). The newest numbers
-are from task P3-FD (Raft cluster mode after batched proposals and
-group commit, and the standalone regression check), first below. P2-T5
-(TLS / mTLS) follows, then P1-T5 (write-ahead log, `-b`), then the T6b section (engine performance fix); the T6 first
-pass, whose profile motivated T6b, is kept at the end.
+are from task P4-T2 (tokio worker-thread count and its default, the
+lever the P4-T1 spike found for CPU efficiency), first below. P3-FD
+(Raft cluster mode after batched proposals and group commit, and the
+standalone regression check) follows, then P2-T5 (TLS / mTLS), then
+P1-T5 (write-ahead log, `-b`), then the T6b section (engine performance
+fix); the T6 first pass, whose profile motivated T6b, is kept at the
+end.
+
+## P4-T2: worker threads
+
+### Summary
+
+- **Standalone default: 1 worker thread.** It is the only thread count of {1, 2, 4} that meets the standalone efficiency gate (≥ 0.8x the reference's ops per CPU-second at 10 and 100 connections): 2 workers gives 0.63x–0.78x and 4 workers 0.50x–0.69x in the same 8 cells (monotonically worse with more workers, as the P4-T1 spike found). All three meet the throughput gate (≥ 1.0x every non-pipelined cell: 1.02x–1.37x), and 1 worker also clears the `-b` and TLS gates (≥ 0.95x the P3 build) and the burst gate (plaintext p99 within 2x of no-burst) with room to spare, so the "smallest thread count that meets every gate" is also the only one that meets the first.
+- **TLS's "needs several cores" assumption (§7.3) does not hold on this machine**: at 1 worker and 100 TLS connections, throughput is 1.06x the P3 build (206k vs 195k ops/s) at 0.43x the CPU (98% vs 226%, P3's default 12 workers). `-b` shows the same pattern (147% vs 263% of a core at 100×16): the WAL's dedicated OS thread is now the *second* thread instead of the *thirteenth*.
+- **Cluster default: 2 worker threads.** All three thread counts already beat the P3 build's cluster throughput measured in the same session (100×16: P3 130.9k/105.2k via leader/follower; 1 worker 142.3k/117.4k; 2 workers 147.3k/119.3k; 4 workers 135.9k/109.5k), so the rule picks the best: 2 workers, at 215% total node CPU for +3.5% leader throughput over 1 worker's 136%. At 1 worker, cluster CPU per operation is already about 2.9 core-seconds / 142k ops ≈ 9.6 µs, ahead of P4-T5's ≤ 15 µs target; this is a P4-T5 note, not a P4-T2 decision.
+- **What 1 worker gives up**, none of it gated: pipelined throughput (1.28x–1.38x vs 2 workers' 1.50x–1.78x — the only cells where more workers win on both throughput and efficiency); burst-scenario cost (plaintext p99 +35% under an 800/s TLS handshake burst, vs +18% at 2 workers and +1% at 4; ops/s -10% vs -5%/-5%); and the `producers-consumers` 100×16 cell, the one standalone cell where rs put p99 (886 µs) is higher than the reference's (716 µs) — 100 consumers sharing one worker queue behind each other's reserve wake-ups.
+- **Noise**: a few cells are flagged by `summarize.py` (> 20% spread across 5 runs), all consistent with host jitter rather than a systematic effect, medians unaffected. `producers-consumers` 100×16 at 1 worker: run 1 was low on *both* the reference (153k vs 189k–193k the other 4 runs) and `beanstalkd-rs` (182k vs 190k–205k) — a transient spike at the start of that invocation, caught evenly by alternation. `producers-consumers` 10×16 at 1 worker: only `beanstalkd-rs` dipped, in run 4 (134k vs 154k–184k the other 4 runs; the reference stayed within 134k–140k throughout); `load_avg` was unremarkable for that run (4.96, mid-range of 4.9–6.0 across the 5). `producers-consumers` 100×16 at 2 workers: the reference's run 2 dipped to 109k (vs 150k–195k the other 4 runs) while `beanstalkd-rs` stayed in a narrower 164k–220k band the same runs, during a period when `load_avg` climbed from 7.2 to 12.2 (the highest measurement on both sides came at the highest load, so this is not a simple load correlation either).
+- The P3-FD table (below) reported 135,256 / 108,313 ops/s via leader/follower at 100×16; this session's P3 rerun gives 130,918 / 105,243 (about 3% lower), consistent with the higher background load (1-minute average 3.6 climbing to 7.6 across the run, vs P3-FD's 4.7 starting load) — the "allowing for machine noise" the rule anticipated. All thread-count comparisons below use this session's own P3 rerun as the baseline, not the P3-FD figures.
+
+### Standalone plaintext vs the optimized reference
+
+1 worker (the chosen default), full matrix, `bench/summarize.py --efficiency`:
+
+| scenario | conns | body | pipe | ref ops/s | rs ops/s | rs/ref | ref ops/CPU-s | rs ops/CPU-s | eff rs/ref | ref CPU % | rs CPU % | ref put p99 µs | rs put p99 µs | ref reserve p99 µs | rs reserve p99 µs |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| put-reserve-delete | 10 | 16 | 1 | 143,710 | 186,675 | 1.30 | 203,493 | 222,763 | 1.09 | 71 | 84 | 109 | 104 | 110 | 104 |
+| put-reserve-delete | 10 | 4096 | 1 | 135,970 | 179,304 | 1.32 | 189,544 | 211,002 | 1.11 | 72 | 85 | 124 | 111 | 111 | 111 |
+| put-reserve-delete | 100 | 16 | 1 | 189,708 | 208,501 | 1.10 | 193,480 | 211,676 | 1.09 | 98 | 99 | 706 | 618 | 707 | 618 |
+| put-reserve-delete | 100 | 4096 | 1 | 180,154 | 206,996 | 1.15 | 183,084 | 209,643 | 1.15 | 98 | 99 | 953 | 650 | 671 | 652 |
+| producers-consumers | 10 | 16 | 1 | 138,730* | 172,661* | 1.24 | 190,040 | 201,236 | 1.06 | 73 | 84 | 125 | 129 | 126 | 129 |
+| producers-consumers | 10 | 4096 | 1 | 126,708 | 154,318 | 1.22 | 171,691 | 178,816 | 1.04 | 74 | 86 | 149 | 150 | 127 | 150 |
+| producers-consumers | 100 | 16 | 1 | 191,820* | 197,127* | 1.03 | 195,535 | 202,805 | 1.04 | 98 | 97 | 716 | 886 | 718 | 886 |
+| producers-consumers | 100 | 4096 | 1 | 168,569 | 191,188 | 1.13 | 173,962 | 195,191 | 1.12 | 97 | 98 | 1,155 | 816 | 816 | 829 |
+
+Pipelined (10/100×16×16, informational, no gate):
+
+| scenario | conns | body | pipe | ref ops/s | rs ops/s | rs/ref | eff rs/ref | ref put p99 µs | rs put p99 µs |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| put-reserve-delete | 10 | 16 | 16 | 289,724* | 371,836* | 1.28 | 1.29 | 867 | 667 |
+| put-reserve-delete | 100 | 16 | 16 | 277,202 | 383,101 | 1.38 | 1.34 | 8,388 | 5,309 |
+
+2 workers, same matrix (efficiency fails every cell; kept for the trade-off numbers in the summary above):
+
+| scenario | conns | body | pipe | ref ops/s | rs ops/s | rs/ref | ref ops/CPU-s | rs ops/CPU-s | eff rs/ref | ref CPU % | rs CPU % |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| put-reserve-delete | 10 | 16 | 1 | 141,662 | 187,782 | 1.33 | 198,483 | 153,794 | 0.77 | 72 | 122 |
+| put-reserve-delete | 10 | 4096 | 1 | 134,929* | 173,275* | 1.28 | 185,342 | 136,216 | 0.73 | 73 | 127 |
+| put-reserve-delete | 100 | 16 | 1 | 188,214* | 217,593* | 1.16 | 192,251 | 144,773 | 0.75 | 98 | 150 |
+| put-reserve-delete | 100 | 4096 | 1 | 179,943 | 222,297 | 1.24 | 183,428 | 142,542 | 0.78 | 98 | 157 |
+| producers-consumers | 10 | 16 | 1 | 138,682 | 189,332 | 1.37 | 196,525 | 153,803 | 0.78 | 71 | 124 |
+| producers-consumers | 10 | 4096 | 1 | 124,124* | 166,090* | 1.34 | 165,384 | 123,855 | 0.75 | 73 | 134 |
+| producers-consumers | 100 | 16 | 1 | 156,577* | 175,175* | 1.12 | 167,104 | 106,784 | 0.64 | 94 | 160 |
+| producers-consumers | 100 | 4096 | 1 | 149,364* | 174,128* | 1.17 | 157,890 | 98,709 | 0.63 | 95 | 176 |
+
+2 workers pipelined (the best pipelined cells measured):
+
+| scenario | conns | body | pipe | ref ops/s | rs ops/s | rs/ref | eff rs/ref |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| put-reserve-delete | 10 | 16 | 16 | 267,534* | 477,395* | 1.78 | 0.90 |
+| put-reserve-delete | 100 | 16 | 16 | 309,046 | 462,873 | 1.50 | 0.82 |
+
+4 workers (ratio-only; efficiency fails every cell, worse than 2 workers, throughput still ≥ 1.0x): put-reserve-delete 10×16 1.25x / 10×4096 1.02x* / 100×16 1.12x / 100×4096 1.14x; producers-consumers 10×16 1.28x / 10×4096 1.32x / 100×16 1.08x / 100×4096 1.17x; efficiency 0.50x–0.69x throughout. Pipelined: 10×16×16 1.61x (eff 0.62x), 100×16×16 1.66x (eff 0.63x).
+
+### `-b` and TLS vs the P3 build
+
+`-b` (default fsync), alternated against the P3 build (raw CSVs: `b-default-alt{1,2,4}.csv`); gate is ≥ 0.95x, all three thread counts pass every cell:
+
+| threads | 10×16 | 10×4096 | 100×16 | 100×4096 |
+|---:|---:|---:|---:|---:|
+| 1 | 1.01 (168%→106% CPU) | 0.98 | 1.09* (263%→147%) | 1.05 |
+| 2 | 1.08 | 1.07 | 1.13* | 1.14 |
+| 4 | 0.99 | 1.01 | 1.15* | 1.06* |
+
+TLS, P3's own listener via the `rs` slot vs the current build (`b-tls-p3.csv` relabeled, `b-tls-rs{1,2,4}.csv`); same gate, all pass:
+
+| threads | 10×16 | 10×4096 | 100×16 | 100×4096 |
+|---:|---:|---:|---:|---:|
+| 1 | 1.00* (144%→83% CPU) | 0.97 | 1.06 (226%→98%) | 1.02 |
+| 2 | 1.08* | 1.11 | 1.11 | 1.15 |
+| 4 | 1.05* | 1.05 | 1.04 | 1.04 |
+
+### Connection/handshake-burst scenario
+
+100 plaintext connections running `put-reserve-delete` (16 B) while a TLS handshake burst (target 800/s, ≤ 64 outstanding, one `use bench-burst` per connection) runs against a second listener on the same server; `none` is the same invocation without the burst client. Gate: burst p99 within 2x of no-burst p99. 0 `burst_errors` and ~797/800 handshakes/s achieved at every thread count (no client-side port exhaustion).
+
+| threads | ops/s (none) | ops/s (burst) | put p99 (none) µs | put p99 (burst) µs | p99 ratio | handshake p50/p99 ms |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 207,528 | 186,753 | 648 | 876 | 1.35 | 1.33 / 10.78 |
+| 2 | 219,237 | 207,693 | 619 | 730 | 1.18 | 1.28 / 7.75 |
+| 4 | 203,944 | 194,618 | 733 | 740 | 1.01 | 1.32 / 3.77 |
+
+(reserve and delete p99 move with put p99 within 1% at every thread count.)
+
+### Cluster mode vs the P3 build
+
+3 nodes, `cluster-leader` / `cluster-follower`, 10/100×16, P3 build vs the current build via the `rs` slot (`d-p3.csv` relabeled, `d-rs{1,2,4}.csv`). Rule: best throughput not below the P3 numbers (this session's rerun, see "Summary" for the cross-check against P3-FD's historical figures).
+
+| target | P3 (this session) | 1 worker | 2 workers | 4 workers |
+|---|---:|---:|---:|---:|
+| leader, 10×16 | 33,878 | 34,267 | 34,776 | 34,355 |
+| follower, 10×16 | 28,442 | 27,241 | 29,586 | 28,362* |
+| leader, 100×16 | 130,918 | 142,315 | **147,338** | 135,905 |
+| follower, 100×16 | 105,243 | 117,397* | **119,325** | 109,520 |
+
+All three thread counts beat P3; 2 workers is best at both connection counts and is the chosen cluster default (215% total node CPU vs 1 worker's 136%, for +3.5% leader throughput at 100×16 — noted for P4-T5, not a reason to change the pick).
+
+### Chosen defaults
+
+Applying the rule from `docs/PLAN.md` §7.5 / the lead's decision text:
+
+- **Standalone** (`server.threads` unset, no `[cluster]`): **1**. It is the smallest — and, on this machine, the *only* — thread count of {1, 2, 4} that meets the standalone efficiency gate (≥ 0.8x) at every 10- and 100-connection cell, while also meeting the throughput gate (≥ 1.0x every non-pipelined cell), the `-b` and TLS gates (≥ 0.95x the P3 build) and the burst gate (plaintext p99 within 2x of no-burst). No thread count needed to be reported to the lead as a no-clean-winner case: 1 clears every gate; 2 and 4 fail the first one outright.
+- **Cluster** (`[cluster]` present): **2**. The standalone-vs-reference gates do not apply in cluster mode (the rule allows a different default); among {1, 2, 4}, all beat the P3 build's cluster throughput measured in the same session, and 2 is the best.
+
+### Environment (P4-T2)
+
+| | |
+|---|---|
+| Machine | Apple M6, 12 cores, 32 GB RAM |
+| OS | macOS 27.0 (Darwin 27.0.0, arm64) |
+| Rust | rustc 1.98.1; release build (opt-level 3, `debug = 1`) |
+| beanstalkd-rs | commit `f7ad41b` plus the P4-T2 changes (uncommitted at measurement time) |
+| P3 baseline | commit `f7ad41b` (`git archive HEAD` before the P4-T2 changes), built the same way, own `CARGO_TARGET_DIR` |
+| Reference | `.ref/beanstalkd-opt/beanstalkd`, `scripts/build-ref.sh --optimized` (commit `25085c5`, `-O2`) |
+| Load generator | `bstk-bench`, same machine, loopback, 5 s per run, 5 runs per cell; connections set up before the clock starts |
+| Background load | Not idle (an OrbStack VM of another user and system services, as in earlier sections). The 1-minute load average was 3.6 at the start of the ~54-minute run used for the tables below and 7.6 at the end (it climbed steadily, not in step with any particular cell); see the per-row `load_avg` column for the value at each run, and "Noise" below for the cells this affected. |
+
+### Method
+
+- **Alternation**: within one `bench/run-matrix.sh` invocation, `SERVERS="ref rs"` interleaves a reference run and a `beanstalkd-rs` run for every cell (ref first), so machine-load drift affects both sides alike. This works for the standalone-vs-C-reference matrix and the `-b` (default fsync) vs P3 matrix (`RS_ARGS="--threads N"` reaches only the `rs` side; a P3-era or reference binary without `--threads` is never given it). It does **not** work for TLS or cluster mode: `run-matrix.sh`'s `ref` slot always means "plaintext plus an external stunnel" for TLS modes, and cluster modes skip `server = ref` unconditionally (cluster mode is ours only) — so those two comparisons run as separate blocks, one binary at a time, both labeled `rs` in their own CSV, relabeled (`sed 's/^rs,/ref,/'`) before feeding both files to `summarize.py` together.
+- **`RS_ARGS`** (`bench/run-matrix.sh`, P4-T2): extra arguments appended for `beanstalkd-rs` only (never the reference, never an `RS_BIN` standing in for it), so a sweep can alternate a fixed reference against several `--threads N` values in one invocation.
+- **`burst` server mode** (`bench/run-matrix.sh`, P4-T2, ours only): a generated `--config` gives the server both a plaintext listener (the normal `$SCENARIOS` traffic) and a TLS listener (`auth = "none"`); `bstk-bench`'s new `handshake-burst` scenario (`--rate`, `BURST_RATE` / `BURST_CONNS` env vars) runs concurrently against the TLS listener, repeatedly connecting, running one cheap command (`use bench-burst`) and closing. The `none` mode cell in the same invocation (same build, same session) is the no-burst comparison point.
+- **Cluster mode vs P3**: `cluster-leader` / `cluster-follower` server modes, `RS_BIN` swapped between the P3 binary and the current build (`RS_ARGS="--threads N"` on the latter only); both labeled `rs`, compared as described above under Alternation.
+
+### Commands
+
+```sh
+cargo build --release -p bstk-server -p bstk-bench
+REF="$PWD/.ref/beanstalkd-opt/beanstalkd"          # scripts/build-ref.sh --optimized
+CUR=target/release/beanstalkd-rs                     # current build (has --threads)
+# P3 baseline: HEAD before the P4-T2 changes, its own target dir.
+git archive HEAD | tar -x -C p3 && \
+  (cd p3 && CARGO_TARGET_DIR=target cargo build --release -p bstk-server)
+P3=p3/target/release/beanstalkd-rs
+
+# A: standalone plaintext vs the reference, alternated, for N in 1 2 4.
+REF_BIN=$REF RS_BIN=$CUR SERVERS="ref rs" RS_ARGS="--threads $N" \
+  SCENARIOS="put-reserve-delete producers-consumers" CONNS="10 100" BODIES="16 4096" \
+  RUNS=5 DURATION=5 SERVER_MODES=none OUT_CSV=a-alt$N-main.csv bench/run-matrix.sh
+REF_BIN=$REF RS_BIN=$CUR SERVERS="ref rs" RS_ARGS="--threads $N" \
+  SCENARIOS=put-reserve-delete CONNS="10 100" BODIES=16 PIPELINES=16 \
+  RUNS=5 DURATION=5 SERVER_MODES=none OUT_CSV=a-alt$N-pipe.csv bench/run-matrix.sh
+bench/summarize.py --efficiency a-alt$N-main.csv
+bench/summarize.py --efficiency a-alt$N-pipe.csv
+
+# C: connection/handshake-burst scenario, for N in 1 2 4.
+RS_BIN=$CUR SERVERS=rs SERVER_ARGS="--threads $N" SCENARIOS=put-reserve-delete \
+  CONNS=100 BODIES=16 RUNS=5 DURATION=5 SERVER_MODES="none burst" \
+  BURST_RATE=800 BURST_CONNS=64 OUT_CSV=c-rs$N.csv bench/run-matrix.sh
+bench/summarize.py --baseline none c-rs$N.csv
+
+# B: -b (default fsync) vs the P3 build, alternated, for N in 1 2 4.
+REF_BIN=$P3 RS_BIN=$CUR SERVERS="ref rs" RS_ARGS="--threads $N" \
+  SCENARIOS=put-reserve-delete CONNS="10 100" BODIES="16 4096" \
+  RUNS=5 DURATION=5 SERVER_MODES=default OUT_CSV=b-default-alt$N.csv bench/run-matrix.sh
+bench/summarize.py b-default-alt$N.csv
+
+# B: TLS vs the P3 build (P3's own TLS listener; block, not alternated).
+RS_BIN=$P3 SERVERS=rs SCENARIOS=put-reserve-delete CONNS="10 100" BODIES="16 4096" \
+  RUNS=5 DURATION=5 SERVER_MODES=tls OUT_CSV=b-tls-p3.csv bench/run-matrix.sh
+RS_BIN=$CUR SERVERS=rs SERVER_ARGS="--threads $N" SCENARIOS=put-reserve-delete \
+  CONNS="10 100" BODIES="16 4096" RUNS=5 DURATION=5 SERVER_MODES=tls \
+  OUT_CSV=b-tls-rs$N.csv bench/run-matrix.sh
+sed 's/^rs,/ref,/' b-tls-p3.csv > b-tls-p3-as-ref.csv
+bench/summarize.py b-tls-p3-as-ref.csv b-tls-rs$N.csv
+
+# D: cluster mode vs the P3 build (ref slot is skipped for cluster modes).
+RS_BIN=$P3 SERVERS=rs SCENARIOS=put-reserve-delete CONNS="10 100" BODIES=16 \
+  RUNS=5 DURATION=5 CLUSTER_NODES=3 SERVER_MODES="cluster-leader cluster-follower" \
+  OUT_CSV=d-p3.csv bench/run-matrix.sh
+RS_BIN=$CUR SERVERS=rs SERVER_ARGS="--threads $N" SCENARIOS=put-reserve-delete \
+  CONNS="10 100" BODIES=16 RUNS=5 DURATION=5 CLUSTER_NODES=3 \
+  SERVER_MODES="cluster-leader cluster-follower" OUT_CSV=d-rs$N.csv bench/run-matrix.sh
+sed 's/^rs,/ref,/' d-p3.csv > d-p3-as-ref.csv
+bench/summarize.py d-p3-as-ref.csv d-rs$N.csv
+```
+
+New CSV columns (empty outside `burst` mode): `burst_attempted`,
+`burst_completed`, `burst_errors` (handshake succeeded but the one
+command after it did not, or the handshake itself failed — not simply
+`attempted - completed`), `burst_rate_achieved` (completed handshakes
+per measured second), `burst_hs_p50_ms` / `burst_hs_p99_ms` (handshake-
+completion latency, measured right after the TLS handshake, before the
+one command).
 
 ## P3: cluster mode
 

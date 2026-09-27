@@ -441,6 +441,7 @@ Only one agent at a time edits the server's wiring (T4); T1–T3 work in separat
 | P4-T5 | Cluster efficiency: owner-only replies, fewer wake-ups, streamed snapshots | subagent |
 | P4-T6 | Full benchmark matrix (standalone, `-b`, TLS, cluster), chaos acceptance re-run, smoke tests | subagent |
 | P4-T7 | P4 acceptance | lead |
+| P4-T8 | Comment cleanup across all crates: keep only comments that state *why* (reference quirks mirrored on purpose, invariants, safety reasoning, rejected alternatives); remove comments that restate the code; move long design reasoning into `docs/DESIGN.md` / `docs/COMPAT.md` and point to it in one line; prefer names and types over comments. No behavior change; all tests green | subagent |
 
 ### 7.5 Acceptance
 

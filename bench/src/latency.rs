@@ -90,6 +90,66 @@ fn percentile(sorted: &[u64], per_mille: usize) -> u64 {
     sorted[rank.clamp(1, n) - 1]
 }
 
+/// Handshake-completion samples for the `handshake-burst` scenario
+/// (P4-T2): a separate, best-effort histogram. Kept out of `Recorder` /
+/// `Op` so a burst never counts toward another scenario's ops/s.
+#[derive(Debug, Default)]
+pub struct HandshakeStats {
+    samples: Vec<u64>,
+    attempted: u64,
+    completed: u64,
+    failed: u64,
+}
+
+impl HandshakeStats {
+    pub fn attempt(&mut self) {
+        self.attempted += 1;
+    }
+
+    pub fn record(&mut self, d: Duration) {
+        self.completed += 1;
+        self.samples
+            .push(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    }
+
+    pub fn fail(&mut self) {
+        self.failed += 1;
+    }
+
+    pub fn merge(&mut self, other: HandshakeStats) {
+        self.samples.extend(other.samples);
+        self.attempted += other.attempted;
+        self.completed += other.completed;
+        self.failed += other.failed;
+    }
+
+    pub fn attempted(&self) -> u64 {
+        self.attempted
+    }
+
+    pub fn completed(&self) -> u64 {
+        self.completed
+    }
+
+    pub fn failed(&self) -> u64 {
+        self.failed
+    }
+
+    pub fn summary(&mut self) -> Option<Summary> {
+        if self.samples.is_empty() {
+            return None;
+        }
+        self.samples.sort_unstable();
+        Some(Summary {
+            count: self.samples.len(),
+            p50: percentile(&self.samples, 500),
+            p99: percentile(&self.samples, 990),
+            p999: percentile(&self.samples, 999),
+            max: self.samples[self.samples.len() - 1],
+        })
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

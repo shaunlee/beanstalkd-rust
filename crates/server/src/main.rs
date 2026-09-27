@@ -157,7 +157,9 @@ fn main() -> ExitCode {
 
     sysinfo::raise_nofile_limit();
 
+    let worker_threads = config::effective_threads(config.threads, cluster_settings.is_some());
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
         .enable_all()
         .build()
     {

@@ -27,6 +27,13 @@ max_job_size = 65535
 # clients cannot use up the process's file descriptors. Plaintext listeners
 # are not limited. Must be at least 1. Default: 1024.
 max_pending_connections = 1024
+# Tokio worker-thread count (like --threads). Must be between 1 and 256.
+# Chosen by measurement (P4-T2; see docs/DESIGN.md §3 and docs/BENCH.md
+# "P4-T2: worker threads"); unlike the other defaults on this page, the
+# default is mode-dependent, not a fixed number: standalone default 1,
+# cluster ([cluster] present) default 2 (see DESIGN.md §3 for the rule
+# that picked them). Uncomment to override either default.
+# threads = 1
 
 # Listening sockets. Zero or more [[listener]] entries; with none, a single
 # plaintext listener on -l / -p (default 0.0.0.0:11300) is used.

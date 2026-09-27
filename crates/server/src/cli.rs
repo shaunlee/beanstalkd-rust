@@ -107,6 +107,15 @@ pub struct Cli {
     #[arg(long = "cluster-init", action = ArgAction::SetTrue)]
     pub cluster_init: bool,
 
+    /// Tokio worker-thread count (default: chosen by mode; see
+    /// docs/DESIGN.md §3)
+    #[arg(
+        long = "threads",
+        value_name = "N",
+        value_parser = clap::value_parser!(u16).range(1..=256),
+    )]
+    pub threads: Option<u16>,
+
     /// Resolved fsync policy (from `-f` / `-F` in argument order); only
     /// meaningful with `-b`.
     #[arg(skip = SyncPolicy::Interval(Duration::from_millis(DEFAULT_FSYNC_MS)))]
@@ -352,7 +361,7 @@ mod tests {
         assert_eq!(cli.config, Some(PathBuf::from("/etc/b.toml")));
         assert!(cli.check_config);
         let cmd = Cli::command();
-        for id in ["config", "check_config"] {
+        for id in ["config", "check_config", "cluster_init", "threads"] {
             let arg = cmd
                 .get_arguments()
                 .find(|a| a.get_id() == id)
@@ -363,6 +372,19 @@ mod tests {
         let mut shorts: Vec<char> = cmd.get_arguments().filter_map(|a| a.get_short()).collect();
         shorts.sort_unstable();
         assert_eq!(shorts, ['F', 'V', 'b', 'f', 'l', 'p', 's', 'u', 'v', 'z']);
+    }
+
+    #[test]
+    fn threads_flag_is_long_only_and_range_checked() {
+        assert_eq!(parse(&[]).expect("no args").threads, None);
+        assert_eq!(
+            parse(&["--threads", "4"]).expect("--threads 4").threads,
+            Some(4)
+        );
+        assert!(parse(&["--threads", "0"]).is_err());
+        assert!(parse(&["--threads", "257"]).is_err());
+        assert!(parse(&["--threads", "256"]).is_ok());
+        assert!(parse(&["--threads", "1"]).is_ok());
     }
 
     #[test]

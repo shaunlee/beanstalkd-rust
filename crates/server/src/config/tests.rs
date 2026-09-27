@@ -188,6 +188,7 @@ fn no_file_is_todays_command_line() {
             auth_timeout: DEFAULT_AUTH_TIMEOUT,
             max_job_size: DEFAULT_MAX_JOB_SIZE,
             max_pending_connections: DEFAULT_MAX_PENDING_CONNECTIONS,
+            threads: None,
             binlog: BinlogSettings {
                 dir: None,
                 file_size: DEFAULT_BINLOG_MAX_SIZE,
@@ -634,6 +635,26 @@ fn max_pending_connections_values() {
 }
 
 #[test]
+fn threads_values() {
+    let threads = |v: i64| resolved(&[], &format!("[server]\nthreads = {v}\n")).threads;
+    assert_eq!(threads(1), Some(1));
+    assert_eq!(threads(256), Some(256));
+    assert_eq!(resolved(&[], "").threads, None);
+    for bad in [0, -1, 257, i64::MIN, i64::MAX] {
+        let e = error(&[], &format!("[server]\nthreads = {bad}\n"));
+        assert!(e.contains("server.threads"), "{bad}: {e}");
+    }
+    // `--threads` overrides the file, like `-z` overrides `max_job_size`.
+    assert_eq!(
+        resolved(&["--threads", "3"], "[server]\nthreads = 8\n").threads,
+        Some(3)
+    );
+    assert_eq!(effective_threads(None, false), DEFAULT_THREADS_STANDALONE);
+    assert_eq!(effective_threads(None, true), DEFAULT_THREADS_CLUSTER);
+    assert_eq!(effective_threads(Some(5), true), 5);
+}
+
+#[test]
 fn tokens_file_mode_warnings() {
     let p = Path::new("/etc/beanstalkd/tokens.txt");
     for ok in [0o600, 0o400, 0o700, 0o100_600, 0o4600] {
@@ -949,7 +970,7 @@ fn debug_output_redacts_tokens() {
 #[test]
 fn check_config_summary() {
     let c = resolved(&[], FULL);
-    let s = summary(&c);
+    let s = summary(&c, false);
     assert!(!s.contains(TOKEN_A) && !s.contains(TOKEN_B), "{s}");
     for expected in [
         "configuration OK: /etc/beanstalkd/b.toml",
@@ -971,12 +992,16 @@ fn check_config_summary() {
     assert!(warnings.is_empty());
     assert_eq!(
         s,
-        "configuration OK: command line only\n\
-         listener 0.0.0.0:11300 (plaintext, auth none)\n\
-         max job size: 65535\n\
-         binlog: disabled\n\
-         http: disabled\n\
-         log: level warn, format text\n"
+        format!(
+            "configuration OK: command line only\n\
+             listener 0.0.0.0:11300 (plaintext, auth none)\n\
+             max job size: 65535\n\
+             threads: {} (default)\n\
+             binlog: disabled\n\
+             http: disabled\n\
+             log: level warn, format text\n",
+            DEFAULT_THREADS_STANDALONE
+        )
     );
 }
 

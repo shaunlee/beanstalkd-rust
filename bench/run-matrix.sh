@@ -78,6 +78,11 @@
 #   STUNNEL     stunnel binary [stunnel from PATH, else /opt/homebrew/bin/stunnel]
 #   BINLOG_ROOT    parent of the per-run binlog directories [a mktemp -d dir]
 #   SERVER_ARGS    extra arguments for both servers (e.g. "-s 1048576")
+#   RS_ARGS        extra arguments for beanstalkd-rs only (e.g.
+#                  "--threads 2"), appended after SERVER_ARGS; never
+#                  reaches the reference or a P3-era RS_BIN without the
+#                  flag (P4-T2's thread-count sweep uses this to alternate
+#                  ref/P3 and rs runs within one invocation)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -97,10 +102,16 @@ IDLE_CONNS="${IDLE_CONNS:-0}"
 DELAYED_TUBES="${DELAYED_TUBES:-0}"
 SERVER_MODES="${SERVER_MODES:-none}"
 SERVER_ARGS="${SERVER_ARGS:-}"
+RS_ARGS="${RS_ARGS:-}"
 CLUSTER_NODES="${CLUSTER_NODES:-3}"
 SERVERS="${SERVERS:-ref rs}"
 KEEP_LOGS="${KEEP_LOGS:-}"
 [ -z "$KEEP_LOGS" ] || mkdir -p "$KEEP_LOGS"
+#   BURST_RATE     "burst" mode only: target TLS handshakes/s [800]
+#   BURST_CONNS    "burst" mode only: handshake attempts allowed in flight
+#                  at once [64]
+BURST_RATE="${BURST_RATE:-800}"
+BURST_CONNS="${BURST_CONNS:-64}"
 need_tls=0
 need_ref=0
 for m in $SERVER_MODES; do
@@ -109,6 +120,11 @@ for m in $SERVER_MODES; do
     tls|mtls|tls-default) need_ref=1; need_tls=1 ;;
     cluster-leader|cluster-follower) ;;
     cluster-mtls-leader|cluster-mtls-follower) need_tls=1 ;;
+    # P4-T2 (ours only, like cluster modes): 100 plaintext connections run
+    # $SCENARIOS while a TLS handshake burst (bstk-bench's
+    # handshake-burst scenario) runs against a second listener on the
+    # same server; see start_server_burst below.
+    burst) need_tls=1 ;;
     *) echo "run-matrix: unknown server mode $m" >&2; exit 1 ;;
   esac
 done
@@ -217,7 +233,7 @@ addr = \"127.0.0.1:${cports[i]}\"
   done
   for i in $(seq 0 $((n - 1))); do
     # shellcheck disable=SC2086
-    "$bin" --config "$CLUSTER_DIR/node$((i + 1)).toml" --cluster-init $SERVER_ARGS \
+    "$bin" --config "$CLUSTER_DIR/node$((i + 1)).toml" --cluster-init $SERVER_ARGS $RS_ARGS \
       >/dev/null 2>"$CLUSTER_DIR/node$((i + 1)).log" &
     CLUSTER_PIDS[i]=$!
   done
@@ -312,7 +328,8 @@ mode_args() {
 # modes, stunnel in front of it); sets SERVER_PID, PROXY_PID and
 # CLIENT_PORT (where bstk-bench connects).
 start_server() {
-  local server="$1" bin="$2" port conf
+  local server="$1" bin="$2" port conf extra=""
+  [ "$server" = rs ] && extra="$RS_ARGS"
   port="$(free_port)"
   if [ -n "$TLS_AUTH" ] && [ "$server" = rs ]; then
     conf="$CERT_DIR/rs.toml"
@@ -322,10 +339,10 @@ start_server() {
       if [ "$TLS_AUTH" = mtls ]; then printf 'client_ca = "%s"\n' "$CERT_DIR/ca.pem"; fi
     } >"$conf"
     # shellcheck disable=SC2086
-    "$bin" --config "$conf" ${MODE_ARGS[@]+"${MODE_ARGS[@]}"} $SERVER_ARGS >/dev/null 2>&1 &
+    "$bin" --config "$conf" ${MODE_ARGS[@]+"${MODE_ARGS[@]}"} $SERVER_ARGS $extra >/dev/null 2>&1 &
   else
     # shellcheck disable=SC2086
-    "$bin" -l 127.0.0.1 -p "$port" ${MODE_ARGS[@]+"${MODE_ARGS[@]}"} $SERVER_ARGS >/dev/null 2>&1 &
+    "$bin" -l 127.0.0.1 -p "$port" ${MODE_ARGS[@]+"${MODE_ARGS[@]}"} $SERVER_ARGS $extra >/dev/null 2>&1 &
   fi
   SERVER_PID=$!
   wait_port "$port"
@@ -349,13 +366,35 @@ start_server() {
   fi
 }
 
+# start_server_burst BIN: "burst" mode (ours only): one server with both a
+# plaintext listener (CLIENT_PORT, for the main $SCENARIOS traffic) and a
+# TLS listener (BURST_PORT, auth none, for the handshake-burst client).
+start_server_burst() {
+  local bin="$1" plain_port tls_port conf
+  plain_port="$(free_port)"; tls_port="$(free_port)"
+  conf="$CERT_DIR/rs-burst.toml"
+  {
+    printf '[[listener]]\naddr = "127.0.0.1:%s"\n' "$plain_port"
+    printf '[[listener]]\naddr = "127.0.0.1:%s"\ntls = true\nauth = "none"\n' "$tls_port"
+    printf '[tls]\ncert = "%s"\nkey = "%s"\n' "$CERT_DIR/server.pem" "$CERT_DIR/server.key"
+  } >"$conf"
+  # shellcheck disable=SC2086
+  "$bin" --config "$conf" ${MODE_ARGS[@]+"${MODE_ARGS[@]}"} $SERVER_ARGS $RS_ARGS >/dev/null 2>&1 &
+  SERVER_PID=$!
+  wait_port "$plain_port"
+  wait_port "$tls_port"
+  CLIENT_PORT="$plain_port"
+  BURST_PORT="$tls_port"
+  PROXY_PID=""
+}
+
 # CPU seconds used so far by a process (ps cputime, [[h:]m:]s.frac).
 cpu_secs() {
   ps -o cputime= -p "$1" 2>/dev/null |
     awk '{ n = split($1, a, ":"); t = 0; for (i = 1; i <= n; i++) t = t * 60 + a[i]; print t }'
 }
 
-[ -s "$OUT_CSV" ] || echo "server,scenario,conns,body_size,pipeline,run,ops_per_sec,server_cpu_pct,put_p50_us,put_p99_us,put_p999_us,reserve_p50_us,reserve_p99_us,reserve_p999_us,delete_p50_us,delete_p99_us,delete_p999_us,load_avg,idle_conns,delayed_tubes,server_mode,proxy_cpu_pct,nodes,target_role,cluster_cpu_pct,node_cpu,resent_inputs,forward_rewinds,drop_node_proposals,refused_connections,rejected_puts,term_changes,leader_changes,isolated_after" >"$OUT_CSV"
+[ -s "$OUT_CSV" ] || echo "server,scenario,conns,body_size,pipeline,run,ops_per_sec,server_cpu_pct,put_p50_us,put_p99_us,put_p999_us,reserve_p50_us,reserve_p99_us,reserve_p999_us,delete_p50_us,delete_p99_us,delete_p999_us,load_avg,idle_conns,delayed_tubes,server_mode,proxy_cpu_pct,nodes,target_role,cluster_cpu_pct,node_cpu,resent_inputs,forward_rewinds,drop_node_proposals,refused_connections,rejected_puts,term_changes,leader_changes,isolated_after,burst_attempted,burst_completed,burst_errors,burst_rate_achieved,burst_hs_p50_ms,burst_hs_p99_ms" >"$OUT_CSV"
 
 # Extracts a numeric field from the bench's JSON line ("" if absent).
 field() {
@@ -378,6 +417,7 @@ for scenario in $SCENARIOS; do
             cluster=0
             case "$mode" in cluster-*) cluster=1 ;; esac
             if [ "$cluster" = 1 ] && [ "$server" = ref ]; then continue; fi
+            if [ "$mode" = "burst" ] && [ "$server" = ref ]; then continue; fi
             if [ "$cluster" = 1 ]; then
               TLS_AUTH=""; BINLOG_DIR=""
               if ! start_cluster "$mode" "$bin"; then
@@ -386,6 +426,9 @@ for scenario in $SCENARIOS; do
               read -r c_resent0 c_rewinds0 c_drops0 c_refused0 c_rejected0 c_term0 c_leader0 _ <<<"$(cluster_counters)"
               node_cpu0=()
               for p in "${CLUSTER_PIDS[@]}"; do node_cpu0+=("$(cpu_secs "$p")"); done
+            elif [ "$mode" = "burst" ]; then
+              TLS_AUTH=""; BINLOG_DIR=""; MODE_ARGS=()
+              start_server_burst "$bin"
             else
               mode_args "$mode"
               start_server "$server" "$bin"
@@ -400,10 +443,31 @@ for scenario in $SCENARIOS; do
             load="$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}' || echo "")"
             proxy_cpu0=""; [ -n "$PROXY_PID" ] && proxy_cpu0="$(cpu_secs "$PROXY_PID")"
             t0="$(python3 -c 'import time; print(time.time())')"
+            # "burst" mode: start the TLS handshake-burst client now, so it
+            # runs concurrently with the plaintext $scenario client below
+            # (both for $DURATION seconds against the same server).
+            burst_out_file=""; BURST_PID=""
+            if [ "$mode" = "burst" ]; then
+              burst_out_file="$(mktemp "$BINLOG_ROOT/burst-out.XXXXXX")"
+              "$BENCH_BIN" --addr "127.0.0.1:$BURST_PORT" --tls --ca "$CERT_DIR/ca.pem" \
+                  --conns "$BURST_CONNS" --duration "$DURATION" --scenario handshake-burst \
+                  --rate "$BURST_RATE" --json >"$burst_out_file" 2>&1 &
+              BURST_PID=$!
+            fi
             # shellcheck disable=SC2086
             if out="$("$BENCH_BIN" --addr "127.0.0.1:$CLIENT_PORT" --conns "$conns" --duration "$DURATION" \
                 --scenario "$scenario" --body-size "$body" --pipeline "$pipeline" --idle-conns "$idle" --delayed-tubes "$delayed" \
                 ${tls_args[@]+"${tls_args[@]}"} --json $BENCH_ARGS 2>&1)"; then
+              burst_json=""
+              if [ -n "$BURST_PID" ]; then
+                if wait "$BURST_PID"; then
+                  burst_json="$(sed -n 's/^JSON //p' "$burst_out_file")"
+                else
+                  echo "WARNING: burst client failed (mode=$mode $scenario conns=$conns run=$run):" >&2
+                  cat "$burst_out_file" >&2
+                fi
+                rm -f "$burst_out_file"
+              fi
               proxy_cpu=""
               if [ -n "$PROXY_PID" ]; then
                 proxy_cpu="$(python3 -c 'import sys, time; print(f"{100 * (float(sys.argv[2]) - float(sys.argv[1])) / (time.time() - float(sys.argv[3])):.1f}")' \
@@ -433,14 +497,24 @@ for scenario in $SCENARIOS; do
                        reserve_p50_us reserve_p99_us reserve_p999_us delete_p50_us delete_p99_us delete_p999_us; do
                 row="$row,$(field "$json" "$f")"
               done
-              echo "$row,$load,$idle,$delayed,$mode,$proxy_cpu$cluster_cols" >>"$OUT_CSV"
-              printf '%-4s %-11s %-20s conns=%-3s body=%-5s pipe=%-3s idle=%-5s delayed=%-5s run=%s  %s ops/s  cpu=%s%%%s%s\n' \
+              burst_cols=",,,,,,"
+              burst_note=""
+              if [ -n "$burst_json" ]; then
+                burst_cols=",$(field "$burst_json" burst_attempted),$(field "$burst_json" burst_completed),$(field "$burst_json" burst_errors),$(field "$burst_json" burst_rate_achieved),$(field "$burst_json" burst_hs_p50_ms),$(field "$burst_json" burst_hs_p99_ms)"
+                burst_note="  burst hs=$(field "$burst_json" burst_completed)/$(field "$burst_json" burst_attempted) achieved=$(field "$burst_json" burst_rate_achieved)/s p99=$(field "$burst_json" burst_hs_p99_ms)ms"
+              fi
+              echo "$row,$load,$idle,$delayed,$mode,$proxy_cpu$cluster_cols$burst_cols" >>"$OUT_CSV"
+              printf '%-4s %-11s %-20s conns=%-3s body=%-5s pipe=%-3s idle=%-5s delayed=%-5s run=%s  %s ops/s  cpu=%s%%%s%s%s\n' \
                 "$server" "$mode" "$scenario" "$conns" "$body" "$pipeline" "$idle" "$delayed" "$run" \
-                "$(field "$json" ops_per_sec)" "$(field "$json" server_cpu_pct)" "${proxy_cpu:+  stunnel cpu=$proxy_cpu%}" "$cluster_note"
+                "$(field "$json" ops_per_sec)" "$(field "$json" server_cpu_pct)" "${proxy_cpu:+  stunnel cpu=$proxy_cpu%}" "$cluster_note" "$burst_note"
             else
               echo "FAILED: $server mode=$mode $scenario conns=$conns body=$body pipeline=$pipeline idle=$idle delayed=$delayed run=$run" >&2
               printf '%s\n' "$out" >&2
               failures=$((failures + 1))
+              if [ -n "$BURST_PID" ]; then
+                wait "$BURST_PID" 2>/dev/null || true
+                rm -f "$burst_out_file"
+              fi
             fi
             if [ -n "$PROXY_PID" ]; then
               kill "$PROXY_PID" 2>/dev/null || true

@@ -15,6 +15,12 @@
 //!   deadline the consumers drain the backlog (not measured).
 //! * `put-only`: every connection puts into a shared tube; afterwards all
 //!   jobs are drained (not measured).
+//! * `handshake-burst` (P4-T2, `--rate N`, `--conns` as the outstanding
+//!   cap): repeatedly connects (normally TLS, via `--tls`), runs one cheap
+//!   command and closes, at a target rate; reports handshake-completion
+//!   latency instead of put/reserve/delete ops. Meant to run alongside
+//!   another `bstk-bench` process driving a normal scenario against the
+//!   same server (`bench/run-matrix.sh`'s `burst` mode does this).
 //!
 //! `--pipeline D` sends D commands of the same kind back to back before
 //! reading their replies (D puts, then D reserves, then D deletes). The
@@ -55,7 +61,7 @@ use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use client::{Client, Reply, Result, Target, TlsOptions, stats_f64, stats_u64, unexpected};
-use latency::{Op, Recorder};
+use latency::{HandshakeStats, Op, Recorder};
 
 const TTR: u32 = 60;
 
@@ -64,6 +70,9 @@ enum Scenario {
     PutReserveDelete,
     ProducersConsumers,
     PutOnly,
+    /// P4-T2 connection/handshake-burst scenario; see the module doc and
+    /// `run_burst`.
+    HandshakeBurst,
 }
 
 impl Scenario {
@@ -72,6 +81,7 @@ impl Scenario {
             Scenario::PutReserveDelete => "put-reserve-delete",
             Scenario::ProducersConsumers => "producers-consumers",
             Scenario::PutOnly => "put-only",
+            Scenario::HandshakeBurst => "handshake-burst",
         }
     }
 }
@@ -128,6 +138,10 @@ struct Args {
     /// Token sent with `auth` on every connection (requires --tls).
     #[arg(long, requires = "tls")]
     token: Option<String>,
+    /// `handshake-burst` only: target connect attempts per second (total,
+    /// shared over up to `--conns` outstanding at once).
+    #[arg(long, default_value_t = 0)]
+    rate: u64,
 }
 
 impl Args {
@@ -204,6 +218,14 @@ fn main() -> ExitCode {
         eprintln!("bstk-bench: producers-consumers needs --conns >= 2");
         return ExitCode::from(2);
     }
+    if args.scenario == Scenario::HandshakeBurst && args.rate == 0 {
+        eprintln!("bstk-bench: handshake-burst needs --rate > 0");
+        return ExitCode::from(2);
+    }
+    if args.scenario != Scenario::HandshakeBurst && args.rate != 0 {
+        eprintln!("bstk-bench: --rate only applies to the handshake-burst scenario");
+        return ExitCode::from(2);
+    }
     raise_nofile_limit(args.conns + args.idle_conns + SETUP_CONNS + 256);
     let mut rt = tokio::runtime::Builder::new_multi_thread();
     rt.enable_all();
@@ -217,13 +239,135 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match rt.block_on(run(&args)) {
+    let result = if args.scenario == Scenario::HandshakeBurst {
+        rt.block_on(run_burst(&args))
+    } else {
+        rt.block_on(run(&args))
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("bstk-bench: FAILED: {e}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// The `handshake-burst` scenario: repeatedly connects, runs one cheap
+/// command (`use bench-burst`) and closes, at `--rate` attempts per second
+/// with up to `--conns` in flight, until `--duration` elapses. Reports
+/// handshake-completion latency (measured right after the TLS handshake,
+/// before the command) and attempted/completed/failed counts; there is no
+/// server-emptiness check (`use` creates no job and no tube state worth
+/// checking).
+async fn run_burst(args: &Args) -> Result<()> {
+    let target = Arc::new(args.target()?);
+    let deadline = Instant::now() + Duration::from_secs(args.duration);
+    let interval = Duration::from_secs_f64(1.0 / args.rate as f64);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let sem = Arc::new(tokio::sync::Semaphore::new(args.conns));
+    let mut set: JoinSet<HandshakeStats> = JoinSet::new();
+    let mut stats = HandshakeStats::default();
+    let start = Instant::now();
+    while Instant::now() < deadline {
+        ticker.tick().await;
+        if Instant::now() >= deadline {
+            break;
+        }
+        let target = Arc::clone(&target);
+        match Arc::clone(&sem).try_acquire_owned() {
+            Ok(permit) => {
+                set.spawn(async move {
+                    let _permit = permit;
+                    let mut s = HandshakeStats::default();
+                    s.attempt();
+                    let t0 = Instant::now();
+                    match Client::connect(&target).await {
+                        // Recorded right after the handshake completes
+                        // (before the one cheap command), so this is
+                        // handshake-completion latency, not round-trip
+                        // latency. `use bench-burst` is UNKNOWN/USING with
+                        // no job data and no stats YAML rendering, unlike
+                        // `stats` (the heaviest read-only command).
+                        Ok(mut c) => {
+                            s.record(t0.elapsed());
+                            match c.call("use bench-burst").await {
+                                Ok(Reply::Using) => {}
+                                _ => s.fail(),
+                            }
+                        }
+                        Err(_) => s.fail(),
+                    }
+                    s
+                });
+            }
+            // The server (or this process) cannot keep up with the
+            // target rate: count the attempt as dropped rather than
+            // blocking the ticker (which would only slow the burst down
+            // further).
+            Err(_) => {
+                stats.attempt();
+                stats.fail();
+            }
+        }
+        while let Some(joined) = set.try_join_next() {
+            stats.merge(joined.map_err(|e| format!("handshake task panicked: {e}"))?);
+        }
+    }
+    while let Some(joined) = set.join_next().await {
+        stats.merge(joined.map_err(|e| format!("handshake task panicked: {e}"))?);
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let rate_achieved = stats.completed() as f64 / elapsed;
+    println!(
+        "scenario={} addr={} rate={}/s conns={} duration={}s",
+        args.scenario.name(),
+        args.addr,
+        args.rate,
+        args.conns,
+        args.duration
+    );
+    println!(
+        "handshakes: attempted={} completed={} errors={} achieved={:.0}/s",
+        stats.attempted(),
+        stats.completed(),
+        stats.failed(),
+        rate_achieved
+    );
+    let summary = stats.summary();
+    if let Some(s) = summary {
+        println!(
+            "handshake latency: p50={:.1}ms p99={:.1}ms p999={:.1}ms max={:.1}ms",
+            us(s.p50) / 1000.0,
+            us(s.p99) / 1000.0,
+            us(s.p999) / 1000.0,
+            us(s.max) / 1000.0
+        );
+    }
+    if args.json {
+        let (p50, p99, p999) = summary.map_or((0.0, 0.0, 0.0), |s| {
+            (us(s.p50) / 1000.0, us(s.p99) / 1000.0, us(s.p999) / 1000.0)
+        });
+        println!(
+            "JSON {{\"scenario\":\"{}\",\"conns\":{},\"duration_s\":{:.3},\"burst_rate_target\":{},\
+             \"burst_attempted\":{},\"burst_completed\":{},\"burst_errors\":{},\
+             \"burst_rate_achieved\":{:.1},\"burst_hs_p50_ms\":{:.3},\"burst_hs_p99_ms\":{:.3},\
+             \"burst_hs_p999_ms\":{:.3}}}",
+            args.scenario.name(),
+            args.conns,
+            elapsed,
+            args.rate,
+            stats.attempted(),
+            stats.completed(),
+            stats.failed(),
+            rate_achieved,
+            p50,
+            p99,
+            p999
+        );
+    }
+    Ok(())
 }
 
 async fn run(args: &Args) -> Result<()> {
@@ -263,6 +407,7 @@ async fn run(args: &Args) -> Result<()> {
         let tube = match args.scenario {
             Scenario::PutReserveDelete => format!("bench-{tag}-{i}"),
             Scenario::ProducersConsumers | Scenario::PutOnly => format!("bench-{tag}-shared"),
+            Scenario::HandshakeBurst => unreachable!("dispatched to run_burst in main()"),
         };
         c.use_and_watch_only(&tube).await?;
         clients.push(c);
@@ -299,6 +444,7 @@ async fn run(args: &Args) -> Result<()> {
                 let left = Arc::clone(&producers_left);
                 set.spawn(consumer(c, deadline, left));
             }
+            Scenario::HandshakeBurst => unreachable!("dispatched to run_burst in main()"),
         }
     }
 

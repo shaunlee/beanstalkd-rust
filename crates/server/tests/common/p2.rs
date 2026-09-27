@@ -181,48 +181,42 @@ impl ConfigServer {
         nports: usize,
         args: &[&str],
     ) -> ConfigServer {
-        let ports: Vec<u16> = (0..nports).map(|_| claim_free_port()).collect();
-        let mut text = template.to_owned();
-        for (i, p) in ports.iter().enumerate() {
-            text = text.replace(&format!("{{port{i}}}"), &p.to_string());
-        }
-        let config = dir.path().join("config.toml");
-        std::fs::write(&config, text).unwrap();
-        let log = dir.path().join("stderr.log");
-        let child = Command::new(BIN)
-            .arg("--config")
-            .arg(&config)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(std::fs::File::create(&log).unwrap())
-            .spawn()
-            .unwrap();
-        let mut server = ConfigServer {
-            child,
-            dir,
-            ports,
-            log,
-        };
-        server.wait_until_listening();
-        server
-    }
-
-    fn wait_until_listening(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        for &port in &self.ports {
-            loop {
-                if let Some(status) = self.child.try_wait().unwrap() {
-                    panic!("server exited early with {status}: {}", self.stderr());
-                }
-                let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-                if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "port {port} never listened");
-                std::thread::sleep(Duration::from_millis(20));
+        // A free port can be taken by another test process between the
+        // probe and the server's bind; then the server exits, and a connect
+        // may even reach the other process. Retry with fresh ports.
+        for _ in 0..5 {
+            let ports: Vec<u16> = (0..nports).map(|_| claim_free_port()).collect();
+            let mut text = template.to_owned();
+            for (i, p) in ports.iter().enumerate() {
+                text = text.replace(&format!("{{port{i}}}"), &p.to_string());
+            }
+            let config = dir.path().join("config.toml");
+            std::fs::write(&config, text).unwrap();
+            let log = dir.path().join("stderr.log");
+            let mut child = Command::new(BIN)
+                .arg("--config")
+                .arg(&config)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(&log).unwrap())
+                .spawn()
+                .unwrap();
+            if wait_until_listening(&mut child, &ports, &log) {
+                return ConfigServer {
+                    child,
+                    dir,
+                    ports,
+                    log,
+                };
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            for &p in &ports {
+                release_port(p);
             }
         }
+        panic!("could not start the server on free ports after 5 attempts");
     }
 
     pub fn addr(&self, i: usize) -> SocketAddr {
@@ -489,4 +483,35 @@ pub fn http(addr: SocketAddr, method: &str, path: &str, extra: &str) -> io::Resu
 
 pub fn get(addr: SocketAddr, path: &str) -> HttpResponse {
     http(addr, "GET", path, "").unwrap_or_else(|e| panic!("GET {path}: {e}"))
+}
+
+/// Waits until every port accepts connections and the server is still
+/// running. Returns false if the server lost a port race (its bind failed).
+fn wait_until_listening(child: &mut Child, ports: &[u16], log: &std::path::Path) -> bool {
+    let stderr = || std::fs::read_to_string(log).unwrap_or_default();
+    let lost_race = |child: &mut Child| -> bool {
+        match child.try_wait().unwrap() {
+            None => false,
+            Some(_) if stderr().contains("Address already in use") => true,
+            Some(status) => panic!("server exited early with {status}: {}", stderr()),
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    for &port in ports {
+        loop {
+            if lost_race(child) {
+                return false;
+            }
+            let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "port {port} never listened");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    // The connects may have reached another process holding one of the
+    // ports; a server that failed to bind exits right away.
+    std::thread::sleep(Duration::from_millis(50));
+    !lost_race(child)
 }

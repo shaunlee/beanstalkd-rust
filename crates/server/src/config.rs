@@ -50,6 +50,34 @@ pub const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 /// TLS handshake or awaiting token authentication, across all listeners.
 pub const DEFAULT_MAX_PENDING_CONNECTIONS: usize = 1024;
 
+/// Smallest accepted `server.threads` / `--threads`.
+pub const MIN_THREADS: u16 = 1;
+/// Largest accepted `server.threads` / `--threads`.
+pub const MAX_THREADS: u16 = 256;
+
+/// Default tokio worker-thread count without `[cluster]` (chosen by
+/// measurement, P4-T2; see docs/DESIGN.md §3 and docs/BENCH.md
+/// "P4-T2: worker threads"). This is the count read by
+/// `engine_actor::run_task` (the actor's own message batching,
+/// `ACTOR_BATCH_LIMIT`, is a separate, unrelated knob).
+pub const DEFAULT_THREADS_STANDALONE: usize = 1;
+/// Default tokio worker-thread count with `[cluster]` (chosen by
+/// measurement, P4-T2). The cluster actor (`cluster::actor::Actor::run`)
+/// is a different code path with its own pre-existing message-draining
+/// loop (`MAX_DRAIN`); only the worker count changes here, not its
+/// batching.
+pub const DEFAULT_THREADS_CLUSTER: usize = 2;
+
+/// The worker-thread count the runtime should use: `server.threads` /
+/// `--threads` if set, else the mode's default.
+pub fn effective_threads(threads: Option<u16>, cluster: bool) -> usize {
+    threads.map(usize::from).unwrap_or(if cluster {
+        DEFAULT_THREADS_CLUSTER
+    } else {
+        DEFAULT_THREADS_STANDALONE
+    })
+}
+
 /// Default `http.snapshot_min_interval`: how old a cached engine snapshot
 /// served by `/metrics` and `/admin` may be.
 pub const DEFAULT_SNAPSHOT_MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -89,6 +117,9 @@ pub struct ResolvedConfig {
     /// `server.max_pending_connections`: cap on TLS connections still in
     /// their handshake or awaiting token authentication (at least 1).
     pub max_pending_connections: usize,
+    /// `server.threads` / `--threads`: tokio worker-thread count.
+    /// `None`: use the mode's default (`effective_threads`).
+    pub threads: Option<u16>,
     pub binlog: BinlogSettings,
     /// `None`: no HTTP listener.
     pub http: Option<HttpSettings>,
@@ -375,6 +406,7 @@ struct RawFile {
 struct RawServer {
     max_job_size: Option<i64>,
     max_pending_connections: Option<i64>,
+    threads: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -616,6 +648,22 @@ pub fn resolve(cli: &Cli, file: Option<FileConfig>) -> Result<ResolvedConfig, Co
             ))
         })?,
     };
+    let file_threads = raw
+        .server
+        .as_ref()
+        .and_then(|s| s.threads)
+        .map(|v| {
+            u16::try_from(v)
+                .ok()
+                .filter(|&v| (MIN_THREADS..=MAX_THREADS).contains(&v))
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "server.threads = {v}: must be between {MIN_THREADS} and {MAX_THREADS}"
+                    ))
+                })
+        })
+        .transpose()?;
+    let threads = cli.threads.or(file_threads);
 
     // [binlog]
     let binlog = raw.binlog.as_ref();
@@ -870,6 +918,7 @@ pub fn resolve(cli: &Cli, file: Option<FileConfig>) -> Result<ResolvedConfig, Co
         auth_timeout,
         max_job_size,
         max_pending_connections,
+        threads,
         binlog,
         http,
         log,
@@ -887,6 +936,7 @@ fn from_cli(cli: &Cli) -> ResolvedConfig {
         auth_timeout: DEFAULT_AUTH_TIMEOUT,
         max_job_size: cli.max_job_size,
         max_pending_connections: DEFAULT_MAX_PENDING_CONNECTIONS,
+        threads: cli.threads,
         binlog: BinlogSettings {
             dir: cli.binlog_dir.clone(),
             file_size: cli.binlog_file_size,
@@ -991,7 +1041,7 @@ fn check_token(token: &str) -> Result<(), String> {
 /// short summary (no secrets) and the warnings.
 pub fn check(cli: &Cli) -> Result<(String, Vec<String>), ConfigError> {
     load_all(cli).map(|(config, cluster)| {
-        let mut text = summary(&config);
+        let mut text = summary(&config, cluster.is_some());
         if let Some(c) = &cluster {
             text.push_str(&cluster_summary(c));
         }
@@ -1019,7 +1069,9 @@ pub fn run_check(cli: &Cli, out: &mut dyn Write, err: &mut dyn Write) -> u8 {
 }
 
 /// Human-readable summary of a resolved configuration (no token values).
-pub fn summary(config: &ResolvedConfig) -> String {
+/// `cluster`: whether `[cluster]` is present, which picks the default
+/// worker-thread count `threads` falls back to.
+pub fn summary(config: &ResolvedConfig, cluster: bool) -> String {
     use std::fmt::Write as _;
 
     let mut s = String::new();
@@ -1065,6 +1117,10 @@ pub fn summary(config: &ResolvedConfig) -> String {
         );
     }
     let _ = writeln!(s, "max job size: {}", config.max_job_size);
+    let _ = match config.threads {
+        Some(n) => writeln!(s, "threads: {n}"),
+        None => writeln!(s, "threads: {} (default)", effective_threads(None, cluster)),
+    };
     let sync = match config.binlog.sync {
         SyncPolicy::Always => "always".to_owned(),
         SyncPolicy::Never => "never".to_owned(),
