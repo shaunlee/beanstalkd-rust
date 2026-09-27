@@ -46,6 +46,12 @@ const SAFETY_MARGIN: Nanos = NANOS_PER_SEC;
 /// check runs before the per-tube arrays of `validate` are allocated.
 const MAX_TUBE_SLOTS: usize = if cfg!(test) { 1 << 12 } else { 1 << 24 };
 
+/// Largest `next_list_seq` (`JobRec::list_seq` counter) accepted by
+/// `import_state`. Left this far below `u64::MAX`, an imported engine can
+/// still run for a very long time without the counter's `+= 1` overflowing;
+/// no healthy node buries or reserves anywhere near this many jobs.
+pub(crate) const MAX_LIST_SEQ: u64 = 1 << 62;
+
 /// "default" is created first and never destroyed, so it always has id 0.
 const DEFAULT_TUBE: TubeId = 0;
 
@@ -57,6 +63,10 @@ pub struct Engine {
 
     next_job_id: JobId,
     jobs: HashMap<JobId, JobRec>,
+    /// Next key handed out for `TubeState::buried` / `ConnState::reserved`
+    /// (`JobRec::list_seq`). One counter for both, like the reference's
+    /// shared `prev`/`next` pair: a job is never in both lists at once.
+    next_list_seq: u64,
 
     /// Tube slab, indexed by `TubeId`; `None` marks a free slot.
     tubes: Vec<Option<TubeState>>,
@@ -134,6 +144,7 @@ impl Engine {
             draining: false,
             next_job_id: 1,
             jobs: HashMap::new(),
+            next_list_seq: 0,
             tubes: Vec::new(),
             free_tube_ids: Vec::new(),
             tube_ids: HashMap::new(),
@@ -214,7 +225,7 @@ impl Engine {
         let reserved: Vec<JobId> = self
             .conns
             .get(&conn)
-            .map(|c| c.reserved_fifo.clone())
+            .map(|c| c.reserved.values().copied().collect())
             .unwrap_or_default();
         for job_id in reserved {
             self.do_unreserve(conn, job_id);
@@ -459,6 +470,7 @@ impl Engine {
             start,
             draining,
             next_job_id,
+            next_list_seq,
             jobs,
             tubes,
             free_tube_ids,
@@ -522,6 +534,7 @@ impl Engine {
             draining: *draining,
             next_job_id: *next_job_id,
             jobs,
+            next_list_seq: *next_list_seq,
             tubes: tubes.clone(),
             free_tube_ids: free_tube_ids.clone(),
             tube_ids,
@@ -580,6 +593,7 @@ impl Engine {
             draining,
             next_job_id,
             jobs: job_list,
+            next_list_seq,
             tubes,
             free_tube_ids,
             tube_ids: tube_id_list,
@@ -664,6 +678,7 @@ impl Engine {
             draining,
             next_job_id,
             jobs,
+            next_list_seq,
             tubes,
             free_tube_ids,
             tube_ids,
@@ -783,6 +798,7 @@ impl Engine {
                     deadline_at: 0,
                     state: JobState::Ready,
                     reserver: None,
+                    list_seq: 0,
                     reserve_ct: r.reserve_ct,
                     timeout_ct: r.timeout_ct,
                     release_ct: r.release_ct,
@@ -1110,31 +1126,33 @@ impl Engine {
     }
 
     fn insert_buried(&mut self, tube: TubeId, id: JobId) {
+        let seq = self.next_list_seq;
+        self.next_list_seq += 1;
         if let Some(j) = self.jobs.get_mut(&id) {
             j.state = JobState::Buried;
             j.reserver = None;
             j.bury_ct += 1;
+            j.list_seq = seq;
         }
         if let Some(t) = self.tube_mut(tube) {
-            t.buried.push_back(id);
+            t.buried.insert(seq, id);
             t.stat.buried_ct += 1;
         }
         self.buried_ct += 1;
     }
 
-    /// Removes a specific job from the buried FIFO (used by delete and
-    /// kick-job, which can target any buried job, not just the front).
+    /// Removes a specific job from the buried set (used by delete and
+    /// kick-job, which can target any buried job, not just the oldest).
     fn remove_buried(&mut self, tube: TubeId, id: JobId) -> bool {
-        let removed = match self.tube_mut(tube) {
-            Some(t) => match t.buried.iter().position(|&x| x == id) {
-                Some(pos) => {
-                    t.buried.remove(pos);
-                    t.stat.buried_ct = t.stat.buried_ct.saturating_sub(1);
-                    true
-                }
-                None => false,
-            },
-            None => false,
+        let seq = self.jobs.get(&id).map(|j| j.list_seq);
+        let removed = match (seq, self.tube_mut(tube)) {
+            // Checked by id, not just `seq` (see `do_unreserve`).
+            (Some(seq), Some(t)) if t.buried.get(&seq) == Some(&id) => {
+                t.buried.remove(&seq);
+                t.stat.buried_ct = t.stat.buried_ct.saturating_sub(1);
+                true
+            }
+            _ => false,
         };
         if removed {
             self.buried_ct = self.buried_ct.saturating_sub(1);
@@ -1144,7 +1162,7 @@ impl Engine {
 
     fn pop_buried_front(&mut self, tube: TubeId) -> Option<JobId> {
         let t = self.tube_mut(tube)?;
-        let id = t.buried.pop_front()?;
+        let (_, id) = t.buried.pop_first()?;
         t.stat.buried_ct = t.stat.buried_ct.saturating_sub(1);
         self.buried_ct = self.buried_ct.saturating_sub(1);
         Some(id)
@@ -1158,12 +1176,15 @@ impl Engine {
         };
         let tube = j.tube;
         let deadline = now.saturating_add((j.ttr as Nanos) * NANOS_PER_SEC);
+        let seq = self.next_list_seq;
+        self.next_list_seq += 1;
         j.state = JobState::Reserved;
         j.reserver = Some(cid);
         j.deadline_at = deadline;
         j.reserve_ct += 1;
+        j.list_seq = seq;
         if let Some(c) = self.conns.get_mut(&cid) {
-            c.reserved_fifo.push(job_id);
+            c.reserved.insert(seq, job_id);
             c.reserved_by_deadline.insert((deadline, job_id));
         }
         self.reserved_ct += 1;
@@ -1177,16 +1198,19 @@ impl Engine {
     /// the reserved-job counters. Does not change the job's state; the
     /// caller decides what happens to the job next.
     fn do_unreserve(&mut self, cid: ConnId, job_id: JobId) {
-        let (deadline, tube) = match self.jobs.get_mut(&job_id) {
+        let (deadline, seq, tube) = match self.jobs.get_mut(&job_id) {
             Some(j) => {
                 j.reserver = None;
-                (j.deadline_at, Some(j.tube))
+                (j.deadline_at, Some(j.list_seq), Some(j.tube))
             }
-            None => (0, None),
+            None => (0, None, None),
         };
         if let Some(c) = self.conns.get_mut(&cid) {
-            if let Some(i) = c.reserved_fifo.iter().position(|&x| x == job_id) {
-                c.reserved_fifo.remove(i);
+            // Checked by id, not just `seq`, in case `job_id` is already gone.
+            if let Some(seq) = seq
+                && c.reserved.get(&seq) == Some(&job_id)
+            {
+                c.reserved.remove(&seq);
             }
             c.reserved_by_deadline.remove(&(deadline, job_id));
         }
@@ -1448,7 +1472,8 @@ impl Engine {
     /// `draining`, `binlog`, `cmd_*`, `total_jobs_ct`, `timeout_ct`,
     /// per-tube `total_jobs_ct` / `total_delete_ct` / `pause_ct`, the
     /// `unpause_at` of an unpaused tube, the `deadline_at` of a ready or
-    /// buried job, `created_at`, the job counters, and every `Ms` cursor.
+    /// buried job, `created_at`, the job counters, `list_seq` of a ready or
+    /// delayed job, and every `Ms` cursor.
     pub(crate) fn validate(&self) -> Result<(), String> {
         macro_rules! ensure {
             ($cond:expr, $($arg:tt)+) => {
@@ -1461,6 +1486,11 @@ impl Engine {
         ensure!(
             n_tubes <= MAX_TUBE_SLOTS,
             "tube slab of {n_tubes} slots exceeds the maximum of {MAX_TUBE_SLOTS}"
+        );
+        ensure!(
+            self.next_list_seq <= MAX_LIST_SEQ,
+            "next_list_seq {} exceeds the maximum of {MAX_LIST_SEQ}",
+            self.next_list_seq
         );
 
         // --- Tube slab, names, list order, free list -------------------
@@ -1582,14 +1612,14 @@ impl Engine {
                 ensure!(pending_ids.insert(id), "pending job id {id} is shared");
             }
 
-            // Reservations: `reserved_fifo` and `reserved_by_deadline` hold
-            // the same jobs, each reserved by this connection.
+            // Reservations: `reserved` and `reserved_by_deadline` hold the
+            // same jobs, each reserved by this connection.
             ensure!(
-                c.reserved_fifo.len() == c.reserved_by_deadline.len(),
+                c.reserved.len() == c.reserved_by_deadline.len(),
                 "conn {cid}: reservation lists differ in length"
             );
-            let mut seen: HashSet<JobId> = HashSet::with_capacity(c.reserved_fifo.len());
-            for &id in &c.reserved_fifo {
+            let mut seen: HashSet<JobId> = HashSet::with_capacity(c.reserved.len());
+            for (&seq, &id) in &c.reserved {
                 ensure!(seen.insert(id), "conn {cid} reserves job {id} twice");
                 let j = self
                     .jobs
@@ -1598,6 +1628,16 @@ impl Engine {
                 ensure!(
                     j.state == JobState::Reserved && j.reserver == Some(cid),
                     "conn {cid} lists job {id}, which it has not reserved"
+                );
+                ensure!(
+                    j.list_seq == seq,
+                    "conn {cid}: job {id} has list_seq {}, not its reservation key {seq}",
+                    j.list_seq
+                );
+                ensure!(
+                    seq < self.next_list_seq,
+                    "conn {cid}: job {id}'s reservation key {seq} is not below next_list_seq {}",
+                    self.next_list_seq
                 );
             }
             for &(d, id) in &c.reserved_by_deadline {
@@ -1610,7 +1650,7 @@ impl Engine {
                     "conn {cid}: stale deadline for job {id}"
                 );
             }
-            reserved_entries += c.reserved_fifo.len() as u64;
+            reserved_entries += c.reserved.len() as u64;
 
             let tick = conn_tickat(c);
             ensure!(c.tick_key == tick, "tick_key of conn {cid} is stale");
@@ -1748,7 +1788,7 @@ impl Engine {
                     "delayed set of tube {tid} holds a stale entry for job {id}"
                 );
             }
-            for &id in &t.buried {
+            for (&seq, &id) in &t.buried {
                 ensure!(
                     self.jobs
                         .get(&id)
@@ -1756,6 +1796,15 @@ impl Engine {
                     "buried list of tube {tid} holds a stale entry for job {id}"
                 );
                 ensure!(seen_buried.insert(id), "job {id} is buried twice");
+                ensure!(
+                    self.jobs.get(&id).is_some_and(|j| j.list_seq == seq),
+                    "buried list of tube {tid}: job {id} has a list_seq not matching its key {seq}"
+                );
+                ensure!(
+                    seq < self.next_list_seq,
+                    "buried list of tube {tid}: job {id}'s key {seq} is not below next_list_seq {}",
+                    self.next_list_seq
+                );
             }
             let mut seen: HashSet<ConnId> = HashSet::with_capacity(t.waiting_conns.len());
             for &cid in &t.waiting_conns.items {
@@ -1955,6 +2004,7 @@ impl Engine {
             deadline_at: 0,
             state: JobState::Ready,
             reserver: None,
+            list_seq: 0,
             reserve_ct: 0,
             timeout_ct: 0,
             release_ct: 0,
@@ -2270,7 +2320,7 @@ impl Engine {
 
     fn cmd_peek_buried(&mut self, cid: ConnId, out: &mut Outbox) {
         self.cmd_peek_buried += 1;
-        let reply = self.peek_used_tube(cid, |t| t.buried.front().copied());
+        let reply = self.peek_used_tube(cid, |t| t.buried.values().next().copied());
         out.push((cid, reply));
     }
 
@@ -2606,7 +2656,7 @@ impl Engine {
 
     pub(crate) fn t_tube_buried_ids(&self, name: &TubeName) -> Vec<JobId> {
         self.t_tube_by_name(name)
-            .map(|t| t.buried.iter().copied().collect())
+            .map(|t| t.buried.values().copied().collect())
             .unwrap_or_default()
     }
 
@@ -2641,7 +2691,7 @@ impl Engine {
     pub(crate) fn t_conn_reserved(&self, cid: ConnId) -> Vec<JobId> {
         self.conns
             .get(&cid)
-            .map(|c| c.reserved_fifo.clone())
+            .map(|c| c.reserved.values().copied().collect())
             .unwrap_or_default()
     }
 

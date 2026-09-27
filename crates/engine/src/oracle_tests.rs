@@ -392,3 +392,44 @@ proptest! {
         run_steps(steps, true);
     }
 }
+
+/// Directed regression for the P4-T3 `reserved` rework (docs/PLAN.md §7.2):
+/// a random `steps` sequence rarely reserves several jobs out of id order
+/// on one connection and then has it disconnect while others wait, which
+/// is exactly when a release-order bug (e.g. sorting by id instead of by
+/// reservation time) would show up as a different `Reserved` assignment.
+#[test]
+fn disconnect_releases_reservations_out_of_id_order_to_two_waiters() {
+    let mut p = Pair::new(false);
+    p.compare();
+
+    for _ in 0..5 {
+        p.run(
+            Msg::Put {
+                conn: 0,
+                pri: 0,
+                delay: 0,
+                ttr: 60,
+                end: PutEnd::Body,
+            },
+            false,
+        );
+    }
+    // Reservation order (3, 1, 5, 2, 4) differs from id order: the FIFO
+    // release order below must follow this, not job id.
+    for id in [3u64, 1, 5, 2, 4] {
+        p.run(Msg::Cmd(0, Command::ReserveJob(id)), false);
+    }
+
+    p.run(Msg::Connect(6), false);
+    p.run(Msg::Connect(7), false);
+    p.run(Msg::Cmd(6, Command::Reserve), false);
+    p.run(Msg::Cmd(7, Command::Reserve), false);
+
+    // `disconnect` releases oldest-reservation-first, running
+    // `process_queue` after each one, so the two waiters are assigned jobs
+    // 3 and 1 (release order), not 1 and 2 (id order). `Pair::run`'s
+    // outbox comparison against the frozen oracle's `Vec`-based FIFO would
+    // fail here if the new `BTreeMap`-based order diverged.
+    p.run(Msg::Disconnect(0), false);
+}

@@ -1106,7 +1106,7 @@ fn snapshot_engine_config_must_match_the_local_one() {
     let install = |b: &mut Node, cfg: bstk_engine::EngineConfig| {
         let engine = Engine::new(0, cfg, Box::new(bstk_engine::StaticSysInfo::default()));
         let p = SnapshotPayload {
-            version: 1,
+            version: crate::storage::state_machine::PAYLOAD_VERSION,
             meta: crate::storage::state_machine::SmMeta::default(),
             engine: engine.export_state(),
         };

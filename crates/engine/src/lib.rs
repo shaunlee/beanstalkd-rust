@@ -17,6 +17,8 @@ mod oracle_tests;
 #[cfg(test)]
 mod recovery_tests;
 #[cfg(test)]
+mod scale_tests;
+#[cfg(test)]
 mod state_tests;
 
 pub use engine::Engine;
@@ -240,6 +242,8 @@ pub struct EngineState {
     pub(crate) next_job_id: bstk_proto::JobId,
     /// Sorted by id (strictly ascending).
     pub(crate) jobs: Vec<model::JobRec>,
+    /// Next key for `TubeState::buried` / `ConnState::reserved`.
+    pub(crate) next_list_seq: u64,
 
     pub(crate) tubes: Vec<Option<model::TubeState>>,
     pub(crate) free_tube_ids: Vec<model::TubeId>,

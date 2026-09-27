@@ -454,6 +454,20 @@ enum Corruption {
     DropWaitingConn(Index),
     SwapConns,
     ProducerFlag(Index),
+    /// Change a buried or reserved job's `list_seq` without touching the
+    /// map key that is supposed to equal it.
+    ListSeqMismatch(Index),
+    /// Move a buried or reserved job's map entry to a key at
+    /// `next_list_seq`, keeping `list_seq` in step with it, so only the
+    /// `seq < next_list_seq` check can catch it.
+    ListSeqAtOrAboveCounter(Index),
+    /// Lower `next_list_seq` to the largest `list_seq` actually in use.
+    NextListSeqTooLow,
+    /// Push `next_list_seq` above `MAX_LIST_SEQ`.
+    ListSeqCounterTooHigh,
+    /// Add a reserved job's id to a tube's buried map, alongside (not
+    /// instead of) its real reservation.
+    ReservedJobInBuriedMap(Index),
 }
 
 fn corruption() -> impl Strategy<Value = Corruption> {
@@ -501,6 +515,11 @@ fn corruption() -> impl Strategy<Value = Corruption> {
         i().prop_map(C::DropWaitingConn),
         Just(C::SwapConns),
         i().prop_map(C::ProducerFlag),
+        i().prop_map(C::ListSeqMismatch),
+        i().prop_map(C::ListSeqAtOrAboveCounter),
+        Just(C::NextListSeqTooLow),
+        Just(C::ListSeqCounterTooHigh),
+        i().prop_map(C::ReservedJobInBuriedMap),
     ]
 }
 
@@ -733,16 +752,19 @@ fn corrupt_conn_or_set(s: &mut EngineState, c: &Corruption, missing_tube: usize)
         }
         C::DuplicateReservation(i) => {
             if let Some(c) = conn_at(s, i)
-                && let Some(&id) = c.reserved_fifo.first()
+                && let Some((&max_seq, &id)) = c.reserved.iter().next_back()
             {
-                c.reserved_fifo.push(id);
+                // A fresh key: the map's own keys are structurally unique,
+                // so duplicating the id is the only way to break "each job
+                // reserved once".
+                c.reserved.insert(max_seq + 1, id);
             }
         }
         C::DropReservation(i) => {
             if let Some(c) = conn_at(s, i)
-                && !c.reserved_fifo.is_empty()
+                && !c.reserved.is_empty()
             {
-                c.reserved_fifo.remove(0);
+                c.reserved.pop_first();
             }
         }
         C::TickKey(i) => {
@@ -788,9 +810,9 @@ fn corrupt_conn_or_set(s: &mut EngineState, c: &Corruption, missing_tube: usize)
         }
         C::DuplicateBuried(i) => {
             if let Some(t) = tube_at(s, i)
-                && let Some(&id) = t.buried.front()
+                && let Some((&max_seq, &id)) = t.buried.iter().next_back()
             {
-                t.buried.push_back(id);
+                t.buried.insert(max_seq + 1, id);
             }
         }
         C::DropReady(i) => {
@@ -805,7 +827,7 @@ fn corrupt_conn_or_set(s: &mut EngineState, c: &Corruption, missing_tube: usize)
         }
         C::DropBuried(i) => {
             if let Some(t) = tube_at(s, i) {
-                t.buried.pop_front();
+                t.buried.pop_first();
             }
         }
         C::DropWaitingConn(i) => {
@@ -823,6 +845,77 @@ fn corrupt_conn_or_set(s: &mut EngineState, c: &Corruption, missing_tube: usize)
         C::ProducerFlag(i) => {
             if let Some(c) = conn_at(s, i) {
                 c.is_producer = !c.is_producer;
+            }
+        }
+        C::ListSeqMismatch(i) => {
+            if !s.jobs.is_empty() {
+                let n = s.jobs.len();
+                let job = &mut s.jobs[i.index(n)];
+                if matches!(job.state, JobState::Buried | JobState::Reserved) {
+                    job.list_seq = job.list_seq.wrapping_add(1);
+                }
+            }
+        }
+        C::ListSeqAtOrAboveCounter(i) => {
+            if !s.jobs.is_empty() {
+                let n = s.jobs.len();
+                let idx = i.index(n);
+                let (id, state, tube, reserver, old_seq) = {
+                    let j = &s.jobs[idx];
+                    (j.id, j.state, j.tube, j.reserver, j.list_seq)
+                };
+                let new_seq = s.next_list_seq;
+                let moved = match state {
+                    JobState::Buried => {
+                        s.tubes
+                            .get_mut(tube)
+                            .and_then(|t| t.as_mut())
+                            .is_some_and(|t| {
+                                t.buried.remove(&old_seq) == Some(id) && {
+                                    t.buried.insert(new_seq, id);
+                                    true
+                                }
+                            })
+                    }
+                    JobState::Reserved => reserver.is_some_and(|cid| {
+                        s.conns
+                            .iter_mut()
+                            .find(|(c, _)| *c == cid)
+                            .is_some_and(|(_, c)| {
+                                c.reserved.remove(&old_seq) == Some(id) && {
+                                    c.reserved.insert(new_seq, id);
+                                    true
+                                }
+                            })
+                    }),
+                    _ => false,
+                };
+                if moved {
+                    s.jobs[idx].list_seq = new_seq;
+                }
+            }
+        }
+        C::NextListSeqTooLow => {
+            let max_used = s
+                .jobs
+                .iter()
+                .filter(|j| matches!(j.state, JobState::Buried | JobState::Reserved))
+                .map(|j| j.list_seq)
+                .max();
+            if let Some(m) = max_used {
+                s.next_list_seq = m;
+            }
+        }
+        C::ListSeqCounterTooHigh => {
+            s.next_list_seq = crate::engine::MAX_LIST_SEQ + 1;
+        }
+        C::ReservedJobInBuriedMap(i) => {
+            if let Some(job) = s.jobs.iter().find(|j| j.state == JobState::Reserved) {
+                let id = job.id;
+                if let Some(t) = tube_at(s, i) {
+                    let new_seq = t.buried.keys().next_back().copied().unwrap_or(0) + 1;
+                    t.buried.insert(new_seq, id);
+                }
             }
         }
         _ => unreachable!("handled by corrupt"),

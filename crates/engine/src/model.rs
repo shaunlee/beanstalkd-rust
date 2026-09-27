@@ -3,7 +3,7 @@
 //! WAL/socket/IO bookkeeping fields that don't apply to a pure state
 //! machine.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 
@@ -41,6 +41,12 @@ pub(crate) struct JobRec {
     pub(crate) deadline_at: Nanos,
     pub(crate) state: JobState,
     pub(crate) reserver: Option<ConnId>,
+    /// This job's key in its current list: `TubeState::buried` while
+    /// `state` is `Buried`, `ConnState::reserved` while `Reserved`. A job
+    /// is never in both, so one field suffices (the reference makes the
+    /// same trade with a single shared `prev`/`next` pair). Meaningful
+    /// only in those two states; stale otherwise, like `deadline_at`.
+    pub(crate) list_seq: u64,
     pub(crate) reserve_ct: u32,
     pub(crate) timeout_ct: u32,
     pub(crate) release_ct: u32,
@@ -80,9 +86,13 @@ pub(crate) struct TubeState {
     pub(crate) name: TubeName,
     pub(crate) ready: BTreeSet<(u32, JobId)>,
     pub(crate) delayed: BTreeSet<(Nanos, JobId)>,
-    /// FIFO order (oldest-buried first), matching the reference's
-    /// doubly-linked list with tail insertion.
-    pub(crate) buried: VecDeque<JobId>,
+    /// Keyed by `Engine::next_list_seq` at insertion time (iteration order
+    /// is then FIFO, matching the reference). An index-linked list, like
+    /// the reference's `prev`/`next`, would be O(1) here, but every
+    /// untrusted snapshot would then need cycle and link-symmetry checks;
+    /// this is O(log n), like the neighboring `ready`/`delayed` sets, and
+    /// `Engine::validate` checks it the same way (key equals `list_seq`).
+    pub(crate) buried: BTreeMap<u64, JobId>,
     pub(crate) waiting_conns: Ms<ConnId>,
     /// Reference counting inputs. A tube is alive while
     /// `using_ct + watching_ct + job_ref_ct > 0`, except "default" which is
@@ -112,7 +122,7 @@ impl TubeState {
             name,
             ready: BTreeSet::new(),
             delayed: BTreeSet::new(),
-            buried: VecDeque::new(),
+            buried: BTreeMap::new(),
             waiting_conns: Ms::new(),
             using_ct: 0,
             watching_ct: 0,
@@ -143,8 +153,10 @@ pub(crate) struct ConnState {
     /// `reserve`).
     pub(crate) wait_deadline: Option<Nanos>,
     /// Reservation order (oldest first), used when releasing all of this
-    /// connection's jobs on disconnect.
-    pub(crate) reserved_fifo: Vec<JobId>,
+    /// connection's jobs on disconnect. Same `list_seq`-keyed shape as
+    /// `TubeState::buried`, for the same reason: O(log n) removal of an
+    /// arbitrary job (release/delete need not target the oldest one).
+    pub(crate) reserved: BTreeMap<u64, JobId>,
     /// Same set, ordered by TTR deadline for fast "soonest" lookups.
     pub(crate) reserved_by_deadline: BTreeSet<(Nanos, JobId)>,
     /// A put whose command line was accepted (`Engine::put_started`) but
@@ -176,7 +188,7 @@ impl ConnState {
             is_worker: false,
             waiting: false,
             wait_deadline: None,
-            reserved_fifo: Vec::new(),
+            reserved: BTreeMap::new(),
             reserved_by_deadline: BTreeSet::new(),
             pending_put: None,
             tick_key: None,

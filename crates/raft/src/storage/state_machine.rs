@@ -124,7 +124,10 @@ pub(crate) struct SnapshotPayload {
     pub(crate) engine: EngineState,
 }
 
-const PAYLOAD_VERSION: u32 = 1;
+/// Bumped whenever the encoding of `EngineState` or `SmMeta` changes
+/// (postcard is positional, so old and new layouts do not decode as each
+/// other). 2: P4-T3 buried / reservation maps.
+pub(crate) const PAYLOAD_VERSION: u32 = 2;
 
 fn local_of(conn: ConnId) -> u64 {
     conn & ((1 << CONN_SEQ_BITS) - 1)
@@ -214,14 +217,17 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 /// difference would make nodes diverge), and it must not turn the journal
 /// on (cluster mode has no binlog).
 fn restore(payload: &[u8], cfg: &EngineConfig, sys: &SysFactory) -> io::Result<(Engine, SmMeta)> {
-    let p: SnapshotPayload =
-        postcard::from_bytes(payload).map_err(|e| invalid(format!("snapshot payload: {e}")))?;
-    if p.version != PAYLOAD_VERSION {
+    // The version is the first field: check it before decoding the rest,
+    // whose layout depends on it.
+    let (version, _) = postcard::take_from_bytes::<u32>(payload)
+        .map_err(|e| invalid(format!("snapshot payload: {e}")))?;
+    if version != PAYLOAD_VERSION {
         return Err(invalid(format!(
-            "unsupported snapshot payload version {}",
-            p.version
+            "unsupported snapshot payload version {version}"
         )));
     }
+    let p: SnapshotPayload =
+        postcard::from_bytes(payload).map_err(|e| invalid(format!("snapshot payload: {e}")))?;
     let engine = Engine::import_state(p.engine, sys()).map_err(|e| invalid(e.to_string()))?;
     let theirs = engine.config();
     if theirs.max_job_size != cfg.max_job_size {

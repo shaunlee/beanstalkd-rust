@@ -108,9 +108,9 @@ impl Engine {
 | Tube list order | `Ms<TubeId>` | faithful `ms.c` multiset: swap-remove, round-robin take |
 | Tube ready queue | `BTreeSet<(pri, JobId)>` | same priority → lower id first |
 | Tube delayed queue | `BTreeSet<(deadline, JobId)>` | |
-| Tube buried queue | `VecDeque<JobId>` | FIFO; kick takes from the front. Removing from the middle is O(n) (known, P4) |
+| Tube buried queue | `BTreeMap<u64, JobId>` | keyed by `Engine::next_list_seq` at insertion (P4-T3); FIFO iteration order, O(log n) removal of any job via `JobRec::list_seq` |
 | Tube waiters | `Ms<ConnId>` | reference round-robin order (COMPAT engine item 4) |
-| Connection state | `HashMap<ConnId, ConnState>` | used tube, watch `Ms<TubeId>`, waiting flag and deadline, reserved jobs (FIFO and by deadline), producer/worker flags, pending put |
+| Connection state | `HashMap<ConnId, ConnState>` | used tube, watch `Ms<TubeId>`, waiting flag and deadline, reserved jobs (`BTreeMap<u64, JobId>`, same `next_list_seq` scheme as buried, plus by-deadline), producer/worker flags, pending put |
 | Connection wake times | `BTreeSet<(Nanos, ConnId)>` | earliest of reserve timeout, DEADLINE_SOON margin and TTR expiry, as in the reference's `conntickat` |
 | Delayed-job heads | `BTreeSet<(Nanos, TubeId)>` | each tube's soonest delayed job |
 | Paused tubes | `BTreeSet<(unpause_at, TubeId)>` | |
