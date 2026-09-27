@@ -103,7 +103,7 @@ impl Engine {
 
 | Purpose | Structure | Notes |
 |---|---|---|
-| All jobs | `HashMap<JobId, JobRec>` | body is `bytes::Bytes` (zero-copy) |
+| All jobs | `HashMap<JobId, Box<JobRec>>` | boxed so empty table slots cost a pointer, not a record; the body is copied out of the connection's read buffer at put (a shared view would pin the whole buffer per live job; see BENCH P4-T4) |
 | Tubes | slab `Vec<Option<TubeState>>` + free list, `HashMap<TubeName, TubeId>` | hot paths use integer `TubeId`s |
 | Tube list order | `Ms<TubeId>` | faithful `ms.c` multiset: swap-remove, round-robin take |
 | Tube ready queue | `BTreeSet<(pri, JobId)>` | same priority → lower id first |

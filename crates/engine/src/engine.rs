@@ -62,7 +62,15 @@ pub struct Engine {
     draining: bool,
 
     next_job_id: JobId,
-    jobs: HashMap<JobId, JobRec>,
+    /// Boxed so a hashbrown table sitting well under its 7/8 max load
+    /// (which it does for a long stretch after every doubling -- e.g.
+    /// 47.7% full right after growing for 1,000,000 jobs, until roughly
+    /// another million inserts) wastes only a pointer's worth of slot
+    /// space per job, not a whole `JobRec`; the job data itself is a
+    /// separate, exactly-sized allocation, as in the reference's `Job*`
+    /// bucket array (the reference tolerates load factors up to 4). See
+    /// docs/BENCH.md P4-T4 for the measurement.
+    jobs: HashMap<JobId, Box<JobRec>>,
     /// Next key handed out for `TubeState::buried` / `ConnState::reserved`
     /// (`JobRec::list_seq`). One counter for both, like the reference's
     /// shared `prev`/`next` pair: a job is never in both lists at once.
@@ -519,7 +527,7 @@ impl Engine {
             binlog,
         } = self;
 
-        let mut jobs: Vec<JobRec> = jobs.values().cloned().collect();
+        let mut jobs: Vec<JobRec> = jobs.values().map(|j| (**j).clone()).collect();
         jobs.sort_unstable_by_key(|j| j.id);
         let mut tube_ids: Vec<(TubeName, TubeId)> =
             tube_ids.iter().map(|(n, &id)| (n.clone(), id)).collect();
@@ -643,14 +651,14 @@ impl Engine {
         // The sorted-vector encodings must be strictly ascending (canonical,
         // no duplicate keys).
         let err = |m: String| StateError(m);
-        let mut jobs: HashMap<JobId, JobRec> = HashMap::with_capacity(job_list.len());
+        let mut jobs: HashMap<JobId, Box<JobRec>> = HashMap::with_capacity(job_list.len());
         let mut prev: Option<JobId> = None;
         for j in job_list {
             if prev.is_some_and(|p| j.id <= p) {
                 return Err(err(format!("jobs not strictly ascending at id {}", j.id)));
             }
             prev = Some(j.id);
-            jobs.insert(j.id, j);
+            jobs.insert(j.id, Box::new(j));
         }
         let mut tube_ids: HashMap<TubeName, TubeId> = HashMap::with_capacity(tube_id_list.len());
         let mut prev: Option<TubeName> = None;
@@ -787,7 +795,7 @@ impl Engine {
             let tube = e.find_or_make_tube(&rj.tube);
             e.jobs.insert(
                 r.id,
-                JobRec {
+                Box::new(JobRec {
                     id: r.id,
                     tube,
                     pri: r.pri,
@@ -808,7 +816,7 @@ impl Engine {
                     // record; that is the store's business and the field is
                     // masked in differential tests.
                     file: 0,
-                },
+                }),
             );
             if let Some(t) = e.tube_mut(tube) {
                 t.job_ref_ct += 1;
@@ -1963,6 +1971,12 @@ impl Engine {
         body: Bytes,
         out: &mut Outbox,
     ) {
+        // Copied instead of stored as received: `body` shares the backing
+        // allocation of whichever connection read buffer framed it, and
+        // one read commonly delivers many pipelined puts sharing that same
+        // buffer. Keeping any one of them alive stops the buffer from ever
+        // being reused in place; see docs/BENCH.md P4-T4.
+        let body = Bytes::copy_from_slice(&body);
         let ttr = ttr.max(1);
 
         // The reference always allocates a job id (bumping next_id) before
@@ -2022,7 +2036,7 @@ impl Engine {
                 0
             },
         };
-        self.jobs.insert(id, job);
+        self.jobs.insert(id, Box::new(job));
         if let Some(t) = self.tube_mut(tube) {
             t.job_ref_ct += 1;
         }
@@ -2603,7 +2617,7 @@ impl Engine {
     pub(crate) fn t_job_raw(&self, id: JobId) -> Option<(JobRec, TubeName)> {
         self.jobs
             .get(&id)
-            .map(|j| (j.clone(), self.tube_name(j.tube)))
+            .map(|j| ((**j).clone(), self.tube_name(j.tube)))
     }
 
     pub(crate) fn t_job_state(&self, id: JobId) -> Option<&'static str> {

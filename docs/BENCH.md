@@ -2,13 +2,336 @@
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`). The newest numbers
-are from task P4-T2 (tokio worker-thread count and its default, the
-lever the P4-T1 spike found for CPU efficiency), first below. P3-FD
-(Raft cluster mode after batched proposals and group commit, and the
-standalone regression check) follows, then P2-T5 (TLS / mTLS), then
+are from task P4-T4 (footprint: memory per job, binlog bytes per
+operation), first below. P4-T2 (tokio worker-thread count and its
+default, the lever the P4-T1 spike found for CPU efficiency) follows,
+then P3-FD (Raft cluster mode after batched proposals and group commit,
+and the standalone regression check), then P2-T5 (TLS / mTLS), then
 P1-T5 (write-ahead log, `-b`), then the T6b section (engine performance
 fix); the T6 first pass, whose profile motivated T6b, is kept at the
 end.
+
+## P4-T4: footprint
+
+### Method
+
+- **Tool**: `bench/footprint.py` (subcommands `mem` and `binlog`), a
+  standalone script rather than a `bstk-bench` scenario: it needs exact
+  job counts and per-connection tube assignment (not a duration-based
+  load), and for `binlog` it reads a process's own I/O counters, which
+  `bstk-bench` has no reason to know about. `bench/pidrusage.c` is a
+  ~40-line C helper around macOS's `proc_pid_rusage`; see "Binlog bytes"
+  below for why. Both are reusable: `python3 bench/footprint.py mem
+  --help` / `binlog --help`.
+- **Memory per job**: for each (body size, job count, tube count) cell,
+  starts a server fresh with no `-b`, samples RSS (`ps -o rss=`, polled
+  until two reads 300 ms apart agree within 1%), pipelined-puts `n` jobs
+  of that body size (content is a random slice per job, not `b'x' * n`,
+  so identical pages can't be folded), confirms `current-jobs-ready == n`
+  via `stats`, samples RSS again, deletes every job (ids are `1..n` on a
+  fresh server, both servers), confirms `current-jobs-ready == 0`, and
+  samples RSS a third time (retention/fragmentation). Bytes/job =
+  `(loaded - baseline) * 1024 / n`. 3 repetitions, medians reported (a
+  few cells, in some runs, show one rep well off the other two -- e.g. an
+  earlier run of this same build (with the pre-fix tube loader below,
+  so `1,000` there meant 512 tubes) read `rs 16×1,000,000×1,000` rep 2 at
+  176.8 B/job (loaded RSS 180,656 KiB) against its other two reps' ~286.5
+  (loaded ~287,000 KiB each), with that same rep's *after-delete* RSS
+  (254,320 KiB) coming in *above* its own loaded RSS. `stats` confirmed
+  all jobs were present before every "loaded" sample, so this isn't the
+  settle-loop returning early; it's consistent with the memory compressor
+  paging part of the process out under the host's memory pressure (the
+  busy Docker VM, see Environment) around the "loaded" sample -- `ps`'s
+  RSS excludes compressed pages. The shipped run
+  (`bench/results/2026-09-27-p4-t4-mem.csv`) happened to be a clean one:
+  every cell's 3 reps agree within 2.9%, so the median in the table below
+  isn't masking a swing this large, but the mechanism is real and worth
+  knowing about if a future run looks noisier).
+- **Binlog bytes**: macOS has no per-process write-byte counter in `ps`
+  or `/usr/bin/time -l`, and `getrusage` doesn't have one either.
+  `bench/pidrusage.c` reads `proc_pid_rusage(pid, RUSAGE_INFO_V4, ...)`,
+  which has both `ri_logical_writes` (bytes passed to `write`/`pwrite`,
+  counted the instant the syscall returns) and `ri_diskio_byteswritten`
+  (actual block I/O, which lags behind writeback and is undercounted if
+  read too soon -- confirmed by writing 64 MiB with no `fsync`: logical
+  read the full 64 MiB immediately, diskio read 56 MiB a second later).
+  `logical_writes` is the metric the acceptance gate uses; `diskio` is
+  reported alongside as a loose cross-check. A control run (`ftruncate`
+  to 64 MiB, no `write`) showed 0 on both counters, confirming neither
+  counts sparse preallocation -- moot here since both the reference
+  (`rawfalloc`, `file.c`) and beanstalkd-rs (`preallocate`, `wal.rs`)
+  preallocate by writing real zero bytes, not `ftruncate`.
+  For each (workload, body size, segment size) cell: starts a server
+  fresh with `-b <fresh dir> -s <size>` (default fsync; fsync policy
+  doesn't affect `logical_writes`, which counts the `write()` calls
+  themselves, not their durability), reads `pidrusage` once after a
+  0.2 s settle (`_wait_ready` only requires the port to accept
+  connections, and both servers `listen()` before finishing their WAL
+  setup -- `make_server_socket` before `srv_acquire_wal` in the
+  reference's `main.c`, and step 3 before step 5 in our own `main.rs` --
+  so either server's first-segment preallocation could still be
+  in flight when the "before" `pidrusage` sample is taken; the largest
+  possible effect is the whole preallocation landing inside the window,
+  ~52 B/cycle at the 10 MiB segment size (10,485,760 / 200,000) and
+  under 1 B/cycle at 64 KiB -- not enough to change any conclusion
+  below either way), runs 200,000 cycles of the workload on one connection
+  (ids are sequential and deterministic, so the whole run is pipelined
+  in chunks of 200 rather than round-tripped one command at a time),
+  reads `pidrusage` again after a 1 s settle (for the `diskio`
+  cross-check). "B/op" in the table below is logical bytes ÷ 200,000
+  *cycles*, not ÷ command count: `churn` is one cycle = 3 commands,
+  put→reserve→delete (2 journaled records: put, delete); `mixed` is one
+  cycle = 9 commands,
+  put→reserve→bury→kick-job→reserve→release(delay=1)→kick-job→reserve→delete
+  (6 journaled records: put, bury, kick, release, kick, delete;
+  `kick-job` targets a specific id so the next step is exact). In both
+  workloads 1 job in 50 is put and buried but never revisited, so the
+  binlog keeps some live records across many segment rotations --
+  otherwise a small `-s` only exercises file turnover, never an actual
+  compaction move of live data forward (COMPAT "Binlog" item 7). A
+  single run per cell (the byte count is deterministic given the op
+  sequence, not a timing measurement); `binlog-records-written` from
+  `stats` is logged alongside as a sanity check (it isn't expected to
+  match exactly once compaction runs, since compaction moves are
+  masked in the differential suites too, but it is expected to be the
+  same order of magnitude, and it is: 401,907-517,859 for churn vs the
+  reference's 402,152-494,243).
+- **Environment**: Apple M6, 12 cores, 34 GiB RAM, macOS 27.0 (Darwin
+  27.0.0). The host also runs a busy Docker VM intermittently during the
+  session (`sysctl vm.loadavg` 1-minute figures from 15 to 71 were
+  observed across these runs, well above the machine's core count, and
+  rising over the session). Byte counts are exact given the same op
+  sequence, so CPU/scheduling noise can't change what either server
+  *wrote*; RSS is a different story -- it *is* sensitive to memory
+  pressure through macOS's memory compressor (see the outlier example
+  above), which is presumably more active with the Docker VM competing
+  for memory. The settle-loop only guards against an in-progress
+  allocation, not a compressed page; 3 reps and taking the median is the
+  actual defense (see the Method note above for a case where it mattered
+  in an earlier run). The shipped run's reps agree within 2.9% in every
+  cell. Reference binary:
+  `.ref/beanstalkd-opt/beanstalkd` (`scripts/build-ref.sh --optimized`).
+  Raw data: `bench/results/2026-09-27-p4-t4-mem.csv`,
+  `bench/results/2026-09-27-p4-t4-binlog.csv`.
+
+### Cause found, and fixed
+
+A 100k×16 B smoke test (before any fix) measured memory per job at 17.6x
+the reference under pipelined loading (the loader `bench/footprint.py`
+recommends, and any realistic producer uses): ~4,377 B/job against the
+reference's ~249. A non-pipelined loader (one put per round trip, same
+unfixed build) cost only ~565 B/job, isolating pipelining as the
+trigger.
+
+**Cause**: `ServerCodec::decode` (`crates/proto/src/codec.rs`, unchanged
+by this task) builds a put's body with `src.split_to(need).freeze()` --
+a *view* into the connection's read buffer (`rbuf`), not a copy.
+`bytes::BytesMut::reserve` can only grow a buffer in place when nothing
+else references its backing allocation; as soon as any live job body is
+a view into it (true for essentially every job, since jobs commonly
+outlive the connection that created them by a lot), every later
+`reserve` on `rbuf` must allocate a fresh buffer instead and abandon the
+old one -- which stays resident for as long as that one job body is
+alive, i.e. forever, until the job is deleted. Under pipelining, the
+server reads many commands per syscall, so this happened roughly once
+per buffer refill: confirmed by writing a 20,000-put probe with and
+without pipelining (565 vs 4,589 B/job) and by the fact that 4,377 is
+close to `INITIAL_BUF_CAPACITY` (4 KiB, `conn.rs`) -- each abandoned
+buffer was close to one buffer-full's worth, retained by whichever job
+happened to still reference it.
+
+This task's edit scope is `crates/engine` and `crates/store`, so the fix
+does not touch `codec.rs`; instead it breaks the sharing where the body
+enters the engine (`Engine::cmd_put`, `crates/engine/src/engine.rs`),
+which is equally effective because a connection only ever has one put
+in flight at a time (`await_reply` in `crates/server/src/conn.rs` never
+decodes a further command while a reply is outstanding): the mechanism
+is not that decoding runs ahead of the engine, but that one socket read
+commonly delivers many pipelined puts at once, and every body sliced out
+of that one read shares its buffer; copying each one out in `cmd_put`,
+right before it is stored, removes the sharing before the job outlives
+the read that produced it. A `crates/proto/src/codec.rs` fix at the
+source (copy at decode time instead of at the engine) was prototyped
+first and measured: 100k×16 B 272.8, 1M×16 B 285.7 B/job -- both within
+1% of the final numbers below -- before being reverted for scope; it is
+a cleaner fix in that it also avoids the transient reallocation, and is
+worth the lead's consideration for a follow-up outside P4-T4's scope.
+
+**Fix** (`crates/engine/src/engine.rs`, `cmd_put`): copy the body into
+its own allocation (`Bytes::copy_from_slice`) as the first thing
+`cmd_put` does, before it's ever stored. This costs one extra memcpy per
+put (proportional to body size). Measured with only this fix in place
+(no `Box`, and using the `codec.rs` variant, which is what P4-T4 had
+built at the time): 100k×16 B pipelined 4,377 → 440.6 B/job (ratio
+1.79x); 1M×16 B 660.5 B/job (ratio 2.73x) -- the copy fixes the
+retention, but the 1.79x/2.73x remaining was still over the 1.5x gate,
+especially at 1,000,000 jobs, so a second fix followed:
+
+**Fix 2** (`crates/engine/src/engine.rs`): box the hash map's values,
+`HashMap<JobId, JobRec>` → `HashMap<JobId, Box<JobRec>>`. `hashbrown`
+resizes at 7/8 load and (like `std::collections::HashMap`) stores each
+value inline in its slot array, so every slot -- empty or occupied --
+costs a full `JobRec` (136 B) until the next resize, not just a few
+bytes; at 1,000,000 jobs the table had *just* crossed a doubling (from
+1,048,576 to 2,097,152 slots for 1,142,858+ needed) and stays only
+47.7% full until about 835k more inserts (7/8 of 2,097,152 is
+1,835,008), which is why the 1M
+cells were worse than the 100k ones even after the copy fix. The
+reference's chained hash table (`job.c`) only ever costs one 8-byte
+pointer per slot; the `Job` itself is a separate, exactly-sized
+allocation either way. Boxing does the same: the table's per-slot cost
+drops from 136 B to a pointer (8 B), and the `JobRec` becomes its own
+allocation, sized exactly, unaffected by the table's load factor.
+`EngineState` (the P3 snapshot / cluster-transfer type) still stores
+jobs as `Vec<JobRec>`, not `HashMap`, so the `Box` never reaches
+serialization and the on-wire snapshot format is unchanged by
+construction, not merely by test coverage.
+
+The measured drop from adding this fix is bigger than the load-factor
+arithmetic alone predicts: at 1M jobs, 2,097,152 slots going from 145
+B/slot (`JobId` + inline `JobRec` + a control byte) to 17 B/slot
+(`JobId` + a pointer + a control byte), holding 1,000,000 boxed
+`JobRec`s on the side, works out to about 124 B/job saved; the measured
+drop was ~375 B/job (660.5 → 285.7). At 100k the same arithmetic gives
+~24 B/job against a measured ~168 B/job (440.6 → 272.8). The remainder
+is consistent with -- not separately confirmed here -- the *previous*
+table generations from earlier doublings (512k, 256k, 128k, ... slots,
+each freed when the map outgrew it): their sizes sum to roughly the
+current table's size at the old 145 B/slot cost, and macOS's allocator
+doesn't necessarily return that memory to the OS immediately, so `ps`'s
+RSS can keep counting it. This doesn't change any conclusion below (if
+anything it makes the reported rs figures slightly conservative, by
+perhaps another ~36 B/job at 1M once that stale memory is eventually
+reclaimed). With both fixes together: 272.8 B/job at 100k×16 B and
+285.7 at 1M×16 B (ratios 1.10x-1.18x on that run, 1.10x-1.20x on the
+final matrix below) -- the two job counts now behave alike instead of
+1M being the visibly worse case.
+
+Both fixes are engine-internal: no protocol-visible change, verified by
+the full differential and oracle-proptest suites (`cargo test
+--workspace` via `scripts/check.sh`, 45 test binaries, all green; one
+`bstk-chaos` multi-process test and one `bstk-server` cluster test each
+failed once with a connection reset during this session's runs and
+passed on every other attempt, including 5 back-to-back reruns of the
+cluster one -- consistent with this host's load rather than these
+changes, see Environment) and a rough throughput/CPU sanity check
+(put-reserve-delete, 100×16, 1 worker thread; `bstk-bench`, not the
+full P4-T6 matrix): four quick 5 s runs at varying host load
+(`vm.loadavg` 24-71 during these checks) gave ops/s ratios of
+0.88x-1.22x against the reference (gate ≥1.0x; 2 of 4 runs below it)
+and ops/CPU-second ratios of 0.96x-1.17x (gate ≥0.8x; every run above
+it). This host, at this load, cannot answer whether the two extra
+per-put allocations (the body copy, the `Box`) cost real throughput --
+the swing between runs is bigger than any effect they could plausibly
+have. It is reported as-is rather than smoothed over; a formal re-check
+under controlled load is P4-T6's job, not this one's, and the lead may
+want it prioritized given this uncertainty.
+
+A cheap A/B narrows this a little: the pre-P4-T4 build (`git archive
+HEAD`, built separately) alternated against the current build -- always
+pre-fix first, current second, within each pair, so drift within a pair
+isn't balanced out -- same scenario, 100 conns, 1 worker thread, 7 valid
+5 s runs each (host load 17-33, one pair discarded for a parse error):
+median ops/s ratio (current/pre-fix) 1.16x, median ops/CPU-second ratio
+1.06x, with one outlier pair at 0.53x/0.58x (a load spike coincident
+with the "current" half of that pair, not a trend -- the other 6 pairs
+range 0.94x-1.40x throughput, 0.99x-1.29x efficiency). A 1.16x median
+"speedup" from a change that only adds work (a memcpy, a heap
+allocation) is itself a sign this is measuring host noise, not a real
+effect: no evidence of a regression, but the fixed pre-fix-first
+ordering means this can't rule one out either. Not a substitute for
+P4-T6's controlled matrix.
+
+No binlog fix was needed or attempted (see the table below): every
+workload/body/segment cell already came in at or under 1.0x. Whether the
+copy happens in the codec or the engine cannot change binlog bytes
+either way (the WAL only ever sees the `JobRec` the engine stores,
+already an owned copy in both variants); a spot check of one cell
+(`churn`, 16 B, 10 MiB segments) after settling on the engine-side fix
+read 268.6 B/op against the table's 268.9, confirming this.
+
+The same class of bug was checked for on binlog recovery
+(`crates/store/src/replay.rs`, where `Engine::recover` gets a job's body
+back from a segment read): both sites that hand a body to a `RecoveredJob`
+already use `Bytes::copy_from_slice(body)`, not a slice of the read
+buffer, so recovered jobs don't pin whole segments the way pipelined puts
+pinned read buffers. No fix needed there.
+
+### Memory per job
+
+Medians of 3 reps; ratio = rs / ref; "after delete" is the third RSS
+sample (retention/fragmentation after every job is deleted, not itself
+gated).
+
+| body | n | tubes | ref B/job | rs B/job | ratio | ref after-delete | rs after-delete |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 100,000 | 1 | 247.2 | 272.5 | 1.10 | 26,128 KiB | 34,592 KiB |
+| 16 | 100,000 | 1,000 | 251.3 | 266.2 | 1.06 | 26,336 KiB | 34,336 KiB |
+| 16 | 1,000,000 | 1 | 241.9 | 285.5 | 1.18 | 238,592 KiB | 254,240 KiB |
+| 16 | 1,000,000 | 1,000 | 240.2 | 287.4 | 1.20 | 237,184 KiB | 256,192 KiB |
+| 1,024 | 100,000 | 1 | 1,390.7 | 1,298.4 | 0.93 | 137,648 KiB | 134,880 KiB |
+| 1,024 | 100,000 | 1,000 | 1,396.4 | 1,311.2 | 0.94 | 138,224 KiB | 136,800 KiB |
+| 1,024 | 1,000,000 | 1 | 1,387.3 | 1,299.4 | 0.94 | 1,357,040 KiB | 1,244,704 KiB |
+| 1,024 | 1,000,000 | 1,000 | 1,386.1 | 1,301.6 | 0.94 | 1,355,872 KiB | 1,246,928 KiB |
+
+("1,000 tubes" is exactly that: each worker connection owns a disjoint
+slice of the 1,000 named tubes and puts that tube's exact share, `n /
+1,000` jobs, rather than round-robining large batches across tubes: an
+earlier version of the loader cycled one 2,000-job batch per tube per
+iteration, needing only 4 iterations at 100k jobs / 16 connections and
+32 at 1M, so it only ever reached 64 or 512 of the requested 1,000
+tubes; `current-tubes` is now checked against `tubes + 1` after loading
+to catch a regression here.)
+
+Worst case 1.20x, against the 1.5x gate. 1 KiB bodies run *under* 1.0x
+(the body itself dominates, and beanstalkd-rs's per-job structure
+overhead is smaller). 1,000 tubes vs. 1 tube makes no material
+difference for either server at these job counts (a `TubeState` is
+~250 B, amortized over 100-1,000 jobs/tube at 100k-1M jobs). `rs`
+after-delete stays well above baseline: hashbrown's jobs table doesn't
+shrink on removal (its ~2^21-slot, 17 B/slot array for the 1,000,000-job
+cells alone accounts for ~36 MB of the ~246 MB retained), and the rest
+is ordinary allocator behavior -- freed small blocks (`BTreeSet`/`Box`
+allocations) kept for reuse rather than returned to the OS. The
+reference's after-delete also stays near its loaded figure, but not for
+the same reason: deleting every job does drop its table below the 1/16
+load `rehash(0)` shrinks at, so its hash table itself goes back down;
+what's retained there is the allocator holding on to the freed `Job`,
+body and `Heap` array blocks instead of returning them to the OS -- the
+same generic allocator behavior, just without the table contribution.
+
+### Binlog bytes per operation
+
+Medians are not applicable (1 run/cell, see Method); ratio = rs / ref
+on `logical_writes`, the gated metric. "B/op" = logical bytes ÷ 200,000
+cycles (3 commands/cycle for `churn`, 9 for `mixed`; see Method).
+
+| workload | body | seg size | ref B/op | rs B/op | ratio | ref records | rs records |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| churn | 16 | 64 KiB | 572.5 | 395.3 | 0.69 | 494,243 | 517,859 |
+| churn | 16 | 10 MiB | 393.3 | 268.9 | 0.68 | 402,152 | 401,907 |
+| churn | 1,024 | 64 KiB | 3,886.3 | 3,793.5 | 0.98 | 489,757 | 490,973 |
+| churn | 1,024 | 10 MiB | 2,985.5 | 2,510.5 | 0.84 | 425,417 | 423,201 |
+| mixed | 16 | 64 KiB | 1,506.7 | 1,210.1 | 0.80 | 1,420,711 | 1,513,470 |
+| mixed | 16 | 10 MiB | 1,186.9 | 795.2 | 0.67 | 1,193,959 | 1,190,808 |
+| mixed | 1,024 | 64 KiB | 4,944.7 | 4,534.8 | 0.92 | 1,297,295 | 1,295,152 |
+| mixed | 1,024 | 10 MiB | 3,815.6 | 3,119.1 | 0.82 | 1,216,674 | 1,213,875 |
+
+Worst case 0.98x, against the 1.2x gate -- every cell already favors
+`beanstalkd-rs`, so no fix was attempted. This tracks the on-disk record
+formats: the reference's short record (used for bury, kick, release and
+delete, `filewrjobshort`, `file.c`) is `int nl=0` (4 B) + the in-memory
+`Jobrec` reused as-is (80 B) = 84 B regardless of the transition, and
+its full (put) record is 4 + tube_len + 80 + body_len; beanstalkd-rs's
+delete record is a flat 17 B (kind + id, `format.rs`) and its
+update record (bury/kick/release) is 66 B, put is 67 + tube_len +
+body_len -- about 20% smaller on puts and far smaller on
+delete/update, because the on-disk `JobRecord` (57 B) was sized for the
+format rather than reusing the in-memory struct, and delete doesn't
+carry a full record at all. A small `-s` (64 KiB) narrows the margin
+(the fixed per-segment preallocation, identical real zero-byte writes
+on both sides, is a larger fraction of the total at that size) but
+never crosses 1.0x in these runs.
 
 ## P4-T2: worker threads
 
