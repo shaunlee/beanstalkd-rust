@@ -136,7 +136,51 @@ PY
   die "server on port $port did not come up"
 }
 
+# await_probe_closed PORT [CA [CERT KEY]]: checks that the server has counted
+# the close of wait_port's probe, so a client's first `stats` reports the same
+# current-connections on every server (beanstalkd-rs closes on another thread
+# and can count the close late). One extra connection sends exactly one
+# `stats` after a fixed pause: polling would add a variable number of counted
+# commands (cmd-stats) to the transcript, and a server needing more polls
+# would differ from the other.
+await_probe_closed() {
+  python3 - "$@" <<'PY' || die "the readiness probe's close was not counted on port $1"
+import re, socket, ssl, sys, time
+port, *tls = sys.argv[1:]
+time.sleep(0.2)
+s = socket.create_connection(("127.0.0.1", int(port)), 2)
+if tls:
+    ctx = ssl.create_default_context(cafile=tls[0])
+    if len(tls) == 3:
+        ctx.load_cert_chain(tls[1], tls[2])
+    s = ctx.wrap_socket(s, server_hostname="127.0.0.1")
+s.settimeout(2)
+s.sendall(b"stats\r\n")
+buf = b""
+while b"\r\n" not in buf:
+    buf += s.recv(4096)
+head, rest = buf.split(b"\r\n", 1)
+n = int(head.split()[1])
+while len(rest) < n + 2:
+    rest += s.recv(4096)
+m = re.search(r"^current-connections: (\d+)$", rest.decode(), re.M)
+seen = m[1] if m else None
+# Wait for the server's side of the close, so this connection is not the next
+# straggler.
+s.sendall(b"quit\r\n")
+try:
+    while s.recv(4096):
+        pass
+except (OSError, ssl.SSLError):
+    pass
+if seen != "1":
+    print(f"current-connections is {seen}, expected 1", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 PIDS=()
+SERVER_PROBE=()
 cleanup() {
   local p
   for p in "${PIDS[@]:-}"; do
@@ -202,6 +246,7 @@ start_server() {
   SERVER_PID=$!
   PIDS+=("$SERVER_PID")
   wait_port "$SERVER_PORT" ${probe[@]:+"${probe[@]}"}
+  SERVER_PROBE=(${probe[@]:+"${probe[@]}"})
 }
 
 stop_server() {
@@ -246,6 +291,8 @@ run_restart() {
   [ "$rc" = 0 ] || return 1
   echo "--- server killed (SIGKILL) and restarted on the same binlog ---" >>"$raw"
   start_server "$name" "$bin" "$dir"
+  [ "${SERVER_AUTH:-none}" = token ] ||
+    await_probe_closed "$SERVER_PORT" ${SERVER_PROBE[@]:+"${SERVER_PROBE[@]}"}
   run_client "$name" "$raw" --after-restart
 }
 

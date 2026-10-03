@@ -218,7 +218,7 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 | Counters after restart | Per-job counters (`reserves`, `releases`, ...) come from the last journaled record. Cumulative server and tube counters (`cmd-*`, `total-jobs`) reset; recovered jobs don't count toward `total-jobs`. |
 | Time | Wall clock (`gettimeofday`): `created_at` and delay deadlines persist, so `age` and remaining delays continue across downtime. |
 | Job ids | Next id = highest id seen in the binlog + 1 (a deleted job's id is not reused while its records remain). |
-| Files | `binlog.N` plus a `lock` file (fcntl lock). A second instance on the same directory exits with status 10. Files are preallocated to `-s` rounded up to 4096; `binlog-max-size` reports `-s` unrounded. A new file is started on startup. |
+| Files | `binlog.N` plus a `lock` file (the reference takes an `fcntl(F_SETLK)` lock; ours uses `flock`, see COMPAT D8). A second instance on the same directory exits with status 10. Files are preallocated to `-s` rounded up to 4096; `binlog-max-size` reports `-s` unrounded. A new file is started on startup. |
 | Space reservation | Space for a job's future records is reserved at put time; if it cannot be reserved the put replies `OUT_OF_MEMORY`. A write error silently disables the WAL. |
 | Compaction | Ratio-based: while (allocated − live) / live ≥ 2, move one live job out of the oldest file. |
 | fsync | `-f MS`: at most once per MS ms (default 50), not awaited before replying. `-f0`: fsync on every write, before the reply. `-F`: never. |

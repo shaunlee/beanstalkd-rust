@@ -82,8 +82,12 @@ Implies `SMOKE_BINLOG=1`. For each (client, server) pair:
 2. the runner kills the server with SIGKILL (the reference has no SIGTERM
    handler, so this is the fair choice for both) while the reservations are
    held, then closes the client's stdin;
-3. it restarts the server on the same binlog dir (on a new port) and runs the
-   client with `--after-restart`, which dumps `stats`, `list-tubes`,
+3. it restarts the server on the same binlog dir (on a new port), waits 0.2 s
+   and checks with one extra connection and exactly one `stats` that the
+   server has counted the close of the readiness probe (`current-connections`
+   is 1, otherwise the run fails; a fixed pause rather than polling keeps
+   `cmd-stats` equal on both servers), and runs the client with
+   `--after-restart`, which dumps `stats`, `list-tubes`,
    `stats-tube`, then walks `peek-ready` / `peek-buried` / `peek-delayed`
    printing `stats-job` for each recovered job and deleting it, and finally
    checks that the next job id continues after the highest id in the log.
@@ -223,7 +227,12 @@ connections: `stats-job` shows the job still reserved by the worker,
 it, and final `stats` are dumped. The runner then restarts the killed
 node (without `--cluster-init`) and waits until it is ready again. The
 transcripts must still be identical: a leader kill loses no reply, no
-connection and no reservation on a surviving node. The runner logs the
+connection and no reservation on a surviving node. The final `stats` is
+taken while all three client connections are still open (the Python client
+closes the waiter only afterwards, as the Go client does through `defer`):
+a server handles a close concurrently with the next command on another
+connection, so closing first made `current-connections` / `current-workers`
+racy on a follower. The runner logs the
 failover time (about 0.6 s with the default election timeouts).
 
 ### Mode matrix

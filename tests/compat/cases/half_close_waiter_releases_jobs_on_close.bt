@@ -3,7 +3,11 @@
 # The job state is only checked after the server-side close: between sending
 # TIMED_OUT and handling the pending EOF, the job is still reserved, but whether
 # another client's command lands inside that window is a race inside the
-# reference (it flips under load), so it is not observed here.
+# reference (it flips under load), so it is not observed here. A pause follows
+# the close: the client sees the close before the server has processed the
+# disconnect that releases the job (in a cluster, before that disconnect has
+# been committed), and the polling a state check would need does not exist in
+# the DSL.
 @p send "put 0 0 60 1\r\nx\r\n"
 @p recv
 @h send "reserve\r\n"
@@ -12,6 +16,7 @@
 sleep 100ms
 @h shutdown_write
 @h recv
-@h recv_closed 500ms
+@h recv_closed 2s
+sleep 300ms
 @p send "stats-job 1\r\n"
 @p recv

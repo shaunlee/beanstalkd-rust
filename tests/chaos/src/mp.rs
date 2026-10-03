@@ -1112,9 +1112,32 @@ pub async fn check_peer_addresses() -> Result<String, String> {
     {
         return Err(format!("follower {f} not ready"));
     }
+    // /readyz can answer 200 while the follower still counts its silence from
+    // the killed leader: it then closes every client socket (crates/server/src/
+    // cluster/actor.rs, "Isolation") until the new leader has accepted a ping
+    // or forward from it, which takes longer under load. A command that
+    // completes through the follower proves it is admitting clients again; it
+    // is the only thing retried, so a node that never recovers still fails.
+    let client_addr = c.nodes[(f - 1) as usize].client;
+    let probe_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let probe = async {
+            let mut cl = BsClient::connect(client_addr, Duration::from_secs(2)).await?;
+            tokio::time::timeout(Duration::from_secs(5), cl.raw("list-tubes"))
+                .await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "probe timed out"))?
+        };
+        match probe.await {
+            Ok(_) => break,
+            Err(e) if Instant::now() >= probe_deadline => {
+                return Err(format!("follower {f} never served a client: {e}"));
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
     let before: BTreeMap<(u64, u64), (u64, u64)> =
         c.proxies.iter().map(|(k, p)| (*k, p.bytes())).collect();
-    let mut cl = BsClient::connect(c.nodes[(f - 1) as usize].client, Duration::from_secs(2))
+    let mut cl = BsClient::connect(client_addr, Duration::from_secs(2))
         .await
         .map_err(|e| e.to_string())?;
     for i in 0..20 {

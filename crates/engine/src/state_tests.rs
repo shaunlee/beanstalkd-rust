@@ -1287,3 +1287,49 @@ proptest! {
         reply_scope_is_invisible(steps, journal);
     }
 }
+
+#[test]
+fn ttr_deadline_equal_to_now_is_not_lost() {
+    use bstk_proto::Response;
+    const SEC: Nanos = crate::NANOS_PER_SEC;
+    let mut e = new_engine(false);
+    let mut out = Outbox::new();
+    for c in 1..=2 {
+        e.apply_input(0, EngineInput::Connect(c), &mut out);
+    }
+    let cmd = |conn, cmd| EngineInput::Command { conn, cmd };
+    e.apply_input(
+        0,
+        cmd(
+            1,
+            Command::Put {
+                pri: 5,
+                delay: 0,
+                ttr: 1,
+                body: Bytes::from_static(b"x"),
+            },
+        ),
+        &mut out,
+    );
+    e.apply_input(0, cmd(1, Command::Reserve), &mut out);
+    e.apply_input(0, cmd(2, Command::ReserveWithTimeout(10)), &mut out);
+    out.clear();
+
+    // The expiry test is strict (docs/COMPAT.md D14): at exactly the deadline
+    // nothing happens, but the timer must stay due so the next instant fires it.
+    e.apply_input(SEC, EngineInput::Tick, &mut out);
+    assert!(out.is_empty());
+    assert_eq!(e.next_deadline(), Some(SEC));
+
+    e.apply_input(SEC + 1, EngineInput::Tick, &mut out);
+    assert_eq!(
+        out,
+        vec![(
+            2,
+            Response::Reserved {
+                id: 1,
+                body: Bytes::from_static(b"x")
+            }
+        )]
+    );
+}

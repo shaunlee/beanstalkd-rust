@@ -12,6 +12,11 @@ P1-T5 (write-ahead log, `-b`), then the T6b section (engine performance
 fix); the T6 first pass, whose profile motivated T6b, is kept at the
 end.
 
+## Environment notes for new measurements
+
+- **Reference build.** `scripts/build-ref.sh` (both the debug and the `--optimized` tree, which the benchmarks use) patches one comparison in the reference's `conn_timeout` (docs/COMPAT.md D14) and, where the compiler knows it, passes `-Wno-error=stringop-truncation` (gcc 14). Neither changes the hot paths, so the numbers below, measured before the patch existed, stay comparable.
+- **Linux container.** Copy the tree in with `COPYFILE_DISABLE=1` (no `._*` files from macOS tar) and leave out `clients/python/.venv`, `target/`, `.ref/` and `.git`; rebuild `.ref/` inside the container. Run it with `docker run --init`, so that orphaned servers are reaped.
+
 ## P4-T6: final P4 matrix
 
 ### Summary

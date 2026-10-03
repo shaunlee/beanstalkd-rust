@@ -1397,8 +1397,16 @@ fn leader_among(c: &Cluster, among: &[usize]) -> usize {
 /// commit anything through a node that lost its data and rejoins. The
 /// rejoining node adopts the highest vote of the other nodes before it
 /// starts Raft, so it rejects the stale leader.
+///
+/// The rejoin may finish (in a few milliseconds) before the new leader is
+/// cut off. The rejoined node then holds X and may win a later term with
+/// the old leader's vote, and the put sent to the old node is forwarded
+/// to it and legitimately committed. So the test checks what the bug
+/// breaks (the adopted vote, the term of any commit, X's body on every
+/// node) rather than whether the put fails.
 #[test]
 fn stale_leader_is_rejected_by_a_rejoined_node() {
+    const X_BODY: &[u8] = b"X, committed in the newer term";
     let opts = Opts {
         // No isolation of the stale leader's clients during the test.
         node_timeout: "30s",
@@ -1417,12 +1425,19 @@ fn stale_leader_is_rejected_by_a_rejoined_node() {
     let acker = rest.iter().copied().find(|&i| i != new).unwrap();
     let (new_id, acker_id) = (c.nodes[new].id, c.nodes[acker].id);
     let mut on_new = c.nodes[new].connect();
-    let x = inserted(&on_new.put(b"X, committed in the newer term"));
+    let x = inserted(&on_new.put(X_BODY));
     drop(on_new);
+    let new_term = c.nodes[new].admin().unwrap()["cluster"]["term"]
+        .as_u64()
+        .unwrap();
     let a = c.nodes[old].admin().unwrap();
     assert_eq!(
         a["cluster"]["role"], "leader",
         "the old leader stepped down: {a}"
+    );
+    assert!(
+        a["cluster"]["term"].as_u64().unwrap() < new_term,
+        "the old leader is not stale: {a}"
     );
 
     // The acker loses its data and rejoins; it reaches both others (the
@@ -1432,13 +1447,25 @@ fn stale_leader_is_rejected_by_a_rejoined_node() {
     c.nodes[acker].wipe();
     c.heal_pair(old_id, acker_id);
     c.nodes[acker].start(&[]);
-    wait_for(Duration::from_secs(20), || {
+    let adopted = wait_for(Duration::from_secs(20), || {
         c.nodes[acker]
             .log_text()
-            .contains("rejoin: adopted the highest vote")
-            .then_some(())
+            .lines()
+            .find(|l| l.contains("rejoin: adopted the highest vote"))
+            .map(str::to_owned)
     })
     .expect("the rejoining node never adopted a vote");
+    // The log is colored: escape codes sit between `vote`, `=` and `T<term>`.
+    let adopted_term: u64 = adopted
+        .rsplit_once("vote")
+        .and_then(|(_, v)| v.split_once('T'))
+        .and_then(|(_, v)| v.split('-').next())
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("no adopted vote in {adopted:?}"));
+    assert!(
+        adopted_term >= new_term,
+        "adopted a vote below the new leader's term {new_term}: {adopted}"
+    );
     c.cut_node(new_id);
     c.heal_pair(old_id, acker_id);
 
@@ -1449,10 +1476,25 @@ fn stale_leader_is_rejected_by_a_rejoined_node() {
     on_old.send(b"put 0 0 60 5\r\nstale\r\n");
     let (got, _) = on_old.read_to_end(Duration::from_secs(4));
     let got = String::from_utf8_lossy(&got).into_owned();
-    assert!(
-        !got.contains("INSERTED"),
-        "the stale leader committed a put through the rejoined node: {got:?}"
-    );
+    // A put committed through a log holding X gets an id above X's; the
+    // stale leader's state machine lacks X and would reuse X's id.
+    let stale = got
+        .strip_prefix("INSERTED ")
+        .map(|s| s.trim_end().parse::<u64>().unwrap());
+    if let Some(s) = stale {
+        assert!(s > x, "the stale leader committed a put: {got:?}");
+        let term = wait_for(Duration::from_secs(5), || {
+            [old, acker]
+                .iter()
+                .filter_map(|&i| c.nodes[i].admin())
+                .find(|a| a["cluster"]["role"] == "leader")
+                .and_then(|a| a["cluster"]["term"].as_u64())
+        });
+        assert!(
+            term.is_some_and(|t| t > new_term),
+            "a put committed without a leader above term {new_term}: {term:?}"
+        );
+    }
     wait_for(Duration::from_secs(5), || {
         (c.nodes[old].admin()?["cluster"]["role"] != "leader").then_some(())
     })
@@ -1462,12 +1504,23 @@ fn stale_leader_is_rejected_by_a_rejoined_node() {
     c.wait_all_ready();
     for n in &c.nodes {
         let mut cl = n.connect();
-        let (hdr, _) = cl.body_reply(&format!("peek {x}"));
+        // The body, not only the id: the bug overwrites X with a job that
+        // reuses X's id.
+        let (hdr, body) = cl.body_reply(&format!("peek {x}"));
         assert!(
-            hdr.starts_with(&format!("FOUND {x} ")),
-            "node {}: {hdr}",
-            n.id
+            hdr.starts_with(&format!("FOUND {x} ")) && body == X_BODY,
+            "node {}: {hdr} {:?}",
+            n.id,
+            String::from_utf8_lossy(&body)
         );
+        if let Some(s) = stale {
+            let (hdr, body) = cl.body_reply(&format!("peek {s}"));
+            assert!(
+                hdr.starts_with(&format!("FOUND {s} ")) && body == b"stale",
+                "node {}: {hdr}",
+                n.id
+            );
+        }
     }
     let log = c.nodes[acker].log_text();
     assert!(log.contains("rejoin complete"), "{log}");

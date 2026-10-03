@@ -433,10 +433,15 @@ def hold_across_kill(addr: tuple[str, int], prod: greenstalk.Client, work: green
     dump("stats-job held", waiter.stats_job(held))
     waiter.delete(j)
     out(f"delete {job(j)}: ok")
-    waiter.close()
+    # The waiter stays open until after `stats`: a server processes a close
+    # concurrently with the next command on another connection (beanstalkd-rs
+    # on a cluster follower does so on another thread), so closing first
+    # makes current-connections / current-workers racy. The Go client does
+    # the same through defer.
     st = prod.stats()
     dump("stats", st)
     expect("total-jobs", st["total-jobs"], 8)
+    waiter.close()
 
 
 def after_restart(addr: tuple[str, int]) -> int:
