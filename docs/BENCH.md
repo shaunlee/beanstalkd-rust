@@ -2,7 +2,7 @@
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`). The newest numbers
-are from task P4-T5c (snapshot memory), first below, then P4-T5b
+are from task P4-T6b (thread default per mode), then P4-T5c (snapshot memory), then P4-T5b
 (cluster wake-ups at low load), then
 P4-T4 (footprint: memory per job, binlog bytes per operation). P4-T2 (tokio worker-thread count and its
 default, the lever the P4-T1 spike found for CPU efficiency) follows,
@@ -11,6 +11,55 @@ and the standalone regression check), then P2-T5 (TLS / mTLS), then
 P1-T5 (write-ahead log, `-b`), then the T6b section (engine performance
 fix); the T6 first pass, whose profile motivated T6b, is kept at the
 end.
+
+## P4-T6b: thread default per mode
+
+### Summary
+
+- **Default worker threads by mode**: 1 for standalone with no TLS listener and no binlog; 2 for standalone with any TLS listener (including mTLS) or with `-b`; 2 in cluster mode (unchanged). An explicit `--threads` / `server.threads` always wins. The rule is `ResolvedConfig::effective_threads`.
+- **Why**: the P4-T6 matrix and a bisect showed the P4-T2 default of 1 worker costs throughput against the P3 build (e9cbb1f) for TLS and `-b` at 10 connections: one worker saturates at about 108% CPU. At 1 thread, `-b` at 10 connections is 0.92–0.94x P3 and TLS 10×4096 is 0.85–0.93x. With 2 workers every TLS and `-b` cell is within ±5% of P3 (TLS 0.98–1.06x, `-b` 1.02–1.07x) at lower CPU than P3. 4 workers buys nothing over 2.
+- **Plaintext without `-b` stays at 1** for efficiency against the reference; users who want its throughput set `--threads`.
+
+### Results (P4-T6b)
+
+put-reserve-delete against the P3 build e9cbb1f. The machine was under load (1-minute average 6–14). TLS: 12 rotated rounds per cell; each cell shows the ratio of medians / the median paired ratio. `-b`: alternated, 6 runs. CPU is percent of one core, this build vs P3.
+
+TLS, `--threads 2`:
+
+| Cell (conns × bytes) | Ratio of medians / median paired ratio | CPU (this build vs P3) |
+|---|---|---|
+| 10×16 | 1.056 / 1.045 | 134% vs 162% |
+| 10×4096 | 1.044 / 1.015 | 141% vs 173% |
+| 100×16 | 1.033 / 1.037 | 169% vs 232% |
+| 100×4096 | 0.988 / 0.978 | 173% vs 245% |
+
+TLS, `--threads 4`: 10×16 1.021 / 1.009, 10×4096 1.027 / 1.025, 100×16 1.005 / 1.000, 100×4096 1.020 / 1.005, at about P3's CPU (160%, 173%, 219%, 232%). That is no gain over 2 workers for more CPU.
+
+`-b`, `--threads 2`:
+
+| Cell (conns × bytes) | Ratio of medians / median paired ratio | CPU (this build vs P3) |
+|---|---|---|
+| 10×16 | 1.015 / 1.025 | 162% vs 194% |
+| 10×4096 | 1.060 / 1.047 | 160% vs 192% |
+| 100×16 | 1.048 / 1.039 | 208% vs 254% |
+| 100×4096 | 1.072 / 1.060 | 226% vs 264% |
+
+At 1 thread (T6 and bisect): `-b` at 10 connections 0.92–0.94x, TLS 10×4096 0.85–0.93x.
+
+### Why plaintext stays at 1 thread
+
+Plaintext 16 B, current build:
+
+| Connections | 1 thread | 2 threads |
+|---|---|---|
+| 10 | 99.6k ops/s at 81% CPU (8.2 µs/op) | 112.0k at 126% (11.4 µs/op) |
+| 100 | 110.9k at 88% (7.9 µs/op) | 136.3k at 159% (11.6 µs/op) |
+
+2 threads buys 12–23% throughput for about 1.4–1.5x the CPU per op, so plaintext stays at 1 for the efficiency target against the reference.
+
+### Note: single-connection plaintext
+
+The single-connection plaintext put-reserve-delete cell is 0.95–0.97x the reference at every build since P3 (bisect: reference vs P3 0.969 / 0.954 at 16 / 4096 B; P3 vs HEAD 1.007 / 1.005), with CPU equal to the reference. It is a latency-bound gap from the connection to engine task hop. It is pre-existing and not addressed in P4.
 
 ## P4-T5c: snapshot memory
 
@@ -671,6 +720,8 @@ TLS, P3's own listener via the `rs` slot vs the current build (`b-tls-p3.csv` re
 All three thread counts beat P3; 2 workers is best at both connection counts and is the chosen cluster default (215% total node CPU vs 1 worker's 136%, for +3.5% leader throughput at 100×16 — noted for P4-T5, not a reason to change the pick).
 
 ### Chosen defaults
+
+Superseded for TLS and `-b` by P4-T6b (above): the standalone default is 2 workers when any listener is TLS or the binlog is enabled; the text below describes the P4-T2 decision.
 
 Applying the rule from `docs/PLAN.md` §7.5 / the lead's decision text:
 

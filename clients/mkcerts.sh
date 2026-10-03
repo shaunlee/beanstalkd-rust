@@ -10,6 +10,8 @@
 # Usage: clients/mkcerts.sh DIR   (DIR is created; existing files are
 # overwritten). Keys are ECDSA P-256 in PKCS#8 PEM, certificates valid for
 # 2 days. Works with OpenSSL 3 and LibreSSL (extensions via -extfile).
+# Leaves carry an authority key identifier: Python 3.14's strict default
+# verification rejects them without one.
 set -euo pipefail
 
 [ $# -eq 1 ] || { echo "usage: $0 DIR" >&2; exit 2; }
@@ -37,7 +39,7 @@ leaf() {
   "$OPENSSL" x509 -req -in "$DIR/$name.csr" -CA "$DIR/$ca.pem" -CAkey "$DIR/$ca.key" \
     -CAcreateserial -days 2 -sha256 -out "$DIR/$name.pem" \
     -extfile <(printf '%s\n' 'basicConstraints=critical,CA:FALSE' \
-      'keyUsage=critical,digitalSignature' "$@") 2>/dev/null
+      'keyUsage=critical,digitalSignature' 'authorityKeyIdentifier=keyid' "$@") 2>/dev/null
   rm -f "$DIR/$name.csr"
 }
 

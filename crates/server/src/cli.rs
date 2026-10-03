@@ -107,8 +107,8 @@ pub struct Cli {
     #[arg(long = "cluster-init", action = ArgAction::SetTrue)]
     pub cluster_init: bool,
 
-    /// Tokio worker-thread count (default: chosen by mode; see
-    /// docs/DESIGN.md §3)
+    /// Tokio worker-thread count (default: 1 standalone, 2 with a TLS
+    /// listener, -b or [cluster]; see docs/DESIGN.md §3)
     #[arg(
         long = "threads",
         value_name = "N",

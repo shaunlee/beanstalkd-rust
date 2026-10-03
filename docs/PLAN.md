@@ -440,6 +440,7 @@ Only one agent at a time edits the server's wiring (T4); T1–T3 work in separat
 | P4-T4 | Footprint measurement (memory per job, binlog bytes per op) vs reference, and fixes if needed | subagent |
 | P4-T5 | Cluster efficiency: owner-only replies (T5a), fewer wake-ups (T5b), streamed snapshots (T5c) — done, see BENCH.md P4-T5b / P4-T5c | subagent |
 | P4-T6 | Full benchmark matrix (standalone, `-b`, TLS, cluster), chaos acceptance re-run, smoke tests | subagent |
+| P4-T6b | Thread default per mode (TLS or -b: 2 workers), after the P4-T6 matrix showed 1 worker below P3 for TLS and -b | subagent |
 | P4-T7 | P4 acceptance | lead |
 | P4-T8 | Comment cleanup across all crates: keep only comments that state *why* (reference quirks mirrored on purpose, invariants, safety reasoning, rejected alternatives); remove comments that restate the code; move long design reasoning into `docs/DESIGN.md` / `docs/COMPAT.md` and point to it in one line; prefer names and types over comments. Also move `QuietTcp` (P4-T5b) out of `bstk-raft` into a module both the server and the cluster transport can own without the client path depending on the Raft crate. No behavior change; all tests green | subagent |
 

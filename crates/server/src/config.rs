@@ -55,28 +55,22 @@ pub const MIN_THREADS: u16 = 1;
 /// Largest accepted `server.threads` / `--threads`.
 pub const MAX_THREADS: u16 = 256;
 
-/// Default tokio worker-thread count without `[cluster]` (chosen by
-/// measurement, P4-T2; see docs/DESIGN.md §3 and docs/BENCH.md
-/// "P4-T2: worker threads"). This is the count read by
+/// Default tokio worker-thread count without `[cluster]`, no TLS listener
+/// and no binlog (chosen by measurement, P4-T2; see docs/DESIGN.md §3 and
+/// docs/BENCH.md "P4-T2: worker threads"). This is the count read by
 /// `engine_actor::run_task` (the actor's own message batching,
 /// `ACTOR_BATCH_LIMIT`, is a separate, unrelated knob).
 pub const DEFAULT_THREADS_STANDALONE: usize = 1;
+/// Default tokio worker-thread count without `[cluster]` but with a TLS
+/// listener or the binlog: one worker measured below the P3 build there
+/// (docs/BENCH.md "P4-T6b: thread default per mode").
+pub const DEFAULT_THREADS_STANDALONE_TLS_OR_BINLOG: usize = 2;
 /// Default tokio worker-thread count with `[cluster]` (chosen by
 /// measurement, P4-T2). The cluster actor (`cluster::actor::Actor::run`)
 /// is a different code path with its own pre-existing message-draining
 /// loop (`MAX_DRAIN`); only the worker count changes here, not its
 /// batching.
 pub const DEFAULT_THREADS_CLUSTER: usize = 2;
-
-/// The worker-thread count the runtime should use: `server.threads` /
-/// `--threads` if set, else the mode's default.
-pub fn effective_threads(threads: Option<u16>, cluster: bool) -> usize {
-    threads.map(usize::from).unwrap_or(if cluster {
-        DEFAULT_THREADS_CLUSTER
-    } else {
-        DEFAULT_THREADS_STANDALONE
-    })
-}
 
 /// Default `http.snapshot_min_interval`: how old a cached engine snapshot
 /// served by `/metrics` and `/admin` may be.
@@ -118,7 +112,7 @@ pub struct ResolvedConfig {
     /// their handshake or awaiting token authentication (at least 1).
     pub max_pending_connections: usize,
     /// `server.threads` / `--threads`: tokio worker-thread count.
-    /// `None`: use the mode's default (`effective_threads`).
+    /// `None`: use the mode's default (`ResolvedConfig::effective_threads`).
     pub threads: Option<u16>,
     pub binlog: BinlogSettings,
     /// `None`: no HTTP listener.
@@ -127,6 +121,23 @@ pub struct ResolvedConfig {
     /// Non-fatal problems found while loading (e.g. a tokens file readable
     /// by other users); logged at startup and printed by `--check-config`.
     pub warnings: Vec<String>,
+}
+
+impl ResolvedConfig {
+    /// The worker-thread count the runtime should use: `server.threads` /
+    /// `--threads` if set, else the mode's default. `cluster`: whether
+    /// `[cluster]` is present.
+    pub fn effective_threads(&self, cluster: bool) -> usize {
+        if let Some(n) = self.threads {
+            usize::from(n)
+        } else if cluster {
+            DEFAULT_THREADS_CLUSTER
+        } else if self.binlog.dir.is_some() || self.listeners.iter().any(|l| l.tls) {
+            DEFAULT_THREADS_STANDALONE_TLS_OR_BINLOG
+        } else {
+            DEFAULT_THREADS_STANDALONE
+        }
+    }
 }
 
 /// One listening socket.
@@ -1119,7 +1130,11 @@ pub fn summary(config: &ResolvedConfig, cluster: bool) -> String {
     let _ = writeln!(s, "max job size: {}", config.max_job_size);
     let _ = match config.threads {
         Some(n) => writeln!(s, "threads: {n}"),
-        None => writeln!(s, "threads: {} (default)", effective_threads(None, cluster)),
+        None => writeln!(
+            s,
+            "threads: {} (default)",
+            config.effective_threads(cluster)
+        ),
     };
     let sync = match config.binlog.sync {
         SyncPolicy::Always => "always".to_owned(),

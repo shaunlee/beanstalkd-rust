@@ -649,9 +649,57 @@ fn threads_values() {
         resolved(&["--threads", "3"], "[server]\nthreads = 8\n").threads,
         Some(3)
     );
-    assert_eq!(effective_threads(None, false), DEFAULT_THREADS_STANDALONE);
-    assert_eq!(effective_threads(None, true), DEFAULT_THREADS_CLUSTER);
-    assert_eq!(effective_threads(Some(5), true), 5);
+}
+
+#[test]
+fn effective_threads_by_mode() {
+    let plain = resolved(&[], "");
+    let tls = format!("[[listener]]\naddr = \"127.0.0.1:1\"\ntls = true\n{TLS}");
+    let mtls = format!(
+        "[[listener]]\naddr = \"127.0.0.1:1\"\ntls = true\nauth = \"mtls\"\n{TLS}client_ca = \"ca.pem\"\n"
+    );
+    let mixed = format!("[[listener]]\naddr = \"127.0.0.1:2\"\n{tls}");
+
+    assert_eq!(plain.effective_threads(false), DEFAULT_THREADS_STANDALONE);
+    assert_eq!(DEFAULT_THREADS_STANDALONE, 1);
+    assert_eq!(plain.effective_threads(true), DEFAULT_THREADS_CLUSTER);
+
+    for text in [&tls, &mtls, &mixed] {
+        let c = resolved(&[], text);
+        assert_eq!(
+            c.effective_threads(false),
+            DEFAULT_THREADS_STANDALONE_TLS_OR_BINLOG
+        );
+        assert_eq!(c.effective_threads(true), DEFAULT_THREADS_CLUSTER);
+    }
+    // A certificate alone does not make a plaintext listener TLS.
+    assert_eq!(
+        resolved(&[], TLS).effective_threads(false),
+        DEFAULT_THREADS_STANDALONE
+    );
+
+    let wal = resolved(&["-b", "/tmp/wal"], "");
+    assert_eq!(
+        wal.effective_threads(false),
+        DEFAULT_THREADS_STANDALONE_TLS_OR_BINLOG
+    );
+    assert_eq!(DEFAULT_THREADS_STANDALONE_TLS_OR_BINLOG, 2);
+    let both = resolved(&["-b", "/tmp/wal"], &tls);
+    assert_eq!(
+        both.effective_threads(false),
+        DEFAULT_THREADS_STANDALONE_TLS_OR_BINLOG
+    );
+
+    // An explicit setting wins in every mode, even below the default.
+    assert_eq!(
+        resolved(&["--threads", "1", "-b", "/tmp/wal"], &tls).effective_threads(false),
+        1
+    );
+    assert_eq!(
+        resolved(&["--threads", "5"], "").effective_threads(false),
+        5
+    );
+    assert_eq!(resolved(&["--threads", "1"], "").effective_threads(true), 1);
 }
 
 #[test]
