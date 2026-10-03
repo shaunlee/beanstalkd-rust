@@ -70,6 +70,7 @@ use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 
 use crate::forward::{ControlRequest, ControlResponse, ForwardError, ForwardTransport};
+use crate::quiet_tcp::QuietTcp;
 use crate::status::{NodeStatus, StatusTransport};
 use crate::wire::{
     self, ClientMsg, FrameError, Hello, PROTOCOL_VERSION, RpcRequest, RpcResponse, ServerHello,
@@ -80,6 +81,9 @@ use crate::{ForwardRequest, ForwardResponse, NodeId, TypeConfig};
 /// Default [`NetworkConfig::append_budget`]: 1 MiB, about 10 ms on a
 /// 1 Gbit/s link, well inside the default 50 ms heartbeat interval.
 pub const DEFAULT_APPEND_BUDGET: usize = 1 << 20;
+
+/// Read buffer of a cluster connection (each side).
+pub(crate) const READ_BUF: usize = 16 * 1024;
 
 /// Settings of the dialing side.
 #[derive(Clone)]
@@ -486,6 +490,7 @@ impl Network {
             .map_err(|e| format!("connect: {e}"))?;
         tcp.set_nodelay(true)
             .map_err(|e| format!("set_nodelay: {e}"))?;
+        let tcp = QuietTcp::new(tcp).map_err(|e| format!("register: {e}"))?;
         let mut io: Box<dyn Io> = match &cfg.tls {
             None => Box::new(tcp),
             Some(tls) => {
@@ -600,7 +605,10 @@ async fn run_conn(
     last_response: &StdMutex<Option<std::time::Instant>>,
     stalled_since: &StdMutex<Option<std::time::Instant>>,
 ) -> String {
-    let (mut r, mut w) = tokio::io::split(io);
+    let (r, mut w) = tokio::io::split(io);
+    // Buffered: a frame is then one read instead of a header read and
+    // one or more payload reads.
+    let mut r = tokio::io::BufReader::with_capacity(READ_BUF, r);
     let reader = async {
         loop {
             match wire::read_frame::<_, ServerMsg>(&mut r, max_frame).await {

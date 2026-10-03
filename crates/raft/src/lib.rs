@@ -16,6 +16,7 @@ pub mod forward;
 pub mod listener;
 #[cfg(test)]
 mod net_tests;
+pub mod quiet_tcp;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
 #[cfg(test)]

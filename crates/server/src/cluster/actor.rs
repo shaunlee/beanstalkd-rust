@@ -274,6 +274,14 @@ impl ForwardQueue {
     }
 }
 
+/// What woke the actor.
+enum Wake {
+    Message(EngineMsg),
+    Forwarded(NodeId, Result<ForwardResponse, ForwardError>),
+    View,
+    Tick,
+}
+
 type Inflight =
     Pin<Box<dyn Future<Output = (NodeId, Result<ForwardResponse, ForwardError>)> + Send>>;
 
@@ -332,14 +340,43 @@ impl Actor {
         mut rx: mpsc::UnboundedReceiver<EngineMsg>,
         mut events: mpsc::UnboundedReceiver<Event>,
     ) {
-        let mut metrics = self.core.raft.metrics();
+        let mut metrics = self.core.watch_view();
+        // A view change between `Actor::new` and this subscription would
+        // otherwise go unnoticed until the next one.
+        metrics.mark_changed();
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut inflight: Option<Inflight> = None;
         loop {
-            tokio::select! {
-                msg = rx.recv() => {
-                    let Some(msg) = msg else { return };
+            let wake = tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(msg) => Wake::Message(msg),
+                    None => return,
+                },
+                (target, res) = async {
+                    match inflight.as_mut() {
+                        Some(f) => f.await,
+                        None => std::future::pending().await,
+                    }
+                } => Wake::Forwarded(target, res),
+                changed = metrics.changed() => {
+                    if changed.is_err() {
+                        // Raft has stopped; nothing more can be sent.
+                        return;
+                    }
+                    Wake::View
+                }
+                _ = tick.tick() => Wake::Tick,
+            };
+            // Applied events are only collected here, never awaited: being
+            // woken for every applied input cost a wake-up per entry, and
+            // nothing waits on them alone (the tick bounds the delay;
+            // docs/DESIGN.md §8, "Fewer wake-ups").
+            while let Ok(ev) = events.try_recv() {
+                self.on_event(ev);
+            }
+            match wake {
+                Wake::Message(msg) => {
                     self.on_message(msg);
                     for _ in 0..MAX_DRAIN {
                         match rx.try_recv() {
@@ -348,31 +385,16 @@ impl Actor {
                         }
                     }
                 }
-                Some(ev) = events.recv() => {
-                    self.on_event(ev);
-                    while let Ok(ev) = events.try_recv() {
-                        self.on_event(ev);
-                    }
-                }
-                (target, res) = async {
-                    match inflight.as_mut() {
-                        Some(f) => f.await,
-                        None => std::future::pending().await,
-                    }
-                } => {
+                Wake::Forwarded(target, res) => {
                     inflight = None;
                     self.on_forward_result(target, res);
                 }
-                changed = metrics.changed() => {
-                    if changed.is_err() {
-                        // Raft has stopped; nothing more can be sent.
-                        return;
-                    }
+                Wake::View => {
                     if self.on_view_change() {
                         inflight = None;
                     }
                 }
-                _ = tick.tick() => {
+                Wake::Tick => {
                     if self.on_tick() {
                         return;
                     }

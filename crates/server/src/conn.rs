@@ -4,8 +4,8 @@
 //! `.ref/beanstalkd/prot.c` (`STATE_WAIT`, `halfclosed`, `h_conn`).
 //!
 //! The protocol loop ([`command_loop`]) is generic over the stream type and
-//! monomorphized for `TcpStream` (plaintext listeners) and
-//! `tokio_rustls::server::TlsStream<TcpStream>` (TLS listeners), so the
+//! monomorphized for `QuietTcp` (plaintext listeners) and
+//! `tokio_rustls::server::TlsStream<QuietTcp>` (TLS listeners), so the
 //! plaintext path pays nothing for TLS. Reads and writes never overlap (a
 //! reply is written only once no read is pending), so the stream is used
 //! whole, without splitting it into halves.
@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use bstk_raft::quiet_tcp::QuietTcp;
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -137,7 +138,13 @@ pub async fn handle_plain(
     let _guard = ConnGuard::connected(conn, engine_tx.clone());
     // Declared after the guard, so the socket is closed before the engine
     // hears about the disconnect.
-    let mut stream = stream;
+    let mut stream = match QuietTcp::new(stream) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("cannot register a client socket: {e}");
+            return;
+        }
+    };
     let mut codec = ServerCodec::new(max_job_size).emit_put_started();
     let mut rbuf = BytesMut::with_capacity(INITIAL_BUF_CAPACITY);
     let mut wbuf = BytesMut::with_capacity(256);
@@ -222,6 +229,13 @@ pub async fn handle_tls(
         auth_timeout,
         clients,
     } = &*listener;
+    let tcp = match QuietTcp::new(tcp) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!(%peer, "cannot register a client socket: {e}");
+            return;
+        }
+    };
     let mut stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {

@@ -98,7 +98,7 @@ type Outstanding = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// Runs the proposer until every submitter is gone or Raft stops.
 pub async fn run(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<Items>) {
-    let mut metrics = core.raft.metrics();
+    let mut metrics = core.watch_view();
     let mut view = core.view();
     let mut queue = Queue::default();
     let mut outstanding: FuturesUnordered<Outstanding> = FuturesUnordered::new();

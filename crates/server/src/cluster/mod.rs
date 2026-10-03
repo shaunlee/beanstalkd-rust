@@ -90,6 +90,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use openraft::metrics::RaftServerMetrics;
 use openraft::storage::RaftLogStorage;
 use openraft::{BasicNode, Raft, RaftMetrics, ServerState, SnapshotPolicy, Vote};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -118,6 +119,7 @@ const CONTROL_APPLY_BOUND: Duration = Duration::from_secs(1);
 pub const SHUTDOWN_BOUND: Duration = Duration::from_secs(1);
 
 type Metrics = RaftMetrics<NodeId, BasicNode>;
+type ServerMetrics = RaftServerMetrics<NodeId, BasicNode>;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -271,6 +273,8 @@ pub struct Core {
     id: NodeId,
     raft: Raft<TypeConfig>,
     metrics: watch::Receiver<Metrics>,
+    /// Leader, role and term (see [`Core::watch_view`]).
+    server: watch::Receiver<ServerMetrics>,
     state: StateHandle,
     net: Network,
     log: LogStore,
@@ -337,18 +341,27 @@ enum ControlOutcome {
 
 impl Core {
     fn leader(&self) -> Option<NodeId> {
-        self.metrics.borrow().current_leader
+        self.server.borrow().current_leader
     }
 
     fn is_leader(&self) -> bool {
-        let m = self.metrics.borrow();
+        let m = self.server.borrow();
         m.current_leader == Some(self.id) && m.state == ServerState::Leader
     }
 
     /// `(leader, term)` as this node sees them.
     fn view(&self) -> (Option<NodeId>, u64) {
-        let m = self.metrics.borrow();
-        (m.current_leader, m.current_term)
+        let m = self.server.borrow();
+        (m.current_leader, m.vote.leader_id().get_term())
+    }
+
+    /// A receiver that wakes only when the leader, vote, role or
+    /// membership changes. The leader / role / term readers above use the
+    /// same source: openraft publishes it before the full metrics, so a
+    /// task woken here could still see stale full metrics
+    /// (docs/DESIGN.md §8, "Fewer wake-ups").
+    fn watch_view(&self) -> watch::Receiver<ServerMetrics> {
+        self.raft.server_metrics()
     }
 
     /// The `now` of a new proposal: never below this node's clock, the
@@ -1023,6 +1036,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         proposer: proposer_tx,
         id,
         metrics: raft.metrics(),
+        server: raft.server_metrics(),
         raft: raft.clone(),
         state,
         net,

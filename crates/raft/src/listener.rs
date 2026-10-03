@@ -64,6 +64,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
 use crate::forward::{ForwardHandler, check_control, check_forward};
+use crate::quiet_tcp::QuietTcp;
 use crate::status::StatusSource;
 use crate::wire::{
     self, ClientMsg, FrameError, PROTOCOL_VERSION, RpcRequest, RpcResponse, ServerHello, ServerMsg,
@@ -447,6 +448,13 @@ async fn serve_tcp<H: ForwardHandler>(
 ) {
     let cfg = &shared.cfg;
     let _ = tcp.set_nodelay(true);
+    let tcp = match QuietTcp::new(tcp) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!(%addr, error = %e, "cluster connection: cannot register the socket");
+            return;
+        }
+    };
     let result = match &cfg.tls {
         None => {
             let handshake = async {
@@ -588,7 +596,7 @@ where
 }
 
 async fn serve<S, H>(
-    mut io: S,
+    io: S,
     peer: NodeId,
     cfg: &ListenerConfig,
     service: &OnceLock<Service<H>>,
@@ -597,6 +605,8 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     H: ForwardHandler,
 {
+    // Buffered reads (see `client::READ_BUF`); writes pass through.
+    let mut io = tokio::io::BufReader::with_capacity(crate::client::READ_BUF, io);
     loop {
         let (id, body) = match wire::read_frame::<_, ClientMsg>(&mut io, cfg.max_frame).await {
             Ok(Some(ClientMsg::Request { id, body })) => (id, body),

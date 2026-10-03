@@ -44,7 +44,7 @@ const PERIOD: Duration = Duration::from_millis(100);
 
 pub async fn leader_duties(core: Arc<Core>) {
     let mut info = core.state.subscribe();
-    let mut metrics = core.raft.metrics();
+    let mut metrics = core.watch_view();
     let mut period = tokio::time::interval(PERIOD);
     period.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let sleep = tokio::time::sleep(Duration::ZERO);
@@ -84,7 +84,9 @@ pub async fn leader_duties(core: Arc<Core>) {
             sleep.as_mut().reset(at);
         }
         tokio::select! {
-            r = info.changed() => if r.is_err() { return },
+            // Only the leader proposes `Tick`s: a follower woken by every
+            // apply would do nothing with it.
+            r = info.changed(), if leading => if r.is_err() { return },
             r = metrics.changed() => if r.is_err() { return },
             () = &mut sleep, if wait_for.is_some() => {}
             _ = period.tick() => {

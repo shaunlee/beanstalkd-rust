@@ -2,14 +2,147 @@
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`). The newest numbers
-are from task P4-T4 (footprint: memory per job, binlog bytes per
-operation), first below. P4-T2 (tokio worker-thread count and its
+are from task P4-T5b (cluster wake-ups at low load), first below, then
+P4-T4 (footprint: memory per job, binlog bytes per operation). P4-T2 (tokio worker-thread count and its
 default, the lever the P4-T1 spike found for CPU efficiency) follows,
 then P3-FD (Raft cluster mode after batched proposals and group commit,
 and the standalone regression check), then P2-T5 (TLS / mTLS), then
 P1-T5 (write-ahead log, `-b`), then the T6b section (engine performance
 fix); the T6 first pass, whose profile motivated T6b, is kept at the
 end.
+
+## P4-T5b: cluster wake-ups at low load
+
+### Summary
+
+- **Where one-connection cluster CPU went** (3 nodes on loopback, 2 worker
+  threads, put-reserve-delete, 16-byte bodies, one command in flight):
+  about two thirds system time, spent waking threads, not doing work.
+  Per entry (one client command) a follower used 12.4 context switches and
+  25 syscalls, the leader 17.7 and 44; tokio's runtime metrics (a
+  `tokio_unstable` scratch build) showed 6.6 worker parks per entry on a
+  follower, 3.4 of them "no-op" (woken, nothing to run), and 11.1 / 4.2
+  on the leader. A follower has three outside events per entry (the
+  AppendEntries with the entry, the flush worker's callback, and the
+  commit-only AppendEntries openraft 0.9 sends right after every commit),
+  the leader about six. `fdatasync` itself costs about 16 µs of system
+  time per call on this machine (a standalone Python loop), once per entry
+  and node.
+- **Dominant avoidable cause: macOS write readiness.** Every write on a
+  tokio `TcpStream` produced a spurious wake-up: kqueue's write filter
+  fires on each acknowledgement. A minimal ping-pong (one worker) does
+  2.0 parks per round trip with `TcpStream` and 1.0 with a read-only
+  registration. Fixed with `QuietTcp` (docs/DESIGN.md §8, "Fewer
+  wake-ups"), together with fewer task wake-ups (Raft view watchers on
+  `server_metrics`, followers' leader duties not woken per apply, the
+  actor pulling applied events) and buffered frame reads.
+- **Counters per entry, before → after** (2 worker threads, via the
+  leader; load-independent): follower parks 6.6 → 5.0 (no-op 3.4 → 1.8),
+  context switches 12.4 → 10.4, syscalls 25 → 21; leader parks 11.1 →
+  8.7 (no-op 4.2 → 2.1), context switches 17.7 → 16.9, syscalls 44 → 38.
+  With 1 worker thread and the changes, a follower parks exactly 3.0
+  times per entry (its three events, no no-op wake-ups) and the leader
+  5.7.
+- **CPU per operation at one connection** (medians of 3 interleaved
+  rounds, `ps` CPU of all three nodes / ops): via the leader 343 → 235 µs
+  (-31%), target node 157 → 110 µs; via a follower 367 → 280 µs (-24%).
+  Throughput rose with it (4,124 → 5,742 and 3,453 → 3,991 ops/s). **The
+  "at least halved" target is not met at the default 2 worker threads.**
+  With `--threads 1` the new build measured 235 µs/op via the leader in
+  the matrix (base 280), and 158 µs/op in a separate quieter run (load 7,
+  `meas.sh`, below): the remaining gap is the second worker's no-op
+  wake-ups plus the openraft-0.9 message pattern.
+- **100 connections:** unchanged within noise (leader 18.4 → 18.6 µs/op at
+  2 workers; 15.5 → 15.7 at 1 worker; follower 25.1 → 22.3 / 21.5 →
+  21.7). The ≤ 15 µs gate is not reached at this machine load at either
+  thread count (P4-T2 measured 9.6 µs/op at 1 worker on a quieter day).
+- **Failover** (leader `kill -9` to a put via a surviving follower
+  answered `INSERTED`, release builds, alternating, 4 runs each): base
+  1.20–1.29 s, new 1.22–1.31 s; no change. Heartbeat and election
+  timeouts are unchanged.
+- **Standalone** (the client-socket change applies there too; 3
+  interleaved runs, load 9–19): 1 connection 23.8k → 32.2k ops/s, 12.7 →
+  9.8 µs/op; 100 connections 118.7k → 105.3k ops/s (ranges 94.7k–121.7k
+  and 41.8k–116.8k: one run hit a load spike of 18), 7.4 → 8.3 µs/op.
+  Within this session's noise; worth re-checking in P4-T6's full matrix.
+- **Not done** (DESIGN §8): inline log sync (about -10% on followers in a
+  prototype, but blocks a runtime worker through a sync stall), a
+  cancel-safe direct frame writer, and changing the cluster thread
+  default (P4-T2's decision; the data here favours 1 worker for CPU per
+  operation, at a throughput cost at 100 connections on this loaded
+  machine: 76k vs 101k ops/s via the leader).
+
+### Results (P4-T5b)
+
+`base` = HEAD `63aac83`, `new` = the P4-T5b changes; `def` = default
+threads (2 in cluster mode), `t1` = `--threads 1`. Rounds alternate
+base/new (and def/t1) through `bench/run-matrix.sh` with `RUNS=1`,
+`DURATION=10`. Medians with ranges; "cluster µs/op" is all nodes' `ps`
+CPU over ops, "target µs/op" the target node's `stats` CPU over ops;
+"load" lists each run's 1-minute load average. No resends, rewinds,
+term or leader changes in any run.
+
+| mode | conns | build | ops/s | cluster CPU % | cluster µs/op | target µs/op | load |
+|---|---:|---|---:|---:|---:|---:|---|
+| cluster-leader | 1 | base-def | 4,124 (3,946–4,180) | 142 (139–143) | 343.4 (342.1–352.7) | 156.7 (154.6–159.9) | 9.27 9.55 12.78 |
+| cluster-leader | 1 | new-def | 5,742 (4,421–6,243) | 130 (129–135) | 235.3 (208.2–292.7) | 110.4 (95.8–134.4) | 9.98 11.28 10.21 |
+| cluster-leader | 1 | base-t1 | 4,095 (4,036–4,393) | 115 (113–124) | 280.0 (262.5–303.0) | 122.4 (114.5–129.9) | 9.32 9.88 11.32 |
+| cluster-leader | 1 | new-t1 | 4,408 (4,336–5,906) | 104 (104–106) | 235.2 (175.6–244.9) | 105.5 (76.0–107.9) | 8.64 10.51 14.13 |
+| cluster-follower | 1 | base-def | 3,453 (2,874–3,825) | 127 (122–127) | 366.9 (332.0–426.3) | 118.1 (106.4–138.8) | 9.43 11.95 11.59 |
+| cluster-follower | 1 | new-def | 3,991 (3,613–5,259) | 112 (110–121) | 279.9 (230.5–303.3) | 94.0 (76.3–101.3) | 8.90 10.78 9.88 |
+| cluster-follower | 1 | base-t1 | 3,486 (3,266–3,662) | 105 (102–111) | 311.6 (287.6–318.1) | 106.5 (98.0–108.4) | 8.61 9.68 10.91 |
+| cluster-follower | 1 | new-t1 | 3,623 (3,210–3,785) | 95 (92–97) | 261.4 (255.2–287.3) | 89.1 (88.5–98.5) | 9.21 9.99 12.62 |
+| cluster-leader | 100 | base-def | 112,840 (97,256–113,162) | 207 (203–208) | 18.4 (18.0–21.4) | 13.4 (13.1–15.7) | 9.27 11.20 11.19 |
+| cluster-leader | 100 | new-def | 101,036 (89,472–135,799) | 196 (166–202) | 18.6 (14.9–19.4) | 13.8 (11.3–14.6) | 8.38 9.71 9.20 |
+| cluster-leader | 100 | base-t1 | 77,942 (52,343–82,256) | 121 (81–123) | 15.5 (15.0–15.5) | 10.9 (10.5–11.0) | 7.98 10.52 10.66 |
+| cluster-leader | 100 | new-t1 | 76,250 (68,477–85,623) | 120 (118–121) | 15.7 (14.2–17.3) | 11.3 (10.2–12.5) | 8.95 12.90 11.37 |
+| cluster-follower | 100 | base-def | 89,886 (85,226–123,883) | 226 (222–237) | 25.1 (17.9–27.9) | 15.2 (11.0–16.7) | 9.98 10.88 11.23 |
+| cluster-follower | 100 | new-def | 95,313 (85,687–96,387) | 215 (202–228) | 22.3 (21.2–26.6) | 14.1 (13.4–16.7) | 7.66 10.06 10.24 |
+| cluster-follower | 100 | base-t1 | 77,015 (69,829–98,762) | 166 (166–180) | 21.5 (18.2–23.7) | 11.1 (9.4–12.2) | 8.12 10.19 14.33 |
+| cluster-follower | 100 | new-t1 | 72,256 (67,190–72,764) | 156 (154–158) | 21.7 (21.6–22.9) | 11.8 (11.7–12.4) | 8.74 13.21 10.70 |
+
+Two further one-connection rounds ran at load 13–28 (another user's VM
+was busy); their throughput fell to 1.4k–2.5k ops/s in places, so they
+are left out of the table (raw CSVs keep them only in the scratch
+directory).
+
+Per-node counters, one connection via the leader, 10 s (`top` CSW and
+BSD syscalls, `ps -M` thread CPU, tokio worker metrics), followers / leader:
+
+| build | threads | CPU µs/op | ctx switches/op | syscalls/op | parks/op | no-op parks/op | load |
+|---|---:|---|---|---|---|---|---:|
+| base | 2 | 99, 99 / 166 | 12.4 / 17.7 | 25 / 44 | 6.6 / 11.1 | 3.4 / 4.2 | 12 |
+| new | 2 | 68, 68 / 114 | 10.4 / 16.9 | 21 / 38 | 5.0 / 8.7 | 1.8 / 2.1 | 9 |
+| new | 1 | 46, 46 / 66 | 8.2 / 7.7 | 17 / 30 | 3.0 / 5.7 | 0.0 / 1.2 | 7 |
+
+(base's parks are from a scratch build of the first two changes, which
+did not move the counters; base CPU and counters from the base binary.)
+
+### Method and commands (P4-T5b)
+
+```sh
+cargo build --release -p bstk-server -p bstk-bench   # base, copied aside first
+# A/B rounds (RS_BIN swapped per invocation; 3 rounds, def and t1):
+RS_BIN=$BIN RS_ARGS="$ARGS" SERVERS=rs SCENARIOS=put-reserve-delete CONNS="1 100" \
+  BODIES=16 RUNS=1 DURATION=10 CLUSTER_NODES=3 \
+  SERVER_MODES="cluster-leader cluster-follower" OUT_CSV=$OUT bench/run-matrix.sh
+# Standalone: the same with SERVER_MODES=none.
+```
+
+Counters: a 3-node cluster started by hand; `top -l 1 -pid P -stats
+pid,csw,sysbsd` and `ps -M -p P` before and after a 10 s `bstk-bench`
+run; tokio metrics from a scratch build (`RUSTFLAGS="--cfg
+tokio_unstable"`, a thread printing `worker_park_count` /
+`worker_noop_count` per second), not part of the tree. Failover: kill
+-9 the leader, time a `put` via a follower until `INSERTED`.
+
+### Environment (P4-T5b)
+
+Same machine and toolchain as P4-T2 (Apple M6, 12 cores, macOS 27.0,
+rustc 1.98.1, release with `debug = 1`), openraft 0.9.25, plaintext
+cluster traffic on loopback, data directories under `/private/tmp`.
+Background load 7–14 during the table's runs (an OrbStack VM of another
+user), higher (13–28) during the extra rounds.
 
 ## P4-T4: footprint
 
