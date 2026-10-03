@@ -32,7 +32,7 @@ use crate::model::{ConnState, JobRec, JobState, PendingPut, TubeId, TubeState};
 use crate::ms::Ms;
 use crate::{
     BinlogStats, ConnId, EngineConfig, EngineInput, EngineState, JobRecord, JournalEntry,
-    NANOS_PER_SEC, Nanos, Outbox, RecordState, Recovery, StateError, SysInfo,
+    LocalConns, NANOS_PER_SEC, Nanos, Outbox, RecordState, Recovery, StateError, SysInfo,
 };
 
 /// `SAFETY_MARGIN` in conn.c: 1 second.
@@ -141,6 +141,9 @@ pub struct Engine {
     journal: Vec<JournalEntry>,
     /// Binlog fields of `stats`, pushed by the server.
     binlog: BinlogStats,
+    /// Runtime setting of this process, deliberately outside `EngineState`
+    /// and `EngineConfig`: see `set_local_conns` and docs/DESIGN.md §8a.
+    local_conns: Option<LocalConns>,
 }
 
 impl Engine {
@@ -198,6 +201,7 @@ impl Engine {
             cmd_pause_tube: 0,
             journal: Vec::new(),
             binlog: BinlogStats::default(),
+            local_conns: None,
         };
         // The "default" tube is immortal (see TubeState::refs / gc_tube_if_orphan).
         let default = e.find_or_make_tube(&TubeName::default_tube());
@@ -283,7 +287,7 @@ impl Engine {
         let waiting = self.conns.get(&conn).map(|c| c.waiting).unwrap_or(false);
         if waiting {
             self.do_remove_waiting_conn(conn);
-            out.push((conn, Response::TimedOut));
+            self.reply(out, conn, Response::TimedOut);
         }
     }
 
@@ -332,7 +336,7 @@ impl Engine {
                 self.next_job_id += 1;
             }
         }
-        out.push((conn, why.response()));
+        self.reply(out, conn, why.response());
     }
 
     pub fn handle(&mut self, now: Nanos, conn: ConnId, cmd: Command, out: &mut Outbox) {
@@ -374,7 +378,7 @@ impl Engine {
             Command::PauseTubeBadName => {
                 // prot.c: op_ct[OP_PAUSE_TUBE]++ precedes is_valid_tube().
                 self.cmd_pause_tube += 1;
-                out.push((conn, Response::BadFormat));
+                self.reply(out, conn, Response::BadFormat);
             }
         }
     }
@@ -525,6 +529,7 @@ impl Engine {
             cmd_pause_tube,
             journal: _,
             binlog,
+            local_conns: _,
         } = self;
 
         let mut jobs: Vec<JobRec> = jobs.values().map(|j| (**j).clone()).collect();
@@ -732,6 +737,7 @@ impl Engine {
             cmd_pause_tube,
             journal: Vec::new(),
             binlog,
+            local_conns: None,
         };
         e.validate().map_err(err)?;
         Ok(e)
@@ -843,6 +849,17 @@ impl Engine {
 
     pub fn set_binlog_stats(&mut self, stats: BinlogStats) {
         self.binlog = stats;
+    }
+
+    /// Build replies only for connections `local` owns (`None`, the
+    /// default: for every connection). Every other effect of an input is
+    /// unchanged, so engines that differ only in this setting export equal
+    /// states; replies for the other connections are simply never built,
+    /// which is what a cluster node wants for the connections another node
+    /// holds. Not part of the exported state: set it again after
+    /// `import_state`.
+    pub fn set_local_conns(&mut self, local: Option<LocalConns>) {
+        self.local_conns = local;
     }
 
     /// Monitoring view (docs/PLAN.md §5.3 decision 4): `server` is exactly
@@ -1313,13 +1330,17 @@ impl Engine {
             };
             self.do_remove_waiting_conn(cid);
             self.do_reserve(cid, id, now);
-            let body = self
-                .jobs
-                .get(&id)
-                .map(|j| j.body.clone())
-                .unwrap_or_default();
-            out.push((cid, Response::Reserved { id, body }));
+            self.reply_with(out, cid, || self.reserved_reply(id));
         }
+    }
+
+    fn reserved_reply(&self, id: JobId) -> Response {
+        let body = self
+            .jobs
+            .get(&id)
+            .map(|j| j.body.clone())
+            .unwrap_or_default();
+        Response::Reserved { id, body }
     }
 
     /// `soonest_delayed_job`: the delayed job with the smallest deadline
@@ -1400,7 +1421,7 @@ impl Engine {
         let waiting = self.conns.get(&cid).map(|c| c.waiting).unwrap_or(false);
         if waiting && self.conn_deadline_soon(cid, now) {
             self.do_remove_waiting_conn(cid);
-            out.push((cid, Response::DeadlineSoon));
+            self.reply(out, cid, Response::DeadlineSoon);
         } else if waiting {
             let expired = self
                 .conns
@@ -1410,7 +1431,7 @@ impl Engine {
                 .unwrap_or(false);
             if expired {
                 self.do_remove_waiting_conn(cid);
-                out.push((cid, Response::TimedOut));
+                self.reply(out, cid, Response::TimedOut);
             }
         }
     }
@@ -2000,7 +2021,7 @@ impl Engine {
         };
 
         if self.draining {
-            out.push((cid, Response::Draining));
+            self.reply(out, cid, Response::Draining);
             return;
         }
 
@@ -2056,7 +2077,7 @@ impl Engine {
         if let Some(t) = self.tube_mut(tube) {
             t.stat.total_jobs_ct += 1;
         }
-        out.push((cid, Response::Inserted(id)));
+        self.reply(out, cid, Response::Inserted(id));
     }
 
     fn cmd_use(&mut self, cid: ConnId, tube: TubeName, out: &mut Outbox) {
@@ -2075,7 +2096,7 @@ impl Engine {
                 c.use_tube = new;
             }
         }
-        out.push((cid, Response::Using(tube)));
+        self.reply(out, cid, Response::Using(tube));
     }
 
     fn cmd_watch(&mut self, cid: ConnId, tube: TubeName, out: &mut Outbox) {
@@ -2095,7 +2116,7 @@ impl Engine {
             }
         }
         let count = self.conns.get(&cid).map(|c| c.watch.len()).unwrap_or(0);
-        out.push((cid, Response::Watching(count as u64)));
+        self.reply(out, cid, Response::Watching(count as u64));
     }
 
     fn cmd_ignore(&mut self, cid: ConnId, tube: TubeName, out: &mut Outbox) {
@@ -2107,7 +2128,7 @@ impl Engine {
         };
         let watch_len = self.conns.get(&cid).map(|c| c.watch.len()).unwrap_or(0);
         if watching_it && watch_len < 2 {
-            out.push((cid, Response::NotIgnored));
+            self.reply(out, cid, Response::NotIgnored);
             return;
         }
         if let (true, Some(tid)) = (watching_it, tid) {
@@ -2120,7 +2141,7 @@ impl Engine {
             self.gc_tube_if_orphan(tid);
         }
         let count = self.conns.get(&cid).map(|c| c.watch.len()).unwrap_or(0);
-        out.push((cid, Response::Watching(count as u64)));
+        self.reply(out, cid, Response::Watching(count as u64));
     }
 
     fn cmd_reserve(&mut self, now: Nanos, cid: ConnId, timeout: Option<u32>, out: &mut Outbox) {
@@ -2130,7 +2151,7 @@ impl Engine {
         }
         self.connsetworker(cid);
         if self.conn_deadline_soon(cid, now) && !self.conn_ready(cid) {
-            out.push((cid, Response::DeadlineSoon));
+            self.reply(out, cid, Response::DeadlineSoon);
             return;
         }
         let wait_deadline = timeout.map(|t| now.saturating_add((t as Nanos) * NANOS_PER_SEC));
@@ -2155,17 +2176,17 @@ impl Engine {
             } else {
                 Response::TimedOut
             };
-            out.push((cid, reply));
+            self.reply(out, cid, reply);
         }
     }
 
     fn cmd_reserve_job(&mut self, now: Nanos, cid: ConnId, id: JobId, out: &mut Outbox) {
         let Some((state, tube)) = self.jobs.get(&id).map(|j| (j.state, j.tube)) else {
-            out.push((cid, Response::NotFound));
+            self.reply(out, cid, Response::NotFound);
             return;
         };
         if state == JobState::Reserved {
-            out.push((cid, Response::NotFound));
+            self.reply(out, cid, Response::NotFound);
             return;
         }
         if state == JobState::Ready {
@@ -2177,12 +2198,7 @@ impl Engine {
         }
         self.connsetworker(cid);
         self.do_reserve(cid, id, now);
-        let body = self
-            .jobs
-            .get(&id)
-            .map(|j| j.body.clone())
-            .unwrap_or_default();
-        out.push((cid, Response::Reserved { id, body }));
+        self.reply_with(out, cid, || self.reserved_reply(id));
     }
 
     fn cmd_delete(&mut self, cid: ConnId, id: JobId, out: &mut Outbox) {
@@ -2190,7 +2206,7 @@ impl Engine {
         let Some((state, reserver, tube)) =
             self.jobs.get(&id).map(|j| (j.state, j.reserver, j.tube))
         else {
-            out.push((cid, Response::NotFound));
+            self.reply(out, cid, Response::NotFound);
             return;
         };
         let ok = match state {
@@ -2216,7 +2232,7 @@ impl Engine {
             }
         };
         if !ok {
-            out.push((cid, Response::NotFound));
+            self.reply(out, cid, Response::NotFound);
             return;
         }
         if let Some(t) = self.tube_mut(tube) {
@@ -2226,7 +2242,7 @@ impl Engine {
         self.jobs.remove(&id);
         self.journal_delete(id);
         self.gc_tube_if_orphan(tube);
-        out.push((cid, Response::Deleted));
+        self.reply(out, cid, Response::Deleted);
     }
 
     /// The tube of `id` if `cid` holds its reservation.
@@ -2248,7 +2264,7 @@ impl Engine {
     ) {
         self.cmd_release += 1;
         let Some(tube) = self.reserved_by(cid, id) else {
-            out.push((cid, Response::NotFound));
+            self.reply(out, cid, Response::NotFound);
             return;
         };
         self.do_unreserve(cid, id);
@@ -2267,13 +2283,13 @@ impl Engine {
             self.insert_ready(tube, id);
         }
         self.process_queue(now, out);
-        out.push((cid, Response::Released));
+        self.reply(out, cid, Response::Released);
     }
 
     fn cmd_bury(&mut self, cid: ConnId, id: JobId, pri: u32, out: &mut Outbox) {
         self.cmd_bury += 1;
         let Some(tube) = self.reserved_by(cid, id) else {
-            out.push((cid, Response::NotFound));
+            self.reply(out, cid, Response::NotFound);
             return;
         };
         self.do_unreserve(cid, id);
@@ -2283,13 +2299,13 @@ impl Engine {
         self.insert_buried(tube, id);
         // `bury_job(c->srv, j, 1)`.
         self.journal_update(id);
-        out.push((cid, Response::Buried));
+        self.reply(out, cid, Response::Buried);
     }
 
     fn cmd_touch(&mut self, now: Nanos, cid: ConnId, id: JobId, out: &mut Outbox) {
         self.cmd_touch += 1;
         if self.reserved_by(cid, id).is_none() {
-            out.push((cid, Response::NotFound));
+            self.reply(out, cid, Response::NotFound);
             return;
         }
         let ttr = self.jobs.get(&id).map(|j| j.ttr).unwrap_or(1);
@@ -2303,39 +2319,39 @@ impl Engine {
             c.reserved_by_deadline.insert((new_deadline, id));
         }
         self.refresh_conn_tick(cid);
-        out.push((cid, Response::Touched));
+        self.reply(out, cid, Response::Touched);
     }
 
     fn cmd_peek(&mut self, cid: ConnId, id: JobId, out: &mut Outbox) {
         self.cmd_peek += 1;
-        match self.jobs.get(&id) {
-            Some(j) => out.push((
-                cid,
-                Response::Found {
-                    id,
-                    body: j.body.clone(),
-                },
-            )),
-            None => out.push((cid, Response::NotFound)),
-        }
+        self.reply_with(out, cid, || match self.jobs.get(&id) {
+            Some(j) => Response::Found {
+                id,
+                body: j.body.clone(),
+            },
+            None => Response::NotFound,
+        });
     }
 
     fn cmd_peek_ready(&mut self, cid: ConnId, out: &mut Outbox) {
         self.cmd_peek_ready += 1;
-        let reply = self.peek_used_tube(cid, |t| t.ready.first().map(|&(_, id)| id));
-        out.push((cid, reply));
+        self.reply_with(out, cid, || {
+            self.peek_used_tube(cid, |t| t.ready.first().map(|&(_, id)| id))
+        });
     }
 
     fn cmd_peek_delayed(&mut self, cid: ConnId, out: &mut Outbox) {
         self.cmd_peek_delayed += 1;
-        let reply = self.peek_used_tube(cid, |t| t.delayed.first().map(|&(_, id)| id));
-        out.push((cid, reply));
+        self.reply_with(out, cid, || {
+            self.peek_used_tube(cid, |t| t.delayed.first().map(|&(_, id)| id))
+        });
     }
 
     fn cmd_peek_buried(&mut self, cid: ConnId, out: &mut Outbox) {
         self.cmd_peek_buried += 1;
-        let reply = self.peek_used_tube(cid, |t| t.buried.values().next().copied());
-        out.push((cid, reply));
+        self.reply_with(out, cid, || {
+            self.peek_used_tube(cid, |t| t.buried.values().next().copied())
+        });
     }
 
     fn cmd_kick(&mut self, now: Nanos, cid: ConnId, n: u32, out: &mut Outbox) {
@@ -2360,67 +2376,71 @@ impl Engine {
                 count += 1;
             }
         }
-        out.push((cid, Response::Kicked(count)));
+        self.reply(out, cid, Response::Kicked(count));
     }
 
     fn cmd_kick_job(&mut self, now: Nanos, cid: ConnId, id: JobId, out: &mut Outbox) {
         let Some((state, tube)) = self.jobs.get(&id).map(|j| (j.state, j.tube)) else {
-            out.push((cid, Response::NotFound));
+            self.reply(out, cid, Response::NotFound);
             return;
         };
         match state {
             JobState::Buried => {
                 self.remove_buried(tube, id);
                 self.kick_to_ready(tube, id, now, out);
-                out.push((cid, Response::KickedJob));
+                self.reply(out, cid, Response::KickedJob);
             }
             JobState::Delayed => {
                 self.remove_delayed(tube, id);
                 self.kick_to_ready(tube, id, now, out);
-                out.push((cid, Response::KickedJob));
+                self.reply(out, cid, Response::KickedJob);
             }
-            _ => out.push((cid, Response::NotFound)),
+            _ => self.reply(out, cid, Response::NotFound),
         }
     }
 
     fn cmd_stats_job(&mut self, now: Nanos, cid: ConnId, id: JobId, out: &mut Outbox) {
         self.cmd_stats_job += 1;
-        match self.build_stats_job(id, now) {
-            Some(s) => out.push((cid, Response::Ok(s.to_yaml()))),
-            None => out.push((cid, Response::NotFound)),
-        }
+        self.reply_with(out, cid, || match self.build_stats_job(id, now) {
+            Some(s) => Response::Ok(s.to_yaml()),
+            None => Response::NotFound,
+        });
     }
 
     fn cmd_stats_tube(&mut self, now: Nanos, cid: ConnId, tube: TubeName, out: &mut Outbox) {
         self.cmd_stats_tube += 1;
-        match self.build_stats_tube(&tube, now) {
-            Some(s) => out.push((cid, Response::Ok(s.to_yaml()))),
-            None => out.push((cid, Response::NotFound)),
-        }
+        self.reply_with(out, cid, || match self.build_stats_tube(&tube, now) {
+            Some(s) => Response::Ok(s.to_yaml()),
+            None => Response::NotFound,
+        });
     }
 
     fn cmd_stats(&mut self, now: Nanos, cid: ConnId, out: &mut Outbox) {
         self.cmd_stats += 1;
-        let s = self.build_stats_server(now);
-        out.push((cid, Response::Ok(s.to_yaml())));
+        self.reply_with(out, cid, || {
+            Response::Ok(self.build_stats_server(now).to_yaml())
+        });
     }
 
     fn cmd_list_tubes(&mut self, cid: ConnId, out: &mut Outbox) {
         self.cmd_list_tubes += 1;
-        let names = self.tube_names();
-        out.push((cid, Response::Ok(bstk_proto::yaml_list(names.iter()))));
+        self.reply_with(out, cid, || {
+            Response::Ok(bstk_proto::yaml_list(self.tube_names().iter()))
+        });
     }
 
     fn cmd_list_tube_used(&mut self, cid: ConnId, out: &mut Outbox) {
         self.cmd_list_tube_used += 1;
-        let tube = self.tube_name(self.use_tube_of(cid));
-        out.push((cid, Response::Using(tube)));
+        self.reply_with(out, cid, || {
+            Response::Using(self.tube_name(self.use_tube_of(cid)))
+        });
     }
 
     fn cmd_list_tubes_watched(&mut self, cid: ConnId, out: &mut Outbox) {
         self.cmd_list_tubes_watched += 1;
-        let names = self.watched_tube_names(cid);
-        out.push((cid, Response::Ok(bstk_proto::yaml_list(names.iter()))));
+        self.reply_with(out, cid, || {
+            Response::Ok(bstk_proto::yaml_list(self.watched_tube_names(cid).iter()))
+        });
     }
 
     fn cmd_pause_tube(
@@ -2433,7 +2453,7 @@ impl Engine {
     ) {
         self.cmd_pause_tube += 1;
         let Some(&tid) = self.tube_ids.get(&tube) else {
-            out.push((cid, Response::NotFound));
+            self.reply(out, cid, Response::NotFound);
             return;
         };
         // prot.c: `if (delay == 0) delay = 1;` runs on the delay already
@@ -2454,7 +2474,7 @@ impl Engine {
         t.unpause_at = now.saturating_add(delay_nanos);
         t.stat.pause_ct += 1;
         self.pauses.insert((t.unpause_at, tid));
-        out.push((cid, Response::Paused));
+        self.reply(out, cid, Response::Paused);
     }
 }
 
@@ -2464,6 +2484,25 @@ impl Engine {
 // struct fields directly without depending on T1's YAML formatting.
 // ---------------------------------------------------------------------
 impl Engine {
+    fn wants_reply(&self, cid: ConnId) -> bool {
+        self.local_conns.is_none_or(|l| l.owns(cid))
+    }
+
+    /// Queue a reply that costs nothing to build (no allocation).
+    fn reply(&self, out: &mut Outbox, cid: ConnId, r: Response) {
+        if self.wants_reply(cid) {
+            out.push((cid, r));
+        }
+    }
+
+    /// Queue a reply whose construction allocates or formats (stats, peeks,
+    /// reserved bodies); `build` runs only when `cid` wants it.
+    fn reply_with(&self, out: &mut Outbox, cid: ConnId, build: impl FnOnce() -> Response) {
+        if self.wants_reply(cid) {
+            out.push((cid, build()));
+        }
+    }
+
     pub(crate) fn tube_names(&self) -> Vec<TubeName> {
         self.tube_order
             .items

@@ -33,8 +33,8 @@ use crate::engine::proptests::check_invariants;
 use crate::model::{ConnState, JobState, PendingPut, TubeState};
 use crate::oracle_tests::{Msg, PutEnd, step};
 use crate::{
-    ConnId, Engine, EngineConfig, EngineInput, EngineState, JournalEntry, Nanos, Outbox,
-    StaticSysInfo,
+    ConnId, Engine, EngineConfig, EngineInput, EngineState, JournalEntry, LocalConns, Nanos,
+    Outbox, StaticSysInfo,
 };
 
 /// Connections that connect before the first random step.
@@ -1194,4 +1194,112 @@ fn absurd_tube_slab_is_rejected() {
     }
     let err = Engine::import_state(big, sys()).map(|_| ()).unwrap_err();
     assert!(err.to_string().contains("tube slab"), "{err}");
+}
+
+// ---------------------------------------------------------------------
+// Reply scope (`Engine::set_local_conns`)
+// ---------------------------------------------------------------------
+
+const NODE_SHIFT: u32 = 48;
+
+/// Spreads the generator's small connection numbers over nodes 1..=3 the
+/// way the cluster numbers them (`node << 48 | local`).
+fn spread(c: ConnId) -> ConnId {
+    ((c % 3 + 1) << NODE_SHIFT) | c
+}
+
+fn spread_msg(m: Msg) -> Msg {
+    match m {
+        Msg::Connect(c) => Msg::Connect(spread(c)),
+        Msg::Disconnect(c) => Msg::Disconnect(spread(c)),
+        Msg::HalfClose(c) => Msg::HalfClose(spread(c)),
+        Msg::PutStarted { conn, too_big } => Msg::PutStarted {
+            conn: spread(conn),
+            too_big,
+        },
+        Msg::Put {
+            conn,
+            pri,
+            delay,
+            ttr,
+            end,
+        } => Msg::Put {
+            conn: spread(conn),
+            pri,
+            delay,
+            ttr,
+            end,
+        },
+        Msg::Cmd(c, cmd) => Msg::Cmd(spread(c), cmd),
+        other => other,
+    }
+}
+
+fn owned_by(out: &Outbox, node: u64) -> Outbox {
+    out.iter()
+        .filter(|(c, _)| c >> NODE_SHIFT == node)
+        .cloned()
+        .collect()
+}
+
+/// One engine builds every reply; the others skip those of connections
+/// outside their node (node 4 owns nothing). All must reach identical
+/// states and journals, and each must emit exactly the full engine's
+/// replies for its own connections.
+fn reply_scope_is_invisible(steps: Vec<(Msg, bool)>, journal: bool) {
+    let nodes: [u64; 4] = [1, 2, 3, 4];
+    let mut d = Driver::new();
+    let mut full = new_engine(journal);
+    let mut scoped: Vec<Engine> = nodes
+        .iter()
+        .map(|&n| {
+            let mut e = new_engine(journal);
+            e.set_local_conns(Some(LocalConns::new(NODE_SHIFT, n)));
+            e
+        })
+        .collect();
+    let mut inputs: Vec<EngineInput> = (0..PRECONNECTED)
+        .map(spread)
+        .inspect(|&c| {
+            d.ever_connected.insert(c);
+        })
+        .map(EngineInput::Connect)
+        .collect();
+    let mut steps = steps.into_iter();
+    loop {
+        for input in inputs.drain(..) {
+            let (out, journal) = apply(&mut full, d.now, input.clone());
+            for (e, &node) in scoped.iter_mut().zip(&nodes) {
+                let (mine, j) = apply(e, d.now, input.clone());
+                assert_eq!(
+                    mine,
+                    owned_by(&out, node),
+                    "node {node}: outbox differs for {input:?}"
+                );
+                assert_eq!(j, journal, "node {node}: journal differs for {input:?}");
+                assert_eq!(e.next_deadline(), full.next_deadline());
+            }
+        }
+        let bytes = encode(&full.export_state());
+        for e in &scoped {
+            assert_eq!(encode(&e.export_state()), bytes, "snapshot bytes differ");
+        }
+        let Some((msg, tick_after)) = steps.next() else {
+            break;
+        };
+        inputs = d.inputs(spread_msg(msg), tick_after, &full);
+    }
+    check_invariants(&scoped[0]);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 1_500, ..ProptestConfig::default() })]
+
+    #[test]
+    fn reply_scope_changes_only_the_outbox(
+        steps in steps(20, 140),
+        journal in any::<bool>(),
+    ) {
+        reply_scope_is_invisible(steps, journal);
+    }
 }

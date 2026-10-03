@@ -250,6 +250,7 @@ addr = "10.0.0.3:11400"
 
 Rules: 3 or 5 peers (1 allowed for tests); `-b` / `binlog` with `[cluster]` is an error; `-z` must match on every node (checked when joining); `--cluster-init` on every initial node bootstraps membership from `[[cluster.peer]]` once (after the status probes above) and is refused if `data_dir` already holds state or a rejoin marker; `[cluster.tls]` and `insecure_plaintext = true` exclude each other; `insecure_plaintext = true` requires `listen` and every peer address to be loopback (`127.0.0.0/8`, `::1`, `localhost`) unless `insecure_plaintext_allow_remote = true`, and logs a warning at startup.
 
+- **Owner-only replies (P4-T5a)**: every node applies every input, but builds replies only for its own connections. `Engine::set_local_conns(Some(LocalConns))` (the state machine sets it with the node id and `CONN_SEQ_BITS` on every engine it creates or restores) makes the engine's `reply` / `reply_with` helpers skip an `Outbox` entry for any other connection; the reply closures of the expensive replies (`stats*`, `list-tubes*`, `peek*`, `reserved` bodies) are not even run. Handlers already counted and mutated before building the reply (builders such as `build_stats_server` take `&self`), and all replies, including `tick`-driven ones (reserve timeouts, `DEADLINE_SOON`, a put waking a reserver), go through the same helpers, so nothing but the `Outbox` differs: a test applies random inputs over three node ids to one engine per scope and requires equal `EngineState` bytes and journals and, per node, exactly the full engine's replies for its connections. Why a runtime setting on the engine: an `Outbox` abstraction would change every engine call site and test, and a predicate in `EngineConfig` or `EngineState` would enter the snapshot payload (which must stay byte-identical on every node), so it is neither; it must be set again after `import_state` (the state machine does). `LocalConns` takes the node shift as a parameter so the engine does not learn the cluster's numbering. Dedup, `Applied` / `Closed` events and journal entries are untouched, and `forward.rs`, the proposer and the actor never saw non-local replies (the state machine's `route` already dropped them), so nothing downstream changes; `route` stays as the delivery guarantee.
 - **Known limitations (P3)**:
   - openraft 0.9 waits for each log append's flush before its next command (`RaftCore::append_to_log`), so a long fsync stall still delays heartbeats; the 500–700 ms election timeout absorbs the stalls seen on this machine's SSD. Removing the wait needs openraft 0.10 or a patched 0.9 (P4).
   - Building or installing a snapshot needs several times the state's size in memory, and `export_state` holds the state-machine lock while it copies (security review M5).
@@ -259,7 +260,7 @@ Rules: 3 or 5 peers (1 allowed for tests); `-b` / `binlog` with `[cluster]` is a
 
 ## 8a. Later Phases (summary)
 
-- **P4 Performance**: reduce the per-command cross-thread hop (ops per CPU-second is about 0.4× the reference), O(1) buried-job removal, openraft 0.10 (no wait on each log flush), streamed snapshots, reply computation only on owners, profiling-driven work. Dynamic membership is a separate later item.
+- **P4 Performance**: reduce the per-command cross-thread hop (ops per CPU-second is about 0.4× the reference), O(1) buried-job removal, openraft 0.10 (no wait on each log flush), streamed snapshots, reply computation only on owners (done in P4-T5a, §8), profiling-driven work. Dynamic membership is a separate later item.
 
 ## 9. Compatibility Strategy
 
@@ -275,6 +276,9 @@ Rules: 3 or 5 peers (1 allowed for tests); `-b` / `binlog` with `[cluster]` is a
 - `server.threads` (TOML) / `--threads N` (CLI, long-only, 1..=256): `Cli::threads`, `config::ResolvedConfig::threads`, `config::effective_threads`, `config::{DEFAULT_THREADS_STANDALONE, DEFAULT_THREADS_CLUSTER, MIN_THREADS, MAX_THREADS}`; feeds `tokio::runtime::Builder::worker_threads` in `main.rs`. Shown by `--check-config`.
 - `engine_actor::run_task` drains up to `ACTOR_BATCH_LIMIT` (64) queued messages per wake-up (still ticking after each) before delivering once per batch; only reachable without a WAL. No measured throughput or efficiency effect on its own (P4-T1); kept because it is harmless.
 - `bstk-bench`: `Scenario::HandshakeBurst` (`--rate N`), reporting handshake-completion latency (`latency::HandshakeStats`); `bench/run-matrix.sh` gained a `burst` server mode (a plaintext and a TLS listener on one server, a normal scenario and the handshake burst running concurrently) and an `RS_ARGS` variable (extra arguments for `beanstalkd-rs` only, so `SERVERS="ref rs"` can alternate the reference against a specific thread count in one invocation).
+
+**P4-T5a (owner-only replies)**
+- `Engine::set_local_conns(Option<LocalConns>)`, `LocalConns::{new, owns}`; the cluster state machine builds replies only for connections whose `conn >> CONN_SEQ_BITS` is its node id. Not part of `EngineState` / `EngineConfig`; snapshot payload unchanged.
 
 **P3-FD (cluster throughput)**
 - `Op::Batch(Vec<(u64, EngineInput)>)` (last variant; `Op::Conn` unchanged), `bstk_raft::{MAX_PROPOSAL_ITEMS, MAX_PROPOSAL_BYTES, proposal_item_size, split_batches}`, `wire::MAX_BATCH_ITEMS`; the leader's proposer batches its own and forwarded inputs.

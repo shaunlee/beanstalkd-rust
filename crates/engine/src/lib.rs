@@ -35,6 +35,26 @@ pub const NANOS_PER_SEC: Nanos = 1_000_000_000;
 /// waiting reserver). Each connection's replies must be written in order.
 pub type Outbox = Vec<(ConnId, Response)>;
 
+/// The connections whose replies this process delivers: those with
+/// `conn >> node_shift == node` (the cluster numbers a connection by its
+/// owner). See `Engine::set_local_conns`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalConns {
+    node_shift: u32,
+    node: u64,
+}
+
+impl LocalConns {
+    pub fn new(node_shift: u32, node: u64) -> Self {
+        debug_assert!(node_shift < u64::BITS);
+        LocalConns { node_shift, node }
+    }
+
+    pub fn owns(&self, conn: ConnId) -> bool {
+        conn >> self.node_shift == self.node
+    }
+}
+
 /// Process-level facts the engine cannot know itself (it has no I/O).
 pub trait SysInfo: Send {
     fn snapshot(&self) -> SysSnapshot;
@@ -360,6 +380,10 @@ impl std::error::Error for StateError {}
 ///     /// Same, with only the first `max_tubes` tubes (in `list-tubes`
 ///     /// order); the server stats are complete. Bounds the work per call.
 ///     pub fn snapshot_limited(&self, now: Nanos, max_tubes: usize) -> Snapshot;
+///     /// Build replies only for the connections `local` owns (cluster
+///     /// nodes); everything else about an input is unchanged and the
+///     /// setting is not part of the exported state.
+///     pub fn set_local_conns(&mut self, local: Option<LocalConns>);
 ///     /// SIGUSR1 drain mode (put -> DRAINING).
 ///     pub fn set_draining(&mut self, on: bool);
 ///     /// P3: run one input (see `EngineInput`), then `tick(now)`.

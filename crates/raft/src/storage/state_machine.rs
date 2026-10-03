@@ -28,10 +28,10 @@
 //! After each engine call, the replies addressed to connections owned by
 //! this node are handed to the [`ReplySink`], in order, after the batch's
 //! state is published (the sink is called without any lock held). Other
-//! nodes' replies are dropped. Each log entry is applied at most once per
-//! process (openraft never re-applies at or below the last applied id; a
-//! defensive check skips such entries), so a reply is delivered at most
-//! once. After a restart, entries re-applied from the log address
+//! nodes' replies are not even built (`Engine::set_local_conns`). Each log
+//! entry is applied at most once per process (openraft never re-applies at
+//! or below the last applied id; a defensive check skips such entries), so
+//! a reply is delivered at most once. After a restart, entries re-applied from the log address
 //! connections of the previous process: the sink must ignore connections
 //! it does not hold, and the server must number new connections above
 //! [`StateHandle::highest_local`] (after catching up), which the dedup
@@ -46,7 +46,9 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use bstk_engine::{ConnId, Engine, EngineConfig, EngineInput, EngineState, Nanos, Outbox, SysInfo};
+use bstk_engine::{
+    ConnId, Engine, EngineConfig, EngineInput, EngineState, LocalConns, Nanos, Outbox, SysInfo,
+};
 use bstk_proto::Response;
 use openraft::storage::RaftStateMachine;
 use openraft::{
@@ -128,6 +130,18 @@ pub(crate) struct SnapshotPayload {
 /// (postcard is positional, so old and new layouts do not decode as each
 /// other). 2: P4-T3 buried / reservation maps.
 pub(crate) const PAYLOAD_VERSION: u32 = 2;
+
+/// Every engine of this state machine builds replies only for its own
+/// node's connections (docs/DESIGN.md §8a).
+fn local_conns(node: NodeId) -> LocalConns {
+    LocalConns::new(CONN_SEQ_BITS, node)
+}
+
+fn new_engine(now: Nanos, cfg: EngineConfig, sys: Box<dyn SysInfo>, node: NodeId) -> Engine {
+    let mut engine = Engine::new(now, cfg, sys);
+    engine.set_local_conns(Some(local_conns(node)));
+    engine
+}
 
 fn local_of(conn: ConnId) -> u64 {
     conn & ((1 << CONN_SEQ_BITS) - 1)
@@ -216,7 +230,12 @@ fn invalid(msg: impl Into<String>) -> io::Error {
 /// change this node's `-z` (the engine answers `JOB_TOO_BIG` by it, so a
 /// difference would make nodes diverge), and it must not turn the journal
 /// on (cluster mode has no binlog).
-fn restore(payload: &[u8], cfg: &EngineConfig, sys: &SysFactory) -> io::Result<(Engine, SmMeta)> {
+fn restore(
+    payload: &[u8],
+    cfg: &EngineConfig,
+    sys: &SysFactory,
+    node: NodeId,
+) -> io::Result<(Engine, SmMeta)> {
     // The version is the first field: check it before decoding the rest,
     // whose layout depends on it.
     let (version, _) = postcard::take_from_bytes::<u32>(payload)
@@ -228,7 +247,8 @@ fn restore(payload: &[u8], cfg: &EngineConfig, sys: &SysFactory) -> io::Result<(
     }
     let p: SnapshotPayload =
         postcard::from_bytes(payload).map_err(|e| invalid(format!("snapshot payload: {e}")))?;
-    let engine = Engine::import_state(p.engine, sys()).map_err(|e| invalid(e.to_string()))?;
+    let mut engine = Engine::import_state(p.engine, sys()).map_err(|e| invalid(e.to_string()))?;
+    engine.set_local_conns(Some(local_conns(node)));
     let theirs = engine.config();
     if theirs.max_job_size != cfg.max_job_size {
         return Err(invalid(format!(
@@ -294,9 +314,10 @@ impl ClusterStateMachine {
         cfg.journal = false;
         let core = match snaps.load_current()? {
             Some((meta, payload)) => {
-                let (engine, sm_meta) = restore(&payload, &cfg, &opts.sys).map_err(|e| {
-                    OpenError::Corrupt(format!("snapshot {}: {e}", meta.snapshot_id))
-                })?;
+                let (engine, sm_meta) =
+                    restore(&payload, &cfg, &opts.sys, opts.node_id).map_err(|e| {
+                        OpenError::Corrupt(format!("snapshot {}: {e}", meta.snapshot_id))
+                    })?;
                 Core {
                     engine,
                     meta: sm_meta,
@@ -305,7 +326,7 @@ impl ClusterStateMachine {
                 }
             }
             None => Core {
-                engine: Engine::new(0, cfg.clone(), (opts.sys)()),
+                engine: new_engine(0, cfg.clone(), (opts.sys)(), opts.node_id),
                 meta: SmMeta::default(),
                 last_applied: None,
                 membership: Membership::default(),
@@ -420,7 +441,7 @@ impl Core {
         let now = req.now.max(self.meta.last_now);
         self.meta.last_now = now;
         if !self.meta.started {
-            self.engine = Engine::new(now, sh.cfg.clone(), (sh.sys)());
+            self.engine = new_engine(now, sh.cfg.clone(), (sh.sys)(), sh.node_id);
             self.meta.started = true;
         }
         let node = sh.node_id;
@@ -626,8 +647,13 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
         snapshot: Box<SnapshotBuf>,
     ) -> SResult<()> {
         let payload = snapshot.into_inner();
-        let (engine, sm_meta) = restore(&payload, &self.shared.cfg, &self.shared.sys)
-            .map_err(|e| snap_err(Some(meta), ErrorVerb::Read, e))?;
+        let (engine, sm_meta) = restore(
+            &payload,
+            &self.shared.cfg,
+            &self.shared.sys,
+            self.shared.node_id,
+        )
+        .map_err(|e| snap_err(Some(meta), ErrorVerb::Read, e))?;
         self.snaps()?
             .save(meta, &payload, true)
             .map_err(|e| snap_err(Some(meta), ErrorVerb::Write, e))?;

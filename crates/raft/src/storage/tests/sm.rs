@@ -479,6 +479,102 @@ fn nodes_fed_the_same_entries_agree() {
     }
 }
 
+/// Every node counts every command (`cmd-stats` and friends are state), but
+/// builds the reply, however expensive, only for its own connections.
+#[test]
+fn replies_are_built_only_for_local_connections() {
+    let conns = [conn_id(1, 1), conn_id(2, 1), conn_id(3, 1)];
+    let mut seq = [1u64; 3];
+    let mut reqs: Vec<Request> = Vec::new();
+    let mut step =
+        |reqs: &mut Vec<Request>, at: u64, i: usize, input: fn(ConnId) -> EngineInput| {
+            reqs.push(req(at, c_in(seq[i], input(conns[i]))));
+            seq[i] += 1;
+        };
+    for i in 0..3 {
+        step(&mut reqs, S, i, EngineInput::Connect);
+    }
+    step(&mut reqs, S, 0, |c| put(c, "alpha"));
+    step(&mut reqs, S, 1, |c| put(c, "beta"));
+    let commands: [fn(ConnId) -> EngineInput; 9] = [
+        |c| cmd(c, Command::Stats),
+        |c| cmd(c, Command::StatsTube(tube("default"))),
+        |c| cmd(c, Command::StatsJob(1)),
+        |c| cmd(c, Command::ListTubes),
+        |c| cmd(c, Command::ListTubesWatched),
+        |c| cmd(c, Command::ListTubeUsed),
+        |c| cmd(c, Command::PeekReady),
+        |c| cmd(c, Command::Peek(2)),
+        |c| cmd(c, Command::StatsJob(99)),
+    ];
+    for f in commands {
+        for i in 0..3 {
+            step(&mut reqs, S, i, f);
+        }
+    }
+    // Two reservers take the two jobs, the third waits and times out on a
+    // tick; its reply comes from `tick`, not from its own command.
+    step(&mut reqs, 2 * S, 1, |c| cmd(c, Command::Reserve));
+    step(&mut reqs, 2 * S, 0, |c| cmd(c, Command::Reserve));
+    step(&mut reqs, 2 * S, 2, |c| {
+        cmd(c, Command::ReserveWithTimeout(1))
+    });
+    reqs.push(req(5 * S, Op::Tick));
+    step(&mut reqs, 5 * S, 0, |c| cmd(c, Command::Stats));
+    let n = reqs.len() as u64;
+
+    let mut ns: Vec<Node> = (1..=3).map(node).collect();
+    for node in &mut ns {
+        apply(&mut node.sm, entries(1, &reqs));
+    }
+    let s0 = state_bytes(&ns[0].sm);
+    assert_eq!(state_bytes(&ns[1].sm), s0);
+    assert_eq!(state_bytes(&ns[2].sm), s0);
+
+    let mut full = Engine::new(S, bstk_engine::EngineConfig::default(), sys());
+    let mut expect: Outbox = Vec::new();
+    for r in &reqs {
+        match &r.op {
+            Op::Conn { input, .. } => full.apply_input(r.now, input.clone(), &mut expect),
+            Op::Tick => full.apply_input(r.now, EngineInput::Tick, &mut expect),
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(postcard::to_allocvec(&full.export_state()).unwrap(), s0);
+    assert!(expect.iter().any(|(_, r)| *r == Response::TimedOut));
+    let mut delivered = 0;
+    for (i, node) in ns.iter().enumerate() {
+        let id = i as u64 + 1;
+        let got = deliveries_by_conn(&node.sink.take());
+        let want: Vec<(ConnId, Response)> = expect
+            .iter()
+            .filter(|(c, _)| owner_of(*c) == id)
+            .cloned()
+            .collect();
+        let flat: Vec<(ConnId, Response)> = got
+            .iter()
+            .flat_map(|(c, rs)| rs.iter().map(|r| (*c, r.clone())))
+            .collect();
+        let mut want_sorted = want.clone();
+        want_sorted.sort_by_key(|(c, _)| *c);
+        assert_eq!(flat, want_sorted, "node {id}");
+        delivered += want.len();
+    }
+    assert_eq!(delivered, expect.len());
+
+    // The last stats counts the four `stats` commands of all three nodes.
+    let last = expect.last().unwrap();
+    assert_eq!(last.0, conns[0]);
+    match &last.1 {
+        Response::Ok(y) => {
+            let y = String::from_utf8_lossy(y);
+            assert!(y.contains("cmd-stats: 4\n"), "{y}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(ns[0].sm.handle().last_applied(), Some(lid(1, n)));
+}
+
 /// Groups runs of consecutive `Op::Conn` requests of `reqs` into
 /// `Op::Batch` entries (sizes cycled from `sizes`; other ops stay alone).
 /// Returns the batched requests and the same items as one `Op::Conn`
