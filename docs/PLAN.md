@@ -446,10 +446,10 @@ Only one agent at a time edits the server's wiring (T4); T1–T3 work in separat
 
 ### 7.5 Acceptance
 
-- [ ] Standalone plaintext: ops per CPU-second ≥ 0.8x the reference at 10 and 100 connections, and throughput ≥ 1.0x the reference in every non-pipelined matrix cell (was 0.88x at worst)
-- [ ] TLS, `-b` and cluster throughput not below their P3 numbers (±5%)
-- [ ] Deleting or kicking 1M buried jobs, and releasing 100k reservations of one connection in random order, run in time linear in the count; the oracle proptest still passes
-- [ ] Memory per job ≤ 1.5x the reference and binlog bytes written per operation ≤ 1.2x the reference (or a documented reason)
-- [ ] Cluster: CPU per operation at 100 connections ≤ 15 µs (was 20); one-connection CPU per operation at least halved; snapshot peak memory ≤ 1.5x the state size
-- [ ] All differential suites, chaos acceptance (≥ 1,000 in-process seeds, ≥ 100 multi-process runs) and smoke tests green
-- [ ] `docs/BENCH.md`, `docs/DESIGN.md` updated
+- [x] Standalone plaintext: ops per CPU-second ≥ 0.8x the reference at 10 and 100 connections, and throughput ≥ 1.0x the reference in every non-pipelined matrix cell (was 0.88x at worst) — 1.04–1.29x efficiency and 1.01–1.40x throughput at 2, 10 and 100 connections; **exception**: 1 connection is 0.95–0.97x, unchanged since P3 (BENCH P4-T6, P4-T6b)
+- [x] TLS, `-b` and cluster throughput not below their P3 numbers (±5%) — TLS and `-b` after P4-T6b (2 workers): 0.98–1.07x; cluster 1.06–1.52x; one cluster mTLS cell 0.94x, single block (BENCH P4-T6)
+- [x] Deleting or kicking 1M buried jobs, and releasing 100k reservations of one connection in random order, run in time linear in the count; the oracle proptest still passes (P4-T3)
+- [x] Memory per job ≤ 1.5x the reference and binlog bytes written per operation ≤ 1.2x the reference (or a documented reason) — worst 1.19x and 0.95x
+- [ ] Cluster: CPU per operation at 100 connections ≤ 15 µs (was 20); one-connection CPU per operation at least halved; snapshot peak memory ≤ 1.5x the state size — **partly met**: snapshot peak 0.04–0.17x (P4-T5c); CPU per operation 17.4–17.8 µs (P3 measured 24–26 on the same loaded machine) and one connection 0.55–0.77x of P3: not met, cause and next step in BENCH P4-T6
+- [x] All differential suites, chaos acceptance (≥ 1,000 in-process seeds, ≥ 100 multi-process runs) and smoke tests green
+- [x] `docs/BENCH.md`, `docs/DESIGN.md` updated

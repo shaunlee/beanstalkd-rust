@@ -2,7 +2,7 @@
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`). The newest numbers
-are from task P4-T6b (thread default per mode), then P4-T5c (snapshot memory), then P4-T5b
+are from task P4-T6 (the final P4 matrix), then P4-T6b (thread default per mode), then P4-T5c (snapshot memory), then P4-T5b
 (cluster wake-ups at low load), then
 P4-T4 (footprint: memory per job, binlog bytes per operation). P4-T2 (tokio worker-thread count and its
 default, the lever the P4-T1 spike found for CPU efficiency) follows,
@@ -11,6 +11,86 @@ and the standalone regression check), then P2-T5 (TLS / mTLS), then
 P1-T5 (write-ahead log, `-b`), then the T6b section (engine performance
 fix); the T6 first pass, whose profile motivated T6b, is kept at the
 end.
+
+## P4-T6: final P4 matrix
+
+### Summary
+
+Run at `36d3db1` (before P4-T6b; the TLS and `-b` cells at the new default
+are in the P4-T6b section below) against the optimized reference and the
+P3 build (`e9cbb1f`). The machine was loaded throughout (OrbStack VM;
+1-minute load 4 to 14, median about 7.5), so absolute numbers are 40 to 50%
+below P4-T2's; ratios come from alternated or order-flipped runs.
+
+| Criterion (PLAN §7.5) | Result |
+|---|---|
+| Standalone ops per CPU-second ≥ 0.8x the reference at 10 and 100 connections | 1.04 to 1.29x: met |
+| Standalone throughput ≥ 1.0x the reference, non-pipelined cells | 1.01 to 1.40x at 2, 10 and 100 connections; **0.95 to 0.97x at 1 connection** (pre-existing since P3, see P4-T6b) |
+| `-b` and TLS not below P3 (±5%) | at one worker 0.91 to 0.93x at 10 connections; with the P4-T6b default (2 workers) 0.98 to 1.07x: met |
+| Cluster throughput not below P3 (±5%) | 1.06 to 1.52x via leader and follower at 1, 10 and 100 connections; mTLS via the leader at 100 connections 0.94x (one block, not rerun) |
+| Cluster CPU per operation at 100 connections ≤ 15 µs | **17.4 to 17.8 µs** via the leader (P3: 24 to 26), 25.3 via a follower (P3: 33); the target node alone 13.0 to 13.4 / 15.9: not met |
+| One-connection cluster CPU per operation halved | **0.73 to 0.77x** of P3 via the leader, 0.55x via a follower: not met |
+| Memory per job ≤ 1.5x, binlog bytes per operation ≤ 1.2x the reference | worst 1.19x and 0.95x: met |
+| Chaos: 1,000 in-process seeds, 100 multi-process runs | 0 failures each (2,288 snapshot installs in-process): met |
+| Smoke tests | all modes pass (TLS modes after the `mkcerts.sh` authority-key-identifier fix in P4-T6b) |
+
+Why the cluster targets are missed: what remains per entry is mostly
+openraft 0.9's own work, two AppendEntries round trips per entry and
+follower (the second only advances the commit index) and the Raft core
+awaiting each append's flush, plus thread wake-ups for each (P4-T5b).
+CPU per operation also rises with machine load (best run 14.1 µs at load
+5.5, worst 20.4 at 9.7). One worker per node removes the idle wake-ups
+but cost 100-connection throughput in the loaded runs (P4-T5b), so the
+cluster default stays at two. Reaching the targets needs openraft 0.10
+(no awaited flush per append) or measurements on a quiet machine to
+revisit the worker count.
+
+### Standalone plaintext vs the reference (alternated, 5 runs)
+
+| scenario | conns | body | rs/ref | ops per CPU-s rs/ref |
+|---|---:|---:|---:|---:|
+| put-reserve-delete | 1 | 16 | 0.91 (rerun 0.89) | 0.89 |
+| put-reserve-delete | 1 | 4096 | 0.93 (rerun 0.96) | 0.91 |
+| put-reserve-delete | 10 | 16 | 1.18 | 1.13 |
+| put-reserve-delete | 10 | 4096 | 1.09 | 1.04 |
+| put-reserve-delete | 100 | 16 | 1.18 | 1.16 |
+| put-reserve-delete | 100 | 4096 | 1.06 | 1.06 |
+| producers-consumers | 2 | 16 | 1.04 | 0.95 |
+| producers-consumers | 2 | 4096 | 1.01 | 0.96 |
+| producers-consumers | 10 | 16 | 1.17 | 1.12 |
+| producers-consumers | 10 | 4096 | 1.40 | 1.29 |
+| producers-consumers | 100 | 16 | 1.02 | 1.01 |
+| producers-consumers | 100 | 4096 | 1.10 | 1.09 |
+| put-reserve-delete, pipelined x16 | 10 | 16 | 1.03 | 1.14 |
+| put-reserve-delete, pipelined x16 | 100 | 16 | 1.26 | 1.27 |
+
+The 1-connection cells were inflated by load: a later bisect measured
+0.95 to 0.97x for every build since P3 (P4-T6b).
+
+### Cluster vs P3 (3 nodes, 10 s, 5 order-flipped rounds)
+
+| mode | conns | ops/s cur/P3 | cluster µs/op P3 → cur | target node µs/op P3 → cur |
+|---|---:|---:|---|---|
+| leader | 1 | 1.15 | 343.6 → 251.5 | 162.4 → 116.6 |
+| follower | 1 | 1.52 | 409.7 → 224.1 | 130.7 → 76.2 |
+| leader | 10 | 1.14 | 92.0 → 64.1 | 48.8 → 33.6 |
+| follower | 10 | 1.22 | 129.0 → 86.2 | 51.1 → 34.3 |
+| leader | 100 | 1.12 | 26.0 → 17.8 | 20.0 → 13.4 |
+| follower | 100 | 1.06 | 33.1 → 25.3 | 21.5 → 15.9 |
+| mtls-leader | 100 | 0.94 | 26.5 → 20.9 | 20.3 → 15.7 |
+| leader (rerun, load 5.6 to 7.9) | 1 | 1.05 | 296.6 → 228.6 | 137.1 → 105.5 |
+| leader (rerun) | 100 | 1.01 | 24.2 → 17.4 | 18.8 → 13.0 |
+
+"Cluster µs/op" is the CPU of all three nodes per operation. No resent
+inputs, rewinds or term changes in any run.
+
+### Commands
+
+As in P4-T2 "Commands" (blocks A to D) with `CONNS="1 10 100"`, no
+`--threads`, and TLS and cluster blocks run as `RUNS=1` rounds with the
+binary order flipped each round; footprint as in P4-T4; chaos:
+`BSTK_CHAOS_SEEDS=1000 cargo test --release -p bstk-chaos --test inprocess full -- --ignored`
+and `BSTK_CHAOS_MP_RUNS=100 cargo test -p bstk-chaos --test multiprocess full -- --ignored`.
 
 ## P4-T6b: thread default per mode
 

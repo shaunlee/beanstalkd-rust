@@ -471,7 +471,7 @@ Rules: 3 or 5 peers (1 allowed for tests); `-b` / `binlog` with `[cluster]` is a
 
 ## 8a. Later Phases (summary)
 
-- **P4 Performance**: reduce the per-command cross-thread hop (ops per CPU-second is about 0.4× the reference), O(1) buried-job removal, openraft 0.10 (no wait on each log flush), streamed snapshots (done in P4-T5c, §8), reply computation only on owners (done in P4-T5a, §8), profiling-driven work. Dynamic membership is a separate later item.
+- **P4 Performance** (done): per-mode worker-thread defaults (§3; standalone plaintext now at 1.04–1.29× the reference's ops per CPU-second), O(log n) buried-job and reservation removal, owner-only replies, fewer cluster wake-ups and streamed snapshots (§8). Open: cluster CPU per operation (17–18 µs at 100 connections, target 15; one connection 0.55–0.77× of P3, target 0.5×) needs openraft 0.10 (no awaited flush per append), see docs/BENCH.md P4-T6. Dynamic membership is a separate later item.
 
 ## 9. Compatibility Strategy
 
