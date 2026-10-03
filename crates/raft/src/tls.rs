@@ -1,20 +1,14 @@
 //! Mutual TLS for the cluster port (docs/DESIGN.md §8, `[cluster.tls]`).
 //!
-//! Every node has one certificate, signed by the cluster CA and carrying
-//! the SAN DNS name `bstk-node-<id>` ([`node_dns_name`]); it is presented
-//! both as the listener's server certificate and as the dialer's client
-//! certificate. The common name is not consulted.
-//!
-//! - The dialer verifies the listener's certificate against the cluster CA
-//!   and for the server name `bstk-node-<target id>`.
-//! - The listener requires a client certificate chaining to the cluster CA
-//!   (enforced during the handshake), then, after reading the hello, checks
-//!   that the certificate is valid for `bstk-node-<hello id>` and that the
-//!   id is a configured peer ([`verify_peer_identity`]). Anything else is
-//!   rejected before a Raft message is processed.
-//!
-//! As in the server's P2 TLS code: rustls 0.23 with the aws-lc-rs provider,
-//! passed explicitly rather than taken from the process default.
+//! One certificate per node, signed by the cluster CA and carrying the SAN DNS
+//! name `bstk-node-<id>` ([`node_dns_name`]; the CN is not consulted), serves
+//! as both the listener's server certificate and the dialer's client
+//! certificate. The dialer verifies the listener as `bstk-node-<target id>`.
+//! The listener requires a CA-signed client certificate during the handshake,
+//! then checks after the hello that it is valid for `bstk-node-<hello id>` and
+//! that the id is a configured peer ([`verify_peer_identity`]), so nothing is
+//! processed for an unverified identity. rustls 0.23 with the aws-lc-rs
+//! provider is passed explicitly, not taken from the process default.
 
 use std::fmt;
 use std::path::Path;
@@ -27,7 +21,6 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 
 use crate::NodeId;
 
-/// The SAN DNS name a node's certificate must carry.
 pub fn node_dns_name(id: NodeId) -> String {
     format!("bstk-node-{id}")
 }
@@ -47,7 +40,6 @@ impl fmt::Debug for ClusterTls {
     }
 }
 
-/// Why TLS material could not be loaded; names the file or item involved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsError(pub String);
 
@@ -82,7 +74,6 @@ pub fn load_cluster_tls(
     )
 }
 
-/// Like [`load_cluster_tls`], from PEM bytes.
 pub fn cluster_tls_from_pem(
     own_id: NodeId,
     cert_pem: &[u8],
@@ -163,7 +154,6 @@ pub fn verify_peer_identity(
     check_name(leaf, id)
 }
 
-/// The server name the dialer verifies when connecting to `target`.
 pub fn server_name_for(target: NodeId) -> Result<ServerName<'static>, String> {
     ServerName::try_from(node_dns_name(target)).map_err(|e| format!("invalid server name: {e}"))
 }

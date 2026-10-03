@@ -84,9 +84,6 @@ fn one_byte_at_a_time_fragmentation() {
 
 #[test]
 fn random_splits_fragmentation() {
-    // Deterministic pseudo-random split points (no external RNG dependency
-    // needed here; the proptest-based roundtrip test covers randomized
-    // command generation separately).
     let full = b"use foo\r\nreserve-with-timeout 5\r\nbury 1 2\r\nput 0 0 100 11\r\nhello world\r\nstats\r\n".to_vec();
     let split_patterns: &[&[usize]] = &[
         &[1, 3, 7, 2, 5, 100],
@@ -128,7 +125,7 @@ fn random_splits_fragmentation() {
 
 #[test]
 fn job_too_big_then_next_command_ok() {
-    let mut codec = ServerCodec::new(4); // tiny limit
+    let mut codec = ServerCodec::new(4);
     let mut buf = BytesMut::from(&b"put 0 0 100 10\r\n0123456789\r\nlist-tubes\r\n"[..]);
     let frames = decode_all(&mut codec, &mut buf);
     assert_eq!(
@@ -154,7 +151,6 @@ fn job_too_big_discard_is_incremental_not_double_buffered() {
         codec.decode(&mut buf).unwrap(),
         Some(Frame::PutRejected(PutRejection::JobTooBig))
     );
-    // Next command still works normally.
     buf.extend_from_slice(b"list-tubes\r\n");
     assert_eq!(
         codec.decode(&mut buf).unwrap(),
@@ -285,7 +281,7 @@ fn discard_from_overflow_window_immediately_continues_scanning() {
     let mut codec = ServerCodec::new(DEFAULT_MAX_JOB_SIZE);
     let mut buf = BytesMut::new();
     buf.extend_from_slice(&vec![b'a'; 224]); // exactly one overflow window, no CRLF
-    buf.extend_from_slice(b"\r\n"); // terminates the bad line
+    buf.extend_from_slice(b"\r\n");
     buf.extend_from_slice(b"list-tubes\r\n");
     let frames = decode_all(&mut codec, &mut buf);
     assert_eq!(
@@ -313,14 +309,11 @@ fn discard_from_overflow_window_consumes_terminator_from_continuation() {
 
 #[test]
 fn empty_buffer_buf_advance_noop_sanity() {
-    // Smoke test that decode() on an empty buffer just waits.
     let mut codec = ServerCodec::new(DEFAULT_MAX_JOB_SIZE);
     let mut buf = BytesMut::new();
     assert_eq!(codec.decode(&mut buf).unwrap(), None);
     buf.advance(0);
 }
-
-// ---- emit_put_started (header-time put side effects) ----
 
 #[test]
 fn put_started_is_emitted_before_the_body_arrives() {

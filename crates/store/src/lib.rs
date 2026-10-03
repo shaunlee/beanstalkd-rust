@@ -1,27 +1,10 @@
 //! Write-ahead log (binlog) for beanstalkd-rs.
 //!
-//! INTERFACE CONTRACT (owned by the lead): the public API in this file must
-//! not change without lead approval. See docs/PLAN.md §4 for the required
-//! behavior. The on-disk format is our own; it is not compatible with the
-//! reference's binlog.
-//!
-//! Model (after the reference's walg.c, adapted):
-//! - Segment files `binlog.N` in the directory, preallocated to
-//!   `file_size` rounded up to a multiple of 4096, plus a `lock` file held
-//!   with an exclusive lock for the lifetime of the `Wal`.
-//! - Records carry a CRC; replay stops at the first torn or corrupt record
-//!   of the last segment and truncates it.
-//! - The last record of a job wins; a `Delete` record removes it.
-//! - Space: a put may only be accepted (`reserve_put`) while the store can
-//!   hold the job's put and delete records and still keep one spare
-//!   preallocated segment. Updates never need a reservation: they may use
-//!   the spare. Only if even the spare is exhausted does `append` fail.
-//! - Compaction (`maintain`): while (allocated - live) / live >= 2, move a
-//!   live job out of the oldest segment; delete segments with no live jobs.
-//!
-//! Implementation notes: the file format is documented in `format.rs`, the
-//! replay and corruption rules in `replay.rs`, and space accounting,
-//! compaction, crash safety and memory use in `wal.rs`.
+//! The public API here is the interface contract with the server: change it
+//! only with the lead's approval (docs/PLAN.md §4). The on-disk format is our
+//! own, not the reference's binlog format (`format.rs`). Replay and corruption
+//! rules: `replay.rs` and docs/DESIGN.md §7.3; space accounting, compaction
+//! and crash safety: docs/DESIGN.md §7.1, §7.2.
 
 mod format;
 mod replay;
@@ -40,7 +23,6 @@ pub use bstk_engine::{BinlogStats, JournalEntry, Recovery};
 /// overflowing or filling the disk.
 pub const MAX_FILE_SIZE: u64 = 1 << 32;
 
-/// When to fsync, mirroring `-f MS` / `-f0` / `-F`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPolicy {
     /// `-f0`: fsync after every `append`, before it returns.
@@ -131,7 +113,6 @@ impl Wal {
         self.inner.sync_if_due(now)
     }
 
-    /// Compaction and removal of dead segments; call after `append`.
     pub fn maintain(&mut self) -> Result<(), WalError> {
         self.inner.maintain()
     }

@@ -13,7 +13,6 @@ fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
 
-/// A history builder; times in milliseconds.
 #[derive(Default)]
 struct B {
     h: History,
@@ -101,8 +100,6 @@ fn found(id: u64, body: &str) -> Reply {
 
 use ViolationKind as V;
 
-// ------------------------------------------------------------------ valid
-
 #[test]
 fn valid_put_reserve_delete() {
     let mut b = B::new();
@@ -117,7 +114,6 @@ fn valid_put_reserve_delete() {
 
 #[test]
 fn valid_overlapping_operations_in_either_order() {
-    // The reserve and the delete overlap: the delete may come first.
     let mut b = B::new();
     b.put(1, "a", 60, 0, (0, 10), 1)
         .op(3, Cmd::Delete(1), 20, Some((100, Reply::Deleted)))
@@ -180,8 +176,6 @@ fn valid_release_bury_kick_cycle() {
     assert_eq!(b.check(0), vec![]);
 }
 
-// ----------------------------------------------------------- violations
-
 #[test]
 fn lost_job() {
     let mut b = B::new();
@@ -228,7 +222,6 @@ fn ids_must_increase_in_commit_order() {
     b.put(1, "a", 60, 0, (0, 10), 5)
         .put(2, "b", 60, 0, (20, 30), 3);
     assert_eq!(b.check(0), vec![V::IdOrder]);
-    // Concurrent puts may get ids in either order.
     let mut b = B::new();
     b.put(1, "a", 60, 0, (0, 30), 5)
         .put(2, "b", 60, 0, (20, 40), 3);
@@ -321,8 +314,6 @@ fn reply_for_a_job_no_put_created() {
     assert_eq!(b.check(0), vec![V::Inconsistent]);
 }
 
-// ------------------------------------------------------------------ TTR
-
 #[test]
 fn ttr_expiry_allows_a_new_reservation() {
     let mut b = B::new();
@@ -336,7 +327,6 @@ fn ttr_expiry_allows_a_new_reservation() {
 
 #[test]
 fn late_expiry_is_allowed() {
-    // The TTR passed, but the holder acts before any expiry was applied.
     let mut b = B::new();
     b.put(1, "a", 1, 0, (0, 10), 1)
         .reserve(2, (100, 110), 1, "a")
@@ -357,7 +347,6 @@ fn ttr_boundary() {
     };
     assert_eq!(early(1099, 0), vec![V::Inconsistent]);
     assert_eq!(early(1100, 0), vec![]);
-    // The slack widens both intervals: (100 − 50) + 1000 <= 1000 + 50.
     assert_eq!(early(1000, 50), vec![]);
     assert_eq!(early(999, 50), vec![V::Inconsistent]);
 }
@@ -395,8 +384,6 @@ fn holder_cannot_act_after_expiry_and_new_reservation() {
     assert_eq!(b.check(0), vec![V::ExclusiveHolding]);
 }
 
-// ---------------------------------------------------------- disconnects
-
 #[test]
 fn disconnect_releases_the_reservation() {
     let mut b = B::new();
@@ -405,7 +392,6 @@ fn disconnect_releases_the_reservation() {
         .close(2, 150)
         .reserve(3, (200, 210), 1, "a");
     assert_eq!(b.check(0), vec![]);
-    // Without the close the job stays reserved for 60 s.
     let mut b = B::new();
     b.put(1, "a", 60, 0, (0, 10), 1)
         .reserve(2, (100, 110), 1, "a")
@@ -436,7 +422,6 @@ fn disconnect_not_before_the_last_acknowledged_operation() {
         .op(2, Cmd::Delete(99), 300, Some((310, Reply::NotFound)))
         .close(2, 400);
     assert_eq!(b.check(0), vec![V::Inconsistent]);
-    // If conn 3's reserve ended after 300, the disconnect explains it.
     let mut b = B::new();
     b.put(1, "a", 60, 0, (0, 10), 1)
         .reserve(2, (100, 110), 1, "a")
@@ -446,8 +431,6 @@ fn disconnect_not_before_the_last_acknowledged_operation() {
     assert_eq!(b.check(0), vec![]);
 }
 
-// --------------------------------------------------- unacknowledged ops
-
 #[test]
 fn unacknowledged_put_identified_by_body() {
     let mut b = B::new();
@@ -456,7 +439,6 @@ fn unacknowledged_put_identified_by_body() {
         .reserve(2, (100, 110), 7, "a")
         .op(2, Cmd::Delete(7), 120, Some((130, Reply::Deleted)));
     assert_eq!(b.check(0), vec![]);
-    // Reserved before the put was even sent: impossible.
     let mut b = B::new();
     b.op(1, put_cmd("a", 60, 0), 200, None)
         .close(1, 250)
@@ -492,12 +474,9 @@ fn unacknowledged_release_may_or_may_not_have_happened() {
                 None,
             )
             .op(3, Cmd::Delete(1), 50, Some((60, later)));
-        // Without a close, NOT_FOUND means the release did not happen yet.
         assert_eq!(b.check(0), vec![]);
     }
 }
-
-// ---------------------------------------------------- delays and kicks
 
 #[test]
 fn delayed_job_not_reservable_before_its_delay() {

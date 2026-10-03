@@ -17,19 +17,11 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(3);
 const SPAWN_ATTEMPTS: u32 = 5;
 
-/// Ports currently claimed by a `Server` somewhere in this test binary.
-///
-/// `TcpListener::bind(("127.0.0.1", 0))` picks a free ephemeral port, but
-/// there is a gap between releasing that listener and the child process
-/// actually binding the same port. With `cargo test`'s default parallel
-/// test threads, two tests can race and get handed the *same* ephemeral
-/// port in that gap: whichever child loses the `bind()` race exits with
-/// `AddrInUse`, while the winning test's `wait_until_accepting` can end up
-/// connecting to a *different* test's already-running server on that same
-/// port -- which then gets killed out from under it when that other test
-/// finishes, producing a spurious `ConnectionReset`. Holding the port for
-/// the entire lifetime of the `Server`, not just during spawn, closes that
-/// race within this process (mirrors `tests/compat/src/server.rs`).
+/// Ports currently claimed by a `Server` in this test binary. Between
+/// releasing an ephemeral-port probe and the child binding it, two parallel
+/// tests can be handed the same port, and one test then talks to the other's
+/// server; holding the port for the `Server`'s lifetime closes that race
+/// (mirrors `tests/compat/src/server.rs`).
 static CLAIMED_PORTS: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 fn claim_free_port() -> u16 {
@@ -51,8 +43,6 @@ fn release_port(port: u16) {
         .remove(&port);
 }
 
-/// A running server process on a free `127.0.0.1` port, killed on drop so a
-/// failing test never leaves an orphan process behind.
 pub struct Server {
     pub child: Child,
     pub addr: SocketAddr,
@@ -99,11 +89,9 @@ impl Server {
         }
     }
 
-    /// Waits until a real request/response round trip succeeds, not a bare
-    /// connect: under a port-claim race (see `CLAIMED_PORTS`), the *other*
-    /// side's leftover listener can accept a TCP connection without this
-    /// process ever having bound the port, so a full `quit` exchange is
-    /// used to make sure it is truly *our* child answering.
+    /// Waits until a real `quit` round trip succeeds, not a bare connect: under a
+    /// port-claim race (see `CLAIMED_PORTS`) another test's leftover listener can
+    /// accept a connection without this process ever having bound the port.
     fn wait_until_accepting(&mut self) -> Result<(), String> {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -197,8 +185,6 @@ impl Client {
             .expect("shutdown(write)");
     }
 
-    /// Reads and consumes one `\r\n`-terminated line (CRLF included),
-    /// refilling from the socket as needed. Panics on EOF or a read error.
     pub fn read_line(&mut self) -> String {
         loop {
             if let Some(pos) = find_crlf(&self.buf) {
@@ -209,7 +195,6 @@ impl Client {
         }
     }
 
-    /// Reads and consumes exactly `n` bytes.
     pub fn read_n(&mut self, n: usize) -> Vec<u8> {
         while self.buf.len() < n {
             self.fill_more();
@@ -217,10 +202,6 @@ impl Client {
         self.buf.drain(..n).collect()
     }
 
-    /// Reads a header line of the form `<prefix><n>\r\n` (e.g. `OK 1043`,
-    /// `RESERVED 1 5`) followed by exactly `n + 2` more bytes (the body and
-    /// its trailing CRLF), and returns `(header_line, body)` with `body`
-    /// stripped of the trailing CRLF.
     pub fn read_body_reply(&mut self) -> (String, Vec<u8>) {
         let header = self.read_line();
         let n: usize = header
@@ -279,8 +260,6 @@ pub fn find_crlf(buf: &[u8]) -> Option<usize> {
 }
 
 impl Server {
-    /// Sends `sig` (SIGTERM, SIGINT or SIGKILL) and waits up to 10 s for
-    /// the process to exit. The port stays claimed until drop.
     pub fn stop(&mut self, sig: nix::sys::signal::Signal) -> std::process::ExitStatus {
         let pid = nix::unistd::Pid::from_raw(i32::try_from(self.child.id()).unwrap());
         nix::sys::signal::kill(pid, sig).expect("kill");
@@ -294,7 +273,6 @@ impl Server {
         }
     }
 
-    /// Everything the server wrote to stderr (after it has exited).
     pub fn stderr(&mut self) -> String {
         let mut err = String::new();
         if let Some(mut e) = self.child.stderr.take() {
@@ -304,8 +282,6 @@ impl Server {
     }
 }
 
-/// Runs the binary with `args` (plus `-l 127.0.0.1 -p <free port>`) and
-/// waits for it to exit on its own; returns its status and stderr.
 pub fn run_to_exit(args: &[&str]) -> (std::process::ExitStatus, String) {
     let port = claim_free_port();
     let mut child = Command::new(env!("CARGO_BIN_EXE_beanstalkd-rs"))
@@ -341,14 +317,11 @@ pub fn run_to_exit(args: &[&str]) -> (std::process::ExitStatus, String) {
 }
 
 impl Client {
-    /// Sends `line` (CRLF appended) and returns the one-line reply without
-    /// its CRLF.
     pub fn cmd(&mut self, line: &str) -> String {
         self.send(format!("{line}\r\n").as_bytes());
         self.read_line().trim_end_matches("\r\n").to_owned()
     }
 
-    /// Sends a put and returns the reply line.
     pub fn put(&mut self, pri: u32, delay: u32, ttr: u32, body: &[u8]) -> String {
         let mut msg = format!("put {pri} {delay} {ttr} {}\r\n", body.len()).into_bytes();
         msg.extend_from_slice(body);
@@ -357,7 +330,6 @@ impl Client {
         self.read_line().trim_end_matches("\r\n").to_owned()
     }
 
-    /// Sends a command with a YAML (`OK <n>`) reply and returns the body.
     pub fn yaml(&mut self, line: &str) -> String {
         self.send(format!("{line}\r\n").as_bytes());
         let (header, body) = self.read_body_reply();
@@ -365,7 +337,6 @@ impl Client {
         String::from_utf8(body).unwrap()
     }
 
-    /// The value of `key` in a YAML reply to `line`.
     pub fn stat(&mut self, line: &str, key: &str) -> String {
         let yaml = self.yaml(line);
         yaml.lines()

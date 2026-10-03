@@ -32,7 +32,6 @@ impl BsClient {
         })
     }
 
-    /// Sends `cmd` (it must be the only command in flight).
     pub async fn send(&mut self, cmd: &Cmd) -> io::Result<()> {
         let mut out = cmd.line().into_bytes();
         out.extend_from_slice(b"\r\n");
@@ -43,7 +42,6 @@ impl BsClient {
         self.w.write_all(&out).await
     }
 
-    /// Sends an arbitrary line (no history).
     pub async fn raw(&mut self, line: &str) -> io::Result<(String, Vec<u8>)> {
         self.w.write_all(format!("{line}\r\n").as_bytes()).await?;
         let l = self.line().await?;
@@ -81,7 +79,6 @@ impl BsClient {
         Ok(b)
     }
 
-    /// Reads the reply to `cmd`.
     pub async fn recv(&mut self, cmd: &Cmd) -> io::Result<Reply> {
         let line = self.line().await?;
         let parts: Vec<&str> = line.split(' ').collect();
@@ -127,7 +124,6 @@ impl BsClient {
     }
 }
 
-/// `GET path` over HTTP/1.1 (`Connection: close`): status and body.
 pub async fn http_get(addr: SocketAddr, path: &str, timeout: Duration) -> Option<(u16, String)> {
     let fut = async {
         let mut s = TcpStream::connect(addr).await.ok()?;

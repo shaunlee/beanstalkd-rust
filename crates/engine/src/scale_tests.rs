@@ -1,29 +1,8 @@
 //! Scale tests for the O(log n) buried/reservation removal (docs/PLAN.md
-//! §7.2 "Linear-time removals", §7.5). A client controls both counts (bury
-//! or reserve as many jobs as it likes, then delete/kick/release them in
-//! any order), so a scan hiding behind a small n would let a quadratic
-//! reintroduction pass unnoticed.
-//!
-//! Every test inserts (buries or reserves) in a shuffled order that
-//! differs from job id order, so a bug that silently sorts by id instead
-//! of tracking real insertion order still fails the order check. Order is
-//! checked cheaply: buried order via the real `peek-buried` command
-//! (O(log n) per check, so checking after every removal stays O(n log n)
-//! overall); reservation order (no O(log n) peek exists for it) via
-//! `Engine::t_conn_reserved` at a handful of checkpoints only, since that
-//! helper rebuilds the whole remaining list.
-//!
-//! Non-`#[ignore]`d tests run at 100k, fast enough for every `cargo test`;
-//! a quadratic scan would take tens of seconds at that size, well outside
-//! normal test-suite time. The `#[ignore]`d tests report both a 100k and a
-//! 1M timing but assert only an absolute bound on the 1M one: at 100k's
-//! sub-100ms scale, a single scheduling hiccup under background load can
-//! swing a 100k-vs-1M *ratio* several-fold, where the 1M absolute time
-//! (seconds) is much less sensitive to the same hiccup, and a
-//! quadratic-time regression would miss the bound by orders of magnitude
-//! rather than by a noise-sized margin. Run them with
-//! `cargo test --release -p bstk-engine --ignored -- --test-threads=1`
-//! and read the printed timings.
+//! §7.2, §7.5; rationale in docs/DESIGN.md §4.6). Inserts happen in a
+//! shuffled order that differs from job id order. Non-`#[ignore]`d tests run
+//! at 100k; the `#[ignore]`d ones also time 1M and assert only an absolute
+//! bound there: `cargo test --release -p bstk-engine --ignored -- --test-threads=1`.
 
 #![allow(clippy::unwrap_used)]
 
@@ -76,20 +55,14 @@ fn shuffled(n: u64, seed: u64) -> Vec<u64> {
     v
 }
 
-/// The smallest of `n` timings of `f`. System jitter only ever adds delay,
-/// so the minimum of a few runs is a much more stable estimate than one
-/// run -- important here because the 100k cases finish in tens of
-/// milliseconds, where a single stray scheduling pause can double the
-/// reading and swing a ratio wildly.
+/// The smallest of `n` timings of `f`: jitter only adds delay, so the minimum
+/// is the stablest estimate for runs this short.
 fn min_of(n: usize, mut f: impl FnMut() -> Duration) -> Duration {
     (0..n).map(|_| f()).min().expect("n > 0")
 }
 
-/// Reports both timings (for the hand-off report) and asserts only the
-/// absolute 1M bound; see the module doc for why a ratio assertion is too
-/// noise-prone at 100k's sub-100ms scale. A quadratic implementation would
-/// take on the order of hours at 1M, not seconds, so this bound is nowhere
-/// near a knife's edge for an O(n log n) one.
+/// Reports both timings and asserts only the absolute 1M bound (a ratio is
+/// too noisy at 100k's scale; see docs/DESIGN.md §4.6).
 fn assert_scales_to_1m(label: &str, small: Duration, big: Duration) {
     eprintln!("  {label}: 100k={small:?} 1M={big:?}");
     let bound = if cfg!(debug_assertions) {
@@ -102,10 +75,6 @@ fn assert_scales_to_1m(label: &str, small: Duration, big: Duration) {
         "{label}: 1M took {big:?}, expected under {bound:?} (100k took {small:?})"
     );
 }
-
-// -----------------------------------------------------------------------
-// Buried jobs (one tube)
-// -----------------------------------------------------------------------
 
 /// Buries `order.len()` jobs, ids `1..=order.len()`, into tube "t", in
 /// `order`, via `Engine::recover` -- this is O(n log n) setup that skips
@@ -303,10 +272,6 @@ fn buried_kick_bulk_time_scales_linearly_100k_vs_1m() {
     let big = run_buried_kick_bulk(1_000_000, 10);
     assert_scales_to_1m("buried kick (bulk)", small, big);
 }
-
-// -----------------------------------------------------------------------
-// One connection's reservations
-// -----------------------------------------------------------------------
 
 /// Puts `n` jobs (sequential ids `1..=n`) and reserves them, on connection
 /// 1, via `reserve-job` in `reserve_order` -- out of id order, so the

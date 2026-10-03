@@ -18,7 +18,6 @@ use subtle::{Choice, ConstantTimeEq};
 
 use crate::config::{MAX_TOKEN_LEN, Tokens};
 
-/// A token padded to a fixed width, plus its real length.
 struct Padded {
     bytes: [u8; MAX_TOKEN_LEN],
     len: u64,
@@ -44,7 +43,6 @@ impl Padded {
     }
 }
 
-/// The tokens accepted by `auth = "token"` listeners.
 pub struct TokenSet {
     tokens: Vec<Padded>,
 }

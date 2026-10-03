@@ -26,7 +26,6 @@ proptest! {
             Some(Frame::Command(decoded)) => prop_assert_eq!(decoded, cmd),
             other => prop_assert!(false, "expected a Command frame, got {other:?} for input {encoded:?}"),
         }
-        // No leftover bytes after decoding exactly one encoded command.
         prop_assert_eq!(buf.len(), 0);
     }
 

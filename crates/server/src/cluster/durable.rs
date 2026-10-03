@@ -20,12 +20,9 @@ use bstk_raft::{CONN_SEQ_BITS, NodeId, conn_id};
 
 /// Local connection numbers reserved per durable write.
 pub const CONN_ID_BLOCK: u64 = 1 << 16;
-/// File holding the first local connection number not yet reserved.
 pub const CONN_IDS_FILE: &str = "conn-ids";
-/// Present while the node is in rejoin mode.
 pub const REJOIN_FILE: &str = "rejoin";
 
-/// Replaces `path` with `contents`, durably.
 pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     let dir = parent(path);
     let tmp = path.with_extension("tmp");
@@ -42,7 +39,6 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     sync_dir(&dir)
 }
 
-/// Removes `path` (if present), durably.
 pub fn remove_durable(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => sync_dir(&parent(path)),
@@ -62,12 +58,10 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-/// Whether the rejoin marker is present in `data_dir`.
 pub fn rejoin_marked(data_dir: &Path) -> bool {
     data_dir.join(REJOIN_FILE).exists()
 }
 
-/// Creates the rejoin marker durably.
 pub fn mark_rejoin(data_dir: &Path) -> io::Result<()> {
     write_atomic(
         &data_dir.join(REJOIN_FILE),
@@ -75,12 +69,10 @@ pub fn mark_rejoin(data_dir: &Path) -> io::Result<()> {
     )
 }
 
-/// Removes the rejoin marker durably.
 pub fn clear_rejoin(data_dir: &Path) -> io::Result<()> {
     remove_durable(&data_dir.join(REJOIN_FILE))
 }
 
-/// Reads the persisted end of the reserved block (`None`: no file).
 pub fn read_conn_ids(data_dir: &Path) -> Result<Option<u64>, String> {
     let path = data_dir.join(CONN_IDS_FILE);
     match std::fs::read_to_string(&path) {
@@ -102,31 +94,20 @@ pub const TIME_FLOOR_SHIFT: u32 = 16;
 /// at least this long after the process started ([`first_local`]).
 pub const FLOOR_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Seconds since the Unix epoch (0 if the clock is before it).
 pub fn unix_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
 }
 
-/// The first local connection number of a new process:
-/// `max(persisted block end, highest number the replicated state has seen
-/// for this node + 1, time floor)` with `time floor = unix_seconds << 16`.
-///
-/// The persisted block end ([`CONN_IDS_FILE`]) covers every number an
-/// earlier process may have handed out, but a wiped data directory loses
-/// it, and the replicated state only knows the numbers whose `Connect` was
-/// committed. The time floor covers the rest: a process that took its
-/// floor at `t0` starts at or above `⌊t0⌋ << 16`, so by time `t` it has
-/// handed out numbers below `t << 16` as long as the node consumes fewer
-/// than 65,536 numbers per second on average (connections, plus one
-/// 65,536 block per restart with the file present). A process from a wiped
-/// directory takes its floor at `t1` at least [`FLOOR_DELAY`] after it
-/// started, hence after the lost process died (at `tc`): `⌊t1⌋ > t1 - 1 >=
-/// tc`, so it starts above all of them. Assumptions (docs/DESIGN.md §8):
-/// that rate, and a wall clock that is not set back across the restart.
-/// The floor must fit in the 48 bits of a local number (until 2106);
-/// otherwise this is an error.
+/// The first local connection number of a new process: `max(persisted block
+/// end, highest number the replicated state has seen for this node + 1, time
+/// floor)`, with `time floor = unix_seconds << 16`. The persisted end covers
+/// every number an earlier process may have handed out; a wiped data directory
+/// loses it, and the state only knows numbers whose `Connect` committed, which
+/// the time floor covers (assumptions and argument: docs/DESIGN.md §8
+/// "Connections"). A floor beyond the 48 bits of a local number (from 2106) is
+/// an error.
 pub fn first_local(persisted: Option<u64>, highest: u64, unix_secs: u64) -> Result<u64, String> {
     let floor = unix_secs
         .checked_shl(TIME_FLOOR_SHIFT)
@@ -145,9 +126,7 @@ pub fn first_local(persisted: Option<u64>, highest: u64, unix_secs: u64) -> Resu
 }
 
 struct Block {
-    /// Next local number to hand out.
     next: u64,
-    /// End (exclusive) of the durably reserved block.
     limit: u64,
 }
 
@@ -164,8 +143,6 @@ pub struct ConnIdBlocks {
 }
 
 impl ConnIdBlocks {
-    /// Starts handing out numbers at `first` (reserving the first block
-    /// durably before returning).
     pub fn open(data_dir: &Path, node: NodeId, first: u64, block: u64) -> Result<Self, String> {
         let this = ConnIdBlocks {
             node,
@@ -209,7 +186,6 @@ impl ConnIdBlocks {
         Some(conn_id(self.node, local))
     }
 
-    /// The next local number that would be handed out (monitoring).
     pub fn peek_local(&self) -> u64 {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).next
     }
@@ -229,7 +205,6 @@ mod tests {
         assert_eq!(read_conn_ids(dir.path()).unwrap(), Some(5));
         let ids: Vec<u64> = (0..6).map(|_| local_of(a.next().unwrap())).collect();
         assert_eq!(ids, [1, 2, 3, 4, 5, 6]);
-        // The sixth number needed a second block.
         assert_eq!(read_conn_ids(dir.path()).unwrap(), Some(9));
         assert_eq!(bstk_raft::owner_of(a.next().unwrap()), 3);
         drop(a);
@@ -241,7 +216,6 @@ mod tests {
         let b = ConnIdBlocks::open(dir.path(), 3, first, 4).unwrap();
         assert_eq!(local_of(b.next().unwrap()), 9);
         assert_eq!(b.peek_local(), 10);
-        // No temporary file is left behind.
         let names: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -254,7 +228,6 @@ mod tests {
     #[test]
     fn wiped_node_starts_above_the_lost_process() {
         let t0: u64 = 1_790_000_000;
-        // First process: empty directory, nothing in the state.
         let dir = tempfile::tempdir().unwrap();
         let first = first_local(None, 0, t0).unwrap();
         assert_eq!(first, t0 << 16);
@@ -277,12 +250,9 @@ mod tests {
         let b = ConnIdBlocks::open(wiped.path(), 2, again, CONN_ID_BLOCK).unwrap();
         assert!(local_of(b.next().unwrap()) > handed);
 
-        // An ordinary restart keeps the persisted end when it is higher.
         let p = read_conn_ids(dir.path()).unwrap().unwrap();
         assert_eq!(first_local(Some(p), highest_seen, t0 + 1).unwrap(), p);
-        // And the state's highest number when that is.
         assert_eq!(first_local(Some(5), 1 << 47, 1).unwrap(), (1 << 47) + 1);
-        // The floor must fit 48 bits.
         assert!(first_local(None, 0, 1 << 32).is_err());
         assert!(first_local(None, 0, u64::MAX).is_err());
         assert!(first_local(None, 0, (1 << 32) - 1).is_ok());

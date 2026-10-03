@@ -1,87 +1,70 @@
-//! The cluster actor: consumes the connection tasks' `EngineMsg`s and
-//! sends them, in order, to the leader.
+//! The cluster actor: consumes the connection tasks' `EngineMsg`s and sends
+//! them, in order, to the leader (docs/DESIGN.md §8 "Forward queue", "Node
+//! loss").
 //!
 //! # Ordering
 //!
 //! The state machine accepts a `Connect` only if its local number is above
-//! every earlier `Connect` of the same node, and any other input only at
-//! its connection's exact next `seq`. So this node's inputs must reach the
-//! log in the order they were generated. They all go through one queue
+//! every earlier `Connect` of the same node, and any other input only at its
+//! connection's exact next `seq`, so this node's inputs must reach the log in
+//! the order they were generated. They all go through one queue
 //! ([`ForwardQueue`]):
 //!
-//! - every message becomes an item `(conn, seq, input)` appended to the
-//!   queue in arrival order (`seq` from a per-connection counter, 1 for
-//!   `Connect`);
+//! - every message becomes an item `(conn, seq, input)` appended in arrival
+//!   order (`seq` from a per-connection counter, 1 for `Connect`);
 //! - one sender drains the queue from a cursor: as the leader, by handing
-//!   every unsent item, in order, to the proposer ([`super::proposer`],
-//!   which proposes them in `Op::Batch` entries together with the inputs
-//!   other owners forwarded, keeping the order of each); otherwise as
+//!   every unsent item, in order, to the [`super::proposer`]; otherwise as
 //!   `ForwardRequest` batches to the leader, one in flight at a time (the
 //!   leader hands each batch to its proposer, in order, before answering);
-//! - an item leaves the queue only when the state machine reports it
-//!   applied (`ReplySink::applied`); being accepted by the leader is not
-//!   enough, as a leader can lose uncommitted entries.
+//! - an item leaves the queue only when the state machine reports it applied
+//!   (`ReplySink::applied`): being accepted by the leader is not enough, as a
+//!   leader can lose uncommitted entries.
 //!
 //! # Resend
 //!
-//! The cursor goes back to the front of the queue ("rewind"), so that every
-//! item not yet applied is sent again in its original order, only when
-//! there is a reason to believe something was lost:
-//! - the leader or the term changes (openraft metrics), which also abandons
-//!   a forward in flight;
-//! - the leader answers `NotLeader`, or a forward fails (then after a short
-//!   pause);
-//! - an item was applied while an item sent before it in the same pass
-//!   was not: entries of one pass reach the log in order, so the earlier
-//!   one was dropped (for example a leader lost and regained leadership
-//!   between two batches without a visible view change);
-//! - as a last resort, the oldest item has not been applied for the stall
-//!   timeout since it was last sent. The timeout starts at
-//!   [`STALL_RESEND`] and doubles after every stall resend up to
-//!   [`STALL_RESEND_MAX`] (reset when the oldest item is applied or the
-//!   view changes), so that an overloaded leader, which is merely slow,
-//!   does not get the whole queue again every few seconds.
-//!
-//! The state machine ignores the duplicates this produces (counted in
-//! `resent_items`). Before such a resend, items that can no longer apply
-//! are pruned (their connection's `Connect` is settled and the connection
-//! is gone, or their `seq` is already applied), and a local connection that
-//! the state no longer has is closed.
+//! The cursor goes back to the front ("rewind") so every unapplied item is
+//! sent again in its original order, only when something was probably lost:
+//! the leader or term changes (which also abandons a forward in flight); the
+//! leader answers `NotLeader` or a forward fails (after a short pause); an item
+//! was applied while one sent before it in the same pass was not (entries of a
+//! pass reach the log in order, so the earlier one was dropped, e.g. a leader
+//! lost and regained leadership between two batches); or, as a last resort,
+//! the oldest item stays unapplied for the stall timeout ([`STALL_RESEND`],
+//! doubling per stall resend up to [`STALL_RESEND_MAX`], reset when the oldest
+//! item is applied or the view changes), so a slow but working leader is not
+//! flooded. The state machine ignores the resulting duplicates
+//! (`resent_items`). Before a resend, items that can no longer apply are
+//! pruned and a local connection the state no longer has is closed.
 //!
 //! # Bounds
 //!
-//! The queue holds at most [`MAX_QUEUE_ITEMS`] items and about
-//! [`MAX_QUEUE_BYTES`] bytes. At the bound, new client connections are
-//! refused at accept (`Clients::admit`) and a put is answered
-//! `OUT_OF_MEMORY` (its body is replaced by a replicated
-//! `PutRejected(OutOfMemory)`, which is what a reference server says when
-//! its binlog cannot take the job). Other inputs of open connections are
-//! still queued: each connection has at most one command in flight, so
-//! they are bounded by the number of connections.
+//! At most [`MAX_QUEUE_ITEMS`] items and about [`MAX_QUEUE_BYTES`] bytes. At
+//! the bound new client connections are refused at accept (`Clients::admit`)
+//! and a put is answered `OUT_OF_MEMORY` (its body is replaced by a replicated
+//! `PutRejected(OutOfMemory)`, what a reference server says when its binlog
+//! cannot take the job). Other inputs of open connections are still queued:
+//! each connection has at most one command in flight, so they are bounded by
+//! the number of connections.
 //!
 //! # Disconnect
 //!
-//! When a connection task ends (the client went away, or this node closed
-//! the socket: `ReplySink::closed`, isolation, shutdown), its guard sends
-//! `Disconnect`. It is queued unless the state has settled the connection's
-//! `Connect` and no longer has the connection (it was dropped already), or
-//! the connection was never queued (refused while isolated).
+//! When a connection task ends (the client left, or this node closed the
+//! socket via `ReplySink::closed`, isolation or shutdown) its guard sends
+//! `Disconnect`; it is queued unless the state has settled the connection's
+//! `Connect` and no longer has the connection, or the connection was never
+//! queued (refused while isolated).
 //!
 //! # Isolation
 //!
-//! The actor tracks when the leader last accepted something from this
-//! node (`last_leader_ok`: a forward, or a *ping*, an empty forward sent
-//! every [`ping_interval`] when there is nothing else to send), which a
-//! rewind does not reset. The node is cut off when:
-//! - it follows a leader that has not accepted anything from it for
-//!   `node_timeout` (this also catches a one-way partition, where the
-//!   leader's replication still reaches this node but nothing gets back);
-//! - or no leader is known, or this node leads without a quorum
-//!   acknowledgement, for `node_timeout`.
-//!
-//! Then every client socket is closed, and so is any new connection (at
-//! accept, before it is numbered or queued) until a leader is reachable
-//! again. Their `Disconnect`s are sent once it is.
+//! The actor tracks when the leader last accepted something from this node
+//! (`last_leader_ok`: a forward, or a *ping* sent every [`ping_interval`] when
+//! there is nothing else to send; a rewind does not reset it). The node is cut
+//! off when it follows a leader that has accepted nothing from it for
+//! `node_timeout` (this also catches a one-way partition), or when no leader is
+//! known, or this node leads without a quorum acknowledgement, for
+//! `node_timeout`. Then every client socket is closed, and so is any new
+//! connection (at accept, before it is numbered or queued) until a leader is
+//! reachable again; their `Disconnect`s are sent once it is.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -103,9 +86,7 @@ use crate::engine_actor::EngineMsg;
 /// Initial stall timeout: resend everything unapplied if the oldest item
 /// waits this long after it was sent.
 pub const STALL_RESEND: Duration = Duration::from_secs(2);
-/// Largest stall timeout (after repeated stall resends).
 pub const STALL_RESEND_MAX: Duration = Duration::from_secs(30);
-/// Pause after a failed forward before trying again.
 const RETRY_PAUSE: Duration = Duration::from_millis(50);
 /// Limits of one `ForwardRequest` (at least one item is always sent).
 const MAX_BATCH_ITEMS: usize = 1024;
@@ -113,9 +94,7 @@ const MAX_BATCH_BYTES: usize = 4 << 20;
 /// Bounds of the forward queue (see the module docs).
 pub const MAX_QUEUE_ITEMS: usize = 100_000;
 pub const MAX_QUEUE_BYTES: usize = 128 << 20;
-/// Housekeeping period (resend, isolation, shutdown).
 const TICK: Duration = Duration::from_millis(50);
-/// Messages handled per wake-up before the queue is pumped.
 const MAX_DRAIN: usize = 1024;
 
 /// How often an owner with nothing to forward pings the leader: a quarter
@@ -129,20 +108,14 @@ struct Item {
     conn: ConnId,
     seq: u64,
     input: EngineInput,
-    /// Approximate encoded size (for batching and the byte bound).
     size: usize,
-    /// Times sent (or proposed).
     sends: u32,
-    /// The pass it was last sent in.
     pass: u64,
 }
 
-/// What [`ForwardQueue::applied`] found.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AppliedOutcome {
-    /// The item was queued (and is now removed).
     found: bool,
-    /// It was the oldest item.
     front: bool,
     /// An item sent before it in the same pass is still unapplied: that
     /// one was dropped.
@@ -155,11 +128,9 @@ struct AppliedOutcome {
 #[derive(Default)]
 struct ForwardQueue {
     items: VecDeque<Item>,
-    /// Items before it have been sent in the current pass.
     cursor: usize,
     pass: u64,
     bytes: usize,
-    /// Items sent again after an earlier send.
     resent: u64,
 }
 
@@ -172,7 +143,6 @@ impl ForwardQueue {
         self.items.is_empty()
     }
 
-    /// At (or beyond) one of the bounds.
     fn full(&self) -> bool {
         self.items.len() >= MAX_QUEUE_ITEMS || self.bytes >= MAX_QUEUE_BYTES
     }
@@ -206,7 +176,6 @@ impl ForwardQueue {
         self.pass += 1;
     }
 
-    /// The next unsent item, marked as sent in the current pass.
     fn send_next(&mut self) -> Option<&Item> {
         let pass = self.pass;
         let item = self.items.get_mut(self.cursor)?;
@@ -223,7 +192,6 @@ impl ForwardQueue {
         self.items.get(self.cursor)
     }
 
-    /// Input `seq` of `conn` was applied.
     fn applied(&mut self, conn: ConnId, seq: u64) -> AppliedOutcome {
         let pos = match self.items.front() {
             Some(f) if f.conn == conn && f.seq == seq => Some(0),
@@ -274,7 +242,6 @@ impl ForwardQueue {
     }
 }
 
-/// What woke the actor.
 enum Wake {
     Message(EngineMsg),
     Forwarded(NodeId, Result<ForwardResponse, ForwardError>),
@@ -287,26 +254,19 @@ type Inflight =
 
 pub struct Actor {
     core: Arc<Core>,
-    /// Next `seq` of every open local connection.
     seqs: HashMap<ConnId, u64>,
     queue: ForwardQueue,
-    /// When the front item was last (re)sent, or became the front.
     front_since: Instant,
-    /// Current stall timeout (see the module docs).
     stall_after: Duration,
     retry_at: Option<Instant>,
-    /// A leader named by a `NotLeader` answer (until the view changes).
     hint: Option<NodeId>,
     view: (Option<NodeId>, u64),
-    /// Last time a leader accepted a forward or ping from this node.
     last_leader_ok: Instant,
     last_ping: Option<Instant>,
     ping_every: Duration,
-    /// Since when no leader is known, or this node leads without a quorum.
     unreachable_since: Option<Instant>,
     isolated: bool,
     was_started: bool,
-    /// Last resend caused by an out-of-order apply.
     last_drop_resend: Option<Instant>,
     shutdown: Option<(Instant, oneshot::Sender<()>)>,
 }
@@ -361,7 +321,6 @@ impl Actor {
                 } => Wake::Forwarded(target, res),
                 changed = metrics.changed() => {
                     if changed.is_err() {
-                        // Raft has stopped; nothing more can be sent.
                         return;
                     }
                     Wake::View
@@ -407,7 +366,6 @@ impl Actor {
         }
     }
 
-    /// Updates the shared status and the admission of new clients.
     fn publish(&self) {
         let st = &self.core.status;
         let full = self.queue.full();
@@ -421,8 +379,6 @@ impl Actor {
             .clients
             .set_admitting(!(self.isolated || self.shutdown.is_some() || full));
     }
-
-    // ------------------------------------------------------------ input
 
     fn on_message(&mut self, msg: EngineMsg) {
         match msg {
@@ -486,8 +442,6 @@ impl Actor {
         }
     }
 
-    /// Whether the replicated state has settled `conn`'s `Connect` and no
-    /// longer has the connection.
     fn gone(&self, conn: ConnId) -> bool {
         let st = &self.core.state;
         local_of(conn) <= st.highest_local(self.core.id) && st.applied_seq(conn).is_none()
@@ -535,8 +489,6 @@ impl Actor {
         }
     }
 
-    // ------------------------------------------------------------ sending
-
     fn rewind(&mut self, cause: &std::sync::atomic::AtomicU64) {
         if self.queue.cursor > 0 {
             cause.fetch_add(1, Ordering::Relaxed);
@@ -545,7 +497,6 @@ impl Actor {
         self.front_since = Instant::now();
     }
 
-    /// Returns whether a forward in flight must be abandoned.
     fn on_view_change(&mut self) -> bool {
         let view = self.core.view();
         if view == self.view {
@@ -605,7 +556,6 @@ impl Actor {
             while let Some(item) = self.queue.send_next() {
                 items.push((item.seq, item.input.clone()));
             }
-            // An error means Raft has stopped: nothing can be sent anymore.
             let _ = core.submit(items);
             return None;
         }
@@ -630,8 +580,6 @@ impl Actor {
         Some(forward(&core, target, items))
     }
 
-    /// A ping (an empty forward) to the leader, when this node follows one
-    /// and has not sent it anything for `ping_every`.
     fn ping(&mut self, core: &Arc<Core>) -> Option<Inflight> {
         let target = self
             .hint
@@ -647,9 +595,6 @@ impl Actor {
         Some(forward(core, target, Vec::new()))
     }
 
-    // ------------------------------------------------------ housekeeping
-
-    /// Returns true when the actor must stop (shutdown finished).
     fn on_tick(&mut self) -> bool {
         let now = Instant::now();
         if self.queue.cursor > 0 && now.duration_since(self.front_since) >= self.stall_after {
@@ -678,8 +623,6 @@ impl Actor {
         false
     }
 
-    /// Drops items that can no longer apply; closes local connections the
-    /// state no longer has.
     fn prune(&mut self) {
         let st = &self.core.state;
         let highest = st.highest_local(self.core.id);
@@ -713,7 +656,6 @@ impl Actor {
             return;
         }
         if !self.was_started {
-            // Startup may have taken long; count from now.
             self.was_started = true;
             self.last_leader_ok = now;
         }
@@ -761,7 +703,6 @@ fn forward(core: &Arc<Core>, target: NodeId, items: Vec<(ConnId, u64, EngineInpu
     Box::pin(async move { (target, net.forward(target, req).await) })
 }
 
-/// SIGUSR1: cluster-wide drain mode, retried until the leader has it.
 async fn set_draining(core: Arc<Core>, on: bool) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -827,11 +768,9 @@ mod tests {
             connect(&mut q, c);
         }
         send_all(&mut q);
-        // Item 1 was lost; item 2 is applied.
         let out = q.applied(2, 1);
         assert!(out.found && !out.front && out.dropped_before, "{out:?}");
         assert_eq!(q.cursor, 2);
-        // The resend of the remaining two counts as duplicates.
         q.rewind();
         assert_eq!(send_all(&mut q), [(1, 1), (3, 1)]);
         assert_eq!(q.resent, 2);
@@ -839,7 +778,6 @@ mod tests {
         // latest copy.
         let out = q.applied(3, 1);
         assert!(out.found && !out.dropped_before, "{out:?}");
-        // Not queued (a duplicate apply): nothing found.
         assert_eq!(q.applied(3, 1), AppliedOutcome::default());
     }
 
@@ -848,8 +786,6 @@ mod tests {
         let mut q = ForwardQueue::default();
         connect(&mut q, 1);
         send_all(&mut q);
-        // A view change: the queue is rewound but not yet resent; a new
-        // item is sent in the new pass, the old one is not yet resent.
         q.rewind();
         connect(&mut q, 2);
         q.cursor = 1;

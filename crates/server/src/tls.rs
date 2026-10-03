@@ -1,15 +1,10 @@
-//! TLS server configurations for TLS listeners (docs/PLAN.md §5.3
-//! decision 2): the certificate chain and private key from `[tls]` (PEM),
-//! and for `auth = "mtls"` listeners a client-certificate verifier over
-//! the `client_ca` bundle.
-//!
-//! Two configurations are built from the same certificate: one that never
-//! requests a client certificate (TLS listeners with `auth = "none"` or
-//! `"token"`), and, only when `client_ca` is set, one that requires a
-//! client certificate chaining to that CA (`auth = "mtls"` listeners).
-//!
-//! The crypto provider (aws-lc-rs, rustls' default) is always passed
-//! explicitly rather than taken from the process default.
+//! TLS server configurations for TLS listeners (docs/PLAN.md §5.3 decision
+//! 2): the certificate chain and private key from `[tls]` (PEM), built into
+//! one configuration that never requests a client certificate (`auth =
+//! "none"` or `"token"`) and, only when `client_ca` is set, one that requires
+//! a client certificate chaining to that CA (`auth = "mtls"`). The crypto
+//! provider (aws-lc-rs) is passed explicitly rather than taken from the
+//! process default.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -22,17 +17,14 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::config::TlsFiles;
 
-/// The server configurations for every kind of TLS listener.
 #[derive(Clone)]
 pub struct TlsConfigs {
-    /// No client certificate is requested.
     pub plain: Arc<ServerConfig>,
     /// A client certificate signed by `client_ca` is required; `None`
     /// without `client_ca` (then no listener uses mTLS).
     pub mtls: Option<Arc<ServerConfig>>,
 }
 
-/// Why TLS material could not be loaded; names the file involved.
 #[derive(Debug)]
 pub struct TlsError(String);
 

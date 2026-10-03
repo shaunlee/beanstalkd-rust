@@ -46,7 +46,6 @@ fn format_roundtrip() {
     ));
     assert!(matches!(parse_at(&buf, buf.len()), Parsed::End));
 
-    // Restamping keeps a valid CRC and changes the record.
     let mut put = buf[..p].to_vec();
     let mut r2 = r.clone();
     r2.bury_ct = 9;
@@ -55,7 +54,6 @@ fn format_roundtrip() {
         matches!(parse_at(&put, 0), Parsed::Rec { rec: Rec::Put { record, .. }, .. } if record == r2)
     );
 
-    // Any flipped bit is detected.
     for i in 0..p {
         let mut bad = buf[..p].to_vec();
         bad[i] ^= 0x10;
@@ -215,7 +213,6 @@ fn new_segment_every_open_and_indexes_never_reused() {
         write(&mut wal, &[JournalEntry::Delete(i + 1)]);
         wal.maintain().unwrap();
     }
-    // Dead segments were collected.
     assert!(seg_files(t.path()).len() <= 3);
 }
 
@@ -308,11 +305,9 @@ fn reservation_fails_at_limit_but_updates_and_deletes_proceed() {
     assert_eq!(seg_files(t.path()).len(), 3);
     // Still refused: nothing changed.
     assert!(!wal.reserve_put(1, body.len()));
-    // Updates use the spare.
     for j in 1..=id {
         wal.append(&[buried(j, 1)]).unwrap();
     }
-    // Deletes never need allocation and free space after compaction/gc.
     for j in 1..=id {
         wal.append(&[JournalEntry::Delete(j)]).unwrap();
     }

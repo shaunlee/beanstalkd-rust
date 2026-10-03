@@ -98,7 +98,6 @@ fn check_config_rejects_invalid_files() {
         assert_eq!(status.code(), Some(1), "{what}: {out} {err}");
         assert!(err.contains("invalid configuration"), "{what}: {err}");
         assert!(!err.contains(TOKEN), "{what}: {err}");
-        // Starting the server fails the same way.
         let (status, _, err) = run(&["--config", &path]);
         assert_eq!(status.code(), Some(1), "{what}: {err}");
         assert!(!err.contains(TOKEN), "{what}: {err}");
@@ -196,7 +195,6 @@ fn loose_tokens_file_permissions_warn() {
     );
     assert!(!log.contains(TOKEN), "{log}");
 
-    // 0600 is quiet.
     let dir = tempfile::tempdir().unwrap();
     Certs::generate(dir.path());
     let tokens = dir.path().join("tokens.txt");

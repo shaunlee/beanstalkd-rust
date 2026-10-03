@@ -1,23 +1,12 @@
 //! The deterministic beanstalkd state machine. Ground truth for every rule
 //! implemented here is `.ref/beanstalkd/{prot,conn,tube,job,ms,heap}.c`.
 //!
-//! Every time-driven event is kept in an ordered index, so `tick` and
-//! `next_deadline` cost O(log n) instead of scanning every tube and
-//! connection:
-//!
-//! * `conn_ticks`: each connection's `conntickat` (the earliest of its
-//!   reserve timeout, the safety margin of its soonest reserved job, and
-//!   that job's TTR expiry), like the reference's connection heap.
-//! * `delay_heads`: the deadline of the soonest delayed job of each tube.
-//! * `pauses`: the unpause time of each paused tube.
-//!
-//! `dispatchable` holds the tubes that have both waiting connections and
-//! ready jobs, the only ones `process_queue` can act on. Each index is
-//! updated by the helper that changes its inputs (`refresh_conn_tick`,
-//! `refresh_delay_head`, `refresh_dispatchable`, `set_pause` /
-//! `clear_expired_pauses`). The frozen pre-index engine in
-//! `crates/engine-oracle` is the behavioral reference for all of this (see
-//! the `oracle` test module).
+//! Every time-driven event sits in an ordered index (`conn_ticks`,
+//! `delay_heads`, `pauses`, plus `dispatchable` for `process_queue`), each
+//! kept current by the helper that changes its inputs (`refresh_*`,
+//! `set_pause`, `clear_expired_pauses`), so `tick` and `next_deadline` cost
+//! O(log n); see docs/DESIGN.md §4.2 and §4.3. The frozen engine in
+//! `crates/engine-oracle` is the behavioral reference (`oracle_tests`).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -39,12 +28,10 @@ use crate::{
 /// `SAFETY_MARGIN` in conn.c: 1 second.
 const SAFETY_MARGIN: Nanos = NANOS_PER_SEC;
 
-/// Largest tube slab (`tubes.len()`, live tubes plus free slots) accepted
-/// by `import_state`. The slab never shrinks (freed slots are reused, not
-/// dropped), so free slots cannot be bounded by the live tubes; but a slab
-/// this large means some 16 million tubes existed at once, gigabytes of
-/// tube state in the running engine, which no healthy node produces. The
-/// check runs before the per-tube arrays of `validate` are allocated.
+/// Largest tube slab (live tubes plus free slots; it never shrinks) accepted
+/// by `import_state`. A slab this large means some 16 million tubes existed
+/// at once, which no healthy node produces. Checked before `validate`
+/// allocates its per-tube arrays.
 const MAX_TUBE_SLOTS: usize = if cfg!(test) { 1 << 12 } else { 1 << 24 };
 
 /// Largest `next_list_seq` (`JobRec::list_seq` counter) accepted by
@@ -63,21 +50,14 @@ pub struct Engine {
     draining: bool,
 
     next_job_id: JobId,
-    /// Boxed so a hashbrown table sitting well under its 7/8 max load
-    /// (which it does for a long stretch after every doubling -- e.g.
-    /// 47.7% full right after growing for 1,000,000 jobs, until roughly
-    /// another million inserts) wastes only a pointer's worth of slot
-    /// space per job, not a whole `JobRec`; the job data itself is a
-    /// separate, exactly-sized allocation, as in the reference's `Job*`
-    /// bucket array (the reference tolerates load factors up to 4). See
-    /// docs/BENCH.md P4-T4 for the measurement.
+    /// Boxed so a sparse hash table costs a pointer per empty slot, not a whole
+    /// `JobRec` (docs/BENCH.md P4-T4).
     jobs: HashMap<JobId, Box<JobRec>>,
     /// Next key handed out for `TubeState::buried` / `ConnState::reserved`
     /// (`JobRec::list_seq`). One counter for both, like the reference's
     /// shared `prev`/`next` pair: a job is never in both lists at once.
     next_list_seq: u64,
 
-    /// Tube slab, indexed by `TubeId`; `None` marks a free slot.
     tubes: Vec<Option<TubeState>>,
     free_tube_ids: Vec<TubeId>,
     tube_ids: HashMap<TubeName, TubeId>,
@@ -88,7 +68,6 @@ pub struct Engine {
 
     conns: HashMap<ConnId, ConnState>,
 
-    /// `(conntickat, conn)` for every connection that has one.
     conn_ticks: BTreeSet<(Nanos, ConnId)>,
     /// `(deadline of the soonest delayed job, tube)` for every tube with
     /// delayed jobs.
@@ -140,7 +119,6 @@ pub struct Engine {
 
     /// Pending binlog records (only ever non-empty when `cfg.journal`).
     journal: Vec<JournalEntry>,
-    /// Binlog fields of `stats`, pushed by the server.
     binlog: BinlogStats,
     /// Runtime setting of this process, deliberately outside `EngineState`
     /// and `EngineConfig`: see `set_local_conns` and docs/DESIGN.md §8a.
@@ -210,6 +188,7 @@ impl Engine {
         e
     }
 
+    /// Registers a new connection (it uses and watches "default").
     pub fn connect(&mut self, _now: Nanos, conn: ConnId) {
         if let Some(t) = self.tube_mut(DEFAULT_TUBE) {
             t.using_ct += 1;
@@ -226,6 +205,9 @@ impl Engine {
         self.tot_conns += 1;
     }
 
+    /// The connection closed: releases its reserved jobs, drops it from wait
+    /// queues and dereferences its tubes. Never produces replies for `conn`,
+    /// but may for others (released jobs can wake waiters).
     pub fn disconnect(&mut self, now: Nanos, conn: ConnId, out: &mut Outbox) {
         if !self.conns.contains_key(&conn) {
             return;
@@ -284,6 +266,8 @@ impl Engine {
         self.cur_conns = self.cur_conns.saturating_sub(1);
     }
 
+    /// The client half-closed its socket: a connection waiting on reserve gets
+    /// TIMED_OUT (`STATE_WAIT` / `halfclosed` in prot.c).
     pub fn half_close(&mut self, _now: Nanos, conn: ConnId, out: &mut Outbox) {
         let waiting = self.conns.get(&conn).map(|c| c.waiting).unwrap_or(false);
         if waiting {
@@ -340,6 +324,11 @@ impl Engine {
         self.reply(out, conn, why.response());
     }
 
+    /// Executes one command. `Command::Quit` is the server's business and must
+    /// not be passed here. A reserve that must wait produces no reply now; a
+    /// later call (`handle`, `tick`, `disconnect`) emits it. Callers must not
+    /// send another command for `conn` until it has received the reply to the
+    /// previous one.
     pub fn handle(&mut self, now: Nanos, conn: ConnId, cmd: Command, out: &mut Outbox) {
         if !self.conns.contains_key(&conn) {
             return;
@@ -384,6 +373,8 @@ impl Engine {
         }
     }
 
+    /// Processes everything due at or before `now`: delays, TTRs,
+    /// DEADLINE_SOON, reserve timeouts and pause expiry.
     pub fn tick(&mut self, now: Nanos, out: &mut Outbox) {
         // Nothing is due before the earliest indexed deadline. This is the
         // common case: the server ticks after every message.
@@ -392,7 +383,6 @@ impl Engine {
             _ => return,
         }
 
-        // 1. Delayed jobs whose deadline has passed, soonest first.
         while let Some((deadline, tube, id)) = self.soonest_delayed_job() {
             if deadline > now {
                 break;
@@ -409,17 +399,11 @@ impl Engine {
             self.process_queue(now, out);
         }
 
-        // 3. Connections with a due TTR/margin/explicit-timeout event,
-        // processed one at a time in `(tickat, conn)` order (re-reading the
-        // index each round, since processing one connection can change
-        // others' schedules via process_queue reassignment). Each
-        // connection is handled at most once per tick() call:
-        // `conn_timeout` drains every one of *its* overdue reserved jobs and
-        // reaches a final, stable decision, so a second pass over the same
-        // still-due connection (e.g. an exact boundary case where the
-        // deadline equals `now`, mirroring the reference's strict `>=`
-        // check, which yields a genuine no-op) cannot make further progress
-        // and must not be retried.
+        // Each connection is handled at most once per tick: `conn_timeout` drains
+        // all of its overdue jobs, so a second pass over a still-due connection
+        // (deadline exactly `now`, the reference's strict `>=`) cannot progress. The
+        // index is re-read each round because handling one connection can
+        // reschedule others.
         let mut processed: HashSet<ConnId> = HashSet::new();
         loop {
             let next = self
@@ -434,6 +418,7 @@ impl Engine {
         }
     }
 
+    /// Earliest time `tick` must be called, if any.
     pub fn next_deadline(&self) -> Option<Nanos> {
         [
             self.delay_heads.first().map(|&(d, _)| d),
@@ -445,7 +430,7 @@ impl Engine {
         .min()
     }
 
-    /// P3: run one input, then `tick(now)` (see `EngineInput`).
+    /// Runs one input, then `tick(now)` (see `EngineInput`).
     pub fn apply_input(&mut self, now: Nanos, input: EngineInput, out: &mut Outbox) {
         match input {
             EngineInput::Connect(c) => self.connect(now, c),
@@ -460,7 +445,7 @@ impl Engine {
         self.tick(now, out);
     }
 
-    /// P3: ids of all connections, ascending.
+    /// Ids of all connections, ascending.
     pub fn conn_ids(&self) -> Vec<ConnId> {
         let mut ids: Vec<ConnId> = self.conns.keys().copied().collect();
         ids.sort_unstable();
@@ -869,36 +854,24 @@ impl Engine {
         Ok(e)
     }
 
+    /// SIGUSR1 drain mode: `put` replies DRAINING.
     pub fn set_draining(&mut self, on: bool) {
         self.draining = on;
     }
 
     /// Rebuilds the state after a restart, as `prot_replay` in prot.c does
-    /// for the job list `walinit` read (docs/PLAN.md §4.1):
+    /// (docs/DESIGN.md §4.5, docs/COMPAT.md Binlog items 2 to 5): jobs are
+    /// created in the given first-record order, a replayed buried job counts one
+    /// more bury, a delayed job past its deadline becomes ready, cumulative
+    /// counters start at zero, and no journal entries are produced.
     ///
-    /// * jobs are created in the given (first-record) order, so tubes are
-    ///   created in order of first appearance after "default", and buried
-    ///   jobs enter each tube's buried FIFO in that order;
-    /// * a buried job goes through `bury_job` again, which counts one more
-    ///   bury (the reference's replay quirk);
-    /// * a delayed job whose deadline has passed (`deadline_at <= now`)
-    ///   becomes ready and keeps its `delay`; otherwise it stays delayed
-    ///   until its original deadline;
-    /// * cumulative counters (`cmd-*`, `total-jobs`, per-tube `total-jobs`
-    ///   and `cmd-delete`, ...) start at zero, and recovered jobs don't count
-    ///   toward `total-jobs`;
-    /// * no journal entries are produced.
+    /// A job reserved at crash time comes back in its last journaled state: a
+    /// reserved state never appears in a record (in the reference only
+    /// compaction writes one, and `readrec` maps it to ready).
     ///
-    /// A job reserved at crash time was never journaled as reserved, so it
-    /// arrives here in its last journaled state, with that record's
-    /// counters. (A reserved state never appears in a record; in the
-    /// reference only compaction writes one, and `readrec` maps it to
-    /// ready.)
-    ///
-    /// Known difference: while replaying, the reference also creates the
-    /// tube of a deleted job at its put record and destroys it (swap-remove)
-    /// at its delete record, which can reorder `list-tubes`. `Recovery` only
-    /// carries live jobs, so we cannot reproduce that (docs/COMPAT.md).
+    /// While replaying, the reference also creates the tube of a deleted job and
+    /// destroys it again, which can reorder `list-tubes`; `Recovery` carries only
+    /// live jobs, so that is not reproduced.
     pub fn recover(
         now: Nanos,
         cfg: EngineConfig,
@@ -944,9 +917,8 @@ impl Engine {
                     release_ct: r.release_ct,
                     bury_ct: r.bury_ct,
                     kick_ct: r.kick_ct,
-                    // The reference reports the file holding the job's full
-                    // record; that is the store's business and the field is
-                    // masked in differential tests.
+                    // The file index is the store's business; stats-job `file` is masked in
+                    // differential tests.
                     file: 0,
                 }),
             );
@@ -968,22 +940,21 @@ impl Engine {
         e
     }
 
-    /// Moves every pending journal entry into `buf`, in order.
+    /// Moves every pending journal entry into `buf` (appending, in order).
     pub fn take_journal(&mut self, buf: &mut Vec<JournalEntry>) {
         buf.append(&mut self.journal);
     }
 
+    /// Binlog fields reported by `stats`, pushed by the server after every
+    /// binlog write.
     pub fn set_binlog_stats(&mut self, stats: BinlogStats) {
         self.binlog = stats;
     }
 
-    /// Build replies only for connections `local` owns (`None`, the
-    /// default: for every connection). Every other effect of an input is
-    /// unchanged, so engines that differ only in this setting export equal
-    /// states; replies for the other connections are simply never built,
-    /// which is what a cluster node wants for the connections another node
-    /// holds. Not part of the exported state: set it again after
-    /// `import_state`.
+    /// Build replies only for connections `local` owns (`None`: all of them).
+    /// Everything else about an input is unchanged, so engines differing only in
+    /// this setting export equal states. Not part of the exported state: set it
+    /// again after `import_state`.
     pub fn set_local_conns(&mut self, local: Option<LocalConns>) {
         self.local_conns = local;
     }
@@ -1016,9 +987,6 @@ impl Engine {
     }
 }
 
-// ---------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------
 impl Engine {
     /// The persistent record of `j` as it is now (`j->r` in the
     /// reference), for a journal entry.
@@ -1063,8 +1031,7 @@ impl Engine {
         self.journal.push(entry);
     }
 
-    /// Journals a later transition of job `id` (a short record): release
-    /// with delay, bury, kick and kick-job.
+    /// Journals a later transition of job `id` (a short record).
     fn journal_update(&mut self, id: JobId) {
         if !self.cfg.journal {
             return;
@@ -1149,7 +1116,6 @@ impl Engine {
         self.free_tube_ids.push(id);
     }
 
-    /// Re-derives whether `tube` belongs in `dispatchable`.
     fn refresh_dispatchable(&mut self, tube: TubeId) {
         let Some(t) = self.tubes.get_mut(tube).and_then(Option::as_mut) else {
             return;
@@ -1165,7 +1131,6 @@ impl Engine {
         }
     }
 
-    /// Re-derives `tube`'s entry in `delay_heads`.
     fn refresh_delay_head(&mut self, tube: TubeId) {
         let Some(t) = self.tubes.get_mut(tube).and_then(Option::as_mut) else {
             return;
@@ -1512,20 +1477,10 @@ impl Engine {
             .any(|&t| self.tube(t).is_some_and(|ts| !ts.ready.is_empty()))
     }
 
-    /// `conn_timeout`: drains every reserved job of `cid` whose TTR has
-    /// fully expired, then decides whether to emit DEADLINE_SOON or
-    /// TIMED_OUT for a connection that is (still) waiting on reserve.
-    ///
-    /// Deliberate simplification vs. the reference: the DEADLINE_SOON /
-    /// TIMED_OUT decision is (re)computed *after* the expiry loop, using
-    /// live state, rather than snapshotting it before the loop runs. This
-    /// is observably identical in every case except one pathological
-    /// corner of the reference (a connection's own about-to-fully-expire
-    /// job gets immediately re-reserved back to itself by `process_queue`
-    /// inside the very same expiry pass, in which case the reference
-    /// silently discards the RESERVED reply and sends DEADLINE_SOON
-    /// instead). We consider that reference behavior a bug and do not
-    /// reproduce it; see the T2 report for details.
+    /// `conn_timeout`: drains the connection's fully expired reserved jobs, then
+    /// decides DEADLINE_SOON or TIMED_OUT for a connection still waiting on
+    /// reserve. The decision uses live state after the drain; see
+    /// docs/COMPAT.md D1.
     fn conn_timeout(&mut self, cid: ConnId, now: Nanos, out: &mut Outbox) {
         while let Some((deadline, job_id)) = self.conns.get(&cid).and_then(|c| c.soonest_reserved())
         {
@@ -1613,9 +1568,6 @@ impl Engine {
     }
 }
 
-// ---------------------------------------------------------------------
-// State validation (P3 snapshots)
-// ---------------------------------------------------------------------
 impl Engine {
     /// Checks every structural invariant the engine relies on, recomputing
     /// each index and counter from scratch and comparing it with the stored
@@ -2103,9 +2055,6 @@ fn conn_tickat(c: &ConnState) -> Option<Nanos> {
     t.map(|v| v.max(0) as Nanos)
 }
 
-// ---------------------------------------------------------------------
-// Command handlers
-// ---------------------------------------------------------------------
 impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn cmd_put(
@@ -2171,12 +2120,10 @@ impl Engine {
             release_ct: 0,
             bury_ct: 0,
             kick_ct: 0,
-            // Approximation: the index of the binlog file the server last
-            // reported, not necessarily the one this job's first record
-            // lands in (the store may start a new file for it). The
-            // reference reports `j->file->seq`, which also changes when
-            // compaction moves the job; the field is masked in differential
-            // tests.
+            // Approximation: the file index the server last reported, not necessarily
+            // the file this job's first record lands in. The reference reports
+            // `j->file->seq`, which compaction changes; the field is masked in
+            // differential tests.
             file: if self.cfg.journal {
                 self.binlog.current_index
             } else {
@@ -2604,11 +2551,6 @@ impl Engine {
     }
 }
 
-// ---------------------------------------------------------------------
-// Stats / introspection builders. `pub(crate)` only: this does not widen
-// the public API. Kept separate from `to_yaml()` so tests can assert on
-// struct fields directly without depending on T1's YAML formatting.
-// ---------------------------------------------------------------------
 impl Engine {
     fn wants_reply(&self, cid: ConnId) -> bool {
         self.local_conns.is_none_or(|l| l.owns(cid))
@@ -2761,9 +2703,6 @@ impl Engine {
     }
 }
 
-// ---------------------------------------------------------------------
-// Test-only introspection. Never widens the public API (all pub(crate)).
-// ---------------------------------------------------------------------
 #[cfg(test)]
 impl Engine {
     fn t_tube_by_name(&self, name: &TubeName) -> Option<&TubeState> {
@@ -2778,7 +2717,6 @@ impl Engine {
         self.next_job_id
     }
 
-    /// A copy of job `id`'s internal record and its tube's name.
     pub(crate) fn t_job_raw(&self, id: JobId) -> Option<(JobRec, TubeName)> {
         self.jobs
             .get(&id)
@@ -2886,7 +2824,6 @@ impl Engine {
         self.conns.keys().copied().collect()
     }
 
-    /// `Some(too_big)` while `cid` has a put in flight.
     pub(crate) fn t_conn_pending_put(&self, cid: ConnId) -> Option<bool> {
         self.conns
             .get(&cid)
@@ -3114,7 +3051,6 @@ mod tests {
         }
     }
 
-    /// Asserts exactly one reply was produced for `cid` and returns it.
     fn only(out: &Outbox, cid: u64) -> Response {
         let matches: Vec<&Response> = out
             .iter()
@@ -3129,7 +3065,6 @@ mod tests {
         matches[0].clone()
     }
 
-    /// Asserts no reply was produced for `cid`.
     fn none_for(out: &Outbox, cid: u64) {
         assert!(
             out.iter().all(|(c, _)| *c != cid),
@@ -3142,10 +3077,6 @@ mod tests {
         e.handle(now, cid, cmd, &mut out);
         out
     }
-
-    // -----------------------------------------------------------------
-    // connect / put / basic tube plumbing
-    // -----------------------------------------------------------------
 
     #[test]
     fn connect_uses_and_watches_default() {
@@ -3164,7 +3095,6 @@ mod tests {
         let id2 = put(&mut e, 0, 1, 0, 0, 0, "b");
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
-        // ttr=0 is bumped to 1 second.
         let stats = e.build_stats_job(id1, 0).unwrap();
         assert_eq!(stats.ttr, 1);
         assert_eq!(e.t_job_state(id1), Some("ready"));
@@ -3220,7 +3150,6 @@ mod tests {
         e.connect(0, 1);
         let out = handle(&mut e, 0, 1, Command::Watch(tube("foo")));
         assert_eq!(only(&out, 1), Response::Watching(2));
-        // Re-watching the same tube does not double-count.
         let out = handle(&mut e, 0, 1, Command::Watch(tube("foo")));
         assert_eq!(only(&out, 1), Response::Watching(2));
 
@@ -3253,7 +3182,6 @@ mod tests {
         for name in ["a", "b", "c"] {
             handle(&mut e, 0, 1, Command::Watch(tube(name)));
         }
-        // watch order: default, a, b, c
         assert_eq!(
             e.watched_tube_names(1),
             vec![tube("default"), tube("a"), tube("b"), tube("c")]
@@ -3281,7 +3209,6 @@ mod tests {
         let mut e = engine_at(0);
         e.connect(0, 1);
         e.disconnect(0, 1, &mut Outbox::new());
-        // No connections left at all, yet "default" must still exist.
         assert!(e.t_tube_exists(&tube("default")));
     }
 
@@ -3291,19 +3218,13 @@ mod tests {
         e.connect(0, 1);
         handle(&mut e, 0, 1, Command::Use(tube("foo")));
         let id = put(&mut e, 0, 1, 0, 0, 0, "x");
-        // Switch away and disconnect; the tube must survive because of the job.
         handle(&mut e, 0, 1, Command::Use(tube("default")));
         e.disconnect(0, 1, &mut Outbox::new());
         assert!(e.t_tube_exists(&tube("foo")));
-        // Once the job is gone (via a fresh connection deleting it), it's collected.
         e.connect(0, 2);
         handle(&mut e, 0, 2, Command::Delete(id));
         assert!(!e.t_tube_exists(&tube("foo")));
     }
-
-    // -----------------------------------------------------------------
-    // reserve / reserve-with-timeout / reserve-job
-    // -----------------------------------------------------------------
 
     #[test]
     fn reserve_returns_ready_job_immediately() {
@@ -3404,7 +3325,6 @@ mod tests {
         let ready_id = put(&mut e, 0, 1, 0, 0, 0, "r");
         let delayed_id = put(&mut e, 0, 1, 0, 100, 0, "d");
         let buried_id = put(&mut e, 0, 1, 0, 0, 0, "b");
-        // conn 1 reserves buried_id then buries it.
         handle(&mut e, 0, 1, Command::ReserveJob(buried_id));
         handle(
             &mut e,
@@ -3439,15 +3359,10 @@ mod tests {
         assert_eq!(only(&out, 2), Response::NotFound);
     }
 
-    // -----------------------------------------------------------------
-    // deadline-soon (both triggers)
-    // -----------------------------------------------------------------
-
     #[test]
     fn deadline_soon_on_reserve_when_no_job_ready() {
         let mut e = engine_at(0);
         e.connect(0, 1);
-        // ttr=2s; margin is 1s, so at t=1s we're within the margin.
         let id = put(&mut e, 0, 1, 0, 0, 2, "x");
         handle(&mut e, 0, 1, Command::ReserveJob(id));
         let out = handle(&mut e, SEC, 1, Command::Reserve);
@@ -3473,17 +3388,11 @@ mod tests {
         );
     }
 
-    /// Empirically verified against the reference binary: when the
-    /// shortcut is skipped because a ready job exists on a *paused* tube
-    /// (so `conn_ready` is true but `process_queue` can't actually hand it
-    /// out), the connection is registered as waiting -- and since it was
-    /// already past the margin at that very moment, an immediate `tick`
-    /// call at the *same* `now` resolves it to DEADLINE_SOON right away,
-    /// exactly like the reference's near-zero-latency event loop
-    /// re-entering `prottick` right after `dispatch_cmd`. This means
-    /// bstk-server (T4) MUST call `tick(now)` immediately after every
-    /// `handle()`, not only when `next_deadline()` says so, or this
-    /// class of DEADLINE_SOON would be delayed compared to the reference.
+    /// Verified against the reference binary: a reserve skips the DEADLINE_SOON
+    /// shortcut when a ready job exists only in a *paused* tube (`conn_ready`
+    /// ignores pause), so the connection starts waiting already past the margin
+    /// and an immediate `tick` at the same `now` resolves it to DEADLINE_SOON.
+    /// This is why the server ticks after every engine call (docs/DESIGN.md §3).
     #[test]
     fn deadline_soon_shortcut_skip_on_paused_ready_job_resolves_on_immediate_tick() {
         let mut e = engine_at(0);
@@ -3512,9 +3421,6 @@ mod tests {
         none_for(&out, 1);
         assert!(e.t_conn_waiting(1));
 
-        // But it was already overdue for the margin the instant it started
-        // waiting, so next_deadline() says "now" (or earlier), and an
-        // immediate tick at the same `now` resolves it to DEADLINE_SOON.
         assert_eq!(e.next_deadline(), Some(SEC));
         let mut out = Outbox::new();
         e.tick(SEC, &mut out);
@@ -3534,12 +3440,10 @@ mod tests {
         let out = handle(&mut e, 0, 1, Command::Reserve);
         none_for(&out, 1);
 
-        // Margin point: deadline(3s) - 1s = 2s.
         assert_eq!(e.next_deadline(), Some(2 * SEC));
         let mut out = Outbox::new();
         e.tick(2 * SEC, &mut out);
         assert_eq!(only(&out, 1), Response::DeadlineSoon);
-        // The held job is untouched: still reserved, not requeued/expired.
         assert_eq!(e.t_job_state(held), Some("reserved"));
         assert!(!e.t_conn_waiting(1));
 
@@ -3552,10 +3456,6 @@ mod tests {
         none_for(&out, 1);
         assert_eq!(e.t_job_state(held), Some("ready"));
     }
-
-    // -----------------------------------------------------------------
-    // delete / release / bury / touch
-    // -----------------------------------------------------------------
 
     #[test]
     fn delete_removes_from_every_state() {
@@ -3701,8 +3601,6 @@ mod tests {
         e.connect(0, 1);
         let id = put(&mut e, 0, 1, 0, 0, 4, "x");
         handle(&mut e, 0, 1, Command::ReserveJob(id));
-        // Halfway through the TTR, touch should push the deadline forward
-        // again so a tick at the *original* deadline no longer expires it.
         let out = handle(&mut e, 2 * SEC, 1, Command::Touch(id));
         assert_eq!(only(&out, 1), Response::Touched);
 
@@ -3719,10 +3617,6 @@ mod tests {
         let out = handle(&mut e, 0, 1, Command::Touch(999));
         assert_eq!(only(&out, 1), Response::NotFound);
     }
-
-    // -----------------------------------------------------------------
-    // peek / peek-ready / peek-delayed / peek-buried
-    // -----------------------------------------------------------------
 
     #[test]
     fn peek_variants_success_and_not_found() {
@@ -3788,10 +3682,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // kick / kick-job
-    // -----------------------------------------------------------------
-
     #[test]
     fn kick_prefers_buried_over_delayed() {
         let mut e = engine_at(0);
@@ -3812,7 +3702,6 @@ mod tests {
         let out = handle(&mut e, 0, 1, Command::Kick(5));
         assert_eq!(only(&out, 1), Response::Kicked(1));
         assert_eq!(e.t_job_state(buried_id), Some("ready"));
-        // The delayed job was left untouched since a buried job existed.
         assert_eq!(e.t_job_state(delayed_id), Some("delayed"));
     }
 
@@ -3824,7 +3713,6 @@ mod tests {
         let b = put(&mut e, 0, 1, 0, 2000, 0, "b");
         let out = handle(&mut e, 0, 1, Command::Kick(1));
         assert_eq!(only(&out, 1), Response::Kicked(1));
-        // Soonest-deadline delayed job (a) is kicked first.
         assert_eq!(e.t_job_state(a), Some("ready"));
         assert_eq!(e.t_job_state(b), Some("delayed"));
     }
@@ -3874,10 +3762,6 @@ mod tests {
         assert_eq!(only(&out, 1), Response::NotFound);
     }
 
-    // -----------------------------------------------------------------
-    // pause-tube
-    // -----------------------------------------------------------------
-
     #[test]
     fn pause_tube_not_found_for_missing_tube() {
         let mut e = engine_at(0);
@@ -3910,7 +3794,6 @@ mod tests {
         );
         assert_eq!(only(&out, 1), Response::Paused);
 
-        // A job put while paused stays ready but undispatched.
         let id = put(&mut e, 0, 1, 0, 0, 0, "x");
         let out = handle(&mut e, 0, 2, Command::Reserve);
         none_for(&out, 2);
@@ -3932,10 +3815,6 @@ mod tests {
         );
         assert!(!e.t_conn_waiting(2));
     }
-
-    // -----------------------------------------------------------------
-    // TTR expiry
-    // -----------------------------------------------------------------
 
     #[test]
     fn ttr_expiry_returns_job_to_ready_and_counts_timeout() {
@@ -3976,13 +3855,8 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // multi-connection waiter wake order / multi-tube priority
-    // -----------------------------------------------------------------
-
-    /// Extracts the connection ids that received a `Reserved` reply, in the
-    /// order those replies were pushed to the outbox (i.e. actual wake
-    /// order), not in some other arbitrary order.
+    /// Connection ids in the order their `Reserved` replies were pushed (the
+    /// actual wake order).
     fn reserved_order(out: &Outbox) -> Vec<u64> {
         out.iter()
             .filter(|(_, r)| matches!(r, Response::Reserved { .. }))
@@ -4110,10 +3984,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // disconnect / half-close
-    // -----------------------------------------------------------------
-
     #[test]
     fn disconnect_releases_reserved_jobs_and_wakes_a_waiter() {
         let mut e = engine_at(0);
@@ -4186,10 +4056,6 @@ mod tests {
         assert!(out.is_empty());
     }
 
-    // -----------------------------------------------------------------
-    // stats builders
-    // -----------------------------------------------------------------
-
     #[test]
     fn build_stats_job_reports_expected_fields() {
         let mut e = engine_at(0);
@@ -4207,10 +4073,6 @@ mod tests {
         assert_eq!(s.reserves, 1);
         assert_eq!(s.file, 0);
     }
-
-    // -----------------------------------------------------------------
-    // T5 differential-test regressions
-    // -----------------------------------------------------------------
 
     /// prot.c applies `if (delay == 0) delay = 1;` to nanoseconds, so
     /// `pause-tube x 0` pauses for 1 ns: a reserve an instant later is
@@ -4310,7 +4172,6 @@ mod tests {
         assert_eq!(only(&out, 1), Response::DeadlineSoon);
         assert!(!e.t_conn_waiting(1));
 
-        // Without a held job in the margin it is still a plain TIMED_OUT.
         e.connect(0, 2);
         handle(&mut e, 0, 2, Command::Watch(tube("p")));
         handle(&mut e, 0, 2, Command::Ignore(tube("default")));
@@ -4386,7 +4247,6 @@ mod tests {
         let stats = e.build_stats_server(0);
         assert_eq!(stats.cmd_put, 2);
         assert_eq!(stats.current_producers, 1);
-        // Only the EXPECTED_CRLF put consumed an id.
         assert_eq!(put(&mut e, 0, 1, 0, 0, 60, "x"), 2);
     }
 
@@ -4439,7 +4299,6 @@ mod tests {
         assert_eq!(s.current_jobs_delayed, 1);
         assert_eq!(s.current_jobs_buried, 1);
         assert_eq!(s.cmd_delete, 1);
-        // Both conn 1 and conn 2 use (and watch) "default" by default.
         assert_eq!(s.current_using, 2);
         assert_eq!(s.current_watching, 2);
     }
@@ -4482,10 +4341,6 @@ mod tests {
         let s = e.build_stats_server(0);
         assert_eq!(s.current_jobs_urgent, 0);
     }
-
-    // -----------------------------------------------------------------
-    // full Response::Ok path via to_yaml(); needs T1's implementation.
-    // -----------------------------------------------------------------
 
     #[test]
     fn stats_command_full_response_needs_t1() {
@@ -4544,10 +4399,8 @@ mod tests {
     }
 }
 
-// -----------------------------------------------------------------------
 // `Engine::snapshot` (P2-T2): equals what `stats` / `stats-tube` /
 // `list-tubes` report at the same `now`, and never changes state.
-// -----------------------------------------------------------------------
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod snapshot_tests {
@@ -4636,10 +4489,8 @@ mod snapshot_tests {
         assert_eq!(e.build_stats_server(now), before, "snapshot changed stats");
         e.take_journal(&mut journal);
         assert!(journal.is_empty(), "snapshot journaled {journal:?}");
-        // Deterministic: a second snapshot is identical.
         assert_eq!(e.snapshot(now), snap);
 
-        // `stats` = snapshot + exactly its own cmd-stats increment.
         let reply = only_reply(&run(e, now, OBSERVER, Command::Stats));
         let mut expected = snap.server.clone();
         expected.cmd_stats += 1;
@@ -4653,7 +4504,6 @@ mod snapshot_tests {
             "stats changed something besides cmd-stats"
         );
 
-        // Tube order and content.
         let reply = only_reply(&run(e, now, OBSERVER, Command::ListTubes));
         let names: Vec<TubeName> = snap.tubes.iter().map(|t| t.name.clone()).collect();
         assert_eq!(reply, Response::Ok(bstk_proto::yaml_list(names.iter())));
@@ -4707,7 +4557,6 @@ mod snapshot_tests {
                 delay: 20,
             },
         );
-        // conn 3 waits on `default`, which is empty.
         let out = run(&mut e, 0, 3, Command::ReserveWithTimeout(100));
         assert!(out.is_empty());
         e
@@ -4745,14 +4594,11 @@ mod snapshot_tests {
             assert_eq!(snap.tubes[1].cmd_delete, 1);
             assert_eq!(snap.tubes[1].cmd_pause_tube, 1);
 
-            // Same state observed at several times, with ticks in between
-            // (TTR expiry, delay expiry, pause expiry, reserve timeout).
             let mut out = Outbox::new();
             for now in [0, SEC / 2, 5 * SEC, 11 * SEC, 25 * SEC, 31 * SEC, 200 * SEC] {
                 e.tick(now, &mut out);
                 check_snapshot(&mut e, now);
             }
-            // A binlog stats push and drain mode are reflected too.
             e.set_binlog_stats(crate::BinlogStats {
                 oldest_index: 2,
                 current_index: 5,
@@ -4764,7 +4610,6 @@ mod snapshot_tests {
             assert!(snap.server.draining);
             assert_eq!(snap.server.binlog_records_written, 17);
             check_snapshot(&mut e, 200 * SEC);
-            // Disconnecting everyone collapses the tube list again.
             for c in 1..=3 {
                 e.disconnect(200 * SEC, c, &mut out);
             }
@@ -4849,7 +4694,6 @@ mod snapshot_tests {
         assert_eq!(lim.server.current_tubes, 51);
         assert_eq!(lim.tubes, full.tubes[..5]);
         check_snapshot_limited(&mut e, SEC);
-        // Taking it counts as nothing either.
         let s = e.build_stats_server(SEC);
         assert_eq!((s.cmd_stats, s.cmd_stats_tube, s.cmd_list_tubes), (0, 0, 0));
     }
@@ -4873,18 +4717,14 @@ mod snapshot_tests {
     }
 }
 
-// -----------------------------------------------------------------------
-// Property-based state machine test.
-//
-// Drives random sequences of (conn, command, time advance) over a handful
-// of connections and tubes, checking after *every* step that:
+// Property-based state machine test: random (conn, command, time advance)
+// sequences over a few connections and tubes, checking after every step that:
 //   (a) each job belongs to exactly one container;
 //   (b) every relevant counter equals the sum of the container sizes it's
 //       supposed to track;
 //   (c) every reserved job's reserver is a connection that still exists;
 //   (d) no tube simultaneously has ready jobs and an unpaused waiting
 //       connection (process_queue must always clear that situation).
-// -----------------------------------------------------------------------
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 pub(crate) mod proptests {

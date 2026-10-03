@@ -1,5 +1,8 @@
-//! A TCP stream registered with the runtime for read readiness only
-//! (P4-T5b).
+//! Socket helpers shared by the client path (`bstk-server`) and the cluster
+//! transport (`bstk-raft`).
+//!
+//! `QuietTcp` is a TCP stream registered with the runtime for read readiness
+//! only (P4-T5b).
 //!
 //! tokio registers every `TcpStream` for both read and write readiness. On
 //! kqueue (macOS, BSD) the write filter fires again whenever the peer

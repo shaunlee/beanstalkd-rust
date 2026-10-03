@@ -1,21 +1,18 @@
-//! Pending TLS connections and the server-side counters that go with them
-//! (P2 security review, finding F1).
+//! Pending TLS connections and their server-side counters (P2 security
+//! review, finding F1).
 //!
-//! A connection accepted on a TLS listener is *pending* while its TLS
-//! handshake runs and, on `auth = "token"` listeners, until the client has
-//! authenticated. Pending connections are invisible to the engine (they
-//! never appear in `stats`), so they are counted here instead, across all
-//! TLS listeners, and capped at `server.max_pending_connections`: once the
-//! cap is reached, newly accepted TLS connections are closed at once, so
-//! unauthenticated clients cannot use up the process's file descriptors
-//! (which would take down every listener, HTTP included).
+//! A TLS connection is *pending* while its handshake runs and, on `auth =
+//! "token"` listeners, until the client has authenticated. Pending connections
+//! are invisible to the engine (never in `stats`), so they are counted here
+//! across all TLS listeners and capped at `server.max_pending_connections`;
+//! past the cap new TLS connections are closed at once, so unauthenticated
+//! clients cannot use up the process's file descriptors (which would take
+//! down every listener, HTTP included). Plaintext listeners never touch any
+//! of this.
 //!
-//! Plaintext listeners never touch any of this: their accept loop is
-//! unchanged, so the hot path pays nothing.
-//!
-//! The counters are exported by the HTTP listener (`/metrics`, and the
-//! `"server_rs"` object of `/admin`), never through the protocol's `stats`
-//! (which stays byte-identical to the reference).
+//! The counters are exported by the HTTP listener (`/metrics`, the
+//! `"server_rs"` object of `/admin`), never through `stats`, which stays
+//! byte-identical to the reference.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -38,11 +35,9 @@ pub struct ServerCounters {
     reject_log: Mutex<RejectLog>,
 }
 
-/// Rate limiting of the "limit reached" log line.
 #[derive(Debug, Default)]
 struct RejectLog {
     last: Option<Instant>,
-    /// Rejections not yet reported in a log line.
     unreported: u64,
 }
 
@@ -108,17 +103,14 @@ impl ServerCounters {
         None
     }
 
-    /// An `auth = "token"` connection did not authenticate in time.
     pub fn auth_timed_out(&self) {
         self.auth_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A wrong token, or a command before authentication.
     pub fn auth_failed(&self) {
         self.auth_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The current values, for `/metrics` and `/admin`.
     pub fn sample(&self) -> ServerRsStats {
         ServerRsStats {
             pending_connections: self.pending.load(Ordering::Acquire) as u64,
@@ -129,8 +121,6 @@ impl ServerCounters {
     }
 }
 
-/// One pending connection; dropping it (once the connection is
-/// established, authenticated or closed) stops counting it.
 #[derive(Debug)]
 pub struct PendingGuard {
     counters: Arc<ServerCounters>,
@@ -199,8 +189,6 @@ mod tests {
         for i in 1..=10 {
             assert_eq!(log.note(t0 + Duration::from_millis(i * 50)), None);
         }
-        // The next line, a second after the last one, reports everything
-        // since.
         assert_eq!(log.note(t0 + Duration::from_secs(1)), Some(11));
         assert_eq!(log.note(t0 + Duration::from_millis(1500)), None);
         assert_eq!(log.note(t0 + Duration::from_millis(2100)), Some(2));

@@ -47,14 +47,10 @@ pub(crate) const KIND_PUT: u8 = 1;
 pub(crate) const KIND_UPDATE: u8 = 2;
 pub(crate) const KIND_DELETE: u8 = 3;
 
-/// Size on disk of a Delete record.
 pub(crate) const DELETE_REC_LEN: u64 = REC_HEADER_LEN + 1 + 8;
-/// Size on disk of an Update record.
 pub(crate) const UPDATE_REC_LEN: u64 = REC_HEADER_LEN + 1 + JOBREC_LEN as u64;
-/// Offset of the JobRecord inside a Put or Update record.
 pub(crate) const JOBREC_OFFSET: usize = REC_HEADER_LEN as usize + 1;
 
-/// Size on disk of a Put record.
 pub(crate) fn put_rec_len(tube_len: usize, body_len: usize) -> u64 {
     REC_HEADER_LEN + 1 + JOBREC_LEN as u64 + 1 + tube_len as u64 + body_len as u64
 }
@@ -153,7 +149,6 @@ fn decode_jobrec(c: &mut Cur<'_>) -> Option<JobRecord> {
     })
 }
 
-/// Append a framed record whose payload is produced by `payload`.
 fn frame(out: &mut Vec<u8>, payload: impl FnOnce(&mut Vec<u8>)) -> std::io::Result<()> {
     let start = out.len();
     out.extend_from_slice(&[0u8; REC_HEADER_LEN as usize]);
@@ -219,7 +214,6 @@ pub(crate) fn restamp_put(rec: &mut [u8], record: &JobRecord) {
     hdr[4..8].copy_from_slice(&crc.to_le_bytes());
 }
 
-/// A decoded record borrowing from the segment buffer.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Rec<'a> {
     Put {
@@ -240,7 +234,6 @@ impl Rec<'_> {
     }
 }
 
-/// Outcome of parsing at one position of a segment buffer.
 #[derive(Debug)]
 pub(crate) enum Parsed<'a> {
     /// A zero length field, or fewer than 8 bytes left that are all zero.

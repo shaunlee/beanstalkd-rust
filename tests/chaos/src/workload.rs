@@ -16,14 +16,10 @@ use bstk_raft::sim::SimRng;
 
 use crate::history::{Cmd, ConnKey, JobId, Reply};
 
-/// Workload shape.
 #[derive(Debug, Clone)]
 pub struct WorkloadConfig {
-    /// Maximum number of puts per run (keeps per-job histories short).
     pub max_puts: u64,
-    /// TTR range, seconds.
     pub ttr: (u32, u32),
-    /// Longest `reserve-with-timeout`, seconds.
     pub max_reserve_timeout: u32,
 }
 
@@ -45,13 +41,11 @@ pub struct Known {
     pub puts: u64,
 }
 
-/// One connection's workload state.
 #[derive(Debug)]
 pub struct ClientState {
     run: u64,
     conn: ConnKey,
     n: u64,
-    /// Jobs this connection holds (as far as it knows).
     held: Vec<JobId>,
 }
 
@@ -65,13 +59,11 @@ impl ClientState {
         }
     }
 
-    /// The next command. `known` is shared by the run's clients.
     pub fn next(&mut self, r: &mut SimRng, cfg: &WorkloadConfig, known: &mut Known) -> Cmd {
         let pick_known = |r: &mut SimRng, known: &Known| -> Option<JobId> {
             if known.ids.is_empty() {
                 return None;
             }
-            // Prefer recent jobs.
             let n = known.ids.len() as u64;
             let back = r.range(0, n.min(12) - 1) as usize;
             known.ids.iter().rev().nth(back).copied()
@@ -129,7 +121,6 @@ impl ClientState {
         }
     }
 
-    /// Learns from a reply.
     pub fn observe(&mut self, cmd: &Cmd, reply: &Reply, known: &mut Known) {
         match (cmd, reply) {
             (_, Reply::Inserted(id) | Reply::BuriedId(id)) => {

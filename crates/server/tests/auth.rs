@@ -49,8 +49,6 @@ fn authed(server: &ConfigServer, certs: &Certs) -> Proto<TlsStream> {
     c
 }
 
-/// Sends `data` and expects exactly `reply` and then the end of the
-/// connection.
 fn expect_reply_then_close(c: &mut Proto<TlsStream>, data: &[u8], reply: &str) {
     c.send(data);
     let (bytes, end) = c.read_to_end(Duration::from_secs(5));
@@ -67,7 +65,6 @@ fn correct_token_authenticates_and_commands_work() {
     assert_eq!((h.as_str(), body.as_slice()), ("RESERVED 1 3", &b"job"[..]));
     assert_eq!(c.cmd("delete 1"), "DELETED");
 
-    // Any configured token works.
     let mut other = connect(&server, &certs);
     assert_eq!(other.cmd(&format!("auth {OTHER_GOOD}")), "AUTHENTICATED");
     assert_eq!(other.cmd("use t"), "USING t");
@@ -91,7 +88,6 @@ fn wrong_token_gets_unauthorized_and_close() {
         format!("auth {WRONG}\r\n").as_bytes(),
         "UNAUTHORIZED\r\n",
     );
-    // Prefixes, extensions and an empty token are all wrong.
     for bad in [&GOOD[..GOOD.len() - 1], &format!("{GOOD}x"), "", " "] {
         let mut c = connect(&server, &certs);
         expect_reply_then_close(
@@ -113,7 +109,6 @@ fn pipelined_wrong_auth_and_stats_reach_nothing() {
     );
     let mut ok = authed(&server, &certs);
     let stats = ok.yaml("stats");
-    // Only this connection and its own `stats`.
     assert_eq!(stat_of(&stats, "cmd-stats"), "1");
     assert_eq!(stat_of(&stats, "current-connections"), "1");
     assert_eq!(stat_of(&stats, "total-connections"), "1");
@@ -124,7 +119,6 @@ fn put_before_auth_consumes_no_job_id() {
     let (server, certs) = start();
     let mut c = connect(&server, &certs);
     expect_reply_then_close(&mut c, b"put 0 0 60 5\r\nhello\r\n", "UNAUTHORIZED\r\n");
-    // A put header alone is refused at once, before any body arrives.
     let mut c = connect(&server, &certs);
     expect_reply_then_close(&mut c, b"put 0 0 60 100000\r\n", "UNAUTHORIZED\r\n");
 
@@ -151,7 +145,6 @@ fn any_other_input_before_auth_is_refused() {
         let mut c = connect(&server, &certs);
         expect_reply_then_close(&mut c, input, "UNAUTHORIZED\r\n");
     }
-    // An overlong line is refused once it ends.
     let mut c = connect(&server, &certs);
     let mut long = vec![b'a'; 1000];
     long.extend_from_slice(b"\r\n");
@@ -179,7 +172,6 @@ fn quit_before_auth_closes_silently() {
 #[test]
 fn unauthenticated_connections_are_not_counted() {
     let (server, certs) = start();
-    // Handshake done, never authenticated.
     let idle: Vec<_> = (0..5).map(|_| connect(&server, &certs)).collect();
     let mut ok = authed(&server, &certs);
     let stats = ok.yaml("stats");
@@ -198,7 +190,6 @@ fn unauthenticated_connections_are_not_counted() {
 fn re_auth_after_authentication() {
     let (server, certs) = start();
     let mut c = authed(&server, &certs);
-    // A correct token again: AUTHENTICATED, no other effect.
     assert_eq!(c.cmd(&format!("auth {OTHER_GOOD}")), "AUTHENTICATED");
     assert_eq!(c.put(b"x"), "INSERTED 1");
     // A wrong one: UNAUTHORIZED and the connection is closed (and
@@ -240,10 +231,8 @@ fn tokens_never_appear_in_logs() {
     assert!(status.success(), "{status}");
 
     let log = server.stderr();
-    // Logging did happen, at info with the peer address.
     assert!(log.contains("authentication failed"), "{log}");
     assert!(log.contains("127.0.0.1:"), "{log}");
-    // Debug and trace output is on too.
     assert!(log.contains("client authenticated"), "{log}");
     assert!(log.contains("TRACE"), "{log}");
     for secret in [GOOD, OTHER_GOOD, WRONG, "s3cr3t", "wr0ng"] {

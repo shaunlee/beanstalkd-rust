@@ -26,25 +26,24 @@ pub enum ControlResponse {
     /// it within its (short) bound, so the requester can wait until it has
     /// applied that index itself; `None` means the outcome is unknown (it
     /// may still commit later).
-    Accepted { index: Option<u64> },
-    /// Not the leader; resend to `leader` if known.
-    NotLeader { leader: Option<NodeId> },
+    Accepted {
+        index: Option<u64>,
+    },
+    NotLeader {
+        leader: Option<NodeId>,
+    },
 }
 
-/// Serves [`ForwardRequest`]s arriving on the cluster port (implemented by
-/// the server in P3-T4).
-///
-/// The listener calls it only after checking that `req.from` is the
-/// authenticated peer and that every item's connection is owned by that
-/// peer (`owner_of(conn) == req.from`). Requests of one peer connection are
-/// served one at a time, in arrival order, and Raft RPCs on the same
-/// connection wait behind it: the implementation must return once the
-/// inputs are proposed (for example with `client_write_ff`), or queued, in
-/// order, for a proposal (the server's batching proposer, P3-FD), never
-/// wait for their commit. A call may be dropped at any await point (the connection
-/// closed, or replaced by a newer connection of the same peer), so an
-/// implementation must not leave shared state inconsistent across an
-/// await.
+/// Serves [`ForwardRequest`]s arriving on the cluster port. The listener
+/// calls it only after checking that `req.from` is the authenticated peer and
+/// that every item's connection is owned by that peer (`owner_of(conn) ==
+/// req.from`). Requests of one peer connection are served one at a time, in
+/// arrival order, and Raft RPCs on the same connection wait behind them: return
+/// once the inputs are proposed (e.g. `client_write_ff`) or queued in order
+/// for a proposal (the batching proposer), never wait for their commit. A
+/// call may be dropped at any await point (connection closed or replaced by a
+/// newer one of the same peer), so do not leave shared state inconsistent
+/// across an await.
 pub trait ForwardHandler: Send + Sync + 'static {
     fn forward(&self, req: ForwardRequest) -> impl Future<Output = ForwardResponse> + Send;
 
@@ -59,8 +58,6 @@ pub trait ForwardHandler: Send + Sync + 'static {
     }
 }
 
-/// The client side of forwarding, implemented by the TCP network
-/// ([`crate::client::Network`]) and the simulated one.
 pub trait ForwardTransport: Clone + Send + Sync + 'static {
     /// Sends `req` to `target` and waits for its answer. There is no
     /// automatic resend: the caller decides (P3-T4) what to resend and
@@ -79,9 +76,7 @@ pub enum ForwardError {
     /// No connection to the target (dial failed, backing off, or unknown
     /// target).
     Unreachable(String),
-    /// No answer within the forward timeout.
     Timeout,
-    /// The connection failed while the request was in flight.
     Network(String),
     /// The target refused the request (for example `from` is not the
     /// authenticated peer).
@@ -101,7 +96,6 @@ impl fmt::Display for ForwardError {
 
 impl std::error::Error for ForwardError {}
 
-/// Checks the listener applies to a forward from authenticated `peer`.
 pub(crate) fn check_forward(peer: NodeId, req: &ForwardRequest) -> Result<(), String> {
     if req.from != peer {
         return Err(format!(

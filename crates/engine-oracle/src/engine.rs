@@ -33,7 +33,6 @@ pub struct Engine {
 
     conns: HashMap<ConnId, ConnState>,
 
-    // Global counters (see `struct stats global_stat` and friends in dat.h).
     ready_ct: u64,
     urgent_ct: u64,
     reserved_ct: u64,
@@ -293,7 +292,6 @@ impl Engine {
     }
 
     pub fn tick(&mut self, now: Nanos, out: &mut Outbox) {
-        // 1. Delayed jobs whose deadline has passed.
         loop {
             let due = self
                 .soonest_delayed_job()
@@ -304,7 +302,6 @@ impl Engine {
             self.process_queue(now, out);
         }
 
-        // 2. Tube pauses whose expiry has passed, in tube_order order.
         let names: Vec<TubeName> = self.tube_order.items.clone();
         for name in names {
             let due = self
@@ -320,16 +317,9 @@ impl Engine {
             }
         }
 
-        // 3. Connections with a due TTR/margin/explicit-timeout event,
-        // processed one at a time (recomputing the earliest each round,
-        // since processing one connection can change others' schedules via
-        // process_queue reassignment). Each connection is handled at most
-        // once per tick() call: `conn_timeout` drains every one of *its*
-        // overdue reserved jobs and reaches a final, stable decision, so a
-        // second pass over the same still-due connection (e.g. an exact
-        // boundary case where the deadline equals `now`, mirroring the
-        // reference's strict `>=` check, which yields a genuine no-op)
-        // cannot make further progress and must not be retried.
+        // Each connection is handled at most once per tick: `conn_timeout` drains
+        // all of its overdue jobs, so a second pass over a still-due connection
+        // (deadline exactly `now`, the reference's strict `>=`) cannot progress.
         let mut processed: std::collections::HashSet<ConnId> = std::collections::HashSet::new();
         loop {
             let mut best: Option<(Nanos, ConnId)> = None;
@@ -383,9 +373,6 @@ impl Engine {
     }
 }
 
-// ---------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------
 impl Engine {
     fn find_or_make_tube(&mut self, name: &TubeName) {
         if !self.tubes.contains_key(name) {
@@ -475,8 +462,6 @@ impl Engine {
         self.buried_ct += 1;
     }
 
-    /// Removes a specific job from the buried FIFO (used by delete and
-    /// kick-job, which can target any buried job, not just the front).
     fn remove_buried(&mut self, tube: &TubeName, id: JobId) -> bool {
         let removed = match self.tubes.get_mut(tube) {
             Some(t) => match t.buried.iter().position(|&x| x == id) {
@@ -703,20 +688,9 @@ impl Engine {
         t.map(|v| v.max(0) as Nanos)
     }
 
-    /// `conn_timeout`: drains every reserved job of `cid` whose TTR has
-    /// fully expired, then decides whether to emit DEADLINE_SOON or
-    /// TIMED_OUT for a connection that is (still) waiting on reserve.
-    ///
-    /// Deliberate simplification vs. the reference: the DEADLINE_SOON /
-    /// TIMED_OUT decision is (re)computed *after* the expiry loop, using
-    /// live state, rather than snapshotting it before the loop runs. This
-    /// is observably identical in every case except one pathological
-    /// corner of the reference (a connection's own about-to-fully-expire
-    /// job gets immediately re-reserved back to itself by `process_queue`
-    /// inside the very same expiry pass, in which case the reference
-    /// silently discards the RESERVED reply and sends DEADLINE_SOON
-    /// instead). We consider that reference behavior a bug and do not
-    /// reproduce it; see the T2 report for details.
+    /// `conn_timeout`: drains the connection's fully expired reserved jobs, then
+    /// decides DEADLINE_SOON or TIMED_OUT for a connection still waiting on
+    /// reserve. The decision uses live state after the drain; see docs/COMPAT.md D1.
     fn conn_timeout(&mut self, cid: ConnId, now: Nanos, out: &mut Outbox) {
         while let Some((deadline, job_id)) = self.conns.get(&cid).and_then(|c| c.soonest_reserved())
         {
@@ -780,9 +754,6 @@ impl Engine {
     }
 }
 
-// ---------------------------------------------------------------------
-// Command handlers
-// ---------------------------------------------------------------------
 impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn cmd_put(
@@ -1351,10 +1322,6 @@ impl Engine {
     }
 }
 
-// ---------------------------------------------------------------------
-// Stats / introspection builders. Public in the oracle copy only, so the
-// differential proptest in bstk-engine can compare stats structs directly.
-// ---------------------------------------------------------------------
 impl Engine {
     pub fn tube_names(&self) -> Vec<TubeName> {
         self.tube_order.items.clone()

@@ -1,37 +1,24 @@
-//! Group commit for the log store (P3-FD): `append` writes its records
-//! and queues its openraft callback here; a flush worker `fdatasync`s
-//! every file written since its last sync once, then invokes all the
-//! callbacks it covered, in queue order.
+//! Group commit for the log store (P3-FD; docs/DESIGN.md §8 "Group commit"):
+//! `append` writes its records and queues its openraft callback here; a flush
+//! worker `fdatasync`s every file written since its last sync once, then
+//! invokes all the callbacks it covered, in queue order (= append order).
 //!
-//! # Worker
+//! At most one worker runs. It starts when a job is queued and none is
+//! running, takes every queued job, syncs the distinct files they name
+//! (usually just the last segment), invokes the callbacks, and repeats until
+//! the queue is empty; jobs queued during a sync share the next one. It runs
+//! on tokio's blocking pool (or a new thread outside a runtime), never on the
+//! caller's task. Being a blocking task also keeps a paused test clock from
+//! jumping ahead during a sync (see the chaos harness).
 //!
-//! At most one worker runs at a time. It is started when a job is queued
-//! and none is running, takes every queued job, syncs the distinct files
-//! they name (one `fdatasync` each, usually just the last segment), invokes
-//! their callbacks, and repeats until the queue is empty, then exits. So
-//! jobs queued while a sync is in progress are covered by the next one.
-//! The worker runs on tokio's blocking pool (`spawn_blocking`), or on a new
-//! thread outside a runtime: never on the caller's task. (Being a blocking
-//! task also keeps a paused test clock from jumping ahead while a sync is
-//! in progress, as it did not when syncs were inline; see the chaos
-//! harness.)
-//!
-//! # Order and durability
-//!
-//! - A job is queued after its records were written (under the log
-//!   store's lock), and a sync of a file covers every write to it that
-//!   completed before the sync started. The worker syncs a job's file
-//!   after taking the job, so a callback is invoked only after its
-//!   entries are durable.
-//! - Callbacks are invoked in queue order, which is append order.
-//! - A failed sync fails every callback it covered, and every later
-//!   append (sticky): after a failed `fdatasync` the state of the written
-//!   pages is unknown.
-//! - [`Flusher::barrier`] waits until every job queued before it has been
-//!   synced and its callback invoked. `truncate`, `purge` and `save_vote`
-//!   call it first, so no sync is pending while they change the files:
-//!   nothing is acknowledged after it was cut off, and a truncated or
-//!   deleted segment is never synced afterwards.
+//! Invariants: a job is queued after its records were written (under the log
+//! store's lock) and the worker syncs its file after taking it, so a callback
+//! runs only after its entries are durable. A failed sync fails every callback
+//! it covered and every later append (sticky): the state of the written pages
+//! is then unknown. [`Flusher::barrier`] waits until every job queued before
+//! it is done; `truncate`, `purge` and `save_vote` call it first, so nothing
+//! is acknowledged after it was cut off and a truncated or deleted segment is
+//! never synced afterwards.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -45,12 +32,10 @@ use super::fsutil;
 use crate::TypeConfig;
 
 enum Job {
-    /// Sync `file` (if any), then invoke `callback`.
     Sync {
         file: Option<Arc<File>>,
         callback: LogFlushed<TypeConfig>,
     },
-    /// Everything queued before has been handled.
     Barrier(oneshot::Sender<()>),
 }
 
@@ -58,17 +43,14 @@ enum Job {
 struct State {
     queue: VecDeque<Job>,
     running: bool,
-    /// A sync failed (sticky).
     failed: Option<String>,
     /// `fdatasync` calls made (tests).
     #[cfg(test)]
     syncs: u64,
-    /// Workers take nothing while set (tests).
     #[cfg(test)]
     paused: bool,
 }
 
-/// The flush queue of one log store (cheap to clone; clones share it).
 #[derive(Clone, Default)]
 pub(crate) struct Flusher {
     state: Arc<Mutex<State>>,
@@ -92,7 +74,6 @@ fn lock(m: &Mutex<State>) -> MutexGuard<'_, State> {
 }
 
 impl Flusher {
-    /// The error of an earlier failed sync, if any.
     pub(crate) fn failed(&self) -> Option<io::Error> {
         lock(&self.state)
             .failed
@@ -106,7 +87,6 @@ impl Flusher {
         self.push(Job::Sync { file, callback });
     }
 
-    /// Waits until every job queued before this call is done.
     pub(crate) async fn barrier(&self) {
         let (tx, rx) = oneshot::channel();
         self.push(Job::Barrier(tx));
@@ -204,12 +184,10 @@ impl Flusher {
 
 #[cfg(test)]
 impl Flusher {
-    /// `fdatasync` calls made so far.
     pub(crate) fn syncs(&self) -> u64 {
         lock(&self.state).syncs
     }
 
-    /// While paused, queued jobs wait (neither synced nor acknowledged).
     pub(crate) fn set_paused(&self, on: bool) {
         let mut st = lock(&self.state);
         st.paused = on;
@@ -220,7 +198,6 @@ impl Flusher {
         }
     }
 
-    /// Jobs waiting (paused, or not yet taken by a worker).
     pub(crate) fn queued(&self) -> usize {
         lock(&self.state).queue.len()
     }

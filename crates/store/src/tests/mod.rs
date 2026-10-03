@@ -72,7 +72,6 @@ pub(crate) fn write(wal: &mut Wal, entries: &[JournalEntry]) {
     wal.append(entries).unwrap();
 }
 
-/// Segment files in the directory, by index.
 pub(crate) fn seg_files(dir: &Path) -> Vec<(u64, PathBuf)> {
     let mut v: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
@@ -90,7 +89,6 @@ pub(crate) fn seg_path(dir: &Path, index: u64) -> PathBuf {
     dir.join(format!("binlog.{index}"))
 }
 
-/// Copy every regular file of `src` into a new temp dir.
 pub(crate) fn copy_dir(src: &Path) -> tempfile::TempDir {
     let d = tmp();
     for e in std::fs::read_dir(src).unwrap() {
@@ -159,7 +157,6 @@ impl Model {
         self.order.iter().map(|id| self.jobs[id].clone()).collect()
     }
 
-    /// Same live jobs with the same contents, in any order.
     pub fn same_set(&self, r: &Recovery) -> bool {
         r.jobs.len() == self.jobs.len()
             && r.jobs

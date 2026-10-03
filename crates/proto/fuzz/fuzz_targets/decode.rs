@@ -1,14 +1,7 @@
-//! Fuzz target for `ServerCodec::decode`.
-//!
-//! Feeds arbitrary bytes through the decoder in two ways: all at once, and
-//! split into arbitrary chunks (driven by the fuzz input itself), checking
-//! only that the codec never panics and never loops forever. This is a
-//! structural fuzzer (no oracle beyond "doesn't crash / doesn't hang");
-//! `tests/roundtrip.rs` in the main crate covers semantic correctness via
-//! `proptest`.
-//!
-//! Run with: `cargo +nightly fuzz run decode` (requires `cargo-fuzz`).
-//! Not part of `scripts/check.sh` (needs nightly).
+//! Fuzz target for `ServerCodec::decode`: arbitrary bytes, fed whole and in
+//! fuzz-chosen chunks; checks only that the codec never panics or hangs
+//! (`tests/roundtrip.rs` covers semantics). Needs nightly, so it is not part
+//! of `scripts/check.sh`: `cargo +nightly fuzz run decode`.
 
 #![no_main]
 
@@ -18,7 +11,6 @@ use libfuzzer_sys::fuzz_target;
 use tokio_util::codec::Decoder;
 
 fuzz_target!(|data: &[u8]| {
-    // Whole-buffer decode.
     {
         let mut codec = ServerCodec::new(bstk_proto::DEFAULT_MAX_JOB_SIZE);
         let mut buf = BytesMut::from(data);
@@ -35,8 +27,6 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // Byte-at-a-time decode: exercises the same paths under maximal
-    // fragmentation.
     {
         let mut codec = ServerCodec::new(bstk_proto::DEFAULT_MAX_JOB_SIZE);
         let mut buf = BytesMut::new();

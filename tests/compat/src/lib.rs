@@ -4,12 +4,10 @@
 //! `.bt` file, see [`dsl`]) and diffs their byte-for-byte responses after
 //! masking volatile fields (pid, uptime, rusage, ...; see [`mask`]).
 //!
-//! Entry points:
-//! - [`runner::run_case_pair`] runs one case against two binaries.
-//! - [`runner::run_all`] runs a whole corpus in parallel.
-//! - [`runner::discover_cases`] lists the `.bt` files under `cases/`.
-//! - [`runner::default_ref_bin`] / [`runner::default_rs_bin`] resolve the
-//!   default binary paths (overridable via `BSTK_REF_BIN` / `BSTK_RS_BIN`).
+//! Entry points: [`runner::run_case_pair`], [`runner::run_all`] (a corpus in
+//! parallel) and [`runner::discover_cases`]; binaries default to
+//! `BSTK_REF_BIN` / `BSTK_RS_BIN` ([`runner::default_ref_bin`],
+//! [`runner::default_rs_bin`]).
 //!
 //! TLS mode ([`runner::RunOptions::tls_b`], `BSTK_COMPAT_TLS=1`) runs
 //! server B behind a TLS listener of its own while server A stays
@@ -68,8 +66,6 @@ pub fn format_case_report(result: &CaseResult) -> String {
     out
 }
 
-/// Summarize a batch of case results as `(passed, failed)` counts and print
-/// a one-line-per-case summary plus full reports for failures.
 pub fn summarize(results: &[CaseResult]) -> (usize, usize) {
     let mut passed = 0usize;
     let mut failed = 0usize;

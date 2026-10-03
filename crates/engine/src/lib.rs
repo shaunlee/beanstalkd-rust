@@ -1,7 +1,7 @@
 //! Deterministic beanstalkd state machine.
 //!
-//! INTERFACE CONTRACT (owned by the lead): the public API in this file must
-//! not change without lead approval.
+//! The public API here is the interface contract with the server and the
+//! Raft layer: change it only with the lead's approval.
 //!
 //! Rules: no system clock, no randomness, no I/O. Time is always passed in as
 //! `now` (monotonic nanoseconds). Identical inputs must yield identical
@@ -74,7 +74,6 @@ pub struct SysSnapshot {
     pub platform: String,
 }
 
-/// Fixed `SysInfo` for tests.
 #[derive(Debug, Clone, Default)]
 pub struct StaticSysInfo(pub SysSnapshot);
 
@@ -145,19 +144,15 @@ pub enum RecordState {
 /// writes (see docs/PLAN.md §4.1). The last record of a job wins on replay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JournalEntry {
-    /// The job's first record: full state plus tube and body.
     Put {
         record: JobRecord,
         tube: bstk_proto::TubeName,
         body: bytes::Bytes,
     },
-    /// A later transition (release with delay, bury, kick, kick-job).
     Update(JobRecord),
-    /// The job was deleted.
     Delete(bstk_proto::JobId),
 }
 
-/// A job rebuilt from the binlog, in its final journaled state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveredJob {
     pub record: JobRecord,
@@ -165,7 +160,6 @@ pub struct RecoveredJob {
     pub body: bytes::Bytes,
 }
 
-/// What the store hands to `Engine::recover`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Recovery {
     /// Live jobs in the reference's replay order (order of each job's first
@@ -231,7 +225,6 @@ pub enum EngineInput {
 }
 
 impl EngineInput {
-    /// The connection this input belongs to, if any.
     pub fn conn(&self) -> Option<ConnId> {
         match self {
             EngineInput::Connect(c) | EngineInput::Disconnect(c) | EngineInput::HalfClose(c) => {
@@ -401,74 +394,3 @@ impl std::fmt::Display for StateError {
 }
 
 impl std::error::Error for StateError {}
-
-/// Public API surface (implemented in `engine.rs`):
-///
-/// ```ignore
-/// impl Engine {
-///     pub fn new(now: Nanos, cfg: EngineConfig, sys: Box<dyn SysInfo>) -> Self;
-///     /// Register a new connection (uses and watches "default").
-///     pub fn connect(&mut self, now: Nanos, conn: ConnId);
-///     /// Connection closed: release its reserved jobs, drop it from wait
-///     /// queues, deref tubes. Never produces replies for `conn`, but may
-///     /// produce replies for others (released jobs can wake waiters).
-///     pub fn disconnect(&mut self, now: Nanos, conn: ConnId, out: &mut Outbox);
-///     /// Client half-closed its socket: if `conn` is waiting on reserve,
-///     /// reply TIMED_OUT (see STATE_WAIT / halfclosed in prot.c).
-///     pub fn half_close(&mut self, now: Nanos, conn: ConnId, out: &mut Outbox);
-///     /// A put command line was accepted (`Frame::PutStarted`): applies the
-///     /// reference's header-time side effects (cmd-put, producer, job id)
-///     /// before the body arrives. No reply.
-///     pub fn put_started(&mut self, now: Nanos, conn: ConnId, too_big: bool);
-///     /// A `put` rejected by the codec (`Frame::PutRejected`): applies the
-///     /// reference's pre-rejection side effects and emits the reply.
-///     pub fn put_rejected(&mut self, now: Nanos, conn: ConnId, why: PutRejection, out: &mut Outbox);
-///     /// Execute one command. `Command::Quit` is handled by the server and
-///     /// must not be passed here. A reserve that must wait produces no reply
-///     /// now; the reply is emitted by a later call (handle/tick/disconnect).
-///     /// Callers must not send another command for `conn` until it has
-///     /// received the reply to the previous one.
-///     pub fn handle(&mut self, now: Nanos, conn: ConnId, cmd: Command, out: &mut Outbox);
-///     /// Process everything due at or before `now` (delays, TTRs,
-///     /// DEADLINE_SOON, reserve timeouts, pause expiry).
-///     pub fn tick(&mut self, now: Nanos, out: &mut Outbox);
-///     /// Earliest time `tick` must be called, if any.
-///     pub fn next_deadline(&self) -> Option<Nanos>;
-///     /// Rebuild state after a restart from the binlog (docs/PLAN.md §4.1):
-///     /// reserved jobs were never journaled as such; delayed jobs whose
-///     /// deadline has passed become ready; replaying a buried job counts
-///     /// one more bury; cumulative counters start at zero; recovered jobs
-///     /// don't count toward `total-jobs`. Emits no journal entries.
-///     pub fn recover(now: Nanos, cfg: EngineConfig, sys: Box<dyn SysInfo>, recovery: Recovery) -> Self;
-///     /// Move all pending journal entries into `buf` (appending, in order).
-///     pub fn take_journal(&mut self, buf: &mut Vec<JournalEntry>);
-///     /// Binlog fields reported by `stats`, pushed by the server after
-///     /// every binlog write.
-///     pub fn set_binlog_stats(&mut self, stats: BinlogStats);
-///     /// Monitoring view; see `Snapshot`. Never changes engine state.
-///     pub fn snapshot(&self, now: Nanos) -> Snapshot;
-///     /// Same, with only the first `max_tubes` tubes (in `list-tubes`
-///     /// order); the server stats are complete. Bounds the work per call.
-///     pub fn snapshot_limited(&self, now: Nanos, max_tubes: usize) -> Snapshot;
-///     /// Build replies only for the connections `local` owns (cluster
-///     /// nodes); everything else about an input is unchanged and the
-///     /// setting is not part of the exported state.
-///     pub fn set_local_conns(&mut self, local: Option<LocalConns>);
-///     /// SIGUSR1 drain mode (put -> DRAINING).
-///     pub fn set_draining(&mut self, on: bool);
-///     /// P3: run one input (see `EngineInput`), then `tick(now)`.
-///     pub fn apply_input(&mut self, now: Nanos, input: EngineInput, out: &mut Outbox);
-///     /// P3: ids of all connections, ascending.
-///     pub fn conn_ids(&self) -> Vec<ConnId>;
-///     pub fn config(&self) -> &EngineConfig;
-///     /// P3: full state for a snapshot; no side effects.
-///     pub fn export_state(&self) -> EngineState;
-///     /// P4-T5c: the same state, borrowed; serializes to the same bytes.
-///     pub fn state_view(&self) -> EngineStateView<'_>;
-///     /// P3: rebuild from a snapshot, validating every invariant
-///     /// (indexes, counters, references); never panics on bad input.
-///     pub fn import_state(state: EngineState, sys: Box<dyn SysInfo>) -> Result<Engine, StateError>;
-/// }
-/// ```
-#[doc(hidden)]
-pub fn _api_doc() {}

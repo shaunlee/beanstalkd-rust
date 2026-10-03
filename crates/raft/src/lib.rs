@@ -1,8 +1,8 @@
 //! Raft replication of the engine (P3), on openraft 0.9.
 //!
-//! INTERFACE CONTRACT (owned by the lead): the public types in this file
-//! must not change without lead approval. See docs/PLAN.md §6 and
-//! docs/DESIGN.md §8.
+//! The public types here are the interface contract with the server: change
+//! them only with the lead's approval. Design: docs/DESIGN.md §8; plan:
+//! docs/PLAN.md §6.
 //!
 //! Model: every engine input is a log entry ([`Request`]). Every node
 //! applies committed entries to its own `Engine` in log order and computes
@@ -10,13 +10,11 @@
 //! ([`owner_of`]). Nothing is acknowledged to a client before its input is
 //! committed on a majority.
 
-// Network (P3-T3).
 pub mod client;
 pub mod forward;
 pub mod listener;
 #[cfg(test)]
 mod net_tests;
-pub mod quiet_tcp;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
 #[cfg(test)]
@@ -27,7 +25,6 @@ mod test_store;
 pub mod tls;
 pub mod wire;
 
-// Storage: log store, state machine, snapshots (P3-T2).
 pub mod snapshot_file;
 pub mod storage;
 
@@ -53,7 +50,6 @@ pub fn conn_id(node: NodeId, local: u64) -> ConnId {
     (node << CONN_SEQ_BITS) | local
 }
 
-/// The node that holds the socket of `conn`.
 pub fn owner_of(conn: ConnId) -> NodeId {
     conn >> CONN_SEQ_BITS
 }
@@ -69,19 +65,19 @@ pub struct Request {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Op {
-    /// A connection's input, forwarded by its owner. `seq` increases by one
-    /// per input of that connection, starting at 1 with `Connect`. The state
-    /// machine applies an input only if `seq` is the connection's next one,
-    /// and a `Connect` only if the connection's local number is above every
-    /// local number of the same owner connected so far (owners forward in
-    /// order, and connection ids are never reused), so resends after a
-    /// leader change, and late duplicates of a closed connection's inputs,
-    /// are ignored.
-    Conn { seq: u64, input: EngineInput },
+    /// A connection's input, forwarded by its owner. `seq` starts at 1 with
+    /// `Connect` and increases by one per input. The state machine applies an
+    /// input only if `seq` is the connection's next one, and a `Connect` only if
+    /// its local number is above every local number of the same owner connected
+    /// so far (connection ids are never reused), so resends after a leader change
+    /// and late duplicates of a closed connection's inputs are ignored.
+    Conn {
+        seq: u64,
+        input: EngineInput,
+    },
     /// A timer is due (proposed by the leader at `next_deadline()`), or a
     /// no-op after a leader change. Applies `EngineInput::Tick`.
     Tick,
-    /// Cluster-wide drain mode (SIGUSR1 on any node).
     SetDraining(bool),
     /// The node is gone: disconnect every connection owned by `node` whose
     /// local number is at most `up_to_local`, in ascending `ConnId` order.
@@ -90,27 +86,17 @@ pub enum Op {
     /// node that has meanwhile restarted) never touches the connections the
     /// node accepted afterwards: a restarted node numbers its new
     /// connections above every local number the state has seen for it.
-    DropNode { node: NodeId, up_to_local: u64 },
-    /// Several connection inputs in one log entry (P3-FD: the leader
-    /// proposes everything it has queued or received in one entry, so one
-    /// log write and one `fdatasync` cover many inputs). Items are
-    /// `(seq, input)` exactly as in [`Op::Conn`]; they may belong to
-    /// connections of several owners, in the proposer's order (each
-    /// owner's items in that owner's order). The state machine applies
-    /// them one by one, in order, each with the dedup rules of `Op::Conn`
-    /// and at the entry's `now` (every applied input is followed by the
-    /// engine's timer pass at that `now`, as for `Op::Conn`), so a batch
-    /// applies exactly like the same items proposed as consecutive
-    /// `Op::Conn` entries with the same `now`. An item that is not a
-    /// connection input (`Tick`, `SetDraining`) is ignored. The applied
-    /// result's `duplicate` is true when every item was ignored.
-    /// Decoding from the cluster port is bounded by
-    /// [`wire::MAX_BATCH_ITEMS`]; the server proposes at most
-    /// [`MAX_PROPOSAL_ITEMS`] items and, unless the batch is a single
-    /// item, at most [`MAX_PROPOSAL_BYTES`] of job bodies per entry.
-    /// `Op::Conn` stays valid (logs written before P3-FD replay as they
-    /// are). Declared last so that the encoding of the older variants is
-    /// unchanged.
+    DropNode {
+        node: NodeId,
+        up_to_local: u64,
+    },
+    /// Several connection inputs in one log entry (P3-FD; docs/DESIGN.md §8
+    /// "Batched proposals"): `(seq, input)` items as in [`Op::Conn`], possibly of
+    /// several owners, applied one by one at the entry's `now` with `Op::Conn`'s
+    /// dedup rules, exactly as consecutive `Op::Conn` entries would be. Items that
+    /// are not connection inputs are ignored; the result's `duplicate` is true
+    /// when every item was ignored. Declared last so the encoding of the older
+    /// variants is unchanged. Decoding is bounded by [`wire::MAX_BATCH_ITEMS`].
     Batch(Vec<(u64, EngineInput)>),
 }
 
@@ -168,7 +154,6 @@ pub struct Applied {
 }
 
 openraft::declare_raft_types!(
-    /// openraft type configuration for beanstalkd-rs.
     pub TypeConfig:
         D = Request,
         R = Applied,
@@ -191,8 +176,9 @@ pub struct ForwardRequest {
 pub enum ForwardResponse {
     /// Proposed (not necessarily committed yet).
     Accepted,
-    /// Not the leader; resend to `leader` if known.
-    NotLeader { leader: Option<NodeId> },
+    NotLeader {
+        leader: Option<NodeId>,
+    },
 }
 
 #[cfg(test)]

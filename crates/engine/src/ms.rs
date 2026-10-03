@@ -29,12 +29,10 @@ impl<T: PartialEq + Clone> Ms<T> {
         self.items.is_empty()
     }
 
-    /// `ms_append`.
     pub(crate) fn append(&mut self, item: T) {
         self.items.push(item);
     }
 
-    /// `ms_contains`.
     pub(crate) fn contains(&self, item: &T) -> bool {
         self.items.iter().any(|x| x == item)
     }

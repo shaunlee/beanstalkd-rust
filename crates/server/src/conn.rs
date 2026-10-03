@@ -1,38 +1,30 @@
-//! Per-connection task: reads and decodes the client's byte stream, sends
-//! at most one command at a time to the engine actor, and writes back
-//! whatever it replies. See docs/DESIGN.md §6 and the half-close notes in
-//! `.ref/beanstalkd/prot.c` (`STATE_WAIT`, `halfclosed`, `h_conn`).
+//! Per-connection task: reads and decodes the client's byte stream, sends at
+//! most one command at a time to the engine actor, and writes back its replies
+//! (docs/DESIGN.md §6; half-close: `STATE_WAIT`, `halfclosed`, `h_conn` in
+//! prot.c).
 //!
 //! The protocol loop ([`command_loop`]) is generic over the stream type and
 //! monomorphized for `QuietTcp` (plaintext listeners) and
-//! `tokio_rustls::server::TlsStream<QuietTcp>` (TLS listeners), so the
-//! plaintext path pays nothing for TLS. Reads and writes never overlap (a
-//! reply is written only once no read is pending), so the stream is used
-//! whole, without splitting it into halves.
+//! `tokio_rustls::server::TlsStream<QuietTcp>` (TLS listeners), so plaintext
+//! pays nothing for TLS. Reads and writes never overlap (a reply is written
+//! only once no read is pending), so the stream is used whole, not split.
 //!
-//! Where the engine learns about a connection (`EngineMsg::Connect`):
-//! - plaintext listeners: in the accept loop, before this task is spawned
-//!   (as before P2);
-//! - TLS listeners: only after the handshake succeeded, and for
-//!   `auth = "token"` listeners only after a correct `auth <token>`. A
-//!   failed handshake or authentication never reaches the engine: no
-//!   counter changes and the connection never shows up in `stats`.
-//!
-//! [`ConnGuard`] sends the matching `Disconnect` on every exit path, and
-//! only if `Connect` was sent.
-//!
-//! TLS connections are *pending* (see `pending`) from the accept until the
-//! handshake completes (`auth = "none"` / `"mtls"`) or the client has
-//! authenticated (`auth = "token"`), and a token connection that has not
-//! authenticated within `auth.timeout` of its handshake is closed without
-//! a reply.
+//! The engine learns about a connection (`EngineMsg::Connect`) in the accept
+//! loop for plaintext listeners, and for TLS listeners only after the
+//! handshake and, with `auth = "token"`, a correct `auth <token>`: a failed
+//! handshake or authentication never reaches the engine (no counter changes,
+//! never in `stats`). [`ConnGuard`] sends the matching `Disconnect` on every
+//! exit path, only if `Connect` was sent. TLS connections are *pending* (see
+//! `pending`) until the handshake or authentication completes; a token
+//! connection not authenticated within `auth.timeout` of its handshake is
+//! closed without a reply.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use bstk_raft::quiet_tcp::QuietTcp;
+use bstk_net::QuietTcp;
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -78,7 +70,6 @@ pub struct ConnGuard {
 }
 
 impl ConnGuard {
-    /// For a connection whose `Connect` the caller has already sent.
     pub fn connected(conn: ConnId, engine_tx: EngineHandle) -> ConnGuard {
         ConnGuard {
             conn: Some(conn),
@@ -86,7 +77,6 @@ impl ConnGuard {
         }
     }
 
-    /// For a connection the engine does not know about yet.
     fn pending(engine_tx: EngineHandle) -> ConnGuard {
         ConnGuard {
             conn: None,
@@ -94,8 +84,6 @@ impl ConnGuard {
         }
     }
 
-    /// Sends `Connect` for `conn`; from now on dropping the guard sends
-    /// `Disconnect`.
     fn connect(
         &mut self,
         conn: ConnId,
@@ -115,7 +103,6 @@ impl Drop for ConnGuard {
     }
 }
 
-/// The token check of an `auth = "token"` connection.
 #[derive(Clone, Copy)]
 struct TokenAuth<'a> {
     tokens: &'a TokenSet,
@@ -123,11 +110,10 @@ struct TokenAuth<'a> {
     counters: &'a ServerCounters,
 }
 
-/// Drives one plaintext client connection until it closes (EOF, `quit`,
-/// or an I/O error). `reply_rx` receives replies the engine actor
-/// addressed to `conn`; the caller must have already sent
-/// `EngineMsg::Connect` for this connection (and must do so before
-/// spawning this task, to preserve ordering on the shared engine channel).
+/// Drives one plaintext client connection until it closes (EOF, `quit` or an
+/// I/O error). The caller must already have sent `EngineMsg::Connect` for it,
+/// before spawning this task, to preserve ordering on the shared engine
+/// channel.
 pub async fn handle_plain(
     stream: TcpStream,
     conn: ConnId,
@@ -161,21 +147,16 @@ pub async fn handle_plain(
     .await;
 }
 
-/// How a TLS listener authenticates its clients.
 #[derive(Clone)]
 pub enum TlsAuth {
     /// No authentication beyond the handshake (`auth = "none"`, and
     /// `auth = "mtls"`, where the acceptor requires a client certificate).
     Handshake,
-    /// `auth <token>` before anything else (`auth = "token"`).
     Token(Arc<TokenSet>),
 }
 
-/// Connection ids, shared by every listener of the process.
 pub enum ConnIds {
-    /// Standalone: a counter from 1.
     Local(AtomicU64),
-    /// Cluster mode: this node's durably reserved blocks.
     Cluster(Arc<crate::cluster::durable::ConnIdBlocks>),
 }
 
@@ -190,29 +171,22 @@ impl ConnIds {
     }
 }
 
-/// What every connection of one TLS listener shares.
 pub struct TlsListener {
     pub acceptor: TlsAcceptor,
     pub auth: TlsAuth,
-    /// Connection ids, unique across all listeners.
     pub next_id: Arc<ConnIds>,
     pub engine_tx: EngineHandle,
     pub max_job_size: u32,
-    /// Pending-connection accounting and the authentication counters.
     pub counters: Arc<ServerCounters>,
-    /// `auth.timeout` (used by `auth = "token"` listeners only).
     pub auth_timeout: Duration,
-    /// Cluster mode: lets the cluster close this listener's connections.
     pub clients: Option<Arc<Clients>>,
 }
 
 /// Drives one TLS client connection: handshake (bounded by
 /// [`HANDSHAKE_TIMEOUT`]), token authentication if configured (bounded by
-/// `auth.timeout`), then the same protocol loop as plaintext. `pending`
-/// counts the connection as pending until the handshake, or the
-/// authentication, succeeds (or the connection is closed). The connection
-/// id is allocated from `next_id` only once the engine is told about the
-/// connection.
+/// `auth.timeout`), then the same protocol loop as plaintext. The connection
+/// counts as pending until the handshake or authentication succeeds, and its
+/// id is allocated only once the engine is told about it.
 pub async fn handle_tls(
     tcp: TcpStream,
     peer: SocketAddr,
@@ -277,7 +251,6 @@ pub async fn handle_tls(
                     return;
                 }
                 Err(_) => {
-                    // Closed without a reply, like a handshake timeout.
                     counters.auth_timed_out();
                     tracing::debug!(%peer, "authentication timed out");
                     close_tls(&mut stream).await;
@@ -334,7 +307,6 @@ pub async fn handle_tls(
     close_tls(&mut stream).await;
 }
 
-/// Sends our `close_notify` (and a TCP FIN), best effort and bounded.
 async fn close_tls<S: AsyncWrite + Unpin>(stream: &mut S) {
     let _ = tokio::time::timeout(CLOSE_NOTIFY_TIMEOUT, stream.shutdown()).await;
 }
@@ -447,7 +419,6 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             Ok(Some(Frame::PutRejected(why))) => {
-                // Same ordering rationale as the `Frame::Command` arm above.
                 if flush(wbuf, stream).await.is_err() {
                     return;
                 }
@@ -482,10 +453,8 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
             Ok(Some(Frame::Auth(token))) => {
-                // Only produced on token-authenticated connections.
                 let Some(auth) = auth else { return };
                 if auth.tokens.verify(&token) {
-                    // Batched like a direct error: no engine round trip.
                     Response::Authenticated.encode(wbuf);
                 } else {
                     tracing::info!(peer = %auth.peer, "re-authentication failed: wrong token");
@@ -506,8 +475,6 @@ async fn command_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     return;
                 }
                 if eof {
-                    // Nothing decodable is left buffered, and the peer will
-                    // never send more: this is a real close.
                     return;
                 }
                 match stream.read_buf(rbuf).await {
@@ -569,8 +536,6 @@ async fn await_reply<S: AsyncRead + Unpin>(
                     reassert_half_close(engine_tx, conn);
                 }
                 Ok(_) => {
-                    // More pipelined bytes arrived; leave them buffered.
-                    // They are only decoded once this reply has arrived.
                 }
                 Err(_) => {
                     *eof = true;

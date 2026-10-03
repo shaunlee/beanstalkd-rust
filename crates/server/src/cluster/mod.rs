@@ -19,64 +19,49 @@
 //! ```
 //!
 //! - The actor numbers each connection's inputs (`seq`, from 1 with
-//!   `Connect`) and appends them to one ordered queue. A single sender
-//!   drains the queue to the current leader: to the [`proposer`] when
-//!   this node leads, otherwise as batched `ForwardRequest`s, one in
-//!   flight at a time. The leader's proposer turns all the inputs it has
-//!   queued (its own and forwarded ones) into `Op::Batch` entries. See [`actor`] for the
-//!   ordering and resend rules.
+//!   `Connect`) and appends them to one ordered queue. A single sender drains
+//!   the queue to the current leader: to the [`proposer`] when this node
+//!   leads, otherwise as batched `ForwardRequest`s, one in flight at a time.
+//!   The leader's proposer turns all the inputs it has queued (its own and
+//!   forwarded ones) into `Op::Batch` entries. See [`actor`] for the ordering
+//!   and resend rules.
 //! - Every node applies every committed entry to its own engine
 //!   (`ClusterStateMachine`), and [`Clients`] (the `ReplySink`) hands the
 //!   replies for this node's connections to their reply channels.
 //! - [`handler::Handler`] serves the cluster port's forwards and control
-//!   requests (on the leader it proposes, elsewhere it answers
-//!   `NotLeader`).
-//! - [`duties`] runs the time-driven work: `Tick` proposals and node
-//!   liveness (`DropNode`) on the leader, and readiness on every node.
+//!   requests (on the leader it proposes, elsewhere it answers `NotLeader`).
+//! - [`duties`] runs the time-driven work: `Tick` proposals and node liveness
+//!   (`DropNode`) on the leader, and readiness on every node.
 //!
 //! # Startup ([`start`])
 //!
-//! Open the storage (a locked data directory exits with status 10) and
-//! start the cluster listener *before* Raft: until Raft runs it answers
-//! only status probes (from the log store, `bstk_raft::status`), which
-//! other nodes deciding how to start need. Then pick the startup mode:
+//! Open the storage (a locked data directory exits with status 10) and start
+//! the cluster listener *before* Raft: until Raft runs it answers only status
+//! probes (from the log store, `bstk_raft::status`). Then pick the startup
+//! mode (docs/DESIGN.md §8 "Startup probes", "Bootstrap", "Rejoin"):
 //!
-//! - **Restart** (the data directory holds state, no rejoin marker):
-//!   start Raft as it is.
-//! - **Bootstrap** (`--cluster-init`, empty data directory): ask the other
-//!   nodes for their status until the answers decide it
-//!   (`bstk_raft::status::bootstrap_decision`): initialize the membership
-//!   from `[[cluster.peer]]` once a majority of the other nodes answered
-//!   without any state (or every other node answered and none belongs to
-//!   a cluster that has had a leader: some initial nodes initialized
-//!   first); rejoin, with a warning, as soon as one belongs to a running
-//!   cluster (a wiped node started with `--cluster-init` by mistake); keep
-//!   asking otherwise (logged). Every initial node is started this way,
-//!   with the same peer list, in any order.
+//! - **Restart** (the data directory holds state, no rejoin marker): start
+//!   Raft as it is.
+//! - **Bootstrap** (`--cluster-init`, empty data directory): probe the other
+//!   nodes until `bstk_raft::status::bootstrap_decision` decides to initialize
+//!   the membership from `[[cluster.peer]]`, or, as soon as one belongs to a
+//!   running cluster, to rejoin it (with a warning: a wiped node started with
+//!   `--cluster-init` by mistake); otherwise keep asking.
 //! - **Rejoin** (an empty data directory without `--cluster-init`, or the
-//!   rejoin marker [`durable::REJOIN_FILE`] left by an unfinished rejoin):
-//!   the node may have acknowledged entries, and granted votes, in a
-//!   previous life that it no longer remembers. It writes the marker, then
-//!   asks the other nodes for their status until a majority of the cluster
-//!   (`⌊n/2⌋ + 1`) of *other* nodes answered, persists the highest vote
-//!   among them and its own (openraft's order; never lower than its own)
-//!   with the log store's `save_vote`, and only then starts Raft (which
-//!   loads that vote), with elections disabled and the vote gate of its
-//!   listener closed, and serves no clients. So it rejects every leader
-//!   older than one it may have followed before (docs/DESIGN.md §8 has the
-//!   argument). It asks the leader to propose `DropNode(self)` and leaves
-//!   rejoin mode once it has applied that entry: its index was learned
-//!   from a leader after this process started, so everything committed
-//!   before is now in this node's log. Leaving removes the marker durably,
-//!   re-enables elections and opens the gate. A crash before that keeps
-//!   the marker, so the node rejoins again (probing again).
+//!   marker [`durable::REJOIN_FILE`] left by an unfinished rejoin): the node
+//!   may have acknowledged entries and granted votes it no longer remembers,
+//!   so it writes the marker, persists the highest vote of a majority of the
+//!   other nodes (`status::adopt_vote`) and only then starts Raft, with
+//!   elections disabled and the vote gate closed, serving no clients. It
+//!   leaves rejoin mode once it has applied a `DropNode(self)` entry proposed
+//!   after this process started (so everything committed before is in its
+//!   log); a crash before that keeps the marker.
 //!
-//! Then wait until a leader is known and this node has applied everything
-//! it knows to be committed, close out the connections of this node's
-//! previous process with `DropNode(self)` and wait until that is applied
-//! here. Only then are clients accepted, with connection numbers from
-//! durably reserved blocks ([`durable::ConnIdBlocks`], starting at
-//! [`durable::first_local`]).
+//! Then wait until a leader is known and this node has applied everything it
+//! knows to be committed, close out the connections of this node's previous
+//! process with `DropNode(self)` and wait until that is applied here. Only
+//! then are clients accepted, with connection numbers from durably reserved
+//! blocks ([`durable::ConnIdBlocks`], starting at [`durable::first_local`]).
 
 pub mod actor;
 pub mod durable;
@@ -125,15 +110,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The local number of a connection id.
 pub fn local_of(conn: ConnId) -> u64 {
     conn & ((1 << CONN_SEQ_BITS) - 1)
 }
 
-/// What the actor learns from the state machine.
 #[derive(Debug)]
 pub enum Event {
-    /// Input `seq` of local connection `conn` was applied.
     Applied(ConnId, u64),
 }
 
@@ -148,7 +130,6 @@ pub struct Clients {
     /// Whether new client connections are admitted (set by the actor:
     /// false while isolated, shutting down, or the forward queue is full).
     admitting: AtomicBool,
-    /// Client connections refused at accept because of that.
     refused: AtomicU64,
 }
 
@@ -185,14 +166,12 @@ impl Clients {
         rx
     }
 
-    /// Closes the socket of local connection `conn` (if still open).
     pub fn close(&self, conn: ConnId) {
         if let Some(tx) = lock(&self.closers).remove(&conn) {
             let _ = tx.send(());
         }
     }
 
-    /// Closes every local client socket.
     pub fn close_all(&self) {
         let all: Vec<_> = lock(&self.closers).drain().collect();
         for (_, tx) in all {
@@ -234,7 +213,6 @@ impl ReplySink for Clients {
     }
 }
 
-/// Counters and flags shared by the cluster tasks (monitoring).
 #[derive(Default)]
 struct Status {
     /// The startup cleanup is done and clients are accepted.
@@ -245,22 +223,17 @@ struct Status {
     /// Client sockets are closed because no leader was reachable for
     /// `node_timeout`.
     isolated: AtomicBool,
-    /// In rejoin mode (see the module docs).
     rejoining: AtomicBool,
-    /// Last commit index learned (`u64::MAX`: none).
     committed: AtomicU64,
-    /// Items in the forward queue, and their approximate size.
     queue_len: AtomicU64,
     queue_bytes: AtomicU64,
     /// The forward queue is at its bound (new clients refused, puts
     /// answered `OUT_OF_MEMORY`).
     queue_full: AtomicBool,
-    /// Puts answered `OUT_OF_MEMORY` because the forward queue was full.
     rejected_puts: AtomicU64,
     /// Items sent again (to the leader, or proposed again as leader) after
     /// having been sent once: duplicates the state machine discards.
     resent_items: AtomicU64,
-    /// Rewinds of the forward queue, by cause.
     rewinds_view: AtomicU64,
     rewinds_error: AtomicU64,
     rewinds_stall: AtomicU64,
@@ -268,19 +241,16 @@ struct Status {
     drop_node_proposals: AtomicU64,
 }
 
-/// Everything the cluster tasks share.
 pub struct Core {
     id: NodeId,
     raft: Raft<TypeConfig>,
     metrics: watch::Receiver<Metrics>,
-    /// Leader, role and term (see [`Core::watch_view`]).
     server: watch::Receiver<ServerMetrics>,
     state: StateHandle,
     net: Network,
     log: LogStore,
     data_dir: PathBuf,
     clock: Clock,
-    /// Highest `now` this node has stamped on a proposal.
     stamped: AtomicU64,
     node_timeout: Duration,
     peers: BTreeSet<NodeId>,
@@ -292,14 +262,11 @@ pub struct Core {
     /// Connection inputs to propose as `Op::Batch` entries (leader only,
     /// see [`proposer`]).
     proposer: mpsc::UnboundedSender<proposer::Items>,
-    /// Refuses inbound votes while in rejoin mode.
     gate: Arc<VoteGate>,
     /// When each peer last sent this node a forward, ping or control
     /// request (leader-side liveness, [`duties`]).
     heard: Mutex<HashMap<NodeId, Instant>>,
-    /// Local connection numbers (set once clients are accepted).
     conn_ids: OnceLock<Arc<durable::ConnIdBlocks>>,
-    /// `(when, bytes)` of the last snapshot-directory scan (`/metrics`).
     snapshot_size: Mutex<Option<(Instant, u64)>>,
 }
 
@@ -309,7 +276,6 @@ const SNAPSHOT_SIZE_TTL: Duration = Duration::from_secs(3);
 /// A proposal's result receiver, awaited by [`reap`] and discarded.
 type Pending = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
-/// Awaits proposal results nobody needs.
 async fn reap(mut rx: mpsc::UnboundedReceiver<Pending>) {
     use futures::StreamExt;
     let mut pending = futures::stream::FuturesUnordered::new();
@@ -324,18 +290,13 @@ async fn reap(mut rx: mpsc::UnboundedReceiver<Pending>) {
     }
 }
 
-/// Raft has stopped (fatal error or shutdown).
 #[derive(Debug)]
 struct RaftStopped;
 
-/// The outcome of a control proposal.
 #[derive(Debug)]
 enum ControlOutcome {
-    /// Applied on the leader at this index.
     Applied(u64),
-    /// Proposed, or perhaps proposed: it may still commit later.
     Unknown,
-    /// Not proposed (no leader, or not the leader).
     NotProposed,
 }
 
@@ -349,7 +310,6 @@ impl Core {
         m.current_leader == Some(self.id) && m.state == ServerState::Leader
     }
 
-    /// `(leader, term)` as this node sees them.
     fn view(&self) -> (Option<NodeId>, u64) {
         let m = self.server.borrow();
         (m.current_leader, m.vote.leader_id().get_term())
@@ -372,7 +332,6 @@ impl Core {
         prev.max(now)
     }
 
-    /// Engine time for monitoring snapshots.
     fn monitoring_now(&self) -> Nanos {
         self.clock.now().max(self.state.last_now())
     }
@@ -459,7 +418,6 @@ impl Core {
         }
     }
 
-    /// Has the leader propose the control operation `op`.
     async fn control(&self, op: Op) -> ControlOutcome {
         match self.leader() {
             None => ControlOutcome::NotProposed,
@@ -488,7 +446,6 @@ impl Core {
         }
     }
 
-    /// Whether this node owns connections in the replicated state.
     fn owns_connections(&self, node: NodeId) -> bool {
         self.state.conn_ids().iter().any(|&c| owner_of(c) == node)
     }
@@ -511,7 +468,6 @@ impl Core {
         }
     }
 
-    /// Waits until this node has applied `index`.
     async fn applied_up_to(&self, index: u64) {
         let mut rx = self.state.subscribe();
         loop {
@@ -581,8 +537,6 @@ impl Core {
         }
     }
 
-    /// Size of the stored snapshots, rescanned at most every
-    /// [`SNAPSHOT_SIZE_TTL`].
     fn snapshot_bytes(&self) -> u64 {
         let mut cached = lock(&self.snapshot_size);
         if let Some((at, bytes)) = *cached
@@ -604,8 +558,6 @@ impl Core {
         bytes
     }
 
-    /// Records that `peer` sent this node a forward, ping or control
-    /// request.
     fn heard_from(&self, peer: NodeId) {
         lock(&self.heard).insert(peer, Instant::now());
     }
@@ -823,20 +775,15 @@ impl ClusterInfo for Core {
     }
 }
 
-/// Why cluster startup failed; `main` maps it to an exit status.
 #[derive(Debug)]
 pub enum StartError {
-    /// Another process holds the data directory (exit status 10).
     Locked(PathBuf),
-    /// Anything else (exit status 1).
     Other(String),
 }
 
-/// A running cluster node.
 pub struct ClusterNode {
     pub core: Arc<Core>,
     pub engine: EngineHandle,
-    /// This process's connection ids.
     pub conn_ids: Arc<durable::ConnIdBlocks>,
     listener: Option<ClusterListener>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -866,7 +813,6 @@ impl ClusterNode {
     }
 }
 
-/// The openraft configuration for `c`.
 fn raft_config(c: &ClusterSettings, elect: bool) -> Result<Arc<openraft::Config>, String> {
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     let config = openraft::Config {
@@ -890,7 +836,6 @@ fn raft_config(c: &ClusterSettings, elect: bool) -> Result<Arc<openraft::Config>
         .map_err(|e| format!("cluster timing: {e}"))
 }
 
-/// Everything `start` needs besides the settings.
 pub struct StartArgs<'a> {
     pub settings: &'a ClusterSettings,
     pub tls: Option<ClusterTls>,
@@ -899,7 +844,6 @@ pub struct StartArgs<'a> {
     pub sys: Arc<ProcessSysInfo>,
 }
 
-/// How this process starts (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Bootstrap,
@@ -919,7 +863,6 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         StartError::Other(format!("{what} {}: {e}", c.data_dir.display()))
     };
 
-    // Before `open`, which creates files of its own.
     let had_state = match storage::has_state(&c.data_dir) {
         Ok(v) => v,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -1014,7 +957,6 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
     if mode == Mode::Rejoin {
         let local = log.status().vote;
         if let Some(v) = probe_rejoin_vote(&net, id, &peers, local).await? {
-            // openraft loads the vote in `Raft::new`.
             let mut store = log.clone();
             RaftLogStorage::save_vote(&mut store, &v)
                 .await
@@ -1022,7 +964,6 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         }
     }
 
-    // Elections are off from the start in rejoin mode.
     let config = raft_config(c, mode != Mode::Rejoin).map_err(StartError::Other)?;
     let raft = Raft::new(id, config, net.clone(), log.clone(), sm)
         .await
@@ -1138,8 +1079,6 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         conn_ids,
         listener: Some(listener),
         tasks: {
-            // The actor ends on `EngineMsg::Shutdown`; the others are
-            // aborted by `shutdown`.
             let actor = tasks.remove(0);
             drop(actor);
             tasks

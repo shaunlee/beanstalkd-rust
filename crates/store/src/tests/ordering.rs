@@ -78,7 +78,6 @@ fn always_policy_fsyncs_every_write_before_append_returns() {
         write(&mut wal, b);
         let ops = std::mem::take(&mut wal.inner.file_ops);
 
-        // Every record reached the file during this call.
         let written: u64 = ops
             .iter()
             .map(|op| match op {

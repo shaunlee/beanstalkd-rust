@@ -12,7 +12,6 @@ use std::time::{Duration, Instant};
 
 use common::p2::{ConfigServer, Proto, get, http, stat_of};
 
-/// Port 0: plaintext protocol; port 1: HTTP.
 const CONFIG: &str = r#"
 [[listener]]
 addr = "127.0.0.1:{port0}"
@@ -26,7 +25,6 @@ fn start() -> ConfigServer {
     ConfigServer::start(CONFIG, 2, &[]).0
 }
 
-/// The value of the sample `name` (with its labels, exactly as rendered).
 fn sample(metrics: &str, name: &str) -> String {
     metrics
         .lines()
@@ -55,17 +53,14 @@ fn health_and_error_statuses() {
         assert_eq!(r.header("allow"), Some("GET"), "{method}");
     }
 
-    // Request bodies are refused (and never read).
     let r = http(addr, "GET", "/metrics", "Content-Length: 5\r\n").unwrap();
     assert_eq!(r.status, 400);
     let r = http(addr, "GET", "/admin", "Transfer-Encoding: chunked\r\n").unwrap();
     assert_eq!(r.status, 400);
 
-    // The server still serves after all that.
     assert_eq!(get(addr, "/healthz").status, 200);
 }
 
-/// Jobs in every state across three tubes.
 fn populate(c: &mut Proto<TcpStream>) {
     assert_eq!(c.cmd("use a"), "USING a");
     assert_eq!(c.put(b"1"), "INSERTED 1");
@@ -164,13 +159,11 @@ fn metrics_match_stats() {
         assert_eq!(sample(&m, &name), stat_of(yaml, "cmd-delete"), "{tube}");
     }
 
-    // Four tubes (default, a, b, c) and a cap of two series.
     assert_eq!(sample(&m, "beanstalkd_current_tubes"), "4");
     assert_eq!(sample(&m, "beanstalkd_tube_series_limit"), "2");
     assert_eq!(sample(&m, "beanstalkd_tube_series_truncated"), "1");
     assert!(!m.contains("tube=\"b\""), "b is past the cap:\n{m}");
 
-    // Taking snapshots changes no counter.
     for _ in 0..3 {
         get(server.addr(1), "/metrics");
         get(server.addr(1), "/admin");
@@ -188,7 +181,6 @@ fn metrics_match_stats() {
     }
 }
 
-/// Parses `key: value` stats YAML into (key, value) pairs.
 fn yaml_pairs(yaml: &str) -> Vec<(String, String)> {
     yaml.lines()
         .skip(1)
@@ -197,7 +189,6 @@ fn yaml_pairs(yaml: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// A JSON value as the text `stats` would show for it.
 fn as_stats_text(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
@@ -256,7 +247,6 @@ fn admin_json_matches_stats() {
         assert_eq!(got, want, "{key}");
     }
 
-    // Tubes are capped at max_tube_series (2), first ones in list order.
     let json_tubes = doc["tubes"].as_array().unwrap();
     assert!(
         per_tube.len() > 2,
@@ -280,7 +270,6 @@ fn admin_json_matches_stats() {
     }
 }
 
-/// Writes `n` jobs of `size` bytes through a pipelined connection.
 fn fill(addr: std::net::SocketAddr, n: usize, size: usize) {
     let s = TcpStream::connect(addr).unwrap();
     let mut w = s.try_clone().unwrap();
@@ -343,7 +332,6 @@ fn readyz_is_503_during_binlog_replay() {
 
     let dir = tempfile::tempdir().unwrap();
     let template = binlog_config(binlog.path());
-    // Start without waiting for the protocol port, then poll HTTP at once.
     let ports = [0, 1].map(|_| common::p2::claim_port());
     let text = template
         .replace("{port0}", &ports[0].to_string())
@@ -374,7 +362,6 @@ fn readyz_is_503_during_binlog_replay() {
                 assert_eq!(r.status, 503);
                 assert_eq!(r.body, "not ready");
                 saw_503 = true;
-                // Recovery may complete between two requests.
                 match get(http_addr, "/metrics").status {
                     503 => metrics_503 = true,
                     200 => {}
@@ -391,7 +378,6 @@ fn readyz_is_503_during_binlog_replay() {
     assert!(saw_503, "never saw 503 (ready after {ready_after:?})");
     assert!(healthy_while_not_ready);
     assert!(metrics_503);
-    // Ready means recovered: every job is back, and served.
     let mut c = Proto::new(TcpStream::connect(("127.0.0.1", ports[0])).unwrap());
     assert_eq!(c.stat("stats", "current-jobs-ready"), JOBS.to_string());
     let m = get(http_addr, "/metrics").body;

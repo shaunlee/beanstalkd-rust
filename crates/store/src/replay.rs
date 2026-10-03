@@ -1,47 +1,9 @@
 //! Directory scan and replay (read-only; `open` applies the fixes).
 //!
-//! # Rules
-//!
-//! Segments `binlog.N` (N = decimal digits without leading zeros) are read
-//! in increasing N. Within a segment, records are read from offset 16
-//! until the first position that is not a valid record:
-//!
-//! - a zero length field (or fewer than 8 bytes left, all zero) is the
-//!   *clean end* if every byte from there to the end of the file is zero;
-//! - anything else (non-zero bytes after the end marker, a length running
-//!   past the end of the file, a CRC mismatch) makes the segment *torn* at
-//!   that offset, even if valid-looking records follow it.
-//!
-//! A torn segment is accepted only if no later segment contains a valid
-//! record, i.e. the damage is in the last segment that has data (later
-//! segments can be preallocated spares with no records). `open` then
-//! truncates it at the torn offset, fsyncs it and logs a warning with the
-//! segment and offset: with `-f N` / `-F`, unsynced writes may reach the
-//! disk out of order after a power loss, and losing that unsynced tail is
-//! the accepted cost of those modes (like the reference, which warns and
-//! continues). Always `Corrupt`: a torn segment followed by a later
-//! segment with valid records, a header with the wrong magic or version,
-//! and a record whose CRC matches but whose payload is malformed.
-//!
-//! A file shorter than the 16-byte header, or whose header is all zero, is
-//! a segment whose creation was interrupted: it has no records (if it has
-//! non-zero bytes past the header it counts as torn at offset 16).
-//!
-//! Records are applied in file order: the last record of a job wins, a
-//! Put for an unknown job creates it, a Put for a known job (compaction
-//! move) replaces its record, tube and body, an Update for an unknown job
-//! is ignored (its Put was in a segment that has been garbage-collected,
-//! so the job was moved or deleted later), and a Delete removes the job.
-//! Every record's id counts toward `next_id`, even ignored ones.
-//!
-//! `tube_order` mirrors the reference's tube list after replay (excluding
-//! `default`): a Put that creates a job appends its tube if no live job
-//! uses it yet, and a Delete that removes a tube's last live job
-//! swap-removes the tube (`ms_remove`). A Put for a known job (a move)
-//! does not touch the list; Updates and Deletes of unknown jobs don't
-//! either. After compaction has moved jobs and deleted old segments, the
-//! surviving records differ from the reference's, so this order (like
-//! the job order) may differ from what the reference would produce.
+//! A segment is read until the first position that is not a valid record. A
+//! torn segment is accepted only if it is the last one holding records;
+//! earlier corruption is `Corrupt`. The rules, and why a torn tail is
+//! truncated rather than refused, are in docs/DESIGN.md §7.3.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -115,7 +77,6 @@ pub(crate) fn scan(dir: &Path) -> Result<Scan, WalError> {
 
     let mut st = ReplayState::default();
     let mut segs = Vec::with_capacity(found.len());
-    // (segment index, offset, reason) of the first torn segment.
     let mut torn: Option<(u64, u64, &'static str)> = None;
 
     for &index in &found {

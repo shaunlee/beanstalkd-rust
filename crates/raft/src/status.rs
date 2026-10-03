@@ -8,13 +8,11 @@
 //!
 //! # Vote order
 //!
-//! Every comparison here uses openraft's own `PartialOrd` on `Vote`. In the
-//! build this workspace uses (without openraft's `single-term-leader`
-//! feature) a vote is ordered by its leader id `(term, node_id)` first and
-//! by `committed` second, so `(T, 2, uncommitted) > (T, 1, committed)`: the
-//! order is not "same term: committed wins". Two votes are never
-//! incomparable in this build, but [`adopt_vote`] still treats an
-//! incomparable maximum as "ask again later" instead of picking one.
+//! Comparisons use openraft's own `PartialOrd` on `Vote`: without its
+//! `single-term-leader` feature a vote is ordered by leader id `(term,
+//! node_id)` first and `committed` second (docs/DESIGN.md §8 "Why rejoin is
+//! safe"). [`adopt_vote`] still treats an incomparable maximum as "ask again
+//! later" instead of picking one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -25,15 +23,12 @@ use serde::{Deserialize, Serialize};
 use crate::NodeId;
 use crate::forward::ForwardError;
 
-/// What a node reports about its durable Raft state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NodeStatus {
-    /// The persisted vote.
     pub vote: Option<Vote<NodeId>>,
     /// The id of the last log entry (or of the purge point, if the log is
     /// empty above it).
     pub last_log_id: Option<LogId<NodeId>>,
-    /// The persisted commit hint.
     pub committed: Option<LogId<NodeId>>,
     /// Any Raft state at all (a vote, log entries or a purge point).
     pub has_state: bool,
@@ -57,8 +52,6 @@ pub trait StatusSource: Send + Sync + 'static {
     fn status(&self) -> NodeStatus;
 }
 
-/// The client side of status probes (the TCP network and the simulated
-/// one).
 pub trait StatusTransport: Clone + Send + Sync + 'static {
     fn status(
         &self,
@@ -98,10 +91,8 @@ pub fn quorum(n: usize) -> usize {
     n / 2 + 1
 }
 
-/// The outcome of [`adopt_vote`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Adopt {
-    /// Not enough answers yet.
     TooFew,
     /// The highest vote among the answers and `local` (`None`: nobody has
     /// voted yet).
@@ -146,40 +137,22 @@ pub fn adopt_vote(
     Adopt::Vote(best)
 }
 
-/// What a node started with `--cluster-init` and an empty data directory
-/// does (see [`bootstrap_decision`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bootstrap {
-    /// Initialize the membership (a fresh cluster).
     Initialize,
     /// A peer belongs to a cluster that has had a leader: rejoin it (a
     /// wiped node started with `--cluster-init` by mistake).
     Rejoin(NodeId),
-    /// Not enough answers to decide: ask again later.
     Wait,
 }
 
-/// The `--cluster-init` decision for a cluster of `n` nodes from the
-/// answers of the other nodes:
-///
-/// - any answer from an [established](NodeStatus::established) node:
-///   rejoin;
-/// - at least [`quorum`]`(n)` answers, all without any state: initialize.
-///   (A node that ever led was elected by a quorum, at least
-///   `quorum(n) - 1` of them other than this node, and each of those holds
-///   a vote, so such a set of answers includes one with state);
-/// - answers from *every* other node, some of them bootstrap-only (the
-///   membership at index 0 and an uncommitted vote: an initial node that
-///   initialized first): initialize too. All of them are needed here, since
-///   the voters of a leader hold its vote uncommitted until its first
-///   append, which looks the same; only the leader itself shows a committed
-///   vote and an entry at index 1, and with every node answering it is
-///   among them. Without this case, bootstrapping would deadlock once one
-///   initial node initialized before the others asked: they would all
-///   rejoin, and nobody could elect the one that initialized.
-/// - otherwise wait.
-///
-/// For `n = 1` there is nobody to ask: initialize.
+/// The `--cluster-init` decision for a cluster of `n` nodes from the answers
+/// of the other nodes: rejoin if any answer is
+/// [established](NodeStatus::established); initialize on at least
+/// [`quorum`]`(n)` answers without any state, or on answers from *every*
+/// other node when some are bootstrap-only (an initial node that initialized
+/// first); otherwise wait. `n = 1` initializes. Why each rule is safe, and why
+/// the second is needed: docs/DESIGN.md §8 "Bootstrap".
 pub fn bootstrap_decision(n: usize, answers: &BTreeMap<NodeId, NodeStatus>) -> Bootstrap {
     if let Some((&p, _)) = answers.iter().find(|(_, s)| s.established()) {
         return Bootstrap::Rejoin(p);
@@ -237,7 +210,6 @@ mod tests {
             adopt_vote(3, &a, None),
             Adopt::Vote(Some(Vote::new_committed(5, 2)))
         );
-        // Never below the local vote.
         assert_eq!(
             adopt_vote(3, &a, Some(Vote::new(6, 1))),
             Adopt::Vote(Some(Vote::new(6, 1)))
@@ -260,7 +232,6 @@ mod tests {
         );
         let two = answers(&[(2, st(None, None)), (4, st(None, None))]);
         assert_eq!(adopt_vote(5, &two, None), Adopt::TooFew);
-        // Nobody voted yet.
         let none = answers(&[(2, st(None, None)), (3, st(None, None))]);
         assert_eq!(adopt_vote(3, &none, None), Adopt::Vote(None));
     }

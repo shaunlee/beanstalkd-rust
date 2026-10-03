@@ -7,24 +7,19 @@ use crate::dsl::Step;
 use crate::escape::escape_bytes;
 use crate::mask::{MaskMode, mask_response_with};
 
-/// A single point of disagreement between the two servers' transcripts.
 #[derive(Debug, Clone)]
 pub struct Mismatch {
     pub line: u32,
     pub step_desc: String,
-    /// The most recent `send` on the same connection before this step, if any.
     pub last_send: Option<(u32, String)>,
     pub expected: String,
     pub actual: String,
 }
 
-/// Compare two transcripts (produced by [`crate::conn::execute`] from the
-/// same step list) and report every step where they disagree.
 pub fn compare(steps: &[Step], a: &[Outcome], b: &[Outcome]) -> Vec<Mismatch> {
     compare_with(steps, a, b, MaskMode::default())
 }
 
-/// Like [`compare`], masking responses according to `mode`.
 pub fn compare_with(steps: &[Step], a: &[Outcome], b: &[Outcome], mode: MaskMode) -> Vec<Mismatch> {
     assert_eq!(
         steps.len(),
@@ -60,8 +55,6 @@ pub fn compare_with(steps: &[Step], a: &[Outcome], b: &[Outcome], mode: MaskMode
     mismatches
 }
 
-/// Render an outcome for reports and transcripts (responses masked per
-/// `mode`).
 pub fn format_outcome(o: &Outcome, mode: MaskMode) -> String {
     match o {
         Outcome::Sent(n) => format!("sent({n} bytes)"),

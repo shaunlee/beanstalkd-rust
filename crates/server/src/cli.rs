@@ -108,7 +108,7 @@ pub struct Cli {
     pub cluster_init: bool,
 
     /// Tokio worker-thread count (default: 1 standalone, 2 with a TLS
-    /// listener, -b or [cluster]; see docs/DESIGN.md §3)
+    /// listener, -b or `[cluster]`; see docs/DESIGN.md §3)
     #[arg(
         long = "threads",
         value_name = "N",
@@ -178,8 +178,6 @@ impl Cli {
         Ok(cli)
     }
 
-    /// Parses `args` (including the program name) like `from_env`, but
-    /// returns the error instead of exiting.
     #[cfg(test)]
     pub(crate) fn try_parse_args(args: &[&str]) -> Result<Cli, clap::Error> {
         let matches = Cli::command().try_get_matches_from(args)?;
@@ -216,7 +214,6 @@ fn parse_max_job_size(s: &str) -> Result<u32, String> {
         eprintln!("beanstalkd-rs: maximum job size was set to {MAX_JOB_SIZE_LIMIT}");
         Ok(MAX_JOB_SIZE_LIMIT)
     } else {
-        // `value <= MAX_JOB_SIZE_LIMIT` (a u32), so this cast never truncates.
         Ok(value as u32)
     }
 }
@@ -246,11 +243,9 @@ fn scan_size_t(s: &str) -> Option<u64> {
     })
 }
 
-/// Maps `-V` repeat count to a tracing level, matching the reference's
-/// `verbose++` behavior (more `-V` = more output). The server now takes
-/// its level from `config::LogLevel::from_verbosity` (which also applies
-/// `[log] level`); this stays as the reference the config tests check it
-/// against.
+/// Maps the `-V` count to a tracing level like the reference's `verbose++`.
+/// The server uses `config::LogLevel::from_verbosity`; this stays as the
+/// reference the config tests check it against.
 #[cfg(test)]
 pub fn tracing_level(verbose: u8) -> tracing::Level {
     match verbose {
@@ -368,7 +363,6 @@ mod tests {
                 .expect("argument exists");
             assert_eq!(arg.get_short(), None, "{id} must have no short flag");
         }
-        // No new short flag at all: exactly the reference's set (plus -h).
         let mut shorts: Vec<char> = cmd.get_arguments().filter_map(|a| a.get_short()).collect();
         shorts.sort_unstable();
         assert_eq!(shorts, ['F', 'V', 'b', 'f', 'l', 'p', 's', 'u', 'v', 'z']);

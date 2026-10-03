@@ -12,8 +12,6 @@ fn tube(s: &str) -> TubeName {
     TubeName::new(s).expect("valid tube name in test fixture")
 }
 
-// ---- put ----
-
 #[test]
 fn put_valid() {
     // parse_line alone cannot read the body; it returns an empty body and
@@ -69,7 +67,6 @@ fn put_pri_u32_max_ok() {
 
 #[test]
 fn put_extra_whitespace_between_fields_ok() {
-    // read_u32 skips leading spaces, so extra spaces between fields are fine.
     assert_eq!(
         parse_line(b"put 1   2  3   5"),
         Ok(Command::Put {
@@ -99,8 +96,6 @@ fn put_trailing_garbage_accepted_by_bare_parse_line() {
         })
     );
 }
-
-// ---- use ----
 
 #[test]
 fn use_valid() {
@@ -152,8 +147,6 @@ fn use_len_201_bad_format() {
         Err(Response::BadFormat)
     );
 }
-
-// ---- reserve / reserve-with-timeout / reserve-job ----
 
 #[test]
 fn reserve_valid() {
@@ -238,8 +231,6 @@ fn reserve_job_trailing_garbage() {
     assert_eq!(parse_line(b"reserve-job 42 x"), Err(Response::BadFormat));
 }
 
-// ---- delete ----
-
 #[test]
 fn delete_valid() {
     assert_eq!(parse_line(b"delete 42"), Ok(Command::Delete(42)));
@@ -286,8 +277,6 @@ fn delete_u64_max_ok() {
 fn delete_missing_arg() {
     assert_eq!(parse_line(b"delete "), Err(Response::BadFormat));
 }
-
-// ---- release ----
 
 #[test]
 fn release_valid() {
@@ -336,8 +325,6 @@ fn release_trailing_garbage() {
     assert_eq!(parse_line(b"release 1 2 3 x"), Err(Response::BadFormat));
 }
 
-// ---- bury ----
-
 #[test]
 fn bury_valid() {
     assert_eq!(parse_line(b"bury 1 2"), Ok(Command::Bury { id: 1, pri: 2 }));
@@ -358,8 +345,6 @@ fn bury_trailing_garbage() {
     assert_eq!(parse_line(b"bury 1 2 3"), Err(Response::BadFormat));
 }
 
-// ---- touch ----
-
 #[test]
 fn touch_valid() {
     assert_eq!(parse_line(b"touch 1"), Ok(Command::Touch(1)));
@@ -369,8 +354,6 @@ fn touch_valid() {
 fn touch_non_numeric() {
     assert_eq!(parse_line(b"touch x"), Err(Response::BadFormat));
 }
-
-// ---- watch / ignore ----
 
 #[test]
 fn watch_valid() {
@@ -395,8 +378,6 @@ fn ignore_len_201_bad_format() {
         Err(Response::BadFormat)
     );
 }
-
-// ---- peek / peek-ready / peek-delayed / peek-buried ----
 
 #[test]
 fn peek_valid() {
@@ -428,8 +409,6 @@ fn peek_delayed_valid() {
 fn peek_buried_valid() {
     assert_eq!(parse_line(b"peek-buried"), Ok(Command::PeekBuried));
 }
-
-// ---- kick / kick-job ----
 
 #[test]
 fn kick_valid() {
@@ -497,8 +476,6 @@ fn kick_job_non_numeric() {
     assert_eq!(parse_line(b"kick-job x"), Err(Response::BadFormat));
 }
 
-// ---- stats / stats-job / stats-tube ----
-
 #[test]
 fn stats_valid() {
     assert_eq!(parse_line(b"stats"), Ok(Command::Stats));
@@ -544,8 +521,6 @@ fn stats_tube_trailing_space() {
     assert_eq!(parse_line(b"stats-tube foo "), Err(Response::BadFormat));
 }
 
-// ---- list-tubes / list-tube-used / list-tubes-watched ----
-
 #[test]
 fn list_tubes_valid() {
     assert_eq!(parse_line(b"list-tubes"), Ok(Command::ListTubes));
@@ -569,8 +544,6 @@ fn list_tubes_watched_valid() {
     );
 }
 
-// ---- quit ----
-
 #[test]
 fn quit_valid() {
     assert_eq!(parse_line(b"quit"), Ok(Command::Quit));
@@ -581,8 +554,6 @@ fn quit_trailing_garbage_ignored() {
     // Quirk: prot.c never checks anything after "quit" matches.
     assert_eq!(parse_line(b"quit garbage"), Ok(Command::Quit));
 }
-
-// ---- pause-tube ----
 
 #[test]
 fn pause_tube_valid() {
@@ -674,8 +645,6 @@ fn pause_tube_no_separator_swallows_digits() {
     // tube name, leaving nothing for read_duration.
     assert_eq!(parse_line(b"pause-tube foo5"), Err(Response::BadFormat));
 }
-
-// ---- unknown command / case sensitivity / malformed input ----
 
 #[test]
 fn unknown_command() {

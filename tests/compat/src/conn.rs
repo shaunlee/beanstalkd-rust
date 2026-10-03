@@ -46,10 +46,8 @@ use crate::mask::{MaskMode, mask_response_with};
 use crate::server::ServerProcess;
 use crate::tls::TlsMaterial;
 
-/// The observable result of executing one DSL step against one server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// `send`: number of bytes written.
     Sent(usize),
     /// `recv`: the full raw response (status line + any body), unmasked.
     Received(Vec<u8>),
@@ -63,13 +61,9 @@ pub enum Outcome {
     Closed,
     /// `recv_closed`: the connection was still open at the end of the window.
     StillOpen,
-    /// `sleep` completed.
     Slept,
-    /// `signal` was delivered to the server process.
     Signaled,
-    /// `shutdown_write` completed.
     ShutdownDone,
-    /// `close` completed.
     ClosedDone,
     /// `restart` / `crash` completed: the server was stopped and is
     /// accepting connections again; all connections were dropped.
@@ -90,10 +84,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// (see `tls_handshake`).
 const TICKET_WAIT: Duration = Duration::from_millis(250);
 
-/// How the harness talks to one server.
 #[derive(Clone, Default)]
 pub enum ClientTransport {
-    /// Plain TCP.
     #[default]
     Plain,
     /// TLS over TCP, trusting only the configured roots; the server
@@ -111,7 +103,6 @@ impl std::fmt::Debug for ClientTransport {
 }
 
 impl ClientTransport {
-    /// Whether this transport uses TLS.
     pub fn is_tls(&self) -> bool {
         matches!(self, ClientTransport::Tls(_))
     }
@@ -135,12 +126,10 @@ impl Stream {
     }
 }
 
-/// A client connection over either transport (see the module docs).
 pub struct ConnHandle {
     stream: Stream,
     buf: Vec<u8>,
     closed_seen: bool,
-    /// `shutdown_write` was performed (TLS: `close_notify` already sent).
     write_closed: bool,
 }
 
@@ -181,8 +170,6 @@ impl ConnHandle {
         })
     }
 
-    /// Write all of `data` (TLS: as application data, flushed to the
-    /// socket).
     pub fn send(&mut self, data: &[u8]) -> std::io::Result<usize> {
         match &mut self.stream {
             Stream::Plain(s) => s.write_all(data)?,
@@ -218,7 +205,6 @@ impl ConnHandle {
         }
     }
 
-    /// Read one complete response (status line plus any data chunk).
     pub fn recv_response(&mut self) -> Outcome {
         let deadline = Instant::now() + RECV_TIMEOUT;
         loop {
@@ -243,7 +229,6 @@ impl ConnHandle {
         }
     }
 
-    /// Record whether any bytes arrive within `dur`.
     pub fn recv_none(&mut self, dur: Duration) -> Outcome {
         if !self.buf.is_empty() {
             return Outcome::SomeBytes(self.buf.clone());
@@ -256,7 +241,6 @@ impl ConnHandle {
         }
     }
 
-    /// Record whether the peer closes the connection within `dur`.
     pub fn recv_closed(&mut self, dur: Duration) -> Outcome {
         if self.closed_seen {
             return Outcome::Closed;
@@ -300,7 +284,6 @@ impl ConnHandle {
         }
     }
 
-    /// Close the connection (TLS: best-effort `close_notify` first).
     pub fn close(mut self) {
         if let Stream::Tls(s) = &mut self.stream {
             // Consume TLS records that already arrived (e.g. session
@@ -320,7 +303,6 @@ impl ConnHandle {
     }
 }
 
-/// Run a TLS client handshake on `sock`, bounded by the connect timeout.
 fn tls_handshake(sock: TcpStream, config: Arc<ClientConfig>) -> std::io::Result<TlsStream> {
     let conn =
         ClientConnection::new(config, TlsMaterial::server_name()).map_err(std::io::Error::other)?;
@@ -349,7 +331,6 @@ fn tls_handshake(sock: TcpStream, config: Arc<ClientConfig>) -> std::io::Result<
             _ => process_tls(&mut s)?,
         }
     }
-    // The client's Finished (and anything else pending).
     flush_tls(&mut s)?;
 
     // A TLS 1.3 server sends its session tickets right after it receives
@@ -362,7 +343,6 @@ fn tls_handshake(sock: TcpStream, config: Arc<ClientConfig>) -> std::io::Result<
     if s.conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3) {
         s.sock.set_read_timeout(Some(TICKET_WAIT))?;
         match s.conn.read_tls(&mut s.sock) {
-            // EOF: recorded by rustls, reported by the next read.
             Ok(0) => {}
             Ok(_) => process_tls(&mut s)?,
             Err(e) if is_timeout(&e) => {}
@@ -390,7 +370,6 @@ fn drain_available(s: &mut TlsStream) {
     let _ = s.sock.set_nonblocking(false);
 }
 
-/// Write every pending TLS record to the socket.
 fn flush_tls(s: &mut TlsStream) -> std::io::Result<()> {
     while s.conn.wants_write() {
         s.conn.write_tls(&mut s.sock)?;
@@ -423,12 +402,10 @@ fn set_deadline(sock: &TcpStream, remaining: Duration) -> std::io::Result<bool> 
     Ok(nonblocking)
 }
 
-/// Undo [`set_deadline`]'s non-blocking fallback after a read.
 fn end_deadline<T>(sock: &TcpStream, nonblocking: bool, res: &std::io::Result<T>) {
     if nonblocking {
         let _ = sock.set_nonblocking(false);
         if matches!(res, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock) {
-            // Not expected on a fully shut down socket; avoid spinning.
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -552,11 +529,8 @@ fn extra_body_len(line: &[u8]) -> Option<usize> {
 /// which process receives `signal` steps, and what `restart` / `crash`
 /// do.
 pub trait Target {
-    /// The address clients connect to.
     fn addr(&self) -> SocketAddr;
-    /// How clients connect.
     fn client_transport(&self) -> ClientTransport;
-    /// The process that receives `signal` steps.
     fn pid(&self) -> u32;
     /// Perform a `restart` / `crash` step. `open` holds every open
     /// connection of the case, in the order they were opened; none of
@@ -582,7 +556,6 @@ impl Target for ServerProcess {
         ServerProcess::pid(self)
     }
 
-    /// Drop every connection, then stop and start the process again.
     fn restart(
         &mut self,
         how: StopMode,
@@ -638,7 +611,6 @@ pub fn close_in_order(conns: Vec<ConnHandle>) {
     }
 }
 
-/// The open connections of a case, in the order they were opened.
 #[derive(Default)]
 struct Conns(Vec<(String, ConnHandle)>);
 
@@ -774,7 +746,6 @@ pub fn outcomes_equal(a: &Outcome, b: &Outcome) -> bool {
     outcomes_equal_with(a, b, MaskMode::default())
 }
 
-/// Like [`outcomes_equal`], masking responses according to `mode`.
 pub fn outcomes_equal_with(a: &Outcome, b: &Outcome, mode: MaskMode) -> bool {
     match (a, b) {
         (Outcome::Received(x), Outcome::Received(y)) => {
@@ -813,8 +784,6 @@ mod tests {
             Outcome::Closed
         );
     }
-
-    // ---- TLS transport, against a tiny in-test rustls server. ----
 
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -880,7 +849,6 @@ mod tests {
         }
     }
 
-    /// Read exactly one CRLF-terminated line of application data.
     fn server_read_line(s: &mut ServerStream) -> Vec<u8> {
         let mut line = Vec::new();
         let mut byte = [0u8; 1];
@@ -904,7 +872,6 @@ mod tests {
         let (mut conn, handle, _m) = tls_pair(|mut s| {
             assert_eq!(server_read_line(&mut s), b"put 0 0 1 5\r\n");
             assert_eq!(server_read_line(&mut s), b"hello\r\n");
-            // A body response split over several TLS records.
             s.write_all(b"RESERVED 7 5\r\nhel").expect("write");
             s.flush().expect("flush");
             std::thread::sleep(Duration::from_millis(50));
@@ -962,7 +929,6 @@ mod tests {
             let (data, clean) = server_read_to_end(&mut s);
             assert_eq!(data, b"reserve\r\n");
             assert!(clean, "half-close must send close_notify");
-            // The TCP write side is shut down as well: raw EOF follows.
             let mut raw = [0u8; 16];
             assert_eq!(s.sock.read(&mut raw).expect("raw read"), 0);
             s.write_all(b"TIMED_OUT\r\n").expect("write");
@@ -979,7 +945,6 @@ mod tests {
             conn.recv_closed(Duration::from_millis(1000)),
             Outcome::Closed
         );
-        // Writing after the half-close is an I/O error, as over TCP.
         assert!(matches!(conn.send(b"x"), Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe));
         handle.join().expect("server thread");
     }
@@ -990,7 +955,6 @@ mod tests {
     fn tls_recv_closed_after_server_close_notify() {
         let (mut conn, handle, _m) = tls_pair(|mut s| {
             server_close_notify(&mut s);
-            // Keep the socket open well past the client's window start.
             std::thread::sleep(Duration::from_millis(500));
         });
         assert_eq!(
@@ -1018,7 +982,6 @@ mod tests {
         );
     }
 
-    /// `recv_closed` on a connection that stays open reports it open.
     #[test]
     fn tls_recv_closed_still_open() {
         let (mut conn, handle, _m) = tls_pair(|mut s| {
@@ -1032,7 +995,6 @@ mod tests {
         handle.join().expect("server thread");
     }
 
-    /// `close` ends the TLS session cleanly (close_notify).
     #[test]
     fn tls_close_sends_close_notify() {
         let (conn, handle, _m) = tls_pair(|mut s| {
@@ -1066,7 +1028,6 @@ mod tests {
         );
     }
 
-    /// The client trusts only the harness's own CA.
     #[test]
     fn tls_rejects_server_with_untrusted_certificate() {
         let server_material = TlsMaterial::generate().expect("generate");

@@ -1,26 +1,20 @@
 //! Serves the cluster port's forwards and control requests
 //! (`bstk_raft::forward::ForwardHandler`).
 //!
-//! - A forward (another node's connection inputs, in order): on the leader,
-//!   the items are handed, in order, to the proposer ([`super::proposer`]),
-//!   which proposes them with the leader's other queued inputs in
-//!   `Op::Batch` entries, and the answer is `Accepted` without waiting for
-//!   the proposal or its commit (requests of one
-//!   peer connection are served one at a time, and Raft RPCs on it wait
-//!   behind them). Elsewhere the answer is `NotLeader` with the leader this
-//!   node knows of.
-//! - A forward without items is a *ping* (an owner checking that the
-//!   leader hears it, see [`super::actor`]): `Accepted` on the leader,
-//!   elsewhere `NotLeader` with the leader this node knows. (Nodes deciding
-//!   how to start ask with status probes instead, which the listener
-//!   answers from the log store.)
-//! - A control request (`SetDraining`, or `DropNode` of the sender, checked
-//!   by the listener): on the leader it is proposed and the answer waits,
-//!   at most one second, for it to be applied, so that the requester knows
-//!   its index. These are rare (SIGUSR1, a node's startup and rejoin).
+//! - A forward (another node's connection inputs, in order): on the leader the
+//!   items go, in order, to the [`super::proposer`] and the answer is
+//!   `Accepted` without waiting for the proposal or its commit (requests of
+//!   one peer connection are served one at a time and Raft RPCs on it wait
+//!   behind them). Elsewhere: `NotLeader` with the leader this node knows of.
+//!   A forward without items is a *ping* (see [`super::actor`]), answered the
+//!   same way.
+//! - A control request (`SetDraining`, or `DropNode` of the sender, checked by
+//!   the listener): on the leader it is proposed and the answer waits, at most
+//!   one second, for it to be applied, so the requester knows its index. These
+//!   are rare (SIGUSR1, startup, rejoin).
 //!
-//! Every forward, ping and control request records that its sender was
-//! heard from (the leader's node liveness, [`super::duties`]).
+//! Every forward, ping and control request records that its sender was heard
+//! from (node liveness, [`super::duties`]).
 
 use std::sync::Arc;
 

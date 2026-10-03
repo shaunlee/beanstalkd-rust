@@ -51,7 +51,6 @@ fn append_read_across_segments_and_reopen() {
     let d = tempfile::tempdir().unwrap();
     let mut log = open_log(d.path());
     assert_eq!(state(&mut log), (None, None));
-    // Several batches, one fdatasync each.
     append(&mut log, (1..=5).map(|i| filler(1, i)));
     append(&mut log, (6..=40).map(|i| filler(1, i)));
     append(&mut log, [filler(2, 41)]);
@@ -119,7 +118,6 @@ fn torn_tail_at_every_offset() {
     let last = segs.last().unwrap().clone();
     let last_name = last.file_name().unwrap().to_owned();
     let full = std::fs::read(&last).unwrap();
-    // Record boundaries in the last segment, from a clean read.
     let first_in_last: u64 = last_name.to_str().unwrap()[..20].parse().unwrap();
     assert!(first_in_last > 1, "need more than one segment");
     let mut ends = vec![24u64];
@@ -178,7 +176,6 @@ fn garbage_tail_is_cut() {
     let mut log = open_log(d.path());
     assert_eq!(state(&mut log), (None, Some(3)));
     assert_eq!(std::fs::metadata(&last).unwrap().len(), good_len as u64);
-    // A flipped byte inside the last record of the last segment.
     drop(log);
     let mut bytes = std::fs::read(&last).unwrap();
     let n = bytes.len();
@@ -201,7 +198,6 @@ fn corruption_before_the_tail_refuses_to_open() {
     assert!(segs.len() >= 3);
     let name = |p: &PathBuf| p.file_name().unwrap().to_owned();
 
-    // A flipped payload byte in the first segment.
     let d = tempfile::tempdir().unwrap();
     copy_dir(base.path(), d.path());
     let p = d.path().join(name(&segs[0]));
@@ -213,7 +209,6 @@ fn corruption_before_the_tail_refuses_to_open() {
         Err(OpenError::Corrupt(_))
     ));
 
-    // A truncated middle segment.
     let d = tempfile::tempdir().unwrap();
     copy_dir(base.path(), d.path());
     let p = d.path().join(name(&segs[1]));
@@ -229,7 +224,6 @@ fn corruption_before_the_tail_refuses_to_open() {
         Err(OpenError::Corrupt(_))
     ));
 
-    // A missing middle segment (a gap).
     let d = tempfile::tempdir().unwrap();
     copy_dir(base.path(), d.path());
     std::fs::remove_file(d.path().join(name(&segs[1]))).unwrap();
@@ -238,7 +232,6 @@ fn corruption_before_the_tail_refuses_to_open() {
         Err(OpenError::Corrupt(_))
     ));
 
-    // A bad segment header in a non-empty last segment.
     let d = tempfile::tempdir().unwrap();
     copy_dir(base.path(), d.path());
     let p = d.path().join(name(segs.last().unwrap()));
@@ -250,7 +243,6 @@ fn corruption_before_the_tail_refuses_to_open() {
         Err(OpenError::Corrupt(_))
     ));
 
-    // A damaged vote file.
     let d = tempfile::tempdir().unwrap();
     copy_dir(base.path(), d.path());
     let p = d.path().join("vote");
@@ -263,7 +255,6 @@ fn corruption_before_the_tail_refuses_to_open() {
         Err(OpenError::Corrupt(_))
     ));
 
-    // The untouched copy opens.
     let d = tempfile::tempdir().unwrap();
     copy_dir(base.path(), d.path());
     let mut log = open_log(d.path());
@@ -369,7 +360,6 @@ fn truncate_and_purge_persist() {
     block_on(log.truncate(lid(1, 25))).unwrap();
     assert_eq!(state(&mut log), (None, Some(24)));
     assert!(segments(d.path()).len() < before);
-    // Conflicting entries get replaced by a new term.
     append(&mut log, (25..=27).map(|i| filler(2, i)));
     block_on(log.purge(lid(1, 10))).unwrap();
     assert_eq!(state(&mut log), (Some(10), Some(27)));
@@ -382,7 +372,6 @@ fn truncate_and_purge_persist() {
     let mut log = open_log(d.path());
     assert_eq!(state(&mut log), (Some(10), Some(27)));
     assert_eq!(read_all(&mut log), all);
-    // Nothing below the purge point is readable.
     assert!(block_on(log.try_get_log_entries(5..12)).unwrap().len() == 1);
 
     // Truncate everything above the purge point, then purge past the end
@@ -430,7 +419,6 @@ fn crash_mid_purge() {
         let mut log = open_log(d.path());
         block_on(log.purge(lid(1, 20))).unwrap();
     }
-    // Put the deleted segments back, as if the deletes never happened.
     for p in segments(saved.path()) {
         let to = d.path().join(p.file_name().unwrap());
         if !to.exists() {
@@ -455,7 +443,6 @@ fn crash_mid_truncate_leaves_a_consecutive_log() {
         append(&mut log, (1..=30).map(|i| filler(1, i)));
     }
     let segs = segments(d.path());
-    // Simulate: only the newest segment got removed.
     std::fs::remove_file(segs.last().unwrap()).unwrap();
     let mut log = open_log(d.path());
     let (_, last) = state(&mut log);
@@ -492,8 +479,6 @@ fn log_ids_keep_leader_and_term() {
     let mut log = open_log(d.path());
     assert_eq!(read_all(&mut log), vec![e]);
 }
-
-// ------------------------------------------------------ group commit (P3-FD)
 
 fn big_segments(dir: &Path) -> LogStore {
     LogStore::open(
@@ -537,7 +522,6 @@ async fn queue_appends(
 fn appends_coalesce_into_few_syncs() {
     let d = tempfile::tempdir().unwrap();
     let mut log = big_segments(d.path());
-    // Without contention: one sync per append.
     let s0 = log.flusher().syncs();
     for i in 1..=20 {
         append(&mut log, [filler(1, i)]);
@@ -547,7 +531,6 @@ fn appends_coalesce_into_few_syncs() {
     block_on(async {
         log.flusher().set_paused(true);
         let hs = queue_appends(&log, 21..=520).await;
-        // Written, not yet durable: already readable, not acknowledged.
         let mut r = log.clone();
         let all = r.try_get_log_entries(..).await.unwrap();
         assert_eq!(indexes(&all), (1..=520).collect::<Vec<_>>());
@@ -605,11 +588,9 @@ fn crash_between_write_and_sync() {
         let all = read_all(&mut log);
         assert_eq!(indexes(&all), (1..=last).collect::<Vec<_>>(), "{what}");
         assert_eq!(all[9], filler(1, 10), "{what}");
-        // The log keeps working after the recovery.
         append(&mut log, [filler(2, last + 1)]);
     };
     for cut in acked_end..=full.len() as u64 {
-        // A prefix of the unsynced bytes survived.
         let d = tempfile::tempdir().unwrap();
         copy_dir(base.path(), d.path());
         let f = std::fs::OpenOptions::new()
@@ -620,7 +601,6 @@ fn crash_between_write_and_sync() {
         drop(f);
         check(d.path(), &format!("cut at {cut}"));
 
-        // The size survived but the data from `cut` on did not.
         let d = tempfile::tempdir().unwrap();
         copy_dir(base.path(), d.path());
         let mut bytes = full.clone();
@@ -670,7 +650,6 @@ fn truncate_purge_and_vote_wait_for_pending_syncs() {
         *order.lock().unwrap(),
         ["appends", "truncate", "appends", "purge", "appends", "vote"]
     );
-    // Truncated at 7 (6 survives), then 7..=10 appended, purged up to 3.
     assert_eq!(state(&mut log), (Some(3), Some(10)));
     drop(log);
     let mut log = big_segments(d.path());

@@ -34,8 +34,6 @@ use crate::tls::{ClusterTls, cluster_tls_from_pem, node_dns_name};
 use crate::wire::{self, ClientMsg, Hello, PROTOCOL_VERSION, ServerHello, ServerMsg};
 use crate::{ForwardRequest, ForwardResponse, NodeId, Op, Request, TypeConfig, conn_id};
 
-// ---------------------------------------------------------------- helpers
-
 #[derive(Default)]
 struct CountingHandler {
     calls: AtomicUsize,
@@ -120,7 +118,6 @@ impl Pki {
         self.ca.pem()
     }
 
-    /// `(cert PEM, key PEM)` for SAN DNS names `names`.
     fn leaf(&self, names: &[String]) -> (String, String) {
         let mut params = CertificateParams::new(names.to_vec()).expect("params");
         params
@@ -166,7 +163,6 @@ fn tls_with_cert_for(signer: &Pki, trust: &Pki, cert_id: NodeId) -> ClusterTls {
     .expect("tls config")
 }
 
-/// One Raft node with a cluster listener.
 struct Node {
     id: NodeId,
     raft: Raft<TypeConfig>,
@@ -329,8 +325,6 @@ fn forward_from(from: NodeId) -> ForwardRequest {
     }
 }
 
-// ------------------------------------------------------------------ tests
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tcp_plaintext_cluster_elects_and_replicates() {
     let nodes = start_cluster(3, None, raft_config()).await;
@@ -352,12 +346,10 @@ async fn each_rpc_round_trips() {
     let addr = node.addr.to_string();
     let mut c = client_to(&net, 1, &addr).await;
 
-    // Vote.
     let v = c.vote(vote_req(1, 2), option()).await.expect("vote");
     assert!(v.vote_granted);
     assert_eq!(v.vote, Vote::new(1, 2));
 
-    // AppendEntries from the leader it voted for, with one entry.
     let leader = CommittedLeaderId::new(1, 2);
     let members: BTreeMap<NodeId, BasicNode> =
         [(2, BasicNode::new("x")), (1, BasicNode::new(addr.clone()))].into();
@@ -422,7 +414,6 @@ async fn each_rpc_round_trips() {
         ),
         other => panic!("unexpected {other:?}"),
     }
-    // Then a snapshot in two chunks is installed.
     let (a, b) = data.split_at(data.len() / 2);
     for (offset, chunk, done) in [(0, a, false), (a.len() as u64, b, true)] {
         let r = c
@@ -447,7 +438,6 @@ async fn each_rpc_round_trips() {
         .expect("installed");
     assert_eq!(node.sm.applied(), vec![req(1), req(2), req(3)]);
 
-    // Forward.
     let r = net.forward(1, forward_from(2)).await.expect("forward");
     assert_eq!(r, ForwardResponse::NotLeader { leader: Some(3) });
     assert_eq!(node.handler.calls(), 1);
@@ -455,7 +445,6 @@ async fn each_rpc_round_trips() {
         node.handler.last.lock().expect("lock").clone(),
         Some(forward_from(2))
     );
-    // Through the transport trait as well.
     let r = ForwardTransport::forward(&net, 1, forward_from(2)).await;
     assert_eq!(r, Ok(ForwardResponse::NotLeader { leader: Some(3) }));
 
@@ -465,22 +454,18 @@ async fn each_rpc_round_trips() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forward_from_another_node_is_rejected() {
     let (node, net) = single_target(None, None).await;
-    // `from` is not the connection's node.
     let e = net.forward(1, forward_from(3)).await.expect_err("rejected");
     assert!(matches!(e, ForwardError::Rejected(_)), "{e:?}");
-    // A connection owned by another node.
     let mut f = forward_from(2);
     let other = conn_id(3, 9);
     f.items.push((other, 1, EngineInput::Connect(other)));
     let e = net.forward(1, f).await.expect_err("rejected");
     assert!(matches!(e, ForwardError::Rejected(_)), "{e:?}");
-    // An input naming another connection.
     let mut f = forward_from(2);
     f.items[0].2 = EngineInput::Disconnect(conn_id(2, 5));
     let e = net.forward(1, f).await.expect_err("rejected");
     assert!(matches!(e, ForwardError::Rejected(_)), "{e:?}");
     assert_eq!(node.handler.calls(), 0);
-    // The connection is still usable.
     net.forward(1, forward_from(2)).await.expect("forward");
     assert_eq!(node.handler.calls(), 1);
     shutdown(vec![node]).await;
@@ -490,7 +475,6 @@ async fn forward_from_another_node_is_rejected() {
 async fn hello_from_unknown_or_misaddressed_node_is_rejected() {
     let (node, _) = single_target(None, None).await;
     let addr = node.addr.to_string();
-    // Node 9 is not a configured peer.
     let net9 = Network::new(net_config(9, [(1, addr.clone())].into(), None));
     let e = net9
         .forward(1, forward_from(9))
@@ -500,7 +484,6 @@ async fn hello_from_unknown_or_misaddressed_node_is_rejected() {
         matches!(e, ForwardError::Unreachable(ref m) if m.contains("rejected: hello rejected")),
         "{e:?}"
     );
-    // Node 2 believes node 5 listens there.
     let net2 = Network::new(net_config(2, [(5, addr.clone())].into(), None));
     let e = net2
         .forward(5, forward_from(2))
@@ -510,7 +493,6 @@ async fn hello_from_unknown_or_misaddressed_node_is_rejected() {
         matches!(e, ForwardError::Unreachable(ref m) if m.contains("rejected: hello rejected")),
         "{e:?}"
     );
-    // Unknown target address.
     let e = net2.forward(7, forward_from(2)).await.expect_err("unknown");
     assert!(matches!(e, ForwardError::Unreachable(_)), "{e:?}");
     assert_eq!(node.handler.calls(), 0);
@@ -519,7 +501,6 @@ async fn hello_from_unknown_or_misaddressed_node_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unreachable_target_maps_to_unreachable_and_backs_off() {
-    // A port with nothing listening.
     let addr = {
         let t = bind().await;
         t.local_addr().expect("addr").to_string()
@@ -531,7 +512,6 @@ async fn unreachable_target_maps_to_unreachable_and_backs_off() {
         .await
         .expect_err("unreachable");
     assert!(matches!(e, RPCError::Unreachable(_)), "{e:?}");
-    // Immediately again: refused by the backoff without dialing.
     let e = c
         .vote(vote_req(1, 2), option())
         .await
@@ -540,7 +520,6 @@ async fn unreachable_target_maps_to_unreachable_and_backs_off() {
         RPCError::Unreachable(u) => assert!(u.to_string().contains("backing off"), "{u}"),
         other => panic!("unexpected {other:?}"),
     }
-    // The backoff schedule doubles and is capped.
     let mut b = c.backoff();
     let delays: Vec<_> = (0..6).filter_map(|_| b.next()).collect();
     assert_eq!(
@@ -561,7 +540,6 @@ async fn reconnects_after_listener_restart() {
     let net = Network::new(net_config(2, [(1, addr_s.to_string())].into(), None));
     net.forward(1, forward_from(2)).await.expect("first");
 
-    // Stop the listener: its connections are closed.
     node.listener.take().expect("listener").shutdown().await;
     let e = net.forward(1, forward_from(2)).await.expect_err("down");
     assert!(
@@ -569,7 +547,6 @@ async fn reconnects_after_listener_restart() {
         "{e:?}"
     );
 
-    // Restart it on the same address; the client re-dials after backoff.
     let tcp = TcpListener::bind(addr_s).await.expect("rebind");
     node.listener = Some(
         ClusterListener::spawn(
@@ -665,7 +642,6 @@ async fn request_timeouts() {
         "{took:?}"
     );
 
-    // The RPCOption's hard TTL caps the configured timeout.
     let t0 = tokio::time::Instant::now();
     let e = c
         .append_entries(
@@ -789,7 +765,6 @@ async fn slow_append_does_not_fail_forwards_on_the_same_connection() {
     let net = Network::new(cfg);
     let mut c = client_to(&net, 1, &addr).await;
 
-    // Our own timeout.
     let e = c
         .append_entries(heartbeat(), option())
         .await
@@ -806,7 +781,6 @@ async fn slow_append_does_not_fail_forwards_on_the_same_connection() {
     assert!(dropped.is_err());
     assert_eq!(net.pending_len(1), 0, "the dropped call left its slot");
 
-    // A forward behind them is answered on the same connection.
     let r = net.forward(1, forward_from(2)).await.expect("forward");
     assert_eq!(r, ForwardResponse::NotLeader { leader: None });
     assert_eq!(accepts.load(Ordering::SeqCst), 1);
@@ -942,7 +916,6 @@ async fn raw_hello(addr: SocketAddr, from: NodeId) -> tokio::net::TcpStream {
     s
 }
 
-/// Reads until EOF (or error); true if the peer closed within 2 s.
 async fn closes(s: &mut tokio::net::TcpStream) -> bool {
     let mut buf = [0u8; 256];
     let r = tokio::time::timeout(Duration::from_secs(2), async {
@@ -960,17 +933,14 @@ async fn closes(s: &mut tokio::net::TcpStream) -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn listener_closes_on_bad_frames() {
     let (node, _) = single_target(None, None).await;
-    // Oversized frame header after the hello.
     let mut s = raw_hello(node.addr, 2).await;
     s.write_all(&u32::MAX.to_be_bytes()).await.expect("write");
     assert!(closes(&mut s).await);
-    // Garbage payload.
     let mut s = raw_hello(node.addr, 2).await;
     s.write_all(&[0, 0, 0, 3, 0xff, 0xff, 0xff])
         .await
         .expect("write");
     assert!(closes(&mut s).await);
-    // A request before the hello.
     let mut s = tokio::net::TcpStream::connect(node.addr)
         .await
         .expect("connect");
@@ -984,7 +954,6 @@ async fn listener_closes_on_bad_frames() {
     .expect("encode");
     s.write_all(&f).await.expect("write");
     assert!(closes(&mut s).await);
-    // A second hello.
     let mut s = raw_hello(node.addr, 2).await;
     let f = wire::encode(
         &ClientMsg::Hello(Hello {
@@ -1002,7 +971,6 @@ async fn listener_closes_on_bad_frames() {
     shutdown(vec![node]).await;
 }
 
-/// Sends a forward on a raw authenticated connection; true if answered.
 async fn raw_forward(s: &mut tokio::net::TcpStream, from: NodeId) -> bool {
     let f = wire::encode(
         &ClientMsg::Request {
@@ -1023,7 +991,6 @@ async fn raw_forward(s: &mut tokio::net::TcpStream, from: NodeId) -> bool {
     matches!(r, Ok(Ok(Some(ServerMsg::Response { id: 1, .. }))))
 }
 
-/// A lone node 1 (peers 2 and 3) with listener settings from `edit`.
 async fn lone_listener(
     edit: impl FnOnce(&mut ListenerConfig),
 ) -> (ClusterListener, Raft<TypeConfig>, SocketAddr) {
@@ -1053,19 +1020,13 @@ async fn listener_limits_handshakes_separately_from_peers() {
     })
     .await;
 
-    // Node 2 is connected and authenticated.
     let mut peer2 = raw_hello(addr, 2).await;
-    // A connection that never says hello takes the only handshake slot.
     let mut idle = tokio::net::TcpStream::connect(addr).await.expect("connect");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // Another one is closed at accept.
     let mut second = tokio::net::TcpStream::connect(addr).await.expect("connect");
     assert!(closes(&mut second).await);
-    // The authenticated peer is still served.
     assert!(raw_forward(&mut peer2, 2).await);
-    // The idle one is closed when the handshake time runs out.
     assert!(closes(&mut idle).await);
-    // Then the slot is free again: node 3 gets in, node 2 stays.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let mut peer3 = raw_hello(addr, 3).await;
     assert!(raw_forward(&mut peer3, 3).await);
@@ -1085,7 +1046,6 @@ async fn listener_limits_handshakes_per_source_address() {
     let _a = tokio::net::TcpStream::connect(addr).await.expect("connect");
     let _b = tokio::net::TcpStream::connect(addr).await.expect("connect");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // The global budget has room, but this address is at its limit.
     let mut c = tokio::net::TcpStream::connect(addr).await.expect("connect");
     assert!(closes(&mut c).await);
     l.shutdown().await;
@@ -1102,7 +1062,6 @@ async fn newer_peer_connection_replaces_the_older_one() {
     let mut new = raw_hello(addr, 2).await;
     assert!(closes(&mut old).await);
     assert!(raw_forward(&mut new, 2).await);
-    // Node 3's connection is untouched.
     assert!(raw_forward(&mut other, 3).await);
     l.shutdown().await;
     let _ = raft.shutdown().await;
@@ -1116,8 +1075,6 @@ fn listener_defaults() {
     assert!(c.max_handshakes >= c.max_handshakes_per_ip);
     assert!(c.vote_gate.is_none());
 }
-
-// -------------------------------------------------------------------- TLS
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mtls_good_certificates_work() {
@@ -1150,7 +1107,6 @@ async fn assert_rejected(server_tls: ClusterTls, client_tls: ClusterTls, why: &s
     }
     let e = net.forward(1, forward_from(2)).await.expect_err("rejected");
     assert!(matches!(e, ForwardError::Unreachable(_)), "{e:?}");
-    // Status probes need the same authentication.
     let e = net.status(1).await.expect_err("rejected");
     assert!(matches!(e, ForwardError::Unreachable(_)), "{e:?}");
     assert_eq!(node.handler.calls(), 0);
@@ -1183,7 +1139,6 @@ async fn mtls_wrong_ca_is_rejected_both_ways() {
     let rogue = Pki::new("rogue CA");
     // The client's certificate is from another CA (it trusts the cluster CA).
     assert_rejected(pki.node(1), tls_with_cert_for(&rogue, &pki, 2), "").await;
-    // The server's certificate is from another CA.
     assert_rejected(
         tls_with_cert_for(&rogue, &pki, 1),
         pki.node(2),
@@ -1255,8 +1210,6 @@ fn tls_config_rejects_own_certificate_for_another_node() {
     assert!(e.0.contains("cluster.tls.ca"), "{e}");
 }
 
-// --------------------------------------------------------------- snapshot
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wiped_node_catches_up_by_chunked_snapshot_over_tls() {
     let pki = Pki::new("cluster CA");
@@ -1268,7 +1221,6 @@ async fn wiped_node_catches_up_by_chunked_snapshot_over_tls() {
     let mut nodes = start_cluster(3, Some(&pki), config.clone()).await;
     replicate_and_check(&nodes, 0, 30).await;
 
-    // Stop the node that is not the leader.
     let leader = wait_leader(&nodes).await;
     let victim_pos = nodes.iter().position(|n| n.id != leader).expect("follower");
     let mut victim = nodes.remove(victim_pos);
@@ -1278,7 +1230,6 @@ async fn wiped_node_catches_up_by_chunked_snapshot_over_tls() {
     }
     victim.raft.shutdown().await.expect("shutdown");
 
-    // More writes, then a snapshot and a purge on the leader.
     replicate_and_check(&nodes, 100, 10).await;
     let l = nodes.iter().find(|n| n.id == leader).expect("leader");
     l.raft.trigger().snapshot().await.expect("snapshot");
@@ -1299,7 +1250,6 @@ async fn wiped_node_catches_up_by_chunked_snapshot_over_tls() {
         .await
         .expect("purged");
 
-    // Restart the wiped node on its old address with empty storage.
     let addrs: BTreeMap<NodeId, String> = [
         (nodes[0].id, nodes[0].addr.to_string()),
         (nodes[1].id, nodes[1].addr.to_string()),
@@ -1321,12 +1271,9 @@ async fn wiped_node_catches_up_by_chunked_snapshot_over_tls() {
     shutdown(nodes).await;
 }
 
-// ------------------------------------------------ protocol version 2 (P3-T4)
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn control_requests_are_checked_and_served() {
     let (node, net) = single_target(None, None).await;
-    // Drain mode and dropping the sender itself are allowed.
     for op in [
         Op::SetDraining(true),
         Op::DropNode {
@@ -1346,7 +1293,6 @@ async fn control_requests_are_checked_and_served() {
             .expect("control");
         assert_eq!(r, ControlResponse::Accepted { index: Some(7) });
     }
-    // Everything else is refused before the handler sees it.
     for (from, op) in [
         (3, Op::SetDraining(true)),
         (
@@ -1512,8 +1458,6 @@ async fn last_response_tracks_answers() {
     shutdown(vec![node]).await;
 }
 
-// ------------------------------------------------------------- P3-FA fixes
-
 /// Like [`single_target`], with `edit` applied to the listener config.
 async fn single_target_with(edit: impl FnOnce(&mut ListenerConfig)) -> (Node, Network) {
     let tcp = bind().await;
@@ -1556,9 +1500,7 @@ async fn closed_vote_gate_refuses_votes_without_touching_raft() {
     let e = c.vote(vote_req(5, 2), option()).await.expect_err("refused");
     assert!(matches!(e, RPCError::Network(_)), "{e:?}");
     assert_eq!(gate.refused(), 1);
-    // Raft never saw the candidate's term.
     assert_eq!(node.raft.metrics().borrow().current_term, 0);
-    // Other requests on the same connection are served.
     let r = net.forward(1, forward_from(2)).await.expect("forward");
     assert_eq!(r, ForwardResponse::NotLeader { leader: Some(3) });
 
@@ -1603,11 +1545,9 @@ async fn snapshot_chunks_cannot_leave_gaps() {
     c.install_snapshot(chunk(0, a, false), option())
         .await
         .expect("first chunk");
-    // Retransmit of the first chunk.
     c.install_snapshot(chunk(0, a, false), option())
         .await
         .expect("retransmit");
-    // A chunk far beyond the received bytes.
     let e = c
         .install_snapshot(chunk(1 << 40, b, false), option())
         .await
@@ -1621,7 +1561,6 @@ async fn snapshot_chunks_cannot_leave_gaps() {
         .await
         .expect_err("gap of one byte");
     assert!(matches!(e, RPCError::RemoteError(_)), "{e:?}");
-    // The node is fine; the sender restarts from 0 with the same id.
     c.install_snapshot(chunk(0, a, false), option())
         .await
         .expect("restart");
@@ -1685,13 +1624,10 @@ async fn status_probes_are_answered_before_raft_runs() {
     assert_eq!(gate.refused(), 1);
     assert!(c.append_entries(heartbeat(), option()).await.is_err());
 
-    // An unknown node gets no answer.
     let stranger = Network::new(net_config(9, [(1, addr.clone())].into(), None));
     let e = stranger.status(1).await.expect_err("unknown peer");
     assert!(matches!(e, ForwardError::Unreachable(_)), "{e:?}");
 
-    // Installing the service: forwards reach the handler; status probes
-    // are still answered from the source.
     let raft_net = Network::new(net_config(1, [(1, addr.clone())].into(), None));
     let raft = Raft::new(
         1,
@@ -1714,7 +1650,6 @@ async fn status_probes_are_answered_before_raft_runs() {
     listener.shutdown().await;
     let _ = raft.shutdown().await;
 
-    // Without a status source, probes are refused.
     let (l, raft, addr) = lone_listener(|_| {}).await;
     let net = Network::new(net_config(2, [(1, addr.to_string())].into(), None));
     let e = net.status(1).await.expect_err("no source");

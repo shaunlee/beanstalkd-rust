@@ -12,10 +12,6 @@ use std::time::{Duration, Instant};
 
 use common::Server;
 
-// ---------------------------------------------------------------------
-// basic flow
-// ---------------------------------------------------------------------
-
 #[test]
 fn basic_put_reserve_delete_and_stats() {
     let server = Server::start(&[]);
@@ -53,10 +49,6 @@ fn quit_closes_connection() {
     assert_eq!(n, 0, "quit must close with no reply");
 }
 
-// ---------------------------------------------------------------------
-// blocking reserve, disconnect, half-close
-// ---------------------------------------------------------------------
-
 #[test]
 fn blocking_reserve_woken_by_put_on_another_connection() {
     let server = Server::start(&[]);
@@ -64,7 +56,6 @@ fn blocking_reserve_woken_by_put_on_another_connection() {
     let mut putter = server.connect();
 
     reserver.send(b"reserve\r\n");
-    // No job exists yet; confirm we are genuinely blocked, not fast-failing.
     assert!(
         !reserver.recv_something(Duration::from_millis(300)),
         "reserve resolved before any job existed"
@@ -116,10 +107,6 @@ fn half_close_while_waiting_on_reserve_times_out() {
     assert_eq!(c.read_line(), "TIMED_OUT\r\n");
 }
 
-// ---------------------------------------------------------------------
-// pipelining
-// ---------------------------------------------------------------------
-
 #[test]
 fn pipelined_commands_in_one_write() {
     let server = Server::start(&[]);
@@ -159,10 +146,6 @@ fn put_body_split_across_writes() {
     assert_eq!(header, "RESERVED 1 5\r\n");
     assert_eq!(body, b"hello");
 }
-
-// ---------------------------------------------------------------------
-// timing: reserve-with-timeout and TTR expiry
-// ---------------------------------------------------------------------
 
 /// prot.c counts a put and allocates its job id as soon as the command
 /// line parses (`Frame::PutStarted`), before the body arrives: a put
@@ -260,10 +243,6 @@ fn ttr_expiry_returns_job_to_ready_and_bumps_timeouts() {
     assert!(body.contains("timeouts: 1"), "body={body}");
 }
 
-// ---------------------------------------------------------------------
-// signals
-// ---------------------------------------------------------------------
-
 #[test]
 fn sigusr1_puts_replies_draining() {
     let server = Server::start(&[]);
@@ -272,7 +251,6 @@ fn sigusr1_puts_replies_draining() {
     let pid = nix::unistd::Pid::from_raw(server.pid() as i32);
     nix::sys::signal::kill(pid, nix::sys::signal::SIGUSR1).expect("kill(SIGUSR1)");
 
-    // Give the signal a moment to be delivered and processed.
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         c.send(b"put 0 0 60 1\r\nx\r\n");
@@ -288,14 +266,8 @@ fn sigusr1_puts_replies_draining() {
     }
 }
 
-// ---------------------------------------------------------------------
-// concurrency / resource cleanup
-// ---------------------------------------------------------------------
-
 #[test]
 fn one_thousand_connections_open_and_close_cleanly() {
-    // Best-effort: raise our own soft RLIMIT_NOFILE, since we are about to
-    // hold ~1,000 sockets open at once ourselves.
     if let Ok((soft, hard)) =
         nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
         && hard > soft
@@ -317,8 +289,6 @@ fn one_thousand_connections_open_and_close_cleanly() {
     assert_responsive(&server);
     drop(conns);
 
-    // Poll briefly: closing 1,000 sockets and having the server notice EOF
-    // on each is not instantaneous.
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let mut c = server.connect();
@@ -339,8 +309,6 @@ fn one_thousand_connections_open_and_close_cleanly() {
     }
 }
 
-/// A fresh connection can still complete a full round trip; used to prove
-/// the server isn't wedged under load.
 fn assert_responsive(server: &Server) {
     let mut c = server.connect();
     c.send(b"stats\r\n");

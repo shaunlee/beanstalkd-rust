@@ -30,7 +30,6 @@ impl Op {
     }
 }
 
-/// Per-connection samples, merged into one after the run.
 #[derive(Debug, Default)]
 pub struct Recorder {
     samples: [Vec<u64>; 3],
@@ -56,7 +55,6 @@ impl Recorder {
         self.samples.iter().map(Vec::len).sum()
     }
 
-    /// Sorts the samples and returns the summary for `op`.
     pub fn summary(&mut self, op: Op) -> Option<Summary> {
         let v = &mut self.samples[op.index()];
         if v.is_empty() {

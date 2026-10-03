@@ -30,27 +30,19 @@ pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A parsed server reply line (plus body, where the reply carries one).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reply {
     Inserted(u64),
-    Reserved {
-        id: u64,
-        body_len: usize,
-    },
+    Reserved { id: u64, body_len: usize },
     Deleted,
     TimedOut,
     Using,
     Watching(u32),
-    /// `AUTHENTICATED` (beanstalkd-rs token authentication).
     Authenticated,
-    /// `OK <n>` followed by `n` bytes of YAML (read by [`Client::read_reply`]).
     Ok(usize),
-    /// Anything else (errors such as `NOT_FOUND`, `DRAINING`, ...).
     Other(String),
 }
 
-/// A reply that did not match what the scenario expected.
 #[derive(Debug)]
 pub struct Unexpected {
     pub op: &'static str,
@@ -69,7 +61,6 @@ pub fn unexpected(op: &'static str, reply: Reply) -> Error {
     Box::new(Unexpected { op, reply })
 }
 
-/// Parses one reply line (without the trailing `\r\n`).
 pub fn parse_reply_line(line: &[u8]) -> Reply {
     let s = String::from_utf8_lossy(line);
     let mut parts = s.split(' ');
@@ -94,12 +85,10 @@ pub fn parse_reply_line(line: &[u8]) -> Reply {
     }
 }
 
-/// Extracts `key: <integer>` from a stats YAML body.
 pub fn stats_u64(yaml: &str, key: &str) -> Option<u64> {
     stats_str(yaml, key).and_then(|v| v.parse().ok())
 }
 
-/// Extracts `key: <float>` from a stats YAML body.
 pub fn stats_f64(yaml: &str, key: &str) -> Option<f64> {
     stats_str(yaml, key).and_then(|v| v.parse().ok())
 }
@@ -119,13 +108,9 @@ pub struct Target {
     token: Option<String>,
 }
 
-/// TLS settings for [`Target::new`].
 pub struct TlsOptions<'a> {
-    /// PEM CA bundle that verifies the server certificate.
     pub ca: &'a Path,
-    /// Name to verify the server certificate against (DNS name or IP).
     pub server_name: String,
-    /// PEM client certificate chain and private key (mTLS).
     pub client_cert: Option<(&'a Path, &'a Path)>,
 }
 
@@ -185,7 +170,6 @@ fn client_config(o: &TlsOptions<'_>) -> Result<ClientConfig> {
     })
 }
 
-/// A plain or TLS connection.
 enum Stream {
     Plain(TcpStream),
     Tls(Box<TlsStream<TcpStream>>),
@@ -238,7 +222,6 @@ pub struct Client {
     rd: BufReader<Stream>,
     wbuf: Vec<u8>,
     line: Vec<u8>,
-    /// Body of the last `RESERVED` / `OK` reply.
     pub body: Vec<u8>,
 }
 
@@ -279,7 +262,6 @@ impl Client {
         Ok(client)
     }
 
-    /// Queues a raw command line (the caller omits the `\r\n`).
     pub fn queue(&mut self, cmd: &str) {
         self.wbuf.extend_from_slice(cmd.as_bytes());
         self.wbuf.extend_from_slice(b"\r\n");
@@ -291,7 +273,6 @@ impl Client {
         self.wbuf.extend_from_slice(b"\r\n");
     }
 
-    /// Writes all queued commands.
     pub async fn flush(&mut self) -> Result<()> {
         if !self.wbuf.is_empty() {
             tokio::time::timeout(REPLY_TIMEOUT, self.rd.get_mut().write_all(&self.wbuf))
@@ -340,14 +321,12 @@ impl Client {
         Ok(reply)
     }
 
-    /// Sends one command and returns its reply.
     pub async fn call(&mut self, cmd: &str) -> Result<Reply> {
         self.queue(cmd);
         self.flush().await?;
         self.read_reply().await
     }
 
-    /// Makes `tube` the only used and watched tube.
     pub async fn use_and_watch_only(&mut self, tube: &str) -> Result<()> {
         match self.call(&format!("use {tube}")).await? {
             Reply::Using => {}
@@ -366,7 +345,6 @@ impl Client {
         Ok(())
     }
 
-    /// Runs `stats` and returns the YAML body.
     pub async fn stats(&mut self) -> Result<String> {
         match self.call("stats").await? {
             Reply::Ok(_) => Ok(String::from_utf8_lossy(&self.body).into_owned()),

@@ -1,34 +1,26 @@
-//! Leader-side proposal batching (P3-FD).
+//! Leader-side proposal batching (P3-FD; docs/DESIGN.md §8 "Batched
+//! proposals").
 //!
-//! openraft 0.9 appends (and syncs) each proposal on its own, so the
-//! leader proposes connection inputs in [`Op::Batch`] entries: the cluster
-//! actor (this node's own inputs) and the forward handler (other owners'
-//! inputs) hand their items to one proposer task, in order, and the
-//! proposer turns everything queued into as few entries as the bounds
-//! allow ([`bstk_raft::split_batches`]: at most
-//! [`bstk_raft::MAX_PROPOSAL_ITEMS`] items and
-//! [`bstk_raft::MAX_PROPOSAL_BYTES`] per entry, a single larger item alone).
-//!
-//! # Proposal rounds
+//! openraft 0.9 appends (and syncs) each proposal on its own, so the leader
+//! proposes connection inputs in [`Op::Batch`] entries: the cluster actor
+//! (this node's own inputs) and the forward handler (other owners' inputs)
+//! hand their items to one proposer task, in order, and the proposer turns
+//! everything queued into as few entries as the bounds allow
+//! ([`bstk_raft::split_batches`]).
 //!
 //! At most [`MAX_INFLIGHT`] batches are outstanding (proposed, and not yet
 //! applied on this node or refused); further items wait in the proposer's
-//! queue and go into the next batch. So while the Raft core is busy with a
-//! log write, inputs accumulate instead of becoming one entry each. An
-//! outstanding batch stops counting after [`INFLIGHT_WAIT`] (a proposal
-//! whose result never arrives, for example after losing leadership) or
-//! when the view (leader, term) changes.
+//! queue, so while the Raft core is busy with a log write, inputs accumulate
+//! instead of becoming one entry each. An outstanding batch stops counting
+//! after [`INFLIGHT_WAIT`] (a proposal whose result never arrives, e.g. after
+//! losing leadership) or when the view (leader, term) changes.
 //!
-//! # Order and resends
-//!
-//! The queue is FIFO over all submissions, and each submission keeps its
-//! items' order, so every owner's items reach the log in the order the
-//! owner sent them, which the state machine's dedup rule and the actor's
-//! resend rules (see [`super::actor`]) rely on. Items are proposed whether
-//! or not this node still leads: openraft refuses proposals on a
-//! non-leader, and the owners resend whatever is not applied (as before
-//! P3-FD, where a forward answered `Accepted` was not guaranteed to
-//! commit either).
+//! The queue is FIFO over all submissions and each submission keeps its items'
+//! order, so every owner's items reach the log in the order the owner sent
+//! them, which the state machine's dedup rule and the actor's resend rules
+//! (see [`super::actor`]) rely on. Items are proposed whether or not this node
+//! still leads: openraft refuses proposals on a non-leader and the owners
+//! resend whatever is not applied.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -45,20 +37,17 @@ use bstk_raft::{MAX_PROPOSAL_BYTES, MAX_PROPOSAL_ITEMS, Op, proposal_item_size};
 
 use super::Core;
 
-/// Most batches outstanding at once (see the module docs). Measured on
-/// one machine (P3-FD, 3 nodes, put-reserve-delete, 100 connections via
-/// the leader): 1 gives about 133k ops/s, 2 about 120k, 4 about 90-120k,
-/// and 64 (effectively unbounded) 35k, as nearly every batch then holds
-/// one input again.
+/// Most batches outstanding at once. One gave the best throughput in the
+/// P3-FD measurements (about 133k ops/s against 35k when unbounded, 100
+/// connections via the leader, because nearly every batch then holds one
+/// input again).
 pub const MAX_INFLIGHT: usize = 1;
 
 /// An outstanding batch stops counting after this long.
 pub const INFLIGHT_WAIT: Duration = Duration::from_millis(500);
 
-/// Items `(seq, input)` handed to the proposer, in order.
 pub type Items = Vec<(u64, EngineInput)>;
 
-/// The proposer's queue (FIFO over all submissions).
 #[derive(Default)]
 struct Queue {
     items: VecDeque<(u64, EngineInput)>,
@@ -96,7 +85,6 @@ impl Queue {
 
 type Outstanding = Pin<Box<dyn Future<Output = ()> + Send>>;
 
-/// Runs the proposer until every submitter is gone or Raft stops.
 pub async fn run(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<Items>) {
     let mut metrics = core.watch_view();
     let mut view = core.view();
@@ -129,7 +117,6 @@ pub async fn run(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<Items>) {
                 Ok(done) => outstanding.push(Box::pin(async move {
                     let _ = tokio::time::timeout(INFLIGHT_WAIT, done).await;
                 })),
-                // Raft has stopped.
                 Err(_) => return,
             }
         }
@@ -165,7 +152,6 @@ mod tests {
         .collect();
         assert_eq!(sizes, [1024, 1024, 452]);
 
-        // Bytes: 300 KiB bodies, three per MiB; a 3 MiB body goes alone.
         let mut q = Queue::default();
         let mut items: Items = (1..=4).map(|i| (i, put(1, 300 << 10))).collect();
         items.push((5, put(1, 3 << 20)));

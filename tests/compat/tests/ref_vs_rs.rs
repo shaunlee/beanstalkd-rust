@@ -46,7 +46,6 @@ fn ref_vs_rs_all_cases_pass() {
     run_and_check(&cases, &ref_bin, &rs_bin, "all");
 }
 
-/// The cases that declare `!binlog` (restart / crash recovery).
 #[test]
 fn ref_vs_rs_binlog_cases_pass() {
     let (ref_bin, rs_bin) = bins();

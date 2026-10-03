@@ -8,8 +8,6 @@ fn push(dst: &mut BytesMut, s: &str) {
     dst.extend_from_slice(s.as_bytes());
 }
 
-/// Appends `<header>\r\n<body>\r\n` where `<header>` already includes the
-/// announced byte count. Used by `RESERVED`, `FOUND` and `OK`.
 fn push_with_body(dst: &mut BytesMut, header: &str, body: &[u8]) {
     push(dst, header);
     dst.extend_from_slice(body);
@@ -17,8 +15,6 @@ fn push_with_body(dst: &mut BytesMut, header: &str, body: &[u8]) {
 }
 
 impl Response {
-    /// Append the wire form (including trailing `\r\n`, and body + `\r\n`
-    /// where applicable) to `dst`.
     pub fn encode(&self, dst: &mut BytesMut) {
         match self {
             Response::Inserted(id) => push(dst, &format!("INSERTED {id}\r\n")),

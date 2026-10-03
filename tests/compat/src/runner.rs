@@ -29,27 +29,22 @@ pub const CLUSTER_ENV: &str = "BSTK_COMPAT_CLUSTER";
 /// [`RunOptions::stunnel_b`].
 pub const STUNNEL_BIN_ENV: &str = "BSTK_STUNNEL_BIN";
 
-/// Options that apply to every case of a run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunOptions {
     /// Global binlog mode: give every server its own fresh `-b <dir>`, as if
     /// every case declared `!binlog` (cases that already do are unchanged).
     pub force_binlog: bool,
-    /// Keep server A's (masked) transcript in [`CaseResult::transcript`].
     pub keep_transcript: bool,
-    /// TLS mode: server B is started with a generated `--config` file
-    /// declaring one TLS listener (throwaway certificate, generated once
-    /// per run) and every connection to it is a TLS client connection.
-    /// Server A stays plaintext. Requires server B to support TLS
-    /// listeners (`beanstalkd-rs`, from task P2-T4).
+    /// TLS mode: server B is started with a generated `--config` file declaring
+    /// one TLS listener (throwaway certificate, generated once per run) and every
+    /// connection to it is a TLS client connection. Server A stays plaintext.
     pub tls_b: bool,
-    /// Stunnel mode: server B runs plaintext behind `stunnel`, which
-    /// terminates TLS on B's public port; every connection to B is a TLS
-    /// client connection. Meant for validating the harness's TLS path with
-    /// the reference as server B. Takes precedence over `tls_b`. No extra
-    /// masks apply: stunnel opens exactly one backend connection per client
-    /// connection (and none for the readiness check), so even the
-    /// connection counts in `stats` match.
+    /// Stunnel mode: server B runs plaintext behind `stunnel`, which terminates
+    /// TLS on B's public port; every connection to B is a TLS client connection.
+    /// For validating the harness's TLS path with the reference as server B. Takes
+    /// precedence over `tls_b`. No extra masks apply: stunnel opens exactly one
+    /// backend connection per client connection (none for the readiness check),
+    /// so even the connection counts in `stats` match.
     pub stunnel_b: bool,
     /// Cluster mode: server B is a fresh 3-node `beanstalkd-rs` cluster
     /// (see [`crate::cluster`]) and every client connection goes to the
@@ -173,12 +168,10 @@ pub fn default_rs_bin() -> PathBuf {
     target_dir.join("debug").join("beanstalkd-rs")
 }
 
-/// The `tests/compat/cases` directory.
 pub fn cases_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("cases")
 }
 
-/// List all `*.bt` case files under `cases_dir()`, sorted by path.
 pub fn discover_cases() -> std::io::Result<Vec<PathBuf>> {
     let mut cases = Vec::new();
     for entry in std::fs::read_dir(cases_dir())? {
@@ -192,7 +185,6 @@ pub fn discover_cases() -> std::io::Result<Vec<PathBuf>> {
     Ok(cases)
 }
 
-/// The outcome of running one case against a pair of servers.
 pub struct CaseResult {
     pub name: String,
     pub path: PathBuf,
@@ -235,7 +227,6 @@ pub fn run_case_pair(case_path: &Path, bin_a: &Path, bin_b: &Path) -> CaseResult
     run_case_pair_with(case_path, bin_a, bin_b, RunOptions::default())
 }
 
-/// Like [`run_case_pair`], with explicit [`RunOptions`].
 pub fn run_case_pair_with(
     case_path: &Path,
     bin_a: &Path,
@@ -327,7 +318,6 @@ fn run_case_pair_ctx(case_path: &Path, bin_a: &Path, bin_b: &Path, ctx: &RunCont
     }
 }
 
-/// Execute `steps` against `a` and `b` concurrently.
 fn run_both<A: Target + Send, B: Target + Send>(
     steps: &[Step],
     a: &mut A,
@@ -361,7 +351,6 @@ pub fn run_all(
     )
 }
 
-/// Like [`run_all`], with explicit [`RunOptions`].
 pub fn run_all_with(
     case_paths: &[PathBuf],
     bin_a: &Path,

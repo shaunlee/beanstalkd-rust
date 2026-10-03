@@ -15,23 +15,19 @@
 //!            meta         postcard(openraft SnapshotMeta)
 //! ```
 //!
-//! The payload comes first so that a snapshot can be streamed into place:
-//! a build encodes it, and a follower receives it, straight into a
-//! temporary file after a header placeholder; the meta is appended and the
-//! header written when it is complete (`commit`). The checksum order lets
-//! both compute it in one pass.
-//!
-//! Version 1 (before P4-T5c; still read, never written): the same header
-//! with version 1, then meta, then payload, the checksum covering bytes
-//! 16.. in file order. The payload encoding is the same in both.
+//! The payload comes first so a snapshot can be streamed into place: a build
+//! or a follower writes it into a temporary file after a header placeholder,
+//! then appends the meta and writes the header (`commit`); the checksum order
+//! lets both compute it in one pass. Version 1 (before P4-T5c; still read,
+//! never written): the same header, then meta, then payload, the checksum
+//! covering bytes 16.. in file order.
 //!
 //! A snapshot is written to a `.tmp` file, fdatasynced, renamed and the
 //! directory fsynced; only then are older snapshots removed. On open the
-//! newest `.snap` is the current one; leftover temporary files (a crash
-//! while building or receiving) and older snapshots are removed; a damaged
-//! newest snapshot refuses to open (it was synced before it was renamed,
-//! so damage is not a crash artifact). Its checksum is verified by
-//! streaming the file, without holding it in memory.
+//! newest `.snap` is current (its checksum verified by streaming); leftover
+//! temporary files and older snapshots are removed; a damaged newest snapshot
+//! refuses to open (it was synced before it was renamed, so damage is not a
+//! crash artifact).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
@@ -69,14 +65,11 @@ const _: () = assert!(
 
 pub(crate) type Meta = SnapshotMeta<NodeId, BasicNode>;
 
-/// Where the payload of a snapshot file is and how to check it.
 #[derive(Debug, Clone)]
 pub(crate) struct Layout {
     pub(crate) payload_off: u64,
     pub(crate) payload_len: u64,
-    /// CRC-32C state before the payload.
     pub(crate) crc_seed: u32,
-    /// Bytes the checksum covers after the payload.
     pub(crate) crc_suffix: Vec<u8>,
     pub(crate) crc: u32,
 }
@@ -420,7 +413,6 @@ pub(crate) fn read_payload(path: &Path) -> io::Result<Vec<u8>> {
     Ok(v)
 }
 
-/// Test-only crash injection for the snapshot write path.
 #[cfg(test)]
 pub(crate) mod crash_point {
     use std::cell::Cell;
@@ -463,7 +455,6 @@ mod tests {
         }
     }
 
-    /// Stores a 7-byte payload as a snapshot with `meta`.
     fn store(s: &mut SnapshotStore, meta: &Meta, installed: bool) -> io::Result<bool> {
         let (mut f, temp) = s.temp_file()?;
         f.write_all(b"payload")?;

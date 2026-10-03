@@ -46,7 +46,6 @@ fn binlog_max_size_reports_s_unrounded() {
     let server = start(dir.path(), &["-s", "5000"]);
     let mut c = server.connect();
     assert_eq!(c.stat("stats", "binlog-max-size"), "5000");
-    // Without -b too, as the reference.
     let server = Server::start(&["-s", "5000"]);
     let mut c = server.connect();
     assert_eq!(c.stat("stats", "binlog-max-size"), "5000");
@@ -61,22 +60,17 @@ fn build_state(c: &mut Client) {
             format!("INSERTED {n}")
         );
     }
-    // 2: buried with pri 5.
     assert_eq!(c.cmd("reserve-job 2"), "RESERVED 2 4");
     c.read_line();
     assert_eq!(c.cmd("bury 2 5"), "BURIED");
-    // 3: released with a delay.
     assert_eq!(c.cmd("reserve-job 3"), "RESERVED 3 4");
     c.read_line();
     assert_eq!(c.cmd("release 3 7 1000"), "RELEASED");
-    // 4: buried, then kicked.
     assert_eq!(c.cmd("reserve-job 4"), "RESERVED 4 4");
     c.read_line();
     assert_eq!(c.cmd("bury 4 100"), "BURIED");
     assert_eq!(c.cmd("kick-job 4"), "KICKED");
-    // 5: deleted.
     assert_eq!(c.cmd("delete 5"), "DELETED");
-    // 1: reserved at shutdown.
     assert_eq!(c.cmd("reserve-job 1"), "RESERVED 1 4");
     c.read_line();
 }
@@ -97,7 +91,6 @@ fn check_state(c: &mut Client) {
     let (header, body) = c.read_body_reply();
     assert_eq!(header, "FOUND 4 4\r\n");
     assert_eq!(body, b"job4");
-    // Ids continue after the highest one in the binlog.
     assert_eq!(c.put(0, 0, 60, b"new"), "INSERTED 6");
 }
 
@@ -156,7 +149,6 @@ fn second_instance_on_the_same_directory_exits_10() {
     let (status, stderr) = run_to_exit(&["-b", dir.path().to_str().unwrap()]);
     assert_eq!(status.code(), Some(10), "stderr: {stderr}");
     assert!(stderr.contains("failed to lock wal dir"), "{stderr}");
-    // The first instance is unaffected.
     assert_eq!(server.connect().put(0, 0, 1, b"x"), "INSERTED 1");
 }
 
@@ -211,7 +203,6 @@ fn acknowledged_changes_survive_an_immediate_kill() {
             format!("INSERTED {id}")
         );
         if round % 2 == 1 {
-            // Every other round also deletes the previous round's job.
             assert_eq!(c.cmd(&format!("delete {}", id - 1)), "DELETED");
         }
         server.stop(Signal::SIGKILL);

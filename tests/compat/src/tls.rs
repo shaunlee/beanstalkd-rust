@@ -1,22 +1,14 @@
 //! Throwaway TLS material for the harness's TLS mode.
 //!
 //! [`TlsMaterial::generate`] creates, in a fresh temporary directory, a
-//! self-signed CA and a server certificate signed by it (SANs `localhost`
-//! and `127.0.0.1`), written as PEM files that a server under test (or
-//! stunnel) can load:
-//!
-//! - `ca.pem`: the CA certificate;
-//! - `server.pem`: the server (leaf) certificate;
-//! - `server.key`: the server private key (PKCS#8 PEM).
-//!
-//! It also builds the matching rustls [`ClientConfig`], which trusts only
-//! that CA. The material is generated once per run and shared (via `Arc`)
-//! by every case; the directory is removed when the last reference is
-//! dropped.
-//!
-//! The crypto provider is always passed explicitly (aws-lc-rs), never taken
-//! from the process default, so this keeps working if feature unification
-//! across the workspace ever enables a second rustls provider.
+//! self-signed CA and a server certificate signed by it (SANs `localhost` and
+//! `127.0.0.1`) as `ca.pem`, `server.pem` and `server.key` (PKCS#8), plus the
+//! matching rustls [`ClientConfig`] trusting only that CA. It is generated
+//! once per run and shared by every case; the directory is removed when the
+//! last reference is dropped. The crypto provider (aws-lc-rs) is passed
+//! explicitly, never taken from the process default, so this keeps working if
+//! feature unification across the workspace ever enables a second rustls
+//! provider.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,7 +25,6 @@ use rustls::pki_types::ServerName;
 /// certificate verification). The TCP address is always `127.0.0.1`.
 pub const TLS_SERVER_NAME: &str = "localhost";
 
-/// A throwaway CA plus server certificate, as files and as a client config.
 pub struct TlsMaterial {
     dir: PathBuf,
     ca_path: PathBuf,
@@ -51,8 +42,6 @@ impl std::fmt::Debug for TlsMaterial {
 }
 
 impl TlsMaterial {
-    /// Generate a fresh CA and server certificate in a new temporary
-    /// directory and build the client configuration trusting the CA.
     pub fn generate() -> Result<Self, String> {
         let dir = create_temp_dir("bstk-compat-tls")
             .map_err(|e| format!("could not create TLS temp directory: {e}"))?;
@@ -122,32 +111,26 @@ impl TlsMaterial {
         })
     }
 
-    /// The temporary directory holding the PEM files.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
-    /// Path of the CA certificate (PEM).
     pub fn ca_path(&self) -> &Path {
         &self.ca_path
     }
 
-    /// Path of the server certificate (PEM).
     pub fn cert_path(&self) -> &Path {
         &self.cert_path
     }
 
-    /// Path of the server private key (PKCS#8 PEM).
     pub fn key_path(&self) -> &Path {
         &self.key_path
     }
 
-    /// Client configuration trusting only the generated CA.
     pub fn client_config(&self) -> Arc<ClientConfig> {
         Arc::clone(&self.client_config)
     }
 
-    /// The server name to verify the server certificate against.
     pub fn server_name() -> ServerName<'static> {
         ServerName::try_from(TLS_SERVER_NAME).expect("TLS_SERVER_NAME is a valid DNS name")
     }
@@ -159,7 +142,6 @@ impl Drop for TlsMaterial {
     }
 }
 
-/// Removes a directory on drop unless defused.
 struct DirGuard(Option<PathBuf>);
 
 impl DirGuard {
@@ -176,7 +158,6 @@ impl Drop for DirGuard {
     }
 }
 
-/// Create a fresh, empty directory `<tmp>/<prefix>-<pid>-<n>`.
 pub(crate) fn create_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let base = std::env::temp_dir();

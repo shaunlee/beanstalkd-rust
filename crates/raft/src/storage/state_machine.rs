@@ -4,38 +4,31 @@
 //! # Apply rules
 //!
 //! - Every normal entry runs at `now = max(entry.now, last applied now)`,
-//!   and that becomes the last applied now (also for ignored entries).
-//! - The engine is created at the first normal entry, with that entry's
-//!   `now` as its start time, so every node reports the same `uptime`
-//!   (counted from the cluster's first entry). Before that, a placeholder
-//!   engine answers the monitoring calls.
-//! - `Op::Conn`: a `Connect` applies only with `seq == 1` and a local
-//!   number above every local number of the same owner connected so far;
-//!   any other input only if `seq` is the connection's next one. Anything
-//!   else is ignored (`Applied { duplicate: true }`). `Disconnect` forgets
-//!   the connection.
-//! - `Op::Batch(items)`: each `(seq, input)` item in order, exactly as an
-//!   `Op::Conn { seq, input }` at the entry's `now`; the entry counts as
-//!   ignored only if every item was.
-//! - `Op::Tick`, `Op::SetDraining` map to the engine inputs;
-//!   `Op::DropNode { node, up_to_local }` disconnects every connection
-//!   owned by `node` with a local number `<= up_to_local`, in
-//!   ascending order.
+//!   which becomes the last applied now (also for ignored entries).
+//! - The engine is created at the first normal entry with that entry's `now`
+//!   as its start time, so every node reports the same `uptime`. Before that,
+//!   a placeholder engine answers the monitoring calls.
+//! - `Op::Conn` and the items of `Op::Batch` follow the dedup rules of
+//!   [`crate::Op::Conn`] (a `Connect` needs `seq == 1` and a new local number,
+//!   anything else the connection's next `seq`); an ignored input is
+//!   `Applied { duplicate: true }`, and a batch counts as ignored only if every
+//!   item was. `Disconnect` forgets the connection.
+//! - `Op::Tick` and `Op::SetDraining` map to engine inputs; `Op::DropNode {
+//!   node, up_to_local }` disconnects `node`'s connections with a local number
+//!   `<= up_to_local`, in ascending order.
 //! - Blank and membership entries only update the metadata.
 //!
 //! # Reply routing
 //!
-//! After each engine call, the replies addressed to connections owned by
-//! this node are handed to the [`ReplySink`], in order, after the batch's
-//! state is published (the sink is called without any lock held). Other
-//! nodes' replies are not even built (`Engine::set_local_conns`). Each log
-//! entry is applied at most once per process (openraft never re-applies at
-//! or below the last applied id; a defensive check skips such entries), so
-//! a reply is delivered at most once. After a restart, entries re-applied from the log address
-//! connections of the previous process: the sink must ignore connections
-//! it does not hold, and the server must number new connections above
-//! [`StateHandle::highest_local`] (after catching up), which the dedup
-//! rule requires anyway.
+//! After each engine call, replies for connections owned by this node go to
+//! the [`ReplySink`], in order, after the batch's state is published (no lock
+//! held); other nodes' replies are not built (`Engine::set_local_conns`). An
+//! entry is applied at most once per process (openraft never re-applies at or
+//! below the last applied id, and a defensive check skips such entries), so a
+//! reply is delivered at most once. After a restart, entries re-applied from
+//! the log address connections of the previous process: the sink must ignore
+//! connections it does not hold, and the server must number new connections
+//! above [`StateHandle::highest_local`].
 //!
 //! Installing a snapshot at runtime skips the entries it covers, so their
 //! replies to local connections are lost: the sink gets `closed` for every
@@ -78,7 +71,6 @@ pub trait ReplySink: Send + Sync + 'static {
     /// Input `seq` of local connection `conn` was applied (it was not a
     /// duplicate). Called before the replies the entry produced.
     fn applied(&self, conn: ConnId, seq: u64);
-    /// A reply for local connection `conn`.
     fn deliver(&self, conn: ConnId, resp: Response);
     /// Local connection `conn` is gone from the replicated state (a
     /// `Disconnect` or `DropNode` entry), or its replies were skipped by a
@@ -86,13 +78,10 @@ pub trait ReplySink: Send + Sync + 'static {
     fn closed(&self, conn: ConnId);
 }
 
-/// Builds the `SysInfo` handed to each engine the state machine creates.
 pub type SysFactory = Arc<dyn Fn() -> Box<dyn SysInfo> + Send + Sync>;
 
-/// State machine construction parameters.
 #[derive(Clone)]
 pub struct SmOptions {
-    /// This node (replies to its connections are delivered).
     pub node_id: NodeId,
     /// Engine configuration (`-z`, `-s`); must be the same on every node.
     /// `journal` is forced off.
@@ -101,7 +90,6 @@ pub struct SmOptions {
     pub sink: Arc<dyn ReplySink>,
 }
 
-/// Published after every applied batch (see [`StateHandle::subscribe`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AppliedInfo {
     pub last_applied: Option<Sid>,
@@ -109,15 +97,11 @@ pub struct AppliedInfo {
     pub next_deadline: Option<Nanos>,
 }
 
-/// Replicated metadata next to the engine, part of every snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) struct SmMeta {
-    /// The engine was created (at the first normal entry).
     pub(crate) started: bool,
     pub(crate) last_now: Nanos,
-    /// Next expected `seq` of every open connection.
     pub(crate) next_seq: BTreeMap<ConnId, u64>,
-    /// Highest local connection number connected so far, per owner.
     pub(crate) highest_local: BTreeMap<NodeId, u64>,
 }
 
@@ -200,7 +184,6 @@ impl Shared {
     }
 }
 
-/// Something the sink must hear about, collected during a batch.
 enum Event {
     Applied(ConnId, u64),
     Deliver(ConnId, Response),
@@ -360,8 +343,6 @@ impl<W: Write> Write for CrcWriter<W> {
     }
 }
 
-/// Encode the payload of `engine` and `meta` into `f` at its position;
-/// returns the payload's length and CRC-32C.
 fn write_payload(f: &File, meta: &SmMeta, engine: &Engine) -> io::Result<(u64, u32)> {
     let w = CrcWriter {
         w: f,
@@ -517,25 +498,20 @@ fn restore_current(
     Ok(Some((meta, engine, sm_meta)))
 }
 
-/// openraft state machine (see the module docs). Also the snapshot builder.
 #[derive(Clone)]
 pub struct ClusterStateMachine {
     shared: Arc<Shared>,
     sink: Arc<dyn ReplySink>,
     snaps: Arc<Mutex<SnapshotStore>>,
-    /// Largest snapshot accepted from the leader.
     max_snapshot_bytes: u64,
 }
 
-/// Cheap, cloneable read access to the applied state for the server.
 #[derive(Clone)]
 pub struct StateHandle {
     shared: Arc<Shared>,
 }
 
 impl ClusterStateMachine {
-    /// Lock `dir` (creating it if needed) and rebuild the state from the
-    /// latest snapshot there, if any; openraft re-applies the log after it.
     pub fn open(dir: &Path, opts: SmOptions) -> Result<ClusterStateMachine, OpenError> {
         let snaps = SnapshotStore::open(dir)?;
         let mut cfg = opts.engine;
@@ -585,7 +561,6 @@ impl ClusterStateMachine {
         self.max_snapshot_bytes = max;
     }
 
-    /// A read handle for the server.
     pub fn handle(&self) -> StateHandle {
         StateHandle {
             shared: self.shared.clone(),
@@ -667,7 +642,6 @@ impl Core {
         true
     }
 
-    /// Apply one normal entry; returns whether it was ignored.
     fn apply_request(&mut self, sh: &Shared, req: Request, events: &mut Vec<Event>) -> bool {
         let now = req.now.max(self.meta.last_now);
         self.meta.last_now = now;
@@ -741,23 +715,19 @@ impl StateHandle {
         self.shared.info.borrow().last_now
     }
 
-    /// Earliest engine time at which a `Tick` entry is due, if any.
     pub fn next_deadline(&self) -> Option<Nanos> {
         self.shared.info.borrow().next_deadline
     }
 
-    /// Watch the state published after every applied batch.
     pub fn subscribe(&self) -> watch::Receiver<AppliedInfo> {
         self.shared.info.subscribe()
     }
 
-    /// Monitoring view of the engine (HTTP endpoints).
     pub fn snapshot_limited(&self, now: Nanos, max_tubes: usize) -> Option<bstk_engine::Snapshot> {
         self.core()
             .map(|c| c.engine.snapshot_limited(now, max_tubes))
     }
 
-    /// Ids of all replicated connections, ascending.
     pub fn conn_ids(&self) -> Vec<ConnId> {
         self.core().map(|c| c.engine.conn_ids()).unwrap_or_default()
     }
@@ -777,12 +747,10 @@ impl StateHandle {
             .unwrap_or(0)
     }
 
-    /// The last applied membership.
     pub fn membership(&self) -> Option<Membership> {
         self.core().map(|c| c.membership.clone())
     }
 
-    /// Full engine state (diagnostics and tests).
     pub fn export_state(&self) -> Option<EngineState> {
         self.core().map(|c| c.engine.export_state())
     }

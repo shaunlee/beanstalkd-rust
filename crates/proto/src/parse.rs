@@ -127,8 +127,6 @@ fn tube_name_from_full_rest(rest: &[u8]) -> Result<TubeName, Response> {
     TubeName::new(s).ok_or(Response::BadFormat)
 }
 
-/// Header fields parsed from a `put` command line, before the body has
-/// been read by the codec.
 pub(crate) struct PutHeader {
     pub pri: u32,
     pub delay: u32,

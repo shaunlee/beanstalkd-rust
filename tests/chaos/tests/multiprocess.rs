@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 use bstk_chaos::mp::{MpConfig, MpOutcome, run};
 use bstk_raft::sim::SimRng;
 
-/// Multi-process runs share the machine: one at a time unless asked.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn env_u64(name: &str) -> Option<u64> {
@@ -36,7 +35,6 @@ fn run_one(cfg: MpConfig) -> MpOutcome {
     out
 }
 
-/// Duration of the fault schedule of `seed`: 20–60 s.
 fn duration(seed: u64) -> Duration {
     Duration::from_secs(SimRng::new(seed ^ 0xD0).range(20, 60))
 }

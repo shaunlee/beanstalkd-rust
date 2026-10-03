@@ -31,7 +31,6 @@ pub struct LinkState {
     pub stall_down: bool,
     pub severed: bool,
     pub latency: Duration,
-    /// Incremented to drop every open connection.
     pub epoch: u64,
 }
 
@@ -56,7 +55,6 @@ impl Drop for Proxy {
 }
 
 impl Proxy {
-    /// Listens on 127.0.0.1 (a free port) and forwards to `target`.
     pub async fn start(target: SocketAddr) -> io::Result<Proxy> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
@@ -115,7 +113,6 @@ impl Proxy {
         *self.state.borrow()
     }
 
-    /// Bytes forwarded (up, down).
     pub fn bytes(&self) -> (u64, u64) {
         (
             self.up_bytes.load(Ordering::Relaxed),
@@ -164,7 +161,6 @@ async fn pump(
 ) {
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        // Wait while stalled; stop on sever or a new epoch.
         loop {
             let st = *rx.borrow_and_update();
             if st.severed || st.epoch != epoch {

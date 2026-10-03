@@ -57,7 +57,6 @@ fn tube(n: &str) -> TubeName {
     TubeName::new(n).unwrap()
 }
 
-/// Entries `first..` holding `reqs`.
 fn entries(first: u64, reqs: &[Request]) -> Vec<Entry<TypeConfig>> {
     reqs.iter()
         .enumerate()
@@ -192,7 +191,6 @@ fn drop_node_disconnects_owner_connections_in_order() {
         req(S, c_in(1, EngineInput::Connect(other))),
         req(S, c_in(2, put(p, "a"))),
         req(S, c_in(3, put(p, "b"))),
-        // r_hi reserves job 1, r_lo reserves job 2.
         req(S, c_in(2, cmd(r_hi, Command::Reserve))),
         req(S, c_in(2, cmd(r_lo, Command::Reserve))),
         req(S, c_in(1, EngineInput::Connect(w))),
@@ -219,7 +217,6 @@ fn drop_node_disconnects_owner_connections_in_order() {
         );
     }
     let ev2 = ns[1].sink.take();
-    // Node 2 is told to close its connections, ascending.
     let closed: Vec<ConnId> = ev2
         .iter()
         .filter_map(|e| match e {
@@ -228,7 +225,6 @@ fn drop_node_disconnects_owner_connections_in_order() {
         })
         .collect();
     assert_eq!(closed, vec![r_lo, r_hi]);
-    // Node 3's waiter gets the job released first: r_lo's job 2.
     let ev3 = ns[2].sink.take();
     let waiter: Vec<&Ev> = ev3
         .iter()
@@ -244,7 +240,6 @@ fn drop_node_disconnects_owner_connections_in_order() {
             }
         )]
     );
-    // Node 1 heard nothing about other nodes' connections.
     let ev1 = ns[0].sink.take();
     assert_eq!(ev1, vec![Ev::Applied(other, 1)]);
     for n in &ns {
@@ -340,7 +335,6 @@ fn workload(len: usize, seed: u64) -> Vec<Request> {
             }
             _ => Op::Tick,
         };
-        // Track replies on the probe (skipping the deliberate duplicates).
         let t = stamp.max(last_now);
         last_now = t;
         let e = probe
@@ -375,7 +369,6 @@ fn workload(len: usize, seed: u64) -> Vec<Request> {
     out
 }
 
-/// Apply `reqs` in batches of the given sizes (cycled).
 fn apply_batched(sm: &mut ClusterStateMachine, first: u64, reqs: &[Request], sizes: &[usize]) {
     let mut i = 0;
     let mut k = 0;
@@ -849,7 +842,6 @@ fn snapshot_install_continue_equals_uninterrupted() {
     let bytes = payload(&mut snap);
     assert_eq!(payload(&mut cur), bytes);
 
-    // Reference node that never snapshots.
     let mut c = node(2);
     apply_batched(&mut c.sm, 1, &reqs[..k], &[5]);
     let local_at_k: Vec<ConnId> =
@@ -860,7 +852,6 @@ fn snapshot_install_continue_equals_uninterrupted() {
             .collect();
     c.sink.take();
 
-    // Fresh node installs.
     let mut b = node(2);
     let rx = receive(&mut b.sm, &bytes);
     block_on(b.sm.install_snapshot(&snap.meta, rx)).unwrap();
@@ -869,7 +860,6 @@ fn snapshot_install_continue_equals_uninterrupted() {
         block_on(b.sm.applied_state()).unwrap(),
         block_on(a.sm.applied_state()).unwrap()
     );
-    // The skipped replies are reported as closed local connections.
     let closed: Vec<ConnId> = b
         .sink
         .take()
@@ -883,7 +873,6 @@ fn snapshot_install_continue_equals_uninterrupted() {
     let installed = block_on(b.sm.get_current_snapshot()).unwrap().unwrap();
     assert_eq!(installed.meta, snap.meta);
 
-    // Continue all three.
     a.sink.take();
     for n in [&mut a, &mut b, &mut c] {
         apply_batched(&mut n.sm, k as u64 + 1, &reqs[k..], &[3]);
@@ -896,7 +885,6 @@ fn snapshot_install_continue_equals_uninterrupted() {
     assert_eq!(a.sink.take(), ec);
     assert_eq!(b.sink.take(), ec);
 
-    // Restart from the snapshot, then re-apply the log after it.
     let dir = a._dir.path().to_path_buf();
     let meta_a = a.sm.handle().meta();
     drop(a.sm);
@@ -912,7 +900,6 @@ fn snapshot_install_continue_equals_uninterrupted() {
         block_on(fresh.sm.install_snapshot(&snap.meta, rx)).unwrap();
         state_bytes(&fresh.sm)
     });
-    // Entries at or below the snapshot are not re-applied.
     apply(&mut re, entries(1, &reqs[..k]));
     assert!(sink.take().is_empty());
     apply_batched(&mut re, k as u64 + 1, &reqs[k..], &[64]);
@@ -920,12 +907,10 @@ fn snapshot_install_continue_equals_uninterrupted() {
     assert_eq!(re.handle().meta(), meta_a);
 }
 
-/// The payload of a snapshot.
 fn payload(s: &mut openraft::Snapshot<TypeConfig>) -> Vec<u8> {
     block_on(s.snapshot.read_all()).unwrap()
 }
 
-/// A receiver that got `bytes` as chunks.
 fn receive(sm: &mut ClusterStateMachine, bytes: &[u8]) -> Box<crate::SnapshotFile> {
     use tokio::io::AsyncWriteExt;
     let mut rx = block_on(sm.begin_receiving_snapshot()).unwrap();
@@ -972,7 +957,6 @@ fn crash_mid_snapshot() {
     apply(&mut a.sm, entries(101, &reqs[100..]));
     let at_200 = state_bytes(&a.sm);
 
-    // Crash after writing the temporary file, before the rename.
     crash_point::arm(Some(Point::SnapshotBeforeRename));
     assert!(build(&mut a.sm).is_err());
     crash_point::arm(None);
@@ -983,7 +967,6 @@ fn crash_mid_snapshot() {
     assert_eq!(snap_files(&dir).len(), 1, "{:?}", snap_files(&dir));
     let cur = block_on(sm.get_current_snapshot()).unwrap().unwrap();
     assert_eq!(cur.meta, first.meta);
-    // openraft re-applies the log after the snapshot.
     apply(&mut sm, entries(101, &reqs[100..]));
     assert_eq!(state_bytes(&sm), at_200);
 
@@ -999,7 +982,6 @@ fn crash_mid_snapshot() {
     assert_eq!(block_on(sm.applied_state()).unwrap().0, Some(lid(1, 200)));
     assert_eq!(state_bytes(&sm), at_200);
 
-    // A normal build replaces the snapshot.
     let again = build(&mut sm).unwrap();
     assert_eq!(snap_files(&dir).len(), 1);
     assert_eq!(
@@ -1073,7 +1055,6 @@ fn install_rejects_invalid_snapshots() {
     p.version = 99;
     assert!(install(&mut b, postcard::to_allocvec(&p).unwrap()).is_err());
 
-    // Random byte flips: never a panic.
     let mut x = 0x9e37_79b9_7f4a_7c15u64;
     for _ in 0..300 {
         x ^= x << 13;
@@ -1091,7 +1072,6 @@ fn install_rejects_invalid_snapshots() {
     assert_eq!(state_bytes(&b.sm), state_bytes(&a.sm));
 }
 
-/// The local number of a connection id.
 fn local(c: ConnId) -> u64 {
     c & ((1 << crate::CONN_SEQ_BITS) - 1)
 }
@@ -1115,9 +1095,7 @@ fn drop_node_with_a_bound_spares_higher_connections() {
                 up_to_local: 3,
             },
         ),
-        // `new` is still open at its next seq.
         req(2 * S, c_in(3, cmd(new, Command::ListTubeUsed))),
-        // `old` is gone.
         req(2 * S, c_in(4, cmd(old, Command::ListTubeUsed))),
     ];
     let mut n = node(2);
@@ -1137,7 +1115,6 @@ fn drop_node_with_a_bound_spares_higher_connections() {
         })
         .collect();
     assert_eq!(closed, vec![old]);
-    // The reservation of `new` is kept.
     let snap = h.snapshot_limited(2 * S, 10).unwrap();
     assert_eq!(snap.server.current_jobs_reserved, 1);
     assert_eq!(snap.server.current_connections, 1);
@@ -1161,7 +1138,6 @@ fn stale_drop_node_after_restart_spares_new_connections() {
     ];
     apply(&mut n.sm, entries(1, &before));
     let h = n.sm.handle();
-    // The leader observes node 2 (silent) and prepares its DropNode.
     let leader_bound = h.highest_local(2);
     assert_eq!(leader_bound, 7);
     // Node 2 restarts: its own startup DropNode uses the bound it observed,
@@ -1179,7 +1155,6 @@ fn stale_drop_node_after_restart_spares_new_connections() {
         ),
         req(2 * S, c_in(1, EngineInput::Connect(new))),
         req(2 * S, c_in(2, cmd(new, Command::Reserve))),
-        // The leader's stale DropNode commits last.
         req(
             3 * S,
             Op::DropNode {
@@ -1194,7 +1169,6 @@ fn stale_drop_node_after_restart_spares_new_connections() {
     assert_eq!(h.conn_ids(), vec![other, new]);
     assert_eq!(h.applied_seq(new), Some(3));
     let snap = h.snapshot_limited(3 * S, 10).unwrap();
-    // The job released from `old` is now reserved by `new`, and stays so.
     assert_eq!(snap.server.current_jobs_reserved, 1);
     let delivered: Vec<Ev> = n.sink.take();
     assert!(
@@ -1266,7 +1240,6 @@ fn received_snapshot_is_bounded() {
     assert_eq!(rx.len(), 16);
 }
 
-/// The payload of the current `.snap` file in `dir`.
 fn stored_payload(dir: &Path) -> Vec<u8> {
     let name = snap_files(dir)
         .into_iter()
@@ -1336,14 +1309,12 @@ fn abandoned_or_rejected_receives_leave_no_garbage() {
         );
     };
 
-    // Dropped half way (the leader went away, or a new stream began).
     let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
     block_on(rx.write_all(&good[..good.len() / 2])).unwrap();
     assert!(snap_files(&dir).iter().any(|n| n.ends_with(".tmp")));
     drop(rx);
     unchanged(&mut b);
 
-    // A chunk past the end (a gap) and one past the maximum.
     let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
     block_on(rx.write_all(&good[..100])).unwrap();
     assert!(block_on(rx.seek(std::io::SeekFrom::Start(101))).is_err());
@@ -1355,7 +1326,6 @@ fn abandoned_or_rejected_receives_leave_no_garbage() {
     b.sm.set_max_snapshot_bytes(crate::snapshot_file::DEFAULT_MAX_SNAPSHOT_BYTES);
     unchanged(&mut b);
 
-    // Complete but invalid: install fails and removes it.
     let rx = receive(&mut b.sm, &good[..good.len() - 1]);
     assert!(block_on(b.sm.install_snapshot(&snap.meta, rx)).is_err());
     let mut bad = good.clone();
@@ -1365,7 +1335,6 @@ fn abandoned_or_rejected_receives_leave_no_garbage() {
     assert!(e.to_string().contains("after its end"), "{e}");
     unchanged(&mut b);
 
-    // A retransmitted chunk and a restart from 0 still install.
     let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
     block_on(async {
         rx.write_all(&[9; 300]).await.unwrap();
@@ -1434,7 +1403,6 @@ fn version_1_snapshot_files_are_read() {
     assert_eq!(cur.meta, snap.meta);
     assert_eq!(payload(&mut cur), p);
 
-    // A damaged version 1 file refuses to open.
     drop(sm);
     let mut bytes = std::fs::read(&v1).unwrap();
     let n = bytes.len();

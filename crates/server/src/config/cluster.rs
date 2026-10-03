@@ -34,54 +34,41 @@ use super::{
 };
 use crate::cli::Cli;
 
-/// Default `cluster.node_timeout`.
 pub const DEFAULT_NODE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Default `cluster.snapshot_every`.
 pub const DEFAULT_SNAPSHOT_EVERY: u64 = 100_000;
-/// Default `cluster.heartbeat`.
 pub const DEFAULT_HEARTBEAT: Duration = Duration::from_millis(100);
-/// Default `cluster.election_timeout`. openraft 0.9 starts an election
-/// only after `max + (a random value in [min, max], fixed per process)`
-/// without a heartbeat (the leader lease is `max`), so a follower waits
-/// 1.0 to 1.2 s (with a heartbeat every 100 ms, a leader's log sync may
-/// stall its heartbeats for about a second before a spurious election),
-/// and a failover takes about 1.3 to 1.5 s.
+/// Default `cluster.election_timeout`. openraft 0.9 waits `max` plus a random
+/// value in `[min, max]` without a heartbeat before it starts an election
+/// (1.0 to 1.2 s), so a log sync stalling heartbeats for about a second does
+/// not cause a spurious one; a failover takes about 1.3 to 1.5 s
+/// (docs/PLAN.md §6.6, docs/BENCH.md P3).
 pub const DEFAULT_ELECTION_TIMEOUT: (Duration, Duration) =
     (Duration::from_millis(500), Duration::from_millis(700));
 
-/// Largest payload of one cluster-port frame (both directions).
 pub const MAX_FRAME: usize = bstk_raft::wire::DEFAULT_MAX_FRAME;
 /// Room reserved in a frame for everything but a job body: the log entry
 /// or forward item around it (ids, command fields, tube names) and the
 /// request envelope.
 pub const ENTRY_OVERHEAD: usize = 64 << 10;
-/// openraft's `snapshot_max_chunk_size` (set explicitly by the server).
 pub const SNAPSHOT_CHUNK: usize = 3 << 20;
-/// Largest `-z` usable in cluster mode.
 pub const MAX_CLUSTER_JOB_SIZE: usize = MAX_FRAME - ENTRY_OVERHEAD;
 
-/// Validated `[cluster]` settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterSettings {
     pub node_id: u64,
-    /// Cluster port (Raft RPCs and forwarding).
     pub listen: SocketAddr,
     /// Raft log, vote and snapshots (relative to the configuration file).
     pub data_dir: PathBuf,
     pub node_timeout: Duration,
     pub snapshot_every: u64,
     pub heartbeat: Duration,
-    /// `(min, max)`.
     pub election_timeout: (Duration, Duration),
     /// `None` only with `insecure_plaintext = true`.
     pub tls: Option<ClusterTlsFiles>,
-    /// Cluster-port address of every member (this node included), by id.
     pub peers: BTreeMap<u64, String>,
-    /// `--cluster-init`: bootstrap the membership from `peers`.
     pub init: bool,
 }
 
-/// `[cluster.tls]` PEM files (paths only; loaded at startup).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterTlsFiles {
     pub cert: PathBuf,
@@ -89,18 +76,15 @@ pub struct ClusterTlsFiles {
     pub ca: PathBuf,
 }
 
-/// Loads `--config` and resolves it, `[cluster]` included.
 pub fn load_all(cli: &Cli) -> Result<(ResolvedConfig, Option<ClusterSettings>), ConfigError> {
     let file = cli.config.as_deref().map(FileConfig::load).transpose()?;
     resolve_all(cli, file)
 }
 
-/// `resolve`, then `resolve_cluster`.
 pub fn resolve_all(
     cli: &Cli,
     mut file: Option<FileConfig>,
 ) -> Result<(ResolvedConfig, Option<ClusterSettings>), ConfigError> {
-    // `resolve` ignores the section; take it out first.
     let raw = file
         .as_mut()
         .and_then(|f| f.raw.cluster.take().map(|r| (f.path.clone(), r)));
@@ -128,7 +112,6 @@ fn duration(key: &str, value: Option<&str>, default: Duration) -> Result<Duratio
     }
 }
 
-/// A peer address: `IP:port`, or `host:port` with a DNS name.
 fn check_peer_addr(i: usize, addr: &str) -> Result<String, ConfigError> {
     if let Ok(a) = addr.parse::<SocketAddr>() {
         return Ok(a.to_string());
@@ -184,7 +167,6 @@ fn resolve_cluster(
     };
     let data_dir = relative(data_dir);
 
-    // Peers.
     let mut peers = BTreeMap::new();
     let mut addrs: Vec<String> = Vec::new();
     for (i, RawPeer { id, addr }) in raw.peers.iter().enumerate() {
@@ -223,7 +205,6 @@ fn resolve_cluster(
         )));
     }
 
-    // Timing.
     let node_timeout = duration(
         "node_timeout",
         raw.node_timeout.as_deref(),
@@ -258,7 +239,6 @@ fn resolve_cluster(
             election_timeout.0, election_timeout.1
         )));
     }
-    // openraft takes milliseconds.
     for (key, d) in [
         ("heartbeat", heartbeat),
         ("election_timeout", election_timeout.0),
@@ -278,7 +258,6 @@ fn resolve_cluster(
             .ok_or_else(|| invalid(format!("cluster.snapshot_every = {v}: must be at least 1")))?,
     };
 
-    // Security.
     let insecure_plaintext = raw.insecure_plaintext.unwrap_or(false);
     let tls = match &raw.tls {
         Some(RawClusterTls { cert, key, ca }) => {
@@ -329,7 +308,6 @@ fn resolve_cluster(
         }
     }
 
-    // Interaction with the rest of the configuration.
     if let Some(dir) = &config.binlog.dir {
         return Err(invalid(format!(
             "-b / binlog.dir ({}) cannot be used with [cluster]: in cluster mode the Raft log \
@@ -380,7 +358,6 @@ fn resolve_cluster(
     })
 }
 
-/// Whether a cluster address (`IP:port` or `host:port`) is loopback.
 fn is_loopback(addr: &str) -> bool {
     if let Ok(a) = addr.parse::<SocketAddr>() {
         return a.ip().is_loopback();
@@ -389,7 +366,6 @@ fn is_loopback(addr: &str) -> bool {
         .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost"))
 }
 
-/// `--check-config` lines for `[cluster]`.
 pub fn cluster_summary(c: &ClusterSettings) -> String {
     let mut s = String::new();
     let _ = writeln!(
@@ -494,7 +470,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(c.init);
-        // Without [cluster] nothing changes.
         assert_eq!(resolve(&[], "").unwrap(), None);
         let s = cluster_summary(&c);
         assert!(s.contains("cluster: node 2 of 3"), "{s}");
@@ -592,7 +567,6 @@ mod tests {
             &config("[cluster.tls]\ncert = \"a\"\nca = \"b\"\nx = 1\n", PEERS3),
         );
         assert!(e.contains("unknown field"), "{e}");
-        // [cluster.tls] and insecure_plaintext exclude each other.
         let e = error(
             &[],
             &config(&format!("insecure_plaintext = true\n{TLS}"), PEERS3),
@@ -612,7 +586,6 @@ mod tests {
         let c = resolve(&[], &local("", loopback)).unwrap().unwrap();
         assert_eq!(c.tls, None);
         assert!(cluster_summary(&c).contains("DISABLED"));
-        // A remote peer, or a listen address on every interface.
         let e = error(&[], &local("", PEERS3));
         assert!(
             e.contains("\"10.0.0.1:11400\" is not") && e.contains("allow_remote"),
@@ -625,7 +598,6 @@ mod tests {
             &local("", &loopback.replace("localhost:3", "node3.example:3")),
         );
         assert!(e.contains("node3.example:3"), "{e}");
-        // The second opt-in allows it.
         let c = resolve(
             &[],
             &local("insecure_plaintext_allow_remote = true", PEERS3),
@@ -633,7 +605,6 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(c.tls, None);
-        // ... but only together with insecure_plaintext.
         let e = error(
             &[],
             &config(
@@ -723,9 +694,7 @@ mod tests {
         assert!(e.contains("cannot be used with [cluster]"), "{e}");
         let e = error(&[], &format!("[binlog]\ndir = \"wal\"\n{text}"));
         assert!(e.contains("cannot be used with [cluster]"), "{e}");
-        // -s alone is fine (only reported by stats).
         assert!(resolve(&["-s", "4096"], &text).is_ok());
-        // Job size against the frame size.
         let max = MAX_CLUSTER_JOB_SIZE.to_string();
         assert!(resolve(&["-z", &max], &text).is_ok());
         let over = (MAX_CLUSTER_JOB_SIZE + 1).to_string();
@@ -733,7 +702,6 @@ mod tests {
         assert!(e.contains("too large for cluster mode"), "{e}");
         let e = error(&[], &format!("[server]\nmax_job_size = 1073741824\n{text}"));
         assert!(e.contains("too large for cluster mode"), "{e}");
-        // Port conflicts.
         let e = error(
             &[],
             &format!("[[listener]]\naddr = \"127.0.0.1:11400\"\n{text}"),
@@ -741,7 +709,6 @@ mod tests {
         assert!(e.contains("conflicts with listener[0]"), "{e}");
         let e = error(&[], &format!("[http]\naddr = \"127.0.0.1:11400\"\n{text}"));
         assert!(e.contains("conflicts with http.addr"), "{e}");
-        // --cluster-init needs [cluster].
         let e = resolve(&["--cluster-init"], "").expect_err("needs [cluster]");
         assert!(e.to_string().contains("--cluster-init requires"), "{e}");
     }

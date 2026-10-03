@@ -1,84 +1,12 @@
-//! The open log: segment list, job index, space accounting, writes,
-//! compaction and garbage collection.
-//!
-//! # Segments
+//! The open log: segment list, job index, writes, compaction and garbage
+//! collection.
 //!
 //! `segs` holds every segment file in index order. `segs[cur]` is the
-//! current (write) segment; segments after it are preallocated spares with
-//! no records; segments before it are closed (truncated to their records).
-//! A new current segment is created on every open.
-//!
-//! # Job index (memory use)
-//!
-//! For every live job the store keeps its latest `JobRecord` (needed to
-//! write a compaction move), the location of its latest Put record and the
-//! bytes it uses: about 120 bytes per job plus hash map overhead. Tubes and
-//! bodies are not kept in memory: a compaction move re-reads the job's Put
-//! record from its segment with a positioned read and re-stamps it with the
-//! latest `JobRecord`. Each segment also keeps a queue of (job, offset)
-//! entries for the Puts it holds (16 bytes per entry, cleaned lazily) and
-//! the count of live jobs whose latest Put it holds ("anchors").
-//!
-//! # Space accounting and reservation
-//!
-//! - `reserved` = one Delete record per live job and per reserved-but-not-
-//!   yet-written put, plus the Put records of reserved puts.
-//! - `avail` = unwritten bytes of the current segment plus the capacity of
-//!   the preallocated spares.
-//! - `slack` = worst-case bytes lost to rollover fragmentation (records
-//!   never straddle segments): one Delete record per future rollover plus
-//!   the pending Put records.
-//! - `reserve_put` (and a compaction move) succeeds when
-//!   `reserved + n + slack + one segment's capacity <= avail`, allocating
-//!   new preallocated segments until it holds. The extra segment is the
-//!   spare that unreserved Update records (and fragmentation) consume. If
-//!   a segment cannot be allocated (disk full, or the test-only size
-//!   limit), `reserve_put` returns false.
-//! - A put reservation lasts until the end of the next `append` call: that
-//!   call's Put entries consume pending reservations in order, and any left
-//!   over (the put was never journaled, e.g. the engine rejected it) are
-//!   released.
-//! - `append` never checks reservations; if it runs out of preallocated
-//!   space it allocates a segment on the spot, and only if that fails does
-//!   it return an error.
-//! - A Put larger than a whole segment cannot be reserved; if one is
-//!   appended anyway it is written at the start of a fresh segment, which
-//!   grows past its preallocated size.
-//!
-//! # Compaction and garbage collection
-//!
-//! `maintain` computes `ratio = (allocated - live) / live` (integer
-//! division) where `allocated` is the bytes of all segment files and
-//! `live` is the bytes of live jobs' records (latest Put plus the Updates
-//! after it) plus `reserved`; like the reference it then performs
-//! `ratio - 1` moves when `ratio >= 2`. A move takes the first live job
-//! whose latest Put is in the oldest segment that holds any (and that is
-//! at least two segments before the current one), re-reads that Put,
-//! verifies its CRC, re-stamps it with the job's latest `JobRecord` and
-//! writes it to the current segment. Moves stop early if space for them
-//! cannot be secured.
-//!
-//! GC deletes segments from the head of the list while they are before
-//! the current segment and anchor no live job. Before the first unlink it
-//! writes out buffered moves and (unless `SyncPolicy::Never`) fsyncs the
-//! current segment; with `SyncPolicy::Always` it also fsyncs the directory
-//! afterwards.
-//!
-//! Why every on-disk state replays to the same live set:
-//! - A move is a full Put carrying the latest state, written after all of
-//!   the job's earlier records, so "last record wins" gives the same
-//!   state whether or not the old copy still exists (a crash between the
-//!   move and the unlink leaves the job in two files).
-//! - Only a prefix of the segment list is ever deleted, and only segments
-//!   without the latest Put of any live job. A live job's latest Put and
-//!   everything after it survive; records before it that survive are
-//!   harmless (an Update for an unknown job is ignored; an older Put is
-//!   overridden). A deleted job's Delete record comes after all its other
-//!   records, so if any of them survives the Delete survives too: a
-//!   deleted job is never resurrected.
-//! - A torn move at the tail is dropped by replay, and the old copy is
-//!   still there because the unlink only happens after the move was
-//!   written (and fsynced unless the policy is `Never`).
+//! current (write) segment; later ones are preallocated spares without
+//! records; earlier ones are closed (truncated to their records). Space
+//! accounting (`reserved` / `avail` / `slack`), compaction and the argument
+//! that every on-disk state replays to the same live set: docs/DESIGN.md
+//! §7.1 and §7.2.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -141,7 +69,6 @@ pub(crate) struct Inner {
     next_index: u64,
     jobs: HashMap<JobId, JobEntry>,
     live_bytes: u64,
-    /// Sum of `size` over `segs`.
     disk_total: u64,
     pending_puts: u64,
     pending_bytes: u64,
@@ -164,15 +91,11 @@ pub(crate) struct Inner {
     pub(crate) file_ops: Vec<FileOp>,
 }
 
-/// A file operation recorded for the ordering tests.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileOp {
-    /// `len` bytes written to `binlog.<seg>` at `off`.
     Write { seg: u64, off: u64, len: u64 },
-    /// fdatasync of `binlog.<seg>`.
     Sync { seg: u64 },
-    /// fsync of the directory.
     DirSync,
 }
 
@@ -382,7 +305,6 @@ impl Inner {
         }
     }
 
-    /// Create and preallocate the next segment file as a spare.
     fn allocate(&mut self) -> Result<(), WalError> {
         if let Some(limit) = self.limit
             && self.disk_bytes() + self.seg_size > limit
@@ -451,7 +373,6 @@ impl Inner {
         let c = &mut self.segs[self.cur];
         let off = c.written;
         c.written += len;
-        // A record bigger than a whole segment grows the file.
         if c.written > c.size {
             self.disk_total += c.written - c.size;
             c.size = c.written;
@@ -632,7 +553,6 @@ impl Inner {
     /// Move one live job out of the oldest segment that anchors any.
     /// `from` is a search hint (segments before it anchor nothing).
     fn move_one(&mut self, from: &mut usize) -> Result<bool, WalError> {
-        // Find the oldest anchoring segment at least two before current.
         let p = loop {
             if *from + 2 > self.cur {
                 return Ok(false);
@@ -714,7 +634,6 @@ impl Inner {
         Ok(())
     }
 
-    /// Delete segments from the head that anchor no live job.
     fn gc(&mut self) -> Result<(), WalError> {
         let mut removed = false;
         while self.cur > 0 && self.segs[0].anchors == 0 {
@@ -766,7 +685,6 @@ fn preallocate(file: &mut File, size: u64) -> io::Result<()> {
 
 #[cfg(test)]
 impl Inner {
-    /// (current segment index, end of written data in it).
     pub(crate) fn cur_pos(&self) -> (u64, u64) {
         let c = &self.segs[self.cur];
         (c.index, c.written)
@@ -776,7 +694,6 @@ impl Inner {
         &self.dir
     }
 
-    /// Check the internal bookkeeping against a recomputation.
     pub(crate) fn check_invariants(&self) {
         let live: u64 = self.jobs.values().map(|j| j.used).sum();
         assert_eq!(live, self.live_bytes, "live bytes");

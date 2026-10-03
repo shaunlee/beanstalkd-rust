@@ -19,38 +19,29 @@
 //! crash 2s                        # SIGKILL the server, stay down 2s, start again
 //! ```
 //!
-//! Connections are named `@c1`, `@c2`, ... and are opened lazily the first
-//! time they are referenced. Over TLS (see [`crate::conn`] for the exact
-//! mapping of every action), a connection completes its handshake when it
-//! is opened.
+//! Connections are named `@c1`, `@c2`, ... and opened lazily on first
+//! reference; over TLS (the mapping of every action is in [`crate::conn`]) the
+//! handshake completes when a connection is opened.
 //!
-//! `!binlog` (a header, like `!args`, allowed anywhere in the file) makes the
-//! harness create a fresh temporary directory per server process and pass
-//! it as `-b <dir>` after the `!args` arguments. The directory is kept
-//! across `restart` / `crash` within the case and removed when the case
-//! ends. It also enables the binlog masks (see [`crate::mask::MaskMode`]).
+//! `!binlog` (a header like `!args`, allowed anywhere) gives each server
+//! process a fresh temporary directory passed as `-b <dir>` after the `!args`
+//! arguments; it survives `restart` / `crash` within the case, is removed when
+//! the case ends, and enables the binlog masks ([`crate::mask::MaskMode`]).
 //!
-//! `restart [DOWNTIME]` sends SIGTERM and `crash [DOWNTIME]` sends SIGKILL to
-//! the server under test, waits for it to exit, optionally stays down for
-//! `DOWNTIME` (default 0), then starts the same binary again with the same
-//! arguments and binlog directory (on the same port when possible) and
-//! waits until it accepts connections. Every open connection is dropped;
-//! the next reference to a connection name opens a fresh connection. Note
-//! that the reference installs a SIGTERM handler only when running as pid
-//! 1, so for it both directives are an abrupt death; `beanstalkd-rs` may
-//! handle SIGTERM gracefully.
-//!
-//! In cluster mode (`crate::cluster`) both directives restart every node of
-//! server B's cluster, while server A keeps running and only sees each of
-//! the case's connections close, in the order they were opened
-//! (`crate::conn::DisconnectOnRestart`), the model of a cluster restart.
+//! `restart [DOWNTIME]` (SIGTERM) and `crash [DOWNTIME]` (SIGKILL) stop the
+//! server, optionally stay down (default 0), and start the same binary again
+//! with the same arguments and binlog directory (same port when possible).
+//! Every open connection is dropped; the next reference to a name opens a
+//! fresh one. The reference installs a SIGTERM handler only as pid 1, so for
+//! it both are an abrupt death. In cluster mode (`crate::cluster`) both restart
+//! every node of server B's cluster while server A keeps running and only sees
+//! each connection close, in opening order (`crate::conn::DisconnectOnRestart`).
 
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// A single parsed step together with its 1-based source line number.
 #[derive(Debug, Clone)]
 pub struct Step {
     pub line: u32,
@@ -59,50 +50,24 @@ pub struct Step {
 
 #[derive(Debug, Clone)]
 pub enum StepKind {
-    Send {
-        conn: String,
-        data: Vec<u8>,
-    },
-    Recv {
-        conn: String,
-    },
-    RecvNone {
-        conn: String,
-        dur: Duration,
-    },
-    RecvClosed {
-        conn: String,
-        dur: Duration,
-    },
+    Send { conn: String, data: Vec<u8> },
+    Recv { conn: String },
+    RecvNone { conn: String, dur: Duration },
+    RecvClosed { conn: String, dur: Duration },
     Sleep(Duration),
-    /// Send a signal to the server process under test (both A and B).
     Signal(Signal),
-    ShutdownWrite {
-        conn: String,
-    },
-    Close {
-        conn: String,
-    },
-    /// Stop the server under test (SIGTERM for `restart`, SIGKILL for
-    /// `crash`), wait for it to exit, stay down for `downtime`, then start
-    /// it again with the same arguments and binlog directory.
-    Restart {
-        how: StopMode,
-        downtime: Duration,
-    },
+    ShutdownWrite { conn: String },
+    Close { conn: String },
+    Restart { how: StopMode, downtime: Duration },
 }
 
-/// How a `restart` / `crash` step stops the server process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopMode {
-    /// `restart`: SIGTERM, then wait for the process to exit.
     Term,
-    /// `crash`: SIGKILL, then wait for the process to exit.
     Kill,
 }
 
 impl StopMode {
-    /// The directive keyword used in case files.
     pub fn directive(self) -> &'static str {
         match self {
             StopMode::Term => "restart",
@@ -112,7 +77,6 @@ impl StopMode {
 }
 
 impl StepKind {
-    /// The connection name this step acts on, if any (`Sleep` has none).
     pub fn conn(&self) -> Option<&str> {
         match self {
             StepKind::Send { conn, .. }
@@ -125,7 +89,6 @@ impl StepKind {
         }
     }
 
-    /// A short human-readable description of this step, for diagnostics.
     pub fn describe(&self) -> String {
         match self {
             StepKind::Send { conn, data } => {
@@ -153,12 +116,10 @@ impl StepKind {
 /// signals whose reference behavior is non-fatal are supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
-    /// SIGUSR1: the reference enters drain mode.
     Usr1,
 }
 
 impl Signal {
-    /// The name as accepted by `kill -<name>` and written in case files.
     pub fn name(self) -> &'static str {
         match self {
             Signal::Usr1 => "USR1",
@@ -175,13 +136,10 @@ impl Signal {
     }
 }
 
-/// A parsed `.bt` case file.
 #[derive(Debug, Clone)]
 pub struct CaseFile {
     pub path: PathBuf,
-    /// Extra CLI arguments to pass to both server binaries (from `!args`).
     pub extra_args: Vec<String>,
-    /// `!binlog`: run each server with its own fresh `-b <dir>`.
     pub binlog: bool,
     pub steps: Vec<Step>,
 }
@@ -210,7 +168,6 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Parse a case file from disk.
 pub fn parse_case_file(path: &Path) -> Result<CaseFile, ParseError> {
     let text = fs::read_to_string(path).map_err(|e| ParseError {
         path: path.to_path_buf(),
@@ -220,7 +177,6 @@ pub fn parse_case_file(path: &Path) -> Result<CaseFile, ParseError> {
     parse_case_str(path, &text)
 }
 
-/// Parse case source text already loaded into memory (used by unit tests).
 pub fn parse_case_str(path: &Path, text: &str) -> Result<CaseFile, ParseError> {
     let mut extra_args = Vec::new();
     let mut binlog = false;
@@ -396,7 +352,6 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-/// Split off the first whitespace-delimited word, returning `(word, rest)`.
 fn split_first_word(s: &str) -> (&str, &str) {
     match s.find(char::is_whitespace) {
         Some(i) => (&s[..i], &s[i..]),
@@ -429,7 +384,6 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
     Err(format!("duration must end with 'ms' or 's': {s}"))
 }
 
-/// Parse a double-quoted string literal with `\r \n \\ \" \xNN` escapes.
 fn parse_quoted(s: &str, err: &dyn Fn(String) -> ParseError) -> Result<Vec<u8>, ParseError> {
     let mut chars = s.char_indices().peekable();
     match chars.next() {
@@ -450,7 +404,6 @@ fn parse_quoted(s: &str, err: &dyn Fn(String) -> ParseError) -> Result<Vec<u8>, 
         }
         let b = bytes[i];
         if b == b'"' {
-            // The rest of the line (already comment-stripped) must be blank.
             if s[i + 1..].trim().is_empty() {
                 return Ok(out);
             }

@@ -4,126 +4,13 @@
 //!
 //! Both renderers are pure functions of the snapshot, so every value they
 //! print is exactly what `stats` / `stats-tube` report at the same instant.
-//!
-//! # Prometheus metrics
-//!
-//! This mapping is public API for operators; do not rename metrics
-//! lightly. Counters end in `_total`; everything else is a gauge.
-//!
-//! ## Server (`stats`)
-//!
-//! | stats key | metric | type |
-//! |---|---|---|
-//! | `current-jobs-urgent` | `beanstalkd_current_jobs{state="urgent"}` | gauge |
-//! | `current-jobs-ready` | `beanstalkd_current_jobs{state="ready"}` | gauge |
-//! | `current-jobs-reserved` | `beanstalkd_current_jobs{state="reserved"}` | gauge |
-//! | `current-jobs-delayed` | `beanstalkd_current_jobs{state="delayed"}` | gauge |
-//! | `current-jobs-buried` | `beanstalkd_current_jobs{state="buried"}` | gauge |
-//! | `cmd-<name>` (all 22) | `beanstalkd_commands_total{cmd="<name>"}` | counter |
-//! | `job-timeouts` | `beanstalkd_job_timeouts_total` | counter |
-//! | `total-jobs` | `beanstalkd_jobs_total` | counter |
-//! | `max-job-size` | `beanstalkd_max_job_size_bytes` | gauge |
-//! | `current-tubes` | `beanstalkd_current_tubes` | gauge |
-//! | `current-connections` | `beanstalkd_current_connections` | gauge |
-//! | `current-producers` | `beanstalkd_current_producers` | gauge |
-//! | `current-workers` | `beanstalkd_current_workers` | gauge |
-//! | `current-waiting` | `beanstalkd_current_waiting` | gauge |
-//! | `total-connections` | `beanstalkd_connections_total` | counter |
-//! | `version` | `beanstalkd_build_info{version="<version>"}` (always 1) | gauge |
-//! | `rusage-utime` | `beanstalkd_cpu_seconds_total{mode="user"}` | counter |
-//! | `rusage-stime` | `beanstalkd_cpu_seconds_total{mode="system"}` | counter |
-//! | `uptime` | `beanstalkd_uptime_seconds` | gauge |
-//! | `binlog-oldest-index` | `beanstalkd_binlog_oldest_index` | gauge |
-//! | `binlog-current-index` | `beanstalkd_binlog_current_index` | gauge |
-//! | `binlog-records-migrated` | `beanstalkd_binlog_records_migrated_total` | counter |
-//! | `binlog-records-written` | `beanstalkd_binlog_records_written_total` | counter |
-//! | `binlog-max-size` | `beanstalkd_binlog_max_size_bytes` | gauge |
-//! | `draining` | `beanstalkd_draining` (0 or 1) | gauge |
-//!
-//! `<name>` in `cmd` is the stats key without its `cmd-` prefix, i.e. the
-//! protocol command name: `put`, `peek`, `peek-ready`, `peek-delayed`,
-//! `peek-buried`, `reserve`, `reserve-with-timeout`, `delete`, `release`,
-//! `use`, `watch`, `ignore`, `bury`, `kick`, `touch`, `stats`, `stats-job`,
-//! `stats-tube`, `list-tubes`, `list-tube-used`, `list-tubes-watched`,
-//! `pause-tube`. Note that `urgent` jobs are a subset of `ready` jobs (as in
-//! `stats`), so summing `beanstalkd_current_jobs` over `state` double-counts.
-//!
-//! Not exported (identity rather than measurements; see `/admin`): `pid`,
-//! `id`, `hostname`, `os`, `platform`.
-//!
-//! The job, connection and tube gauges are named `beanstalkd_current_*`
-//! after their stats keys, which also keeps every gauge name distinct from
-//! every counter's base name (`beanstalkd_jobs_total` is a counter whose
-//! OpenMetrics family would be `beanstalkd_jobs`).
-//!
-//! ## Per tube (`stats-tube`), label `tube="<name>"`
-//!
-//! | stats-tube key | metric | type |
-//! |---|---|---|
-//! | `current-jobs-urgent` | `beanstalkd_tube_current_jobs{state="urgent"}` | gauge |
-//! | `current-jobs-ready` | `beanstalkd_tube_current_jobs{state="ready"}` | gauge |
-//! | `current-jobs-reserved` | `beanstalkd_tube_current_jobs{state="reserved"}` | gauge |
-//! | `current-jobs-delayed` | `beanstalkd_tube_current_jobs{state="delayed"}` | gauge |
-//! | `current-jobs-buried` | `beanstalkd_tube_current_jobs{state="buried"}` | gauge |
-//! | `total-jobs` | `beanstalkd_tube_jobs_total` | counter |
-//! | `current-using` | `beanstalkd_tube_current_using` | gauge |
-//! | `current-watching` | `beanstalkd_tube_current_watching` | gauge |
-//! | `current-waiting` | `beanstalkd_tube_current_waiting` | gauge |
-//! | `cmd-delete` | `beanstalkd_tube_commands_total{cmd="delete"}` | counter |
-//! | `cmd-pause-tube` | `beanstalkd_tube_commands_total{cmd="pause-tube"}` | counter |
-//! | `pause` | `beanstalkd_tube_pause_seconds` | gauge |
-//! | `pause-time-left` | `beanstalkd_tube_pause_time_left_seconds` | gauge |
-//!
-//! Tube counters restart from zero when a tube is destroyed (no users,
-//! watchers or jobs) and later recreated; Prometheus treats that as a
-//! counter reset.
-//!
-//! ## Cardinality cap
-//!
-//! Per-tube series are emitted for at most `max_tube_series` tubes: the
-//! first ones in `list-tubes` order. Two gauges describe the cap:
-//!
-//! | metric | meaning |
-//! |---|---|
-//! | `beanstalkd_tube_series_limit` | the configured `max_tube_series` |
-//! | `beanstalkd_tube_series_truncated` | 1 if some tubes were left out, else 0 |
-//!
-//! `beanstalkd_current_tubes` always reports the full tube count.
-//!
-//! The snapshot may already hold only some of the tubes (the HTTP listener
-//! asks the engine for `max_tube_series + 1` of them, see
-//! `Engine::snapshot_limited`): "truncated" means that the snapshot has more
-//! tubes than the limit, which that extra tube tells.
-//!
-//! ## Server-side (beanstalkd-rs only, not in `stats`)
-//!
-//! | metric | type | meaning |
-//! |---|---|---|
-//! | `beanstalkd_pending_connections` | gauge | TLS connections in their handshake or awaiting token authentication |
-//! | `beanstalkd_pending_rejected_total` | counter | TLS connections closed at accept because `server.max_pending_connections` was reached |
-//! | `beanstalkd_auth_timeouts_total` | counter | token connections closed for not authenticating within `auth.timeout` |
-//! | `beanstalkd_auth_failures_total` | counter | wrong tokens and commands sent before authentication |
-//!
-//! # Admin JSON
-//!
-//! `{"server": {...}, "server_rs": {...}, "tube_limit": N,
-//! "tubes_truncated": bool, "tubes": [{...}, ...]}` where `server` holds
-//! every `stats` key and each `tubes` entry every `stats-tube` key, with the
-//! reference's key names in the reference's order. Numbers are JSON numbers
-//! (`rusage-utime` / `rusage-stime` as seconds with six decimals), `draining`
-//! is a boolean, and `version`, `id`, `hostname`, `os`, `platform` and the
-//! tube `name` are strings. Tubes appear in `list-tubes` order, at most
-//! `tube_limit` (`http.max_tube_series`) of them; `tubes_truncated` tells
-//! whether some were left out. `server_rs` holds the server-side counters
-//! above as `pending-connections`, `pending-rejected`, `auth-timeouts` and
-//! `auth-failures` (cumulative ones without the `_total` suffix, like the
-//! `stats` keys).
+//! The metric names and the JSON layout are public API for operators: the
+//! full mapping is in docs/DESIGN.md §6.2, and metrics must not be renamed
+//! lightly.
 
 use bstk_engine::Snapshot;
 use bstk_proto::{StatsServer, StatsTube};
 
-/// Server-side counters of beanstalkd-rs that `stats` does not have (see
-/// `pending::ServerCounters`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ServerRsStats {
     pub pending_connections: u64,
@@ -132,7 +19,6 @@ pub struct ServerRsStats {
     pub auth_failures: u64,
 }
 
-/// Server-side metrics: (name, help, kind, value).
 type RsScalar = (&'static str, &'static str, Kind, fn(&ServerRsStats) -> u64);
 
 const RS_SCALARS: [RsScalar; 4] = [
@@ -187,9 +73,7 @@ impl Kind {
     }
 }
 
-/// A server metric sample label value and the field it reads.
 type ServerLabelled = (&'static str, fn(&StatsServer) -> u64);
-/// A per-tube metric sample label value and the field it reads.
 type TubeLabelled = (&'static str, fn(&StatsTube) -> u64);
 
 /// `cmd-*` stats keys, labelled by command name, in STATS_FMT order.
@@ -226,7 +110,6 @@ const SERVER_JOB_STATES: [ServerLabelled; 5] = [
     ("buried", |s| s.current_jobs_buried),
 ];
 
-/// Unlabelled server metrics: (name, help, kind, value).
 type ServerScalar = (&'static str, &'static str, Kind, fn(&StatsServer) -> u64);
 
 const SERVER_SCALARS: [ServerScalar; 16] = [
@@ -341,7 +224,6 @@ const TUBE_COMMANDS: [TubeLabelled; 2] = [
     ("pause-tube", |t| t.cmd_pause_tube),
 ];
 
-/// Per-tube metrics with only the `tube` label: (name, help, kind, value).
 type TubeScalar = (&'static str, &'static str, Kind, fn(&StatsTube) -> u64);
 
 const TUBE_SCALARS: [TubeScalar; 6] = [
@@ -543,8 +425,6 @@ pub fn render_prometheus(s: &Snapshot, max_tube_series: usize, rs: &ServerRsStat
     out
 }
 
-/// `# HELP` and `# TYPE` lines of one metric family. `help` must not
-/// contain a backslash or newline (all help texts are constants).
 fn family(out: &mut String, name: &str, help: &str, kind: Kind) {
     out.push_str("# HELP ");
     out.push_str(name);
@@ -598,7 +478,6 @@ fn rusage((secs, micros): (u64, u64)) -> String {
 
 enum Json<'a> {
     Num(u64),
-    /// Already a valid JSON number literal.
     Raw(String),
     Str(&'a str),
     Bool(bool),
@@ -750,10 +629,6 @@ fn push_json_str(out: &mut String, v: &str) {
     out.push('"');
 }
 
-// ---------------------------------------------------------------------------
-// Cluster mode (P3)
-// ---------------------------------------------------------------------------
-
 /// What the HTTP endpoints need from a cluster node (`cluster::Core`).
 pub trait ClusterInfo: Send + Sync {
     /// `/readyz`: a leader is known, this node has applied up to the last
@@ -762,38 +637,9 @@ pub trait ClusterInfo: Send + Sync {
     fn stats(&self) -> ClusterStats;
 }
 
-/// Cluster figures for `/metrics` and `/admin` (cluster mode only).
-///
-/// | metric | type | meaning |
-/// |---|---|---|
-/// | `beanstalkd_cluster_node_id` | gauge | this node's id |
-/// | `beanstalkd_cluster_role{role}` | gauge | 1 for the current role (`leader`, `follower`, `candidate`, `learner`, `shutdown`), else 0 |
-/// | `beanstalkd_cluster_term` | gauge | current Raft term |
-/// | `beanstalkd_cluster_leader_id` | gauge | leader known to this node (0: none) |
-/// | `beanstalkd_cluster_commit_index` | gauge | last commit index this node learned |
-/// | `beanstalkd_cluster_applied_index` | gauge | last log index applied here |
-/// | `beanstalkd_cluster_last_log_index` | gauge | last log index stored here |
-/// | `beanstalkd_cluster_replication_lag{peer}` | gauge | leader only: entries a peer is missing |
-/// | `beanstalkd_cluster_log_bytes` | gauge | size of the log segments |
-/// | `beanstalkd_cluster_log_segments` | gauge | number of log segments |
-/// | `beanstalkd_cluster_snapshot_index` | gauge | last log index in the snapshot |
-/// | `beanstalkd_cluster_snapshot_bytes` | gauge | size of the stored snapshot |
-/// | `beanstalkd_cluster_forward_queue` | gauge | this node's inputs not yet applied |
-/// | `beanstalkd_cluster_forward_queue_bytes` | gauge | approximate size of those inputs |
-/// | `beanstalkd_cluster_forward_queue_full` | gauge | 1 while the forward queue is at its bound |
-/// | `beanstalkd_cluster_refused_connections_total` | counter | client connections closed at accept (cut off, shutting down, or queue full) |
-/// | `beanstalkd_cluster_rejected_puts_total` | counter | puts answered `OUT_OF_MEMORY` because the forward queue was full |
-/// | `beanstalkd_cluster_resent_inputs_total` | counter | inputs sent to the leader again (duplicates the state machine discards) |
-/// | `beanstalkd_cluster_forward_rewinds_total{cause}` | counter | resends of the forward queue, by cause (`view`, `error`, `stall`, `dropped`) |
-/// | `beanstalkd_cluster_drop_node_proposals_total` | counter | `DropNode` proposals made by this node as leader for silent nodes |
-/// | `beanstalkd_cluster_ready` | gauge | 1 when `/readyz` is 200 |
-/// | `beanstalkd_cluster_isolated` | gauge | 1 while client sockets are closed for lack of a leader |
-/// | `beanstalkd_cluster_rejoining` | gauge | 1 while the node is in rejoin mode (no votes, no clients) |
-/// | `beanstalkd_cluster_votes_refused_total` | counter | vote requests refused in rejoin mode |
-/// | `beanstalkd_cluster_next_local_conn` | gauge | local number of the next client connection (-1 before clients are accepted) |
-///
-/// Absent indexes are exported as -1. `/admin` has the same values under
-/// `"cluster"` (absent ones as `null`).
+/// Cluster figures for `/metrics` and `/admin` (cluster mode only). Metric
+/// names and meanings: docs/DESIGN.md §6.2 "Cluster metrics". Absent indexes
+/// are exported as -1 (`null` in `/admin`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClusterStats {
     pub node_id: u64,
@@ -1094,7 +940,6 @@ mod tests {
 
     use super::{ServerRsStats, render_admin_json, render_prometheus};
 
-    /// Every field distinct.
     fn rs() -> ServerRsStats {
         ServerRsStats {
             pending_connections: 901,
@@ -1103,10 +948,6 @@ mod tests {
             auth_failures: 904,
         }
     }
-
-    // -----------------------------------------------------------------
-    // Fixtures
-    // -----------------------------------------------------------------
 
     /// Every numeric field distinct, so a mixed-up mapping cannot pass.
     fn server() -> StatsServer {
@@ -1233,10 +1074,6 @@ mod tests {
         e.snapshot(3 * bstk_engine::NANOS_PER_SEC)
     }
 
-    // -----------------------------------------------------------------
-    // Strict parser for the text exposition format (0.0.4)
-    // -----------------------------------------------------------------
-
     #[derive(Debug)]
     struct Family {
         kind: String,
@@ -1359,7 +1196,6 @@ mod tests {
         families
     }
 
-    /// `key: value` pairs of a stats YAML document, quotes stripped.
     fn yaml_map(yaml: &[u8]) -> Vec<(String, String)> {
         std::str::from_utf8(yaml)
             .unwrap()
@@ -1538,7 +1374,6 @@ mod tests {
         assert_eq!(order, shown);
     }
 
-    /// The value of a server-side metric in `rs()`.
     fn rs_value(name: &str) -> Option<u64> {
         let r = rs();
         match name {
@@ -1549,10 +1384,6 @@ mod tests {
             _ => None,
         }
     }
-
-    // -----------------------------------------------------------------
-    // Prometheus tests
-    // -----------------------------------------------------------------
 
     #[test]
     fn prometheus_values_equal_snapshot_fields() {
@@ -1679,10 +1510,6 @@ mod tests {
         assert_eq!(label(labels, "version"), Some("a\\b\"c\nd"));
     }
 
-    // -----------------------------------------------------------------
-    // Admin JSON tests
-    // -----------------------------------------------------------------
-
     fn json_matches_yaml(obj: &serde_json::Value, yaml: &[u8], string_keys: &[&str]) {
         let obj = obj.as_object().unwrap();
         let yaml = yaml_map(yaml);
@@ -1706,7 +1533,6 @@ mod tests {
         }
     }
 
-    /// Keys of the top-level objects in textual order.
     fn key_order(text: &str) -> Vec<String> {
         text.split(['{', ','])
             .filter_map(|p| p.strip_prefix('"'))

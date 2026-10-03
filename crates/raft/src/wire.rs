@@ -1,31 +1,24 @@
 //! Wire protocol of the cluster port (docs/DESIGN.md §8).
 //!
-//! A connection carries frames in both directions. A frame is a `u32`
-//! big-endian payload length followed by that many bytes of a postcard
-//! message. Frames longer than the configured maximum are rejected and the
-//! connection is closed; nothing larger than the maximum is ever allocated.
-//!
-//! The dialer sends [`ClientMsg::Hello`] first; the listener answers with
-//! [`ServerMsg::Hello`] (accepted or rejected) and then serves
-//! [`ClientMsg::Request`]s, answering each with a [`ServerMsg::Response`]
-//! carrying the same request id. Remote failures are values
-//! ([`WireError`]), never a dropped connection.
+//! A frame is a `u32` big-endian payload length followed by a postcard
+//! message, in both directions. Frames above the configured maximum close the
+//! connection, and nothing larger is ever allocated. The dialer sends
+//! [`ClientMsg::Hello`] first; the listener answers with [`ServerMsg::Hello`]
+//! and then serves [`ClientMsg::Request`]s, each answered by a
+//! [`ServerMsg::Response`] with the same request id. Remote failures are
+//! values ([`WireError`]), never a dropped connection.
 //!
 //! openraft's own error types are not sent as is: `StorageError` embeds a
-//! recursive `AnyError` chain, and a deeply nested value could exhaust the
-//! receiver's stack while decoding. [`WireError`] is flat.
+//! recursive `AnyError` chain that could exhaust the receiver's stack while
+//! decoding. [`WireError`] is flat.
 //!
-//! Decoding is bounded: a frame is at most `max_frame` bytes, and the
-//! collections in requests that a few bytes each could expand into large
-//! allocations are limited while decoding (before they are built):
-//! AppendEntries entries ([`MAX_APPEND_ENTRIES`]), forward items
-//! ([`MAX_FORWARD_ITEMS`]), the items of an `Op::Batch` in a log entry or
-//! a control request ([`MAX_BATCH_ITEMS`]), and the node sets of memberships
-//! ([`MAX_MEMBERS`], [`MAX_JOINT_CONFIGS`]); the text a snapshot's meta
-//! carries is limited too ([`MAX_SNAPSHOT_ID_LEN`], [`MAX_NODE_ADDR_LEN`]).
-//! A request beyond a limit is a decode error, which closes the connection. A status probe and its
-//! answer ([`RpcRequest::Status`], [`RpcResponse::Status`]) have a fixed
-//! size (no collections), so they need no bound of their own.
+//! Decoding is bounded before anything is built, for collections that a few
+//! bytes each could expand into large allocations: AppendEntries entries
+//! ([`MAX_APPEND_ENTRIES`]), forward items ([`MAX_FORWARD_ITEMS`]), `Op::Batch`
+//! items ([`MAX_BATCH_ITEMS`]), membership node sets ([`MAX_MEMBERS`],
+//! [`MAX_JOINT_CONFIGS`]) and snapshot meta text ([`MAX_SNAPSHOT_ID_LEN`],
+//! [`MAX_NODE_ADDR_LEN`]). A request beyond a limit is a decode error, which
+//! closes the connection. Status probes have a fixed size and need no bound.
 
 use std::fmt;
 use std::io;
@@ -53,7 +46,6 @@ use crate::{ForwardRequest, ForwardResponse, NodeId, TypeConfig};
 ///   log store even before Raft runs (safe rejoin, `--cluster-init`).
 pub const PROTOCOL_VERSION: u32 = 3;
 
-/// Bytes of the length prefix.
 pub const HEADER_LEN: usize = 4;
 
 /// Default maximum payload size of one frame (32 MiB). It must exceed the
@@ -94,20 +86,16 @@ pub const MAX_SNAPSHOT_ID_LEN: usize = 256;
 /// the store's `MAX_META_LEN`).
 pub const MAX_NODE_ADDR_LEN: usize = 1024;
 
-/// First frame on a connection, from the dialer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub version: u32,
-    /// The dialer's node id. With TLS it must match the client certificate.
     pub from: NodeId,
-    /// The node the dialer believes it is connected to.
     pub to: NodeId,
     /// The dialer's `-z`. Every node must use the same value (the engine
     /// replies `JOB_TOO_BIG` by it), so the listener rejects a mismatch.
     pub max_job_size: u32,
 }
 
-/// The listener's answer to [`Hello`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerHello {
     Accepted {
@@ -117,18 +105,17 @@ pub enum ServerHello {
         /// have been rejected); the dialer checks it too.
         max_job_size: u32,
     },
-    /// The connection is closed right after this frame.
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+    },
 }
 
-/// Dialer → listener.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
     Hello(Hello),
     Request { id: u64, body: RpcRequest },
 }
 
-/// Listener → dialer.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
     Hello(ServerHello),
@@ -141,12 +128,10 @@ pub enum ServerMsg {
 pub enum RpcRequest {
     AppendEntries(#[serde(deserialize_with = "bounded::append")] AppendEntriesRequest<TypeConfig>),
     Vote(VoteRequest<NodeId>),
-    /// One chunk of openraft 0.9's chunked snapshot transfer.
     InstallSnapshot(
         #[serde(deserialize_with = "bounded::install")] InstallSnapshotRequest<TypeConfig>,
     ),
     Forward(#[serde(deserialize_with = "bounded::forward")] ForwardRequest),
-    /// A cluster-wide operation requested by a non-leader (version 2).
     Control(#[serde(deserialize_with = "bounded::control")] ControlRequest),
     /// The peer's durable Raft state (version 3), answered from its log
     /// store whether or not its Raft is running (see [`crate::status`]).
@@ -160,8 +145,6 @@ pub enum RpcResponse {
     InstallSnapshot(Result<InstallSnapshotResponse<NodeId>, WireError>),
     Forward(Result<ForwardResponse, WireError>),
     Control(Result<ControlResponse, WireError>),
-    /// The answer to [`RpcRequest::Status`] (see
-    /// [`crate::status::NodeStatus`] for the fields).
     Status {
         vote: Option<Vote<NodeId>>,
         last_log_id: Option<LogId<NodeId>>,
@@ -171,7 +154,6 @@ pub enum RpcResponse {
 }
 
 impl RpcResponse {
-    /// The status answer for `s`.
     pub fn status(s: NodeStatus) -> RpcResponse {
         RpcResponse::Status {
             vote: s.vote,
@@ -181,7 +163,6 @@ impl RpcResponse {
         }
     }
 
-    /// The status carried by a [`RpcResponse::Status`].
     pub fn into_status(self) -> Option<NodeStatus> {
         match self {
             RpcResponse::Status {
@@ -200,10 +181,8 @@ impl RpcResponse {
     }
 }
 
-/// A remote failure, transported as a value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WireError {
-    /// The remote Raft node failed (`RaftError::Fatal`).
     Fatal(WireFatal),
     /// `InstallSnapshotError::SnapshotMismatch`: the sender restarts the
     /// snapshot from offset 0.
@@ -217,7 +196,6 @@ pub enum WireError {
 pub enum WireFatal {
     Stopped,
     Panicked,
-    /// A storage error, reduced to its message.
     Storage(String),
 }
 
@@ -258,7 +236,6 @@ impl WireFatal {
 }
 
 impl WireError {
-    /// From the error of `Raft::append_entries` / `Raft::vote`.
     pub fn from_raft(e: &RaftError<NodeId>) -> Self {
         match e {
             RaftError::APIError(never) => match *never {},
@@ -266,7 +243,6 @@ impl WireError {
         }
     }
 
-    /// From the error of `Raft::install_snapshot`.
     pub fn from_snapshot(e: &RaftError<NodeId, InstallSnapshotError>) -> Self {
         match e {
             RaftError::APIError(InstallSnapshotError::SnapshotMismatch(m)) => {
@@ -340,7 +316,6 @@ mod bounded {
         })
     }
 
-    /// A map of at most `max` entries.
     struct MapVisitor<K, V> {
         max: usize,
         _kv: PhantomData<(K, V)>,
@@ -371,7 +346,6 @@ mod bounded {
         }
     }
 
-    /// A string of at most `max` bytes.
     struct StrVisitor {
         max: usize,
     }
@@ -397,7 +371,6 @@ mod bounded {
         })
     }
 
-    /// Mirror of `BasicNode`.
     #[derive(Deserialize)]
     struct NodeWire {
         #[serde(deserialize_with = "node_addr")]
@@ -473,7 +446,6 @@ mod bounded {
         })
     }
 
-    /// A membership config (a set of node ids).
     struct Config(BTreeSet<NodeId>);
 
     impl<'de> Deserialize<'de> for Config {
@@ -637,20 +609,12 @@ pub fn sanitize(s: &str) -> String {
     out
 }
 
-/// Why a frame could not be read or written.
 #[derive(Debug)]
 pub enum FrameError {
     Io(io::Error),
-    /// The frame's payload exceeds the maximum.
-    TooLarge {
-        len: usize,
-        max: usize,
-    },
-    /// The stream ended inside a frame.
+    TooLarge { len: usize, max: usize },
     Truncated,
-    /// The payload is not a valid message.
     Decode(postcard::Error),
-    /// The message could not be serialized.
     Encode(postcard::Error),
 }
 
@@ -676,7 +640,6 @@ impl From<io::Error> for FrameError {
     }
 }
 
-/// Serializes `msg` into a complete frame (header included).
 pub fn encode<T: Serialize>(msg: &T, max_frame: usize) -> Result<Vec<u8>, FrameError> {
     let buf = postcard::to_extend(msg, vec![0u8; HEADER_LEN]).map_err(FrameError::Encode)?;
     let len = buf.len() - HEADER_LEN;
@@ -760,7 +723,6 @@ where
         .map_err(FrameError::Decode)
 }
 
-/// Writes one already-encoded frame (see [`encode`]) and flushes.
 pub async fn write_frame<W>(w: &mut W, frame: &[u8]) -> Result<(), FrameError>
 where
     W: AsyncWrite + Unpin,
@@ -944,7 +906,6 @@ mod tests {
             assert_eq!(format!("{got:?}"), format!("{m:?}"));
             assert_eq!(used, frame.len());
         }
-        // The status fields survive the round trip.
         let s = NodeStatus {
             vote: Some(Vote::new(3, 1)),
             last_log_id: None,
@@ -1019,7 +980,6 @@ mod tests {
     #[tokio::test]
     async fn async_reader_handles_eof_truncation_and_oversize() {
         let frame = encode(&sample_append(), DEFAULT_MAX_FRAME).expect("encode");
-        // Two frames then clean EOF.
         let mut two = frame.clone();
         two.extend(&frame);
         let mut r = two.as_slice();
@@ -1030,7 +990,6 @@ mod tests {
         let m: Option<ClientMsg> = read_frame(&mut r, DEFAULT_MAX_FRAME).await.expect("eof");
         assert!(m.is_none());
 
-        // EOF inside the header and inside the payload.
         for cut in [2, HEADER_LEN + 1, frame.len() - 1] {
             let mut r = &frame[..cut];
             let e = read_frame::<_, ClientMsg>(&mut r, DEFAULT_MAX_FRAME).await;
@@ -1042,7 +1001,6 @@ mod tests {
         let e = read_frame::<_, ClientMsg>(&mut r, DEFAULT_MAX_FRAME).await;
         assert!(matches!(e, Err(FrameError::TooLarge { .. })));
 
-        // Garbage payload.
         let mut r = &[0u8, 0, 0, 2, 0xff, 0xff][..];
         let e = read_frame::<_, ClientMsg>(&mut r, DEFAULT_MAX_FRAME).await;
         assert!(matches!(e, Err(FrameError::Decode(_))));
@@ -1102,7 +1060,6 @@ mod tests {
         payload.push(0);
         assert!(postcard::from_bytes::<ClientMsg>(&payload).is_err());
 
-        // Membership entries (the leader's normal case) round-trip.
         let m = Entry {
             log_id: LogId::new(CommittedLeaderId::new(3, 1), 1),
             payload: EntryPayload::Membership(membership(5)),
@@ -1110,7 +1067,6 @@ mod tests {
         let ok = append_with(vec![m]);
         let got = decode_msg(&ok).expect("membership");
         assert_eq!(format!("{got:?}"), format!("{ok:?}"));
-        // Too many nodes.
         let big = Entry {
             log_id: LogId::new(CommittedLeaderId::new(3, 1), 1),
             payload: EntryPayload::Membership(membership(MAX_MEMBERS as u64 + 1)),
@@ -1120,7 +1076,6 @@ mod tests {
             Err(FrameError::Decode(_))
         ));
 
-        // Forward items.
         let fwd = |n: u64| ClientMsg::Request {
             id: 2,
             body: RpcRequest::Forward(ForwardRequest {

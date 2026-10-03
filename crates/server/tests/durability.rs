@@ -75,11 +75,6 @@ use nix::sys::signal::Signal;
 
 use common::Server;
 
-// ---------------------------------------------------------------------
-// Small utilities
-// ---------------------------------------------------------------------
-
-/// xorshift64*: deterministic, dependency-free and good enough here.
 #[derive(Clone)]
 struct Rng(u64);
 
@@ -95,7 +90,6 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
-    /// Uniform in `0..n` (`n > 0`).
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
@@ -124,7 +118,6 @@ fn seed() -> u64 {
     )
 }
 
-/// Wall clock in milliseconds (the server's job times are wall-anchored).
 fn wall_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -132,7 +125,6 @@ fn wall_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Total size of the `binlog.*` files in `dir` and their count.
 fn binlog_usage(dir: &Path) -> (u64, u64) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return (0, 0);
@@ -188,7 +180,6 @@ impl Conn {
         Ok(())
     }
 
-    /// One reply line without its CRLF.
     fn line(&mut self) -> io::Result<String> {
         loop {
             if let Some(p) = self.buf.windows(2).position(|w| w == b"\r\n") {
@@ -199,7 +190,6 @@ impl Conn {
         }
     }
 
-    /// `n` body bytes plus the trailing CRLF (stripped).
     fn body(&mut self, n: usize) -> io::Result<Vec<u8>> {
         while self.buf.len() < n + 2 {
             self.fill()?;
@@ -221,7 +211,6 @@ impl Conn {
         msg
     }
 
-    /// Reads a reply that is either `<word> <..> <n>` + body, or one line.
     fn reply_with_body(&mut self) -> io::Result<(String, Option<Vec<u8>>)> {
         let line = self.line()?;
         if line.starts_with("OK ") || line.starts_with("FOUND ") || line.starts_with("RESERVED ") {
@@ -232,7 +221,6 @@ impl Conn {
         Ok((line, None))
     }
 
-    /// YAML of `line` as key -> value, or `None` on `NOT_FOUND`.
     fn yaml(&mut self, line: &str) -> io::Result<Option<HashMap<String, String>>> {
         self.send(format!("{line}\r\n").as_bytes())?;
         let (head, body) = self.reply_with_body()?;
@@ -265,7 +253,6 @@ impl Conn {
         }
     }
 
-    /// Sum of ready, reserved, delayed and buried jobs.
     fn total_jobs(&mut self) -> io::Result<u64> {
         let s = self.yaml("stats")?.unwrap_or_default();
         let get = |k: &str| s.get(k).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
@@ -276,20 +263,11 @@ impl Conn {
     }
 }
 
-// ---------------------------------------------------------------------
-// Job model
-// ---------------------------------------------------------------------
-
-/// A job state as it is (or will be after a restart) on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum St {
     Ready,
     Buried,
-    /// Deadline between `lo` and `hi` (wall-clock ms).
-    Delayed {
-        lo: u64,
-        hi: u64,
-    },
+    Delayed { lo: u64, hi: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,14 +276,11 @@ struct Durable {
     st: St,
 }
 
-/// A job as the server holds it while it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Live {
     Ready,
     Buried,
-    /// Deadline in wall-clock ms.
     Delayed(u64),
-    /// Reserved by its owner (after `reserve-job`).
     Reserved,
 }
 
@@ -314,7 +289,6 @@ struct Job {
     id: u64,
     tube: String,
     body: Vec<u8>,
-    /// The last acknowledged journaled state.
     dur: Durable,
     /// An unacknowledged journaled change: `Some(None)` = maybe deleted,
     /// `Some(Some(d))` = maybe in state `d`.
@@ -334,7 +308,6 @@ impl Job {
     }
 }
 
-/// A put whose reply was not received.
 #[derive(Debug, Clone)]
 struct PendingPut {
     tube: String,
@@ -349,9 +322,7 @@ struct Counts {
     buried: u64,
     released_delay: u64,
     kicked: u64,
-    /// Acknowledged unjournaled changes (reserve-job, release with delay 0).
     unjournaled: u64,
-    /// Changes (journaled or not) whose reply never arrived.
     in_flight: u64,
 }
 
@@ -378,7 +349,6 @@ const TUBES: [&str; 5] = [
     "t-long-tube-name-for-bigger-records",
 ];
 const TTR: u32 = 600;
-/// Tolerance around a delayed job's deadline when checking ready/delayed.
 const DELAY_MARGIN_MS: u64 = 1000;
 
 struct Worker {
@@ -682,10 +652,8 @@ enum Then {
     Release0,
 }
 
-/// The state of a durability run across rounds.
 struct Model {
     jobs: BTreeMap<u64, Job>,
-    /// Ids ever acknowledged or resolved (so gaps can be probed).
     known: BTreeSet<u64>,
     pending_puts: Vec<PendingPut>,
     deleted: Vec<u64>,
@@ -694,8 +662,6 @@ struct Model {
     unknown_adopted: u64,
 }
 
-/// Checks one job against the model; returns the observed durable state
-/// (`None` if absent) or a violation.
 fn check_job(c: &mut Conn, j: &Job) -> io::Result<Result<Option<Durable>, String>> {
     let before = wall_ms();
     let stats = c.yaml(&format!("stats-job {}", j.id))?;
@@ -767,18 +733,14 @@ impl Model {
         }
     }
 
-    /// Verifies the restarted server against the model and resolves every
-    /// in-flight change to what was observed.
     fn verify(&mut self, addr: SocketAddr, round: u64) {
         let mut c = Conn::connect(addr).expect("connect for verification");
-        // Every acknowledged delete is gone.
         for id in std::mem::take(&mut self.deleted) {
             if c.yaml(&format!("stats-job {id}")).unwrap().is_some() {
                 self.violations
                     .push(format!("round {round}: deleted job {id} is back"));
             }
         }
-        // Every known job.
         let ids: Vec<u64> = self.jobs.keys().copied().collect();
         let mut present = 0u64;
         for id in ids {
@@ -806,7 +768,6 @@ impl Model {
                 }
             }
         }
-        // Puts whose reply was lost: probe unknown ids.
         let pending = std::mem::take(&mut self.pending_puts);
         let max_known = self.known.last().copied().unwrap_or(0);
         let top = max_known + pending.len() as u64 + 8;
@@ -862,7 +823,6 @@ impl Model {
                 }
             }
         }
-        // Nothing else is on the server.
         let total = c.total_jobs().unwrap();
         if total != present {
             self.violations.push(format!(
@@ -884,7 +844,6 @@ struct ModeReport {
     elapsed: Duration,
 }
 
-/// Runs `rounds` kill/restart rounds with the given fsync flag.
 fn torture(
     mode: &'static str,
     flag: &[&'static str],
@@ -913,7 +872,6 @@ fn torture(
     let mut max_disk = 0;
     let mut max_files = 0;
     for round in 0..rounds {
-        // Hand out the jobs by id.
         let mut owned: Vec<Vec<Job>> = vec![Vec::new(); WORKERS];
         for (id, j) in std::mem::take(&mut model.jobs) {
             owned[(id % WORKERS as u64) as usize].push(j);
@@ -1005,7 +963,6 @@ fn run_torture(default_rounds: u64, max_run_ms: u64) {
     let rounds = env_u64("BSTK_DURABILITY_ROUNDS", default_rounds);
     let seed = seed();
     eprintln!("durability: seed {seed} (BSTK_DURABILITY_SEED), {rounds} rounds per mode");
-    // The modes run concurrently, each on its own server and directory.
     let handles: Vec<_> = modes()
         .into_iter()
         .enumerate()
@@ -1050,36 +1007,28 @@ fn run_torture(default_rounds: u64, max_run_ms: u64) {
     assert!(!failed, "durability violations (seed {seed})");
 }
 
-/// Always-on: a few rounds per fsync mode (see the module docs).
 #[test]
 fn durability_torture_short() {
     run_torture(4, 400);
 }
 
-/// ≥ 100 rounds per fsync mode (see the module docs for the command).
 #[test]
 #[ignore = "long-running; run explicitly (see the module docs)"]
 fn durability_torture_full() {
     run_torture(100, 1500);
 }
 
-// ---------------------------------------------------------------------
-// Compaction churn
-// ---------------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Steady {
     tube: String,
     body: Vec<u8>,
     pri: u32,
-    /// "ready", "buried" or "delayed".
     state: &'static str,
 }
 
 const STEADY_JOBS: usize = 1000;
 const STEADY_DELAY: u32 = 1_000_000;
 
-/// Puts one steady job in `state` and returns its id.
 fn put_steady(c: &mut Conn, rng: &mut Rng, n: u64, state: &'static str) -> (u64, Steady) {
     let tube = format!("steady-{}", n % 7);
     assert_eq!(
@@ -1155,7 +1104,6 @@ fn churn_conn(addr: SocketAddr, pairs: u64, body_len: usize, tube: String, done:
     }
 }
 
-/// Samples the binlog directory size until `stop`.
 fn sampler(dir: PathBuf, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<(u64, u64)> {
     std::thread::spawn(move || {
         let mut max = (0, 0);
@@ -1199,7 +1147,6 @@ fn churn_phase(
             std::thread::spawn(move || churn_conn(addr, n, len, format!("churn-{k}"), done))
         })
         .collect();
-    // Replace one steady job per ~500 churned pairs.
     let mut c = Conn::connect(server.addr).unwrap();
     let mut replaced = 0u64;
     while done.load(Ordering::Relaxed) < pairs {
@@ -1234,7 +1181,6 @@ fn churn_phase(
     }
 }
 
-/// Checks that the server holds exactly `steady`.
 fn check_steady(server: &Server, steady: &BTreeMap<u64, Steady>, when: &str) {
     let mut c = Conn::connect(server.addr).unwrap();
     for (id, s) in steady {
@@ -1357,13 +1303,11 @@ fn compaction_churn(pairs: u64) {
     );
 }
 
-/// Always-on: a short churn (see the module docs).
 #[test]
 fn compaction_churn_short() {
     compaction_churn(env_u64("BSTK_CHURN_OPS", 20_000));
 }
 
-/// 1M put + delete pairs (see the module docs for the command).
 #[test]
 #[ignore = "long-running; run explicitly (see the module docs)"]
 fn compaction_churn_full() {

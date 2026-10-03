@@ -3,8 +3,8 @@
 //! `bstk-engine`. Its differential proptest feeds this engine and the
 //! optimized one identical `(now, message)` sequences and requires
 //! identical outboxes, deadlines and stats. Do not change its behavior:
-//! the only edits vs. the original are removed test modules and the stats
-//! builders made `pub` for that comparison.
+//! the only edits vs. the original are removed test modules, comments trimmed
+//! (P4-T8) and the stats builders made `pub` for that comparison.
 //!
 //! Rules: no system clock, no randomness, no I/O. Time is always passed in as
 //! `now` (monotonic nanoseconds). Identical inputs must yield identical
@@ -49,7 +49,6 @@ pub struct SysSnapshot {
     pub platform: String,
 }
 
-/// Fixed `SysInfo` for tests.
 #[derive(Debug, Clone, Default)]
 pub struct StaticSysInfo(pub SysSnapshot);
 
@@ -80,42 +79,3 @@ impl Default for EngineConfig {
         }
     }
 }
-
-/// Public API surface (implemented in `engine.rs`):
-///
-/// ```ignore
-/// impl Engine {
-///     pub fn new(now: Nanos, cfg: EngineConfig, sys: Box<dyn SysInfo>) -> Self;
-///     /// Register a new connection (uses and watches "default").
-///     pub fn connect(&mut self, now: Nanos, conn: ConnId);
-///     /// Connection closed: release its reserved jobs, drop it from wait
-///     /// queues, deref tubes. Never produces replies for `conn`, but may
-///     /// produce replies for others (released jobs can wake waiters).
-///     pub fn disconnect(&mut self, now: Nanos, conn: ConnId, out: &mut Outbox);
-///     /// Client half-closed its socket: if `conn` is waiting on reserve,
-///     /// reply TIMED_OUT (see STATE_WAIT / halfclosed in prot.c).
-///     pub fn half_close(&mut self, now: Nanos, conn: ConnId, out: &mut Outbox);
-///     /// A put command line was accepted (`Frame::PutStarted`): applies the
-///     /// reference's header-time side effects (cmd-put, producer, job id)
-///     /// before the body arrives. No reply.
-///     pub fn put_started(&mut self, now: Nanos, conn: ConnId, too_big: bool);
-///     /// A `put` rejected by the codec (`Frame::PutRejected`): applies the
-///     /// reference's pre-rejection side effects and emits the reply.
-///     pub fn put_rejected(&mut self, now: Nanos, conn: ConnId, why: PutRejection, out: &mut Outbox);
-///     /// Execute one command. `Command::Quit` is handled by the server and
-///     /// must not be passed here. A reserve that must wait produces no reply
-///     /// now; the reply is emitted by a later call (handle/tick/disconnect).
-///     /// Callers must not send another command for `conn` until it has
-///     /// received the reply to the previous one.
-///     pub fn handle(&mut self, now: Nanos, conn: ConnId, cmd: Command, out: &mut Outbox);
-///     /// Process everything due at or before `now` (delays, TTRs,
-///     /// DEADLINE_SOON, reserve timeouts, pause expiry).
-///     pub fn tick(&mut self, now: Nanos, out: &mut Outbox);
-///     /// Earliest time `tick` must be called, if any.
-///     pub fn next_deadline(&self) -> Option<Nanos>;
-///     /// SIGUSR1 drain mode (put -> DRAINING).
-///     pub fn set_draining(&mut self, on: bool);
-/// }
-/// ```
-#[doc(hidden)]
-pub fn _api_doc() {}

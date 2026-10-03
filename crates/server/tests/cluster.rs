@@ -30,7 +30,6 @@ fn serial() -> MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Polls `f` every 20 ms until it returns `Some`, for at most `timeout`.
 fn wait_for<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -45,10 +44,6 @@ fn wait_for<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T>
 }
 
 type Client = Proto<TcpStream>;
-
-// ---------------------------------------------------------------------------
-// Harness
-// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct Opts {
@@ -90,7 +85,6 @@ impl Proxy {
         let cut = Arc::new(AtomicBool::new(false));
         let conns: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
         let (cut2, conns2) = (cut.clone(), conns.clone());
-        // Threads of a proxy end with the test process.
         std::thread::spawn(move || {
             for down in listener.incoming() {
                 let Ok(down) = down else { continue };
@@ -191,7 +185,6 @@ impl Node {
         }
     }
 
-    /// Sends `sig` and waits for the exit status.
     fn stop(&mut self, sig: Signal) -> ExitStatus {
         self.signal(sig);
         let mut c = self.child.take().unwrap();
@@ -212,7 +205,6 @@ impl Node {
         }
     }
 
-    /// `/readyz` status, 0 if the HTTP listener does not answer.
     fn readyz(&self) -> u16 {
         http(self.http_addr(), "GET", "/readyz", "").map_or(0, |r| r.status)
     }
@@ -221,7 +213,6 @@ impl Node {
         wait_for(timeout, || (self.readyz() == 200).then_some(())).is_some()
     }
 
-    /// The `/admin` document, if served.
     fn admin(&self) -> Option<Value> {
         let r = http(self.http_addr(), "GET", "/admin", "").ok()?;
         if r.status != 200 {
@@ -258,7 +249,6 @@ impl Node {
         })
     }
 
-    /// Removes the Raft state (the node must be stopped).
     fn wipe(&self) {
         assert!(self.child.is_none());
         std::fs::remove_dir_all(&self.data_dir).unwrap();
@@ -268,7 +258,6 @@ impl Node {
 struct Cluster {
     _dir: tempfile::TempDir,
     nodes: Vec<Node>,
-    /// `(from, to)` node ids -> the proxy of that link (`Opts::proxied`).
     proxies: BTreeMap<(u64, u64), Proxy>,
     _serial: MutexGuard<'static, ()>,
 }
@@ -313,7 +302,6 @@ impl Cluster {
                 }
             }
         }
-        // The peer list as node `a` sees it.
         let peers = |a: u64| -> String {
             ports
                 .iter()
@@ -392,7 +380,6 @@ impl Cluster {
         }
     }
 
-    /// Index of the leader among the running nodes, per their `/admin`.
     fn leader(&mut self) -> usize {
         self.try_leader(Duration::from_secs(15))
             .expect("no leader elected")
@@ -411,7 +398,6 @@ impl Cluster {
         })
     }
 
-    /// Cuts every proxied link to and from node `id` (`Opts::proxied`).
     fn cut_node(&self, id: u64) {
         for (&(a, b), p) in &self.proxies {
             if a == id || b == id {
@@ -420,7 +406,6 @@ impl Cluster {
         }
     }
 
-    /// Heals the proxied links between nodes `a` and `b`, both ways.
     fn heal_pair(&self, a: u64, b: u64) {
         self.proxies[&(a, b)].heal();
         self.proxies[&(b, a)].heal();
@@ -432,7 +417,6 @@ impl Cluster {
         }
     }
 
-    /// Indexes of the running nodes other than `leader`.
     fn followers(&mut self, leader: usize) -> Vec<usize> {
         (0..self.nodes.len())
             .filter(|&i| i != leader && self.nodes[i].running())
@@ -440,7 +424,6 @@ impl Cluster {
     }
 }
 
-/// `RESERVED <id> <n>` + body: the job id.
 fn reserve(c: &mut Client, line: &str) -> u64 {
     let (header, _) = c.body_reply(line);
     assert!(header.starts_with("RESERVED "), "{line}: {header}");
@@ -469,17 +452,12 @@ fn inserted(reply: &str) -> u64 {
         .unwrap()
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[test]
 fn bootstrap_and_operations_through_leader_and_follower() {
     let mut c = Cluster::start(3, &Opts::default());
     let l = c.leader();
     let fs = c.followers(l);
     assert_eq!(fs.len(), 2);
-    // Every node agrees on the leader.
     let leader_id = c.nodes[l].id;
     for n in &c.nodes {
         let a = n.admin().unwrap();
@@ -490,12 +468,10 @@ fn bootstrap_and_operations_through_leader_and_follower() {
     let mut on_leader = c.nodes[l].connect();
     let mut on_follower = c.nodes[fs[0]].connect();
 
-    // Put on the leader, reserve and delete on a follower.
     let a = inserted(&on_leader.put(b"through-leader"));
     let got = reserve(&mut on_follower, "reserve-with-timeout 5");
     assert_eq!(got, a);
     assert_eq!(on_follower.cmd(&format!("delete {a}")), "DELETED");
-    // Put on a follower, reserve and delete on the leader.
     let b = inserted(&on_follower.put(b"through-follower"));
     assert!(b > a);
     let (hdr, body) = on_leader.body_reply("reserve-with-timeout 5");
@@ -504,11 +480,9 @@ fn bootstrap_and_operations_through_leader_and_follower() {
     assert_eq!(on_leader.cmd(&format!("delete {b}")), "DELETED");
     assert_eq!(on_leader.cmd(&format!("peek {b}")), "NOT_FOUND");
 
-    // A waiting reserve on a follower is woken by a put on another node.
     let mut waiter = c.nodes[fs[1]].connect();
     waiter.send(b"reserve\r\n");
     let mut other = c.nodes[fs[0]].connect();
-    // The waiter is registered once its reserve is applied.
     wait_for(Duration::from_secs(5), || {
         (other.stat("stats", "current-waiting") == "1").then_some(())
     })
@@ -518,7 +492,6 @@ fn bootstrap_and_operations_through_leader_and_follower() {
     assert_eq!((id, body.as_slice()), (d, &b"wake"[..]));
     assert_eq!(waiter.cmd(&format!("release {d} 0 0")), "RELEASED");
 
-    // `stats` counters agree across nodes (identity fields differ).
     let keys = [
         "cmd-put",
         "cmd-delete",
@@ -532,8 +505,6 @@ fn bootstrap_and_operations_through_leader_and_follower() {
         "current-tubes",
     ];
     let mut clients: Vec<Client> = c.nodes.iter().map(Node::connect).collect();
-    // A reply means the connection's `Connect` is committed; every later
-    // entry (the `stats` below) is applied after it on every node.
     for cl in &mut clients {
         assert_eq!(cl.cmd("list-tube-used"), "USING default");
     }
@@ -545,8 +516,6 @@ fn bootstrap_and_operations_through_leader_and_follower() {
         let vals: Vec<String> = keys.iter().map(|k| stat_of(&y, k)).collect();
         match &seen {
             None => seen = Some(vals),
-            // Earlier `stats` calls only change cmd-stats, which is not
-            // compared.
             Some(first) => assert_eq!(first, &vals),
         }
     }
@@ -554,12 +523,10 @@ fn bootstrap_and_operations_through_leader_and_follower() {
     assert_eq!(vals[0], "3", "cmd-put");
     assert_eq!(vals[5], "3", "total-jobs");
     assert_eq!(vals[6], "1", "current-jobs-ready");
-    // `stats` shows the pid of the node the client is connected to.
     pids.sort();
     pids.dedup();
     assert_eq!(pids.len(), 3);
 
-    // Cluster metrics.
     let m = c.nodes[l].metrics();
     assert!(
         m.contains("beanstalkd_cluster_role{role=\"leader\"} 1"),
@@ -609,7 +576,6 @@ fn leader_kill_keeps_follower_connections_and_reservations() {
     let killed = Instant::now();
     c.nodes[l].kill9();
 
-    // A new leader serves within 2 s: a put through a survivor commits.
     let reply = producer.put(b"after failover");
     let took = killed.elapsed();
     let second = inserted(&reply);
@@ -617,10 +583,8 @@ fn leader_kill_keeps_follower_connections_and_reservations() {
         took <= Duration::from_secs(2),
         "the put after the leader kill took {took:?}"
     );
-    // The waiting reserve on the follower got it.
     let (id, body) = read_reserved(&mut waiter);
     assert_eq!((id, body.as_slice()), (second, &b"after failover"[..]));
-    // The reservation survived: touch and delete still work.
     assert_eq!(worker.cmd(&format!("touch {job}")), "TOUCHED");
     assert_eq!(worker.cmd(&format!("delete {job}")), "DELETED");
     assert_eq!(waiter.cmd(&format!("delete {second}")), "DELETED");
@@ -659,13 +623,11 @@ fn follower_kill_releases_its_reservations_after_drop_node() {
         a["cluster"]["drop_node_proposals"].as_u64().unwrap() >= 1,
         "{a}"
     );
-    // Only the connections of the lost node were closed.
     assert_eq!(on_leader.stat("stats", "current-connections"), "2");
 }
 
 #[test]
 fn restarted_node_drops_its_stale_connections() {
-    // A long node_timeout: the leader does not drop the node by itself.
     let mut c = Cluster::start(3, &Opts::default());
     let l = c.leader();
     let f = c.followers(l)[0];
@@ -685,7 +647,6 @@ fn restarted_node_drops_its_stale_connections() {
     );
     c.nodes[f].start(&[]);
     assert!(c.nodes[f].wait_ready(Duration::from_secs(20)));
-    // `DropNode(self)` at startup closed out the old connections.
     assert_eq!(
         on_leader.stat(&format!("stats-job {job}"), "state"),
         "ready"
@@ -693,7 +654,6 @@ fn restarted_node_drops_its_stale_connections() {
     assert_eq!(on_leader.stat("stats", "current-connections"), "1");
     assert_eq!(on_leader.stat("stats", "current-tubes"), "1");
 
-    // New connections work, and are numbered above the old ones.
     let mut fresh = c.nodes[f].connect();
     assert_eq!(reserve(&mut fresh, "reserve-with-timeout 5"), job);
     let second = inserted(&fresh.put(b"y"));
@@ -722,7 +682,6 @@ fn wiped_node_rejoins_from_a_snapshot() {
 
     c.nodes[f].kill9();
     c.nodes[f].wipe();
-    // More entries, so the leader's log no longer reaches back far enough.
     for i in 60..80 {
         ids.push(inserted(&on_leader.put(format!("job {i}").as_bytes())));
     }
@@ -767,7 +726,6 @@ fn full_cluster_kill_and_restart_loses_no_committed_job() {
     for &id in &ids[..5] {
         assert_eq!(clients[1].cmd(&format!("delete {id}")), "DELETED");
     }
-    // A reservation held when everything dies returns to ready.
     assert_eq!(reserve(&mut clients[2], "reserve-with-timeout 5"), ids[5]);
     drop(clients);
 
@@ -789,7 +747,6 @@ fn full_cluster_kill_and_restart_loses_no_committed_job() {
         assert!(hdr.starts_with(&format!("FOUND {id} ")), "{hdr}");
         assert_eq!(body, format!("body {i}").as_bytes());
     }
-    // New ids continue after the old ones.
     assert!(inserted(&cl.put(b"new")) > *ids.last().unwrap());
 }
 
@@ -815,7 +772,6 @@ fn sigusr1_on_a_follower_drains_the_cluster() {
 #[test]
 fn readyz_follows_leader_and_catch_up() {
     let mut c = Cluster::configure(3, &Opts::default());
-    // One bootstrapped node alone has no leader: not ready.
     c.nodes[1].start(&["--cluster-init"]);
     wait_for(Duration::from_secs(10), || {
         (c.nodes[1].readyz() == 503).then_some(())
@@ -823,13 +779,11 @@ fn readyz_follows_leader_and_catch_up() {
     .expect("HTTP never answered");
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(c.nodes[1].readyz(), 503);
-    // Bootstrapping the others makes every node ready.
     c.nodes[0].start(&["--cluster-init"]);
     c.nodes[2].start(&["--cluster-init"]);
     c.wait_all_ready();
     let l = c.leader();
     let fs = c.followers(l);
-    // A lone survivor has no leader: not ready.
     c.nodes[l].kill9();
     c.nodes[fs[0]].kill9();
     assert!(
@@ -840,7 +794,6 @@ fn readyz_follows_leader_and_catch_up() {
     );
     let a = c.nodes[fs[1]].admin().unwrap();
     assert_eq!(a["cluster"]["ready"], false, "{a}");
-    // A majority again: ready.
     c.nodes[fs[0]].start(&[]);
     assert!(c.nodes[fs[1]].wait_ready(Duration::from_secs(20)));
     assert!(c.nodes[fs[0]].wait_ready(Duration::from_secs(20)));
@@ -863,7 +816,6 @@ fn mismatched_max_job_size_is_rejected() {
         logs.contains("max_job_size mismatch").then_some(())
     });
     assert!(found.is_some(), "no mismatch error was logged");
-    // The two matching nodes serve.
     let mut cl = c.nodes[1].connect();
     inserted(&cl.put(b"ok"));
 }
@@ -879,7 +831,6 @@ fn graceful_shutdown_disconnects_clients() {
     assert_eq!(reserve(&mut worker, "reserve-with-timeout 5"), job);
     let status = c.nodes[f].stop(Signal::SIGTERM);
     assert_eq!(status.code(), Some(0), "{}", c.nodes[f].log_text());
-    // Its Disconnect was proposed before it left: the job is ready at once.
     assert_eq!(
         on_leader.stat(&format!("stats-job {job}"), "state"),
         "ready"
@@ -900,7 +851,6 @@ fn wiped_node_does_not_vote_until_it_has_caught_up() {
     let mut on_leader = c.nodes[l].connect();
     inserted(&on_leader.put(b"before"));
 
-    // Committed on the leader and `acker` only.
     c.nodes[behind].signal(Signal::SIGSTOP);
     let job = inserted(&on_leader.put(b"acknowledged by two"));
     drop(on_leader);
@@ -948,7 +898,6 @@ fn wiped_node_does_not_vote_until_it_has_caught_up() {
     assert!(!marker.exists());
     let a = c.nodes[acker].admin().unwrap();
     assert_eq!(a["cluster"]["rejoining"], false, "{a}");
-    // `behind` asked it for votes while it was rejoining.
     assert!(a["cluster"]["votes_refused"].as_u64().unwrap() > 0, "{a}");
     assert!(c.nodes[acker].log_text().contains("rejoin complete"));
     for n in &c.nodes {
@@ -1046,7 +995,6 @@ fn one_way_partition_isolates_the_follower_and_the_leader_drops_it() {
 
     let cut = Instant::now();
     c.proxies[&(fid, lid)].cut();
-    // The follower closes its client connections.
     worker
         .stream
         .set_read_timeout(Some(Duration::from_millis(200)))
@@ -1070,7 +1018,6 @@ fn one_way_partition_isolates_the_follower_and_the_leader_drops_it() {
         a["cluster"]["drop_node_proposals"].as_u64().unwrap() >= 1,
         "{a}"
     );
-    // Replication to the follower still works (the other direction).
     let a = c.nodes[f].admin().unwrap();
     assert_eq!(a["cluster"]["leader_id"], lid, "{a}");
     assert_eq!(a["cluster"]["isolated"], true, "{a}");
@@ -1090,7 +1037,6 @@ fn one_way_partition_isolates_the_follower_and_the_leader_drops_it() {
     );
     assert!(a["cluster"]["forward_queue"].as_u64().unwrap() <= 4, "{a}");
 
-    // Healed: the follower serves again.
     c.proxies[&(fid, lid)].heal();
     wait_for(Duration::from_secs(10), || {
         (c.nodes[f].admin()?["cluster"]["isolated"] == false).then_some(())
@@ -1133,7 +1079,6 @@ fn sustained_load_through_a_follower_resends_nothing() {
     for w in workers {
         w.join().unwrap();
     }
-    // The workers' `Disconnect`s drain.
     let a = wait_for(Duration::from_secs(10), || {
         let a = c.nodes[f].admin()?;
         (a["cluster"]["forward_queue"] == 0).then_some(a)
@@ -1161,10 +1106,6 @@ fn sustained_load_through_a_follower_resends_nothing() {
         "{m}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// mTLS
-// ---------------------------------------------------------------------------
 
 fn write_cluster_pki(dir: &Path, n: u64) {
     use rcgen::{
@@ -1228,10 +1169,6 @@ fn mtls_cluster_replicates() {
     let mut on_l = c.nodes[l].connect();
     assert_eq!(reserve(&mut on_l, "reserve-with-timeout 5"), job);
 }
-
-// ---------------------------------------------------------------------------
-// Configuration errors
-// ---------------------------------------------------------------------------
 
 /// A one-node cluster configuration in `dir` (plus `extra` in
 /// `[cluster]`, and `peers` instead of the default peer list).
@@ -1419,7 +1356,6 @@ fn cluster_init_refuses_existing_state_and_the_data_dir_is_locked() {
     // Another process on the same data directory: exit status 10.
     let other = single_node_config(dir.path(), "insecure_plaintext = true", None);
     let other_text = std::fs::read_to_string(&other).unwrap();
-    // Same data_dir as `cfg` (both use <dir>/data).
     assert!(other_text.contains(&dir.path().join("data").display().to_string()));
     let (st, _, err) = run(&["--config", &other]);
     assert_eq!(st.code(), Some(10), "{err}");
@@ -1433,13 +1369,11 @@ fn cluster_init_refuses_existing_state_and_the_data_dir_is_locked() {
     let st = first.wait().unwrap();
     assert_eq!(st.code(), Some(0));
 
-    // The data directory now holds state: --cluster-init is refused.
     let (st, _, err) = run(&["--config", &cfg, "--cluster-init"]);
     assert_eq!(st.code(), Some(1), "{err}");
     assert!(err.contains("already holds Raft state"), "{err}");
 }
 
-/// Seconds since the Unix epoch.
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1447,8 +1381,6 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// Waits until one of the nodes at `among` reports itself leader in
-/// `/admin`; returns its index.
 fn leader_among(c: &Cluster, among: &[usize]) -> usize {
     wait_for(Duration::from_secs(15), || {
         among.iter().copied().find(|&i| {
@@ -1480,7 +1412,6 @@ fn stale_leader_is_rejected_by_a_rejoined_node() {
     let mut on_old = c.nodes[old].connect();
     inserted(&on_old.put(b"before"));
 
-    // The old leader is cut off; the others elect a leader and commit X.
     c.cut_node(old_id);
     let new = leader_among(&c, &rest);
     let acker = rest.iter().copied().find(|&i| i != new).unwrap();
@@ -1511,7 +1442,6 @@ fn stale_leader_is_rejected_by_a_rejoined_node() {
     c.cut_node(new_id);
     c.heal_pair(old_id, acker_id);
 
-    // Nothing commits through the stale leader.
     on_old
         .stream
         .set_read_timeout(Some(Duration::from_millis(200)))
@@ -1523,13 +1453,11 @@ fn stale_leader_is_rejected_by_a_rejoined_node() {
         !got.contains("INSERTED"),
         "the stale leader committed a put through the rejoined node: {got:?}"
     );
-    // It learned the newer vote from the rejoined node and stepped down.
     wait_for(Duration::from_secs(5), || {
         (c.nodes[old].admin()?["cluster"]["role"] != "leader").then_some(())
     })
     .expect("the stale leader still leads");
 
-    // Everything heals: X is on every node.
     c.heal_all();
     c.wait_all_ready();
     for n in &c.nodes {
@@ -1567,7 +1495,6 @@ fn cluster_init_on_a_wiped_node_waits_for_the_survivors_and_rejoins() {
         log.contains("--cluster-init: waiting for the other nodes' status"),
         "{log}"
     );
-    // Neither initialized nor voted.
     assert!(!c.nodes[f].has_raft_state());
     assert_ne!(c.nodes[f].readyz(), 200);
     assert!(c.nodes[f].running());

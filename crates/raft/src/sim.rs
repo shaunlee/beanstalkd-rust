@@ -78,12 +78,10 @@ impl SimRng {
         z ^ (z >> 31)
     }
 
-    /// Uniform in `[0, 1)`.
     pub fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
     }
 
-    /// Uniform in `[lo, hi]` (`lo` if `hi <= lo`).
     pub fn range(&mut self, lo: u64, hi: u64) -> u64 {
         if hi <= lo {
             return lo;
@@ -96,14 +94,12 @@ impl SimRng {
     }
 }
 
-/// Timeouts and backoff of simulated RPCs.
 #[derive(Debug, Clone)]
 pub struct SimConfig {
     pub append_timeout: Duration,
     pub vote_timeout: Duration,
     pub snapshot_timeout: Duration,
     pub forward_timeout: Duration,
-    /// Returned by `RaftNetwork::backoff` (constant).
     pub backoff: Duration,
 }
 
@@ -119,10 +115,8 @@ impl Default for SimConfig {
     }
 }
 
-/// What happened to one message, as recorded in the fault log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FaultKind {
-    /// The link was blocked: the request failed as `Unreachable`.
     Blocked,
     DropRequest,
     DropResponse,
@@ -130,7 +124,6 @@ pub enum FaultKind {
     Delay(Duration),
 }
 
-/// One injected fault: message number `seq` on the link `from → to`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaultEvent {
     pub from: NodeId,
@@ -139,7 +132,6 @@ pub struct FaultEvent {
     pub kind: FaultKind,
 }
 
-/// The per-message decision (a pure function of seed, link and seq).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Decision {
     pub drop_request: bool,
@@ -165,7 +157,6 @@ struct SimState {
     log: Vec<FaultEvent>,
 }
 
-/// Type-erased [`ForwardHandler`].
 trait DynForward: Send + Sync {
     fn forward_boxed(
         &self,
@@ -207,13 +198,10 @@ struct SimInner {
     endpoints: RwLock<HashMap<NodeId, Endpoint>>,
     /// Vote gates by node (kept across re-registration and restarts).
     vote_gates: RwLock<HashMap<NodeId, Arc<crate::listener::VoteGate>>>,
-    /// Status sources by node (removed by `unregister`).
     status: RwLock<HashMap<NodeId, Arc<dyn StatusSource>>>,
-    /// Woken whenever a node is resumed.
     resumed: Notify,
 }
 
-/// The simulated network (see the module docs). Cheap to clone.
 #[derive(Clone)]
 pub struct SimNetwork {
     inner: Arc<SimInner>,
@@ -223,7 +211,6 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Mixes a link and sequence number into the seed (SplitMix64 finalizer).
 fn message_seed(seed: u64, from: NodeId, to: NodeId, seq: u64) -> u64 {
     let mut r = SimRng::new(seed ^ from.rotate_left(17) ^ to.rotate_left(41));
     let a = r.next_u64();
@@ -276,8 +263,6 @@ impl SimNetwork {
         lock(&self.inner.state).seed
     }
 
-    /// The network as seen by node `id` (its Raft network factory and
-    /// forward transport).
     pub fn node(&self, id: NodeId) -> SimNode {
         SimNode {
             id,
@@ -285,7 +270,6 @@ impl SimNetwork {
         }
     }
 
-    /// Makes `raft` reachable as node `id`, forwards going to `handler`.
     pub fn register<H: ForwardHandler>(
         &self,
         id: NodeId,
@@ -369,7 +353,6 @@ impl SimNetwork {
             .cloned()
     }
 
-    /// Blocks messages from `from` to `to` (one direction).
     pub fn block(&self, from: NodeId, to: NodeId) {
         lock(&self.inner.state).blocked.insert((from, to));
     }
@@ -378,14 +361,12 @@ impl SimNetwork {
         lock(&self.inner.state).blocked.remove(&(from, to));
     }
 
-    /// Blocks both directions between `a` and `b`.
     pub fn partition(&self, a: NodeId, b: NodeId) {
         let mut s = lock(&self.inner.state);
         s.blocked.insert((a, b));
         s.blocked.insert((b, a));
     }
 
-    /// Cuts `id` off from every node in `others`, both directions.
     pub fn isolate(&self, id: NodeId, others: &[NodeId]) {
         for &o in others {
             if o != id {
@@ -394,7 +375,6 @@ impl SimNetwork {
         }
     }
 
-    /// Removes every partition and resumes every paused node.
     pub fn heal(&self) {
         let mut s = lock(&self.inner.state);
         s.blocked.clear();
@@ -412,7 +392,6 @@ impl SimNetwork {
         self.inner.resumed.notify_waiters();
     }
 
-    /// Per-message loss probability, for requests and responses separately.
     pub fn set_drop(&self, p: f64) {
         lock(&self.inner.state).probs.drop = p.clamp(0.0, 1.0);
     }
@@ -425,7 +404,6 @@ impl SimNetwork {
         lock(&self.inner.state).probs.delay = (min, max.max(min));
     }
 
-    /// Faults injected so far, in the order they were decided.
     pub fn fault_log(&self) -> Vec<FaultEvent> {
         lock(&self.inner.state).log.clone()
     }
@@ -502,7 +480,6 @@ impl SimNetwork {
         }
     }
 
-    /// Applies one action of a [`FaultSchedule`].
     pub fn apply(&self, action: &FaultAction) {
         match action {
             FaultAction::Partition(a, b) => self.partition(*a, *b),
@@ -517,7 +494,6 @@ impl SimNetwork {
         }
     }
 
-    /// One simulated request from `from` to `to`.
     async fn call(
         &self,
         from: NodeId,
@@ -593,7 +569,6 @@ enum SimError {
     Timeout(Duration),
 }
 
-/// One node's view of the [`SimNetwork`].
 #[derive(Clone)]
 pub struct SimNode {
     id: NodeId,
@@ -646,7 +621,6 @@ impl StatusTransport for SimNode {
     }
 }
 
-/// openraft's client from one node to another over the [`SimNetwork`].
 pub struct SimClient {
     from: NodeId,
     to: NodeId,
@@ -752,7 +726,6 @@ impl RaftNetwork<TypeConfig> for SimClient {
     }
 }
 
-/// One action of a fault schedule.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FaultAction {
     Partition(NodeId, NodeId),
@@ -766,11 +739,9 @@ pub enum FaultAction {
     Heal,
 }
 
-/// A timed sequence of fault actions derived from a seed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FaultSchedule {
     pub seed: u64,
-    /// `(offset from the start, action)`, in increasing offset order.
     pub steps: Vec<(Duration, FaultAction)>,
 }
 
@@ -811,7 +782,6 @@ impl FaultSchedule {
         FaultSchedule { seed, steps: out }
     }
 
-    /// Applies the steps to `net` at their offsets from now.
     pub async fn run(&self, net: &SimNetwork) {
         let start = tokio::time::Instant::now();
         for (at, action) in &self.steps {
@@ -822,7 +792,6 @@ impl FaultSchedule {
     }
 }
 
-/// N openraft nodes over one [`SimNetwork`], generic over the storage.
 pub struct SimCluster {
     pub net: SimNetwork,
     config: Arc<openraft::Config>,
@@ -857,7 +826,6 @@ impl SimCluster {
         Ok(cluster)
     }
 
-    /// Starts (or restarts, after [`SimCluster::stop_node`]) node `id`.
     pub async fn start_node<LS, SM>(&mut self, id: NodeId, log: LS, sm: SM) -> Result<(), String>
     where
         LS: RaftLogStorage<TypeConfig>,
@@ -871,7 +839,6 @@ impl SimCluster {
         Ok(())
     }
 
-    /// Shuts node `id` down and makes it unreachable.
     pub async fn stop_node(&mut self, id: NodeId) {
         self.net.unregister(id);
         if let Some(r) = self.nodes.remove(&id) {
@@ -951,7 +918,6 @@ impl SimCluster {
         lm.state.is_leader().then_some(l)
     }
 
-    /// Waits until every node in `among` has applied at least `index`.
     pub async fn wait_applied(
         &self,
         among: &[NodeId],
@@ -970,7 +936,6 @@ impl SimCluster {
         Ok(())
     }
 
-    /// Shuts every node down.
     pub async fn shutdown(self) {
         for (_, r) in self.nodes {
             let _ = r.shutdown().await;

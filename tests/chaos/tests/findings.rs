@@ -185,7 +185,6 @@ async fn wiped_voter_in_rejoin_mode_keeps_committed_entries() {
     .await;
     eprintln!("connect of {x} committed at index {idx} on nodes {leader} and {acker}");
 
-    // The acker loses its data and restarts in rejoin mode.
     f.cluster.stop_node(acker).await;
     wipe(&f.dirs[&acker]);
     let gate = Arc::new(VoteGate::new(false));
@@ -230,7 +229,6 @@ async fn wiped_voter_in_rejoin_mode_keeps_committed_entries() {
         );
     }
 
-    // Leave rejoin mode; the cluster keeps working.
     gate.open();
     f.cluster.raft(acker).unwrap().runtime_config().elect(true);
     let idx = write(&f.cluster, &all, Op::Tick).await;

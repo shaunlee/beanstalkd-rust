@@ -40,7 +40,6 @@ fn tube_name(i: usize) -> TubeName {
     TubeName::new(TUBES[i % TUBES.len()]).unwrap()
 }
 
-/// How a put completes (see `Frame::PutStarted` / `Frame::PutRejected`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PutEnd {
     Body,
@@ -154,14 +153,12 @@ pub(crate) fn step() -> impl Strategy<Value = (Msg, bool)> {
 pub(crate) struct Pair {
     pub(crate) new: Engine,
     journal: bool,
-    /// The entries the last `run` drained from `new`.
     pub(crate) journal_buf: Vec<JournalEntry>,
     old: oracle::Engine,
     pub(crate) now: Nanos,
     connected: HashSet<ConnId>,
     ever_connected: HashSet<ConnId>,
     waiting: HashSet<ConnId>,
-    /// Connections with a put in flight: `Some(too_big)`.
     pending_put: std::collections::HashMap<ConnId, bool>,
 }
 
@@ -204,7 +201,6 @@ impl Pair {
         }
     }
 
-    /// Whether the server would send `c` another frame now.
     fn can_send(&self, c: ConnId) -> bool {
         !self.waiting.contains(&c) && !self.pending_put.contains_key(&c)
     }
@@ -309,7 +305,6 @@ impl Pair {
         }
         assert_eq!(out_new, out_old, "outbox differs at now={}", self.now);
 
-        // Drain like the server does after every call.
         self.journal_buf.clear();
         self.new.take_journal(&mut self.journal_buf);
         if !self.journal {
@@ -415,8 +410,6 @@ fn disconnect_releases_reservations_out_of_id_order_to_two_waiters() {
             false,
         );
     }
-    // Reservation order (3, 1, 5, 2, 4) differs from id order: the FIFO
-    // release order below must follow this, not job id.
     for id in [3u64, 1, 5, 2, 4] {
         p.run(Msg::Cmd(0, Command::ReserveJob(id)), false);
     }

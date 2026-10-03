@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/proto", "crates/engine", "crates/store", "crates/engine-oracle", "crates/raft", "crates/server", "tests/compat", "tests/chaos", "bench"]
+members = ["crates/proto", "crates/engine", "crates/store", "crates/engine-oracle", "crates/raft", "crates/net", "crates/server", "tests/compat", "tests/chaos", "bench"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,6 +24,7 @@ bstk-proto = { path = "crates/proto" }
 bstk-engine = { path = "crates/engine" }
 bstk-engine-oracle = { path = "crates/engine-oracle" }
 bstk-raft = { path = "crates/raft" }
+bstk-net = { path = "crates/net" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

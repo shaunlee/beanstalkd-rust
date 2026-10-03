@@ -31,17 +31,11 @@ pub fn release(port: u16) {
     release_port(port);
 }
 
-// ---------------------------------------------------------------------------
-// Certificates
-// ---------------------------------------------------------------------------
-
 /// Which client certificate a TLS client presents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientCert {
     None,
-    /// Signed by the CA the server trusts for client certificates.
     Valid,
-    /// Signed by an unrelated CA.
     WrongCa,
 }
 
@@ -150,25 +144,16 @@ impl Certs {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Servers started from a configuration file
-// ---------------------------------------------------------------------------
-
 /// A `beanstalkd-rs` started with `--config`, killed on drop. Its stderr
 /// goes to a file (a pipe could fill up at trace level).
 pub struct ConfigServer {
     pub child: Child,
     pub dir: tempfile::TempDir,
-    /// Ports substituted for `{port0}`, `{port1}`, ... in the template.
     pub ports: Vec<u16>,
     pub log: PathBuf,
 }
 
 impl ConfigServer {
-    /// Writes `template` (with `{portN}` replaced by free ports) as
-    /// `config.toml` into a fresh directory (with the test certificates,
-    /// see [`Certs`]) and starts the server with `--config` plus `args`.
-    /// Waits until every port accepts TCP connections.
     pub fn start(template: &str, nports: usize, args: &[&str]) -> (ConfigServer, Certs) {
         let dir = tempfile::tempdir().unwrap();
         let certs = Certs::generate(dir.path());
@@ -223,24 +208,20 @@ impl ConfigServer {
         ([127, 0, 0, 1], self.ports[i]).into()
     }
 
-    /// A plaintext protocol connection to port `i`.
     pub fn plain(&self, i: usize) -> Proto<TcpStream> {
         let s = TcpStream::connect_timeout(&self.addr(i), Duration::from_secs(2)).unwrap();
         s.set_read_timeout(Some(DEFAULT_TIMEOUT)).unwrap();
         Proto::new(s)
     }
 
-    /// A TLS protocol connection to port `i` (handshake completed).
     pub fn tls(&self, i: usize, config: Arc<ClientConfig>) -> Proto<TlsStream> {
         tls_connect(self.addr(i), config).expect("TLS handshake")
     }
 
-    /// Everything written to stderr so far.
     pub fn stderr(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    /// Sends `sig` and waits up to 10 s for the process to exit.
     pub fn stop(&mut self, sig: nix::sys::signal::Signal) -> ExitStatus {
         let pid = nix::unistd::Pid::from_raw(i32::try_from(self.child.id()).unwrap());
         nix::sys::signal::kill(pid, sig).unwrap();
@@ -268,7 +249,6 @@ impl Drop for ConfigServer {
     }
 }
 
-/// Runs the binary with `args` and waits for it to exit on its own.
 pub fn run(args: &[&str]) -> (ExitStatus, String, String) {
     let out = Command::new(BIN)
         .args(args)
@@ -281,10 +261,6 @@ pub fn run(args: &[&str]) -> (ExitStatus, String, String) {
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
 }
-
-// ---------------------------------------------------------------------------
-// Clients
-// ---------------------------------------------------------------------------
 
 pub type TlsStream = StreamOwned<ClientConnection, TcpStream>;
 
@@ -303,20 +279,15 @@ pub fn tls_connect(addr: SocketAddr, config: Arc<ClientConfig>) -> io::Result<Pr
     Ok(Proto::new(StreamOwned::new(conn, sock)))
 }
 
-/// A protocol client over any byte stream, with its own buffer.
 pub struct Proto<S> {
     pub stream: S,
     buf: Vec<u8>,
 }
 
-/// How reading until the peer closes ended.
 #[derive(Debug, PartialEq, Eq)]
 pub enum End {
-    /// EOF (or a TLS end of stream, with or without close_notify).
     Closed,
-    /// A connection reset or another error; carries its text.
     Error(String),
-    /// Nothing more within the timeout, and still open.
     Timeout,
 }
 
@@ -333,7 +304,6 @@ impl<S: Read + Write> Proto<S> {
         self.stream.flush().expect("flush");
     }
 
-    /// Reads one line (CRLF included); panics on EOF or an error.
     pub fn read_line(&mut self) -> String {
         loop {
             if let Some(pos) = find_crlf(&self.buf) {
@@ -357,7 +327,6 @@ impl<S: Read + Write> Proto<S> {
         self.buf.drain(..n).collect()
     }
 
-    /// Sends `line` + CRLF and returns the one-line reply without CRLF.
     pub fn cmd(&mut self, line: &str) -> String {
         self.send(format!("{line}\r\n").as_bytes());
         self.read_line().trim_end_matches("\r\n").to_owned()
@@ -371,7 +340,6 @@ impl<S: Read + Write> Proto<S> {
         self.read_line().trim_end_matches("\r\n").to_owned()
     }
 
-    /// A reply with a body (`OK <n>` / `RESERVED <id> <n>`): (header, body).
     pub fn body_reply(&mut self, line: &str) -> (String, Vec<u8>) {
         self.send(format!("{line}\r\n").as_bytes());
         let header = self.read_line();
@@ -397,7 +365,6 @@ impl<S: Read + Write> Proto<S> {
         stat_of(&self.yaml(line), key)
     }
 
-    /// Reads everything until the peer closes (or `timeout` passes).
     pub fn read_to_end(&mut self, timeout: Duration) -> (Vec<u8>, End) {
         let deadline = Instant::now() + timeout;
         let mut out = std::mem::take(&mut self.buf);
@@ -419,7 +386,6 @@ impl<S: Read + Write> Proto<S> {
     }
 }
 
-/// The value of `key` in a YAML stats body.
 pub fn stat_of(yaml: &str, key: &str) -> String {
     yaml.lines()
         .find_map(|l| l.strip_prefix(&format!("{key}: ")))
@@ -428,13 +394,8 @@ pub fn stat_of(yaml: &str, key: &str) -> String {
         .to_owned()
 }
 
-// ---------------------------------------------------------------------------
-// HTTP
-// ---------------------------------------------------------------------------
-
 pub struct HttpResponse {
     pub status: u16,
-    /// Header lines, lowercased names (`name: value`).
     pub headers: Vec<(String, String)>,
     pub body: String,
 }
@@ -448,8 +409,6 @@ impl HttpResponse {
     }
 }
 
-/// Sends a raw HTTP/1.1 request and reads the response until the server
-/// closes the connection (it never keeps connections alive).
 pub fn http(addr: SocketAddr, method: &str, path: &str, extra: &str) -> io::Result<HttpResponse> {
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
     s.set_read_timeout(Some(Duration::from_secs(5)))?;

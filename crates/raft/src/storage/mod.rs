@@ -22,16 +22,11 @@
 //!
 //! # Durability
 //!
-//! - `append` writes the whole batch and hands the openraft callback to
-//!   the flusher (group commit, P3-FD): a worker off the caller's task
-//!   `fdatasync`s every segment written since its last sync once, then
-//!   invokes every callback it covered, in order. A callback is invoked
-//!   only after its entries are durable. (openraft 0.9 itself still waits
-//!   for each append's callback before its next command; see
-//!   docs/DESIGN.md §8.)
+//! - `append` hands the openraft callback to the flusher (group commit,
+//!   P3-FD; `flusher.rs`), which invokes it only after the entries are
+//!   durable.
 //! - `vote`, `purged` and snapshots are written to a temporary file,
-//!   `fdatasync`ed, renamed over the old file, and the directory is
-//!   `fsync`ed.
+//!   `fdatasync`ed, renamed over the old file, and the directory is `fsync`ed.
 //! - `committed` is only a hint that lets a restarted node re-apply
 //!   committed entries before it hears from a leader; it is overwritten in
 //!   place without a sync, and an unreadable value reads as `None`.
@@ -56,10 +51,8 @@ pub use state_machine::{
     AppliedInfo, ClusterStateMachine, ReplySink, SmOptions, StateHandle, SysFactory,
 };
 
-/// Why a store could not be opened.
 #[derive(Debug)]
 pub enum OpenError {
-    /// Another process holds the directory lock.
     Locked(PathBuf),
     Io(std::io::Error),
     /// Unrecoverable corruption (anything but a torn tail of the last log
@@ -93,7 +86,6 @@ pub fn log_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("log")
 }
 
-/// Subdirectory of the data directory holding snapshots.
 pub fn snapshot_dir(data_dir: &Path) -> PathBuf {
     data_dir.join("snapshot")
 }
@@ -124,7 +116,6 @@ pub fn has_state(data_dir: &Path) -> std::io::Result<bool> {
     Ok(false)
 }
 
-/// Open the log store and the state machine of `data_dir`.
 pub fn open(
     data_dir: &Path,
     log_opts: LogOptions,

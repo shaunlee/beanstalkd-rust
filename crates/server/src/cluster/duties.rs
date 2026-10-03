@@ -5,22 +5,18 @@
 //! - **Timers**: followers never tick on their own. The leader watches the
 //!   applied state (`StateHandle::subscribe`) and proposes `Op::Tick` when
 //!   its clock reaches `next_deadline()`. Any applied entry also ticks the
-//!   engine, so a `Tick` is only needed when nothing else is applied; one
-//!   is re-proposed if the applied state has not moved [`TICK_RETRY`] later
-//!   (a proposal lost to a leader change).
-//! - **Node liveness**: a peer is alive only if the link works in both
-//!   directions. The leader replicates to every follower (with heartbeats
-//!   every `cluster.heartbeat` when idle) over its cluster network, which
-//!   records when each peer last answered anything
-//!   (`Network::last_response`); and every node sends the leader its
-//!   forwards, or pings when it has nothing to forward
-//!   (`Core::heard_from`). A peer from which either has been missing for
-//!   `2 × node_timeout` (counted from when this node became leader at the
-//!   earliest) is gone: if the state still holds connections it owns, the
-//!   leader proposes `DropNode { node: peer, up_to_local }` with the
-//!   highest local number the state has seen for it, at most once per
-//!   silence period (an answer ends the period). The bound keeps a late
-//!   commit from closing connections the node accepted after a restart.
+//!   engine, so a `Tick` is only needed when nothing else is applied; one is
+//!   re-proposed if the applied state has not moved [`TICK_RETRY`] later (a
+//!   proposal lost to a leader change).
+//! - **Node liveness** (docs/DESIGN.md §8 "Node loss"): a peer is alive only
+//!   if the link works both ways: it answers the leader's replication
+//!   (`Network::last_response`) and sends forwards or pings
+//!   (`Core::heard_from`). A peer missing either for `2 × node_timeout`
+//!   (counted from when this node became leader at the earliest) is gone: the
+//!   leader proposes `DropNode { node: peer, up_to_local }` with the highest
+//!   local number the state has seen for it, at most once per silence period.
+//!   The bound keeps a late commit from closing connections the node accepted
+//!   after a restart.
 //!
 //! # Readiness ([`readiness`])
 //!
@@ -37,9 +33,7 @@ use bstk_raft::{NodeId, Op};
 
 use super::Core;
 
-/// Re-propose a due `Tick` if nothing was applied for this long.
 pub const TICK_RETRY: Duration = Duration::from_millis(500);
-/// How often liveness and readiness are evaluated.
 const PERIOD: Duration = Duration::from_millis(100);
 
 pub async fn leader_duties(core: Arc<Core>) {
@@ -165,7 +159,6 @@ pub async fn readiness(core: Arc<Core>) {
             .await
         {
             Ok(c) => c,
-            // Raft has stopped.
             Err(_) => {
                 core.status.ready.store(false, Ordering::Release);
                 return;

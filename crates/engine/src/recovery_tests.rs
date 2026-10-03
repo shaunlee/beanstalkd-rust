@@ -210,7 +210,6 @@ fn rjob(record: JobRecord, t: &str) -> RecoveredJob {
     }
 }
 
-/// Buried order of `name`: repeatedly peek-buried and kick one.
 fn buried_order(e: &mut Engine, now: Nanos, c: ConnId, name: &TubeName) -> Vec<JobId> {
     cmd(e, now, c, Command::Use(name.clone()));
     let mut ids = Vec::new();
@@ -224,7 +223,6 @@ fn buried_order(e: &mut Engine, now: Nanos, c: ConnId, name: &TubeName) -> Vec<J
     ids
 }
 
-/// Ready order across `tubes`: reserve-with-timeout 0 until nothing is left.
 fn ready_order(e: &mut Engine, now: Nanos, c: ConnId, tubes: &[TubeName]) -> Vec<JobId> {
     for t in tubes {
         cmd(e, now, c, Command::Watch(t.clone()));
@@ -237,10 +235,6 @@ fn ready_order(e: &mut Engine, now: Nanos, c: ConnId, tubes: &[TubeName]) -> Vec
     }
     ids
 }
-
-// ---------------------------------------------------------------------
-// Journaled transitions
-// ---------------------------------------------------------------------
 
 #[test]
 fn put_journals_full_record() {
@@ -275,7 +269,6 @@ fn put_journals_full_record() {
             },
         ]
     );
-    // Draining leaves the buffer empty.
     assert!(journal(&mut e).is_empty());
 }
 
@@ -330,7 +323,7 @@ fn release_journals_only_with_delay() {
         },
     );
     assert_eq!(out, vec![(1, Response::Released)]);
-    journal(&mut e); // the put
+    journal(&mut e);
     assert!(journal(&mut e).is_empty());
 
     cmd(&mut e, SEC, 1, Command::ReserveJob(id));
@@ -373,7 +366,6 @@ fn bury_journals_buried_record() {
     want.reserve_ct = 1;
     want.bury_ct = 1;
     assert_eq!(j, vec![want]);
-    // Failed bury / release: nothing.
     cmd(&mut e, SEC, 1, Command::Bury { id, pri: 1 });
     cmd(
         &mut e,
@@ -413,7 +405,6 @@ fn kick_journals_each_kicked_job_after_the_transition() {
         assert_eq!((r.bury_ct, r.kick_ct, r.reserve_ct), (1, 1, 1));
         assert_eq!(r.deadline_at, 0);
     }
-    // Kicking with nothing to kick journals nothing.
     cmd(&mut e, 0, 1, Command::Kick(5));
     journal(&mut e);
     assert_eq!(
@@ -453,7 +444,7 @@ fn kick_job_journals_before_handing_to_waiter() {
     let b = put(&mut e, 0, 1, 1, 0, 10, "y");
     cmd(&mut e, 0, 1, Command::ReserveJob(b));
     cmd(&mut e, 0, 1, Command::Bury { id: b, pri: 1 });
-    cmd(&mut e, 0, 2, Command::Reserve); // waits
+    cmd(&mut e, 0, 2, Command::Reserve);
     journal(&mut e);
     let out = cmd(&mut e, 0, 1, Command::KickJob(a));
     assert!(out.contains(&(1, Response::KickedJob)));
@@ -470,7 +461,6 @@ fn kick_job_journals_before_handing_to_waiter() {
         (j[1].id, j[1].state, j[1].bury_ct, j[1].kick_ct),
         (b, RecordState::Ready, 1, 1)
     );
-    // kick-job of a ready / reserved / missing job: nothing.
     cmd(&mut e, 0, 1, Command::KickJob(a));
     cmd(&mut e, 0, 1, Command::KickJob(b));
     cmd(&mut e, 0, 1, Command::KickJob(99));
@@ -504,7 +494,6 @@ fn delete_journals_in_every_state() {
             JournalEntry::Delete(reserved),
         ]
     );
-    // Not found, or reserved by another connection: nothing.
     let other = put(&mut e, 0, 1, 1, 0, 10, "o");
     e.connect(0, 2);
     cmd(&mut e, 0, 2, Command::ReserveJob(other));
@@ -550,16 +539,13 @@ fn non_journaled_transitions_produce_nothing() {
             delay: 0,
         },
     );
-    // TTR timeout of `a` and delay expiry of `b`.
     e.tick(3 * SEC, &mut out);
     assert_eq!(stats_job(&e, 3 * SEC, a).timeouts, 1);
     assert_eq!(stats_job(&e, 3 * SEC, b).state, "ready");
-    // Disconnect releasing `c`.
     e.disconnect(3 * SEC, 2, &mut out);
     assert_eq!(stats_job(&e, 3 * SEC, c).state, "ready");
     assert!(journal(&mut e).is_empty());
 
-    // Rejected and draining puts, and a put whose body never arrives.
     e.put_rejected(3 * SEC, 1, PutRejection::JobTooBig, &mut out);
     e.put_rejected(3 * SEC, 1, PutRejection::ExpectedCrlf, &mut out);
     e.put_rejected(3 * SEC, 1, PutRejection::TrailingGarbage, &mut out);
@@ -698,10 +684,6 @@ fn binlog_stats_and_file() {
     assert_eq!(e.build_stats_server(0).binlog_current_index, 4);
 }
 
-// ---------------------------------------------------------------------
-// Recovery rules
-// ---------------------------------------------------------------------
-
 #[test]
 fn recover_creates_tubes_in_first_appearance_order() {
     let recovery = Recovery {
@@ -718,7 +700,6 @@ fn recover_creates_tubes_in_first_appearance_order() {
     let e = recover(SEC, false, recovery);
     assert_eq!(names(&e), vec!["default", "b", "a", "c"]);
     assert_eq!(e.build_stats_server(SEC).current_tubes, 4);
-    // No jobs at all: only "default".
     let e = recover(
         SEC,
         false,
@@ -758,7 +739,6 @@ fn recover_buried_in_replay_order_with_extra_bury() {
     assert_eq!(e.build_stats_server(SEC).current_jobs_buried, 2);
     e.connect(SEC, 1);
     assert_eq!(buried_order(&mut e, SEC, 1, &tube("t")), vec![7, 3]);
-    // Kicks after recovery are journaled as updates of the old jobs.
     let j = update_of(&journal(&mut e));
     assert_eq!(
         j.iter()
@@ -806,7 +786,6 @@ fn recover_delayed_by_deadline() {
     assert_eq!(e.build_stats_server(now).current_jobs_delayed, 2);
     assert_eq!(e.build_stats_server(now).current_jobs_ready, 2);
     e.t_check_indexes();
-    // The original deadlines hold.
     let mut out = Outbox::new();
     e.tick(now + 1, &mut out);
     assert_eq!(stats_job(&e, now + 1, 3).state, "ready");
@@ -913,7 +892,6 @@ fn recover_next_id_and_counters() {
 
     e.connect(t0, 1);
     assert_eq!(put(&mut e, t0, 1, 1, 0, 1, "n"), 12);
-    // A deleted recovered job journals a Delete; the tube goes away.
     cmd(&mut e, t0, 1, Command::Delete(4));
     let j = journal(&mut e);
     assert!(matches!(j[0], JournalEntry::Put { .. }));
@@ -1011,7 +989,6 @@ fn journal_replay_round_trip_matches_reference_restart() {
     // The reference reported binlog-records-written = 17.
     assert_eq!(entries.len(), 17);
 
-    // Restart 1.5 s later.
     let t1 = t0 + 3 * SEC / 2;
     let recovery = replay(&entries);
     assert_eq!(recovery.next_id, 11);
@@ -1124,7 +1101,7 @@ fn reserved_at_crash_reverts_to_last_journaled_state() {
     let d = put(&mut e, t0, 1, 100, 0, 1, "d");
     cmd(&mut e, t0, 1, Command::ReserveJob(d));
     let mut out = Outbox::new();
-    e.tick(t0 + 2 * SEC + 1, &mut out); // d times out
+    e.tick(t0 + 2 * SEC + 1, &mut out);
     let f = put(&mut e, t0, 1, 100, 0, 60, "e");
     cmd(&mut e, t0, 1, Command::ReserveJob(f));
     cmd(
@@ -1149,10 +1126,6 @@ fn reserved_at_crash_reverts_to_last_journaled_state() {
     assert_eq!(got(d), ("ready", 100, 0, 0, 0, 0));
     assert_eq!(got(f), ("ready", 100, 0, 0, 0, 0));
 }
-
-// ---------------------------------------------------------------------
-// Proptest: random sequences, journal, restart, compare
-// ---------------------------------------------------------------------
 
 /// What the harness believes the binlog holds for one job, derived from the
 /// live engine at each journaled transition (not from the engine's
@@ -1226,8 +1199,6 @@ fn expected_entries(before: &Snapshot, after: &Snapshot) -> Vec<JournalEntry> {
 #[derive(Debug, Clone, Copy)]
 enum Restart {
     After(Nanos),
-    /// Exactly at the deadline of the n-th persisted delayed job, plus an
-    /// offset in nanoseconds.
     AtDeadline(usize, i64),
 }
 
@@ -1328,7 +1299,6 @@ fn run_restart(steps: Vec<(crate::oracle_tests::Msg, bool)>, restart: Restart) {
     r.t_check_indexes();
     crate::engine::proptests::check_invariants(&r);
 
-    // Expected state, by the rules of docs/PLAN.md §4.1.
     let mut tubes: Vec<TubeName> = vec![TubeName::default_tube()];
     let mut want_jobs: HashMap<JobId, StatsJob> = HashMap::new();
     let mut tube_counts: HashMap<TubeName, [u64; 4]> = HashMap::new(); // urgent, ready, delayed, buried
@@ -1415,7 +1385,6 @@ fn run_restart(steps: Vec<(crate::oracle_tests::Msg, bool)>, restart: Restart) {
     assert_eq!(r.build_stats_server(now2), want, "stats");
     assert_eq!(r.next_deadline(), next_delay, "next_deadline");
 
-    // Buried FIFO order per tube.
     r.connect(now2, 1);
     for t in &tubes {
         assert_eq!(
@@ -1424,7 +1393,6 @@ fn run_restart(steps: Vec<(crate::oracle_tests::Msg, bool)>, restart: Restart) {
             "buried order of {t}"
         );
     }
-    // Ready order, and the next job id.
     let mut r = recover(now2, true, recovery);
     r.connect(now2, 1);
     ready.sort_unstable();

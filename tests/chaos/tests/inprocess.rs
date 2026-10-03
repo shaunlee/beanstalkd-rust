@@ -14,7 +14,6 @@ use std::time::Instant;
 
 use bstk_chaos::inproc::{Outcome, RunConfig, run};
 
-/// Runs one seed on its own current-thread runtime with paused time.
 fn run_seed(cfg: RunConfig) -> Outcome {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

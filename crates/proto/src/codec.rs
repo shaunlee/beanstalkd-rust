@@ -11,7 +11,6 @@ use tokio_util::codec::{Decoder, Encoder};
 use crate::parse::{ParsedLine, parse_line_raw};
 use crate::{Command, Frame, LINE_BUF_SIZE, PutRejection, Response};
 
-/// Internal decoder state, mirroring the relevant `Conn` states in prot.c.
 #[derive(Debug)]
 enum State {
     /// `STATE_WANT_COMMAND` / `STATE_WANT_ENDLINE`. `overflowed` tracks
@@ -32,15 +31,11 @@ enum State {
     Discard { remaining: u64 },
 }
 
-/// Server-side codec. Decodes client bytes into `Frame`s and encodes
-/// `Response`s.
 #[derive(Debug)]
 pub struct ServerCodec {
     max_job_size: u32,
     state: State,
-    /// Whether to emit `Frame::PutStarted` when a put header is accepted.
     emit_put_started: bool,
-    /// Whether `auth <token>` lines decode to `Frame::Auth`.
     recognize_auth: bool,
 }
 
@@ -77,13 +72,8 @@ impl ServerCodec {
 /// followed by `\n`, the line is considered not-yet-found, even if a
 /// well-formed `\r\n` exists later in the buffer.
 enum LineScan {
-    /// Found a full line; `usize` is the content length (excluding `\r\n`).
     Found(usize),
-    /// No `\r\n` found and fewer than `LINE_BUF_SIZE` bytes buffered yet:
-    /// need more data.
     Incomplete,
-    /// No `\r\n` found within the first `LINE_BUF_SIZE` bytes: the line is
-    /// too long (`STATE_WANT_ENDLINE` territory).
     Overflow,
 }
 

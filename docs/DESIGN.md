@@ -43,11 +43,12 @@
 | `bstk-proto` | Command parsing, response encoding, stats YAML, `ServerCodec`. No I/O, fuzzable (`crates/proto/fuzz`). | bytes, tokio-util |
 | `bstk-engine` | Deterministic state machine: jobs, tubes, connection state, queues, timers | bstk-proto |
 | `bstk-engine-oracle` | Dev-only frozen copy of the engine before the T6b index refactor; used by an equivalence proptest | bstk-proto |
-| `bstk-server` | Binary `beanstalkd-rs`: listeners (plain / TLS), connection tasks, engine actor, CLI and config, auth, HTTP monitoring, system info | tokio, tokio-rustls, hyper, clap, toml, nix, getrandom, tracing |
+| `bstk-server` | Binary `beanstalkd-rs`: listeners (plain / TLS), connection tasks, engine actor, CLI and config, auth, HTTP monitoring, system info | tokio, bstk-net, tokio-rustls, hyper, clap, toml, nix, getrandom, tracing |
 | `bstk-compat` (`tests/compat`) | Differential harness and `.bt` case corpus against the reference | — |
 | `bstk-bench` (`bench/`) | Load generator and benchmark matrix | tokio |
 | `bstk-store` | Write-ahead log: segments, CRC records, reservation, compaction, replay | bstk-engine (types), crc32c, nix |
-| `bstk-raft` | Raft replication (P3): log entry and RPC types, log / snapshot storage, state-machine wrapper, network | openraft, bstk-engine, postcard |
+| `bstk-raft` | Raft replication (P3): log entry and RPC types, log / snapshot storage, state-machine wrapper, network | openraft, bstk-engine, bstk-net, postcard |
+| `bstk-net` | `QuietTcp`, a TCP stream registered for read readiness only (P4-T5b); shared by the server's client path and the cluster transport so neither depends on the other | tokio |
 
 `clients/` holds real-client smoke tests (Python greenstalk, Go go-beanstalk).
 
@@ -141,6 +142,12 @@ Tube creation and destruction follow the reference's refcounting (use + watch + 
 - `Engine::recover` rebuilds state from `Recovery` (live jobs in first-record order, the next id and the reference's replay tube order), applying the reference's replay rules: a job returns in its last journaled state, delayed jobs past their deadline become ready, replayed buried jobs count one more bury, cumulative counters start at zero. See COMPAT "Binlog".
 - The binlog stats fields come from the store through `set_binlog_stats`.
 
+### 4.6 Scale tests (`scale_tests.rs`, P4-T3)
+
+- The O(log n) buried / reservation removals are guarded by tests at 100k and 1M jobs: a client controls both counts (bury or reserve as many jobs as it likes, then delete, kick or release them in any order), so a scan hiding behind a small n would let a quadratic regression pass unnoticed.
+- Every test inserts in a shuffled order that differs from job id order, so a bug that silently sorts by id still fails the order check. Buried order is checked with the real `peek-buried` after every removal (O(log n) each); reservation order has no O(log n) peek, so `Engine::t_conn_reserved` is read at a few checkpoints only.
+- The non-`#[ignore]`d tests run at 100k (a quadratic scan would take tens of seconds there). The `#[ignore]`d ones report 100k and 1M timings but assert only an absolute bound on the 1M one: at 100k's sub-100 ms scale a single scheduling hiccup can swing a 100k-versus-1M ratio several-fold, while a quadratic regression misses the 1M bound by orders of magnitude. Timings take the minimum of several runs, since jitter only adds delay. Run them with `cargo test --release -p bstk-engine --ignored -- --test-threads=1`.
+
 ## 5. Protocol (proto)
 
 - `Command`: one variant per protocol command (put carries its body), plus `PauseTubeBadName` for a `pause-tube` whose name fails validation after the reference has already counted it.
@@ -175,6 +182,159 @@ Tube creation and destruction follow the reference's refcounting (use + watch + 
 - **HTTP** (off by default; binds 127.0.0.1 unless configured): `/healthz`, `/readyz` (503 until recovery completes), `/metrics` (Prometheus), `/admin` (read-only JSON). Snapshots come from the engine via `EngineMsg::Snapshot` → `Engine::snapshot_limited` (at most `max_tube_series + 1` tubes) and are cached for `http.snapshot_min_interval` (default 1 s). Up to 256 connections, 2 s header timeout, health endpoints never wait behind the 4-request limit on `/metrics` / `/admin`.
 - **Server-side counters** outside `stats` (which stays byte-identical to the reference): pending connections, pending rejections, auth timeouts, auth failures (in `/metrics` and `/admin` `server_rs`).
 
+### 6.2 Monitoring reference (`/metrics`, `/admin`; `metrics.rs`)
+
+Both renderers are pure functions of an engine snapshot, so every value they print is exactly what `stats` / `stats-tube` report at the same instant.
+
+#### Prometheus metrics
+
+This mapping is public API for operators; do not rename metrics
+lightly. Counters end in `_total`; everything else is a gauge.
+
+##### Server (`stats`)
+
+| stats key | metric | type |
+|---|---|---|
+| `current-jobs-urgent` | `beanstalkd_current_jobs{state="urgent"}` | gauge |
+| `current-jobs-ready` | `beanstalkd_current_jobs{state="ready"}` | gauge |
+| `current-jobs-reserved` | `beanstalkd_current_jobs{state="reserved"}` | gauge |
+| `current-jobs-delayed` | `beanstalkd_current_jobs{state="delayed"}` | gauge |
+| `current-jobs-buried` | `beanstalkd_current_jobs{state="buried"}` | gauge |
+| `cmd-<name>` (all 22) | `beanstalkd_commands_total{cmd="<name>"}` | counter |
+| `job-timeouts` | `beanstalkd_job_timeouts_total` | counter |
+| `total-jobs` | `beanstalkd_jobs_total` | counter |
+| `max-job-size` | `beanstalkd_max_job_size_bytes` | gauge |
+| `current-tubes` | `beanstalkd_current_tubes` | gauge |
+| `current-connections` | `beanstalkd_current_connections` | gauge |
+| `current-producers` | `beanstalkd_current_producers` | gauge |
+| `current-workers` | `beanstalkd_current_workers` | gauge |
+| `current-waiting` | `beanstalkd_current_waiting` | gauge |
+| `total-connections` | `beanstalkd_connections_total` | counter |
+| `version` | `beanstalkd_build_info{version="<version>"}` (always 1) | gauge |
+| `rusage-utime` | `beanstalkd_cpu_seconds_total{mode="user"}` | counter |
+| `rusage-stime` | `beanstalkd_cpu_seconds_total{mode="system"}` | counter |
+| `uptime` | `beanstalkd_uptime_seconds` | gauge |
+| `binlog-oldest-index` | `beanstalkd_binlog_oldest_index` | gauge |
+| `binlog-current-index` | `beanstalkd_binlog_current_index` | gauge |
+| `binlog-records-migrated` | `beanstalkd_binlog_records_migrated_total` | counter |
+| `binlog-records-written` | `beanstalkd_binlog_records_written_total` | counter |
+| `binlog-max-size` | `beanstalkd_binlog_max_size_bytes` | gauge |
+| `draining` | `beanstalkd_draining` (0 or 1) | gauge |
+
+`<name>` in `cmd` is the stats key without its `cmd-` prefix, i.e. the
+protocol command name: `put`, `peek`, `peek-ready`, `peek-delayed`,
+`peek-buried`, `reserve`, `reserve-with-timeout`, `delete`, `release`,
+`use`, `watch`, `ignore`, `bury`, `kick`, `touch`, `stats`, `stats-job`,
+`stats-tube`, `list-tubes`, `list-tube-used`, `list-tubes-watched`,
+`pause-tube`. Note that `urgent` jobs are a subset of `ready` jobs (as in
+`stats`), so summing `beanstalkd_current_jobs` over `state` double-counts.
+
+Not exported (identity rather than measurements; see `/admin`): `pid`,
+`id`, `hostname`, `os`, `platform`.
+
+The job, connection and tube gauges are named `beanstalkd_current_*`
+after their stats keys, which also keeps every gauge name distinct from
+every counter's base name (`beanstalkd_jobs_total` is a counter whose
+OpenMetrics family would be `beanstalkd_jobs`).
+
+##### Per tube (`stats-tube`), label `tube="<name>"`
+
+| stats-tube key | metric | type |
+|---|---|---|
+| `current-jobs-urgent` | `beanstalkd_tube_current_jobs{state="urgent"}` | gauge |
+| `current-jobs-ready` | `beanstalkd_tube_current_jobs{state="ready"}` | gauge |
+| `current-jobs-reserved` | `beanstalkd_tube_current_jobs{state="reserved"}` | gauge |
+| `current-jobs-delayed` | `beanstalkd_tube_current_jobs{state="delayed"}` | gauge |
+| `current-jobs-buried` | `beanstalkd_tube_current_jobs{state="buried"}` | gauge |
+| `total-jobs` | `beanstalkd_tube_jobs_total` | counter |
+| `current-using` | `beanstalkd_tube_current_using` | gauge |
+| `current-watching` | `beanstalkd_tube_current_watching` | gauge |
+| `current-waiting` | `beanstalkd_tube_current_waiting` | gauge |
+| `cmd-delete` | `beanstalkd_tube_commands_total{cmd="delete"}` | counter |
+| `cmd-pause-tube` | `beanstalkd_tube_commands_total{cmd="pause-tube"}` | counter |
+| `pause` | `beanstalkd_tube_pause_seconds` | gauge |
+| `pause-time-left` | `beanstalkd_tube_pause_time_left_seconds` | gauge |
+
+Tube counters restart from zero when a tube is destroyed (no users,
+watchers or jobs) and later recreated; Prometheus treats that as a
+counter reset.
+
+##### Cardinality cap
+
+Per-tube series are emitted for at most `max_tube_series` tubes: the
+first ones in `list-tubes` order. Two gauges describe the cap:
+
+| metric | meaning |
+|---|---|
+| `beanstalkd_tube_series_limit` | the configured `max_tube_series` |
+| `beanstalkd_tube_series_truncated` | 1 if some tubes were left out, else 0 |
+
+`beanstalkd_current_tubes` always reports the full tube count.
+
+The snapshot may already hold only some of the tubes (the HTTP listener
+asks the engine for `max_tube_series + 1` of them, see
+`Engine::snapshot_limited`): "truncated" means that the snapshot has more
+tubes than the limit; the one extra tube is what shows this.
+
+##### Server-side (beanstalkd-rs only, not in `stats`)
+
+| metric | type | meaning |
+|---|---|---|
+| `beanstalkd_pending_connections` | gauge | TLS connections in their handshake or awaiting token authentication |
+| `beanstalkd_pending_rejected_total` | counter | TLS connections closed at accept because `server.max_pending_connections` was reached |
+| `beanstalkd_auth_timeouts_total` | counter | token connections closed for not authenticating within `auth.timeout` |
+| `beanstalkd_auth_failures_total` | counter | wrong tokens and commands sent before authentication |
+
+#### Admin JSON
+
+`{"server": {...}, "server_rs": {...}, "tube_limit": N,
+"tubes_truncated": bool, "tubes": [{...}, ...]}` where `server` holds
+every `stats` key and each `tubes` entry every `stats-tube` key, with the
+reference's key names in the reference's order. Numbers are JSON numbers
+(`rusage-utime` / `rusage-stime` as seconds with six decimals), `draining`
+is a boolean, and `version`, `id`, `hostname`, `os`, `platform` and the
+tube `name` are strings. Tubes appear in `list-tubes` order, at most
+`tube_limit` (`http.max_tube_series`) of them; `tubes_truncated` tells
+whether some were left out. `server_rs` holds the server-side counters
+above as `pending-connections`, `pending-rejected`, `auth-timeouts` and
+`auth-failures` (cumulative ones without the `_total` suffix, like the
+`stats` keys).
+
+#### Cluster metrics
+
+Cluster figures, added to `/metrics` and `/admin` in cluster mode only (`metrics::ClusterStats`).
+
+| metric | type | meaning |
+|---|---|---|
+| `beanstalkd_cluster_node_id` | gauge | this node's id |
+| `beanstalkd_cluster_role{role}` | gauge | 1 for the current role (`leader`, `follower`, `candidate`, `learner`, `shutdown`), else 0 |
+| `beanstalkd_cluster_term` | gauge | current Raft term |
+| `beanstalkd_cluster_leader_id` | gauge | leader known to this node (0: none) |
+| `beanstalkd_cluster_commit_index` | gauge | last commit index this node learned |
+| `beanstalkd_cluster_applied_index` | gauge | last log index applied here |
+| `beanstalkd_cluster_last_log_index` | gauge | last log index stored here |
+| `beanstalkd_cluster_replication_lag{peer}` | gauge | leader only: entries a peer is missing |
+| `beanstalkd_cluster_log_bytes` | gauge | size of the log segments |
+| `beanstalkd_cluster_log_segments` | gauge | number of log segments |
+| `beanstalkd_cluster_snapshot_index` | gauge | last log index in the snapshot |
+| `beanstalkd_cluster_snapshot_bytes` | gauge | size of the stored snapshot |
+| `beanstalkd_cluster_forward_queue` | gauge | this node's inputs not yet applied |
+| `beanstalkd_cluster_forward_queue_bytes` | gauge | approximate size of those inputs |
+| `beanstalkd_cluster_forward_queue_full` | gauge | 1 while the forward queue is at its bound |
+| `beanstalkd_cluster_refused_connections_total` | counter | client connections closed at accept (cut off, shutting down, or queue full) |
+| `beanstalkd_cluster_rejected_puts_total` | counter | puts answered `OUT_OF_MEMORY` because the forward queue was full |
+| `beanstalkd_cluster_resent_inputs_total` | counter | inputs sent to the leader again (duplicates the state machine discards) |
+| `beanstalkd_cluster_forward_rewinds_total{cause}` | counter | resends of the forward queue, by cause (`view`, `error`, `stall`, `dropped`) |
+| `beanstalkd_cluster_drop_node_proposals_total` | counter | `DropNode` proposals made by this node as leader for silent nodes |
+| `beanstalkd_cluster_ready` | gauge | 1 when `/readyz` is 200 |
+| `beanstalkd_cluster_isolated` | gauge | 1 while client sockets are closed for lack of a leader |
+| `beanstalkd_cluster_rejoining` | gauge | 1 while the node is in rejoin mode (no votes, no clients) |
+| `beanstalkd_cluster_votes_refused_total` | counter | vote requests refused in rejoin mode |
+| `beanstalkd_cluster_next_local_conn` | gauge | local number of the next client connection (-1 before clients are accepted) |
+
+Absent indexes are exported as -1. `/admin` has the same values under
+`"cluster"` (absent ones as `null`).
+
 ## 7. Write-Ahead Log (P1, `bstk-store`)
 
 - Segment files `binlog.N`, preallocated to `-s` rounded up to 4096 (at most 4 GiB), and a `lock` file held for the process lifetime.
@@ -183,6 +343,44 @@ Tube creation and destruction follow the reference's refcounting (use + watch + 
 - Space: a put reserves room for its put and delete records while one spare preallocated segment always remains for updates (COMPAT D6).
 - Compaction: while (allocated − live) / live ≥ 2, move a live job out of the oldest segment; delete segments without live records. Crash-safe at every step.
 - fsync: `fdatasync`, per the `-f` / `-F` policy.
+
+### 7.1 Job index and space accounting (`wal.rs`)
+
+- **Segments**: `segs` holds every segment file in index order. `segs[cur]` is the current (write) segment; later ones are preallocated spares without records; earlier ones are closed (truncated to their records). Every open starts a new current segment.
+- **Job index (memory use)**: for every live job the store keeps its latest `JobRecord` (needed to write a compaction move), the location of its latest Put record and the bytes it uses: about 120 bytes per job plus hash map overhead. Tubes and bodies stay on disk: a compaction move re-reads the job's Put with a positioned read and re-stamps it with the latest `JobRecord`. Each segment also keeps a queue of (job, offset) entries for its Puts (16 bytes each, cleaned lazily) and the count of live jobs whose latest Put it holds ("anchors").
+- **Accounting terms**:
+  - `reserved`: one Delete record per live job and per reserved-but-not-yet-written put, plus the Put records of reserved puts.
+  - `avail`: unwritten bytes of the current segment plus the capacity of the preallocated spares.
+  - `slack`: worst-case bytes lost to rollover fragmentation (records never straddle segments): one Delete record per future rollover plus the pending Put records.
+- **Reservation**: `reserve_put` (and a compaction move) succeeds when `reserved + n + slack + one segment's capacity <= avail`, allocating new preallocated segments until it holds. The extra segment is the spare that unreserved Update records and fragmentation consume. If a segment cannot be allocated (disk full, or the test-only size limit) `reserve_put` returns false.
+- A put reservation lasts until the end of the next `append`: that call's Put entries consume the pending reservations in order, and leftovers (the put was never journaled, e.g. the engine rejected it) are released.
+- `append` never checks reservations; when preallocated space runs out it allocates a segment on the spot and fails only if that fails. A Put larger than a whole segment cannot be reserved; if one is appended anyway it is written at the start of a fresh segment, which grows past its preallocated size.
+
+### 7.2 Compaction and garbage collection (`wal.rs`)
+
+`maintain` computes `ratio = (allocated - live) / live` (integer division) where `allocated` is the bytes of all segment files and `live` is the bytes of live jobs' records (latest Put plus the Updates after it) plus `reserved`. Like the reference it performs `ratio - 1` moves when `ratio >= 2`. A move takes the first live job whose latest Put is in the oldest segment that holds any (and is at least two segments before the current one), re-reads that Put, verifies its CRC, re-stamps it with the job's latest `JobRecord` and writes it to the current segment. Moves stop early if space for them cannot be secured.
+
+GC deletes segments from the head of the list while they are before the current segment and anchor no live job. Before the first unlink it writes out buffered moves and (unless `SyncPolicy::Never`) fsyncs the current segment; with `SyncPolicy::Always` it also fsyncs the directory afterwards.
+
+**Why every on-disk state replays to the same live set**:
+- A move is a full Put carrying the latest state, written after all of the job's earlier records, so "last record wins" gives the same state whether or not the old copy still exists (a crash between the move and the unlink leaves the job in two files).
+- Only a prefix of the segment list is ever deleted, and only segments without the latest Put of any live job. A live job's latest Put and everything after it survive; surviving records before it are harmless (an Update for an unknown job is ignored; an older Put is overridden). A deleted job's Delete record comes after all its other records, so if any of them survives the Delete survives too: a deleted job is never resurrected.
+- A torn move at the tail is dropped by replay, and the old copy is still there because the unlink only happens after the move was written (and fsynced unless the policy is `Never`).
+
+### 7.3 Replay rules (`replay.rs`)
+
+Segments `binlog.N` (N = decimal digits without leading zeros) are read in increasing N. Within a segment, records are read from offset 16 until the first position that is not a valid record:
+
+- a zero length field (or fewer than 8 bytes left, all zero) is the *clean end* if every byte from there to the end of the file is zero;
+- anything else (non-zero bytes after the end marker, a length running past the end of the file, a CRC mismatch) makes the segment *torn* at that offset, even if valid-looking records follow it.
+
+A torn segment is accepted only if no later segment contains a valid record, i.e. the damage is in the last segment that has data (later segments can be preallocated spares). `open` then truncates it at the torn offset, fsyncs it and logs a warning with the segment and offset: with `-f N` / `-F`, unsynced writes may reach the disk out of order after a power loss, and losing that unsynced tail is the accepted cost of those modes (like the reference, which warns and continues). Always `Corrupt`: a torn segment followed by a later segment with valid records, a header with the wrong magic or version, and a record whose CRC matches but whose payload is malformed.
+
+A file shorter than the 16-byte header, or whose header is all zero, is a segment whose creation was interrupted: it has no records (non-zero bytes past the header count as torn at offset 16).
+
+Records are applied in file order: the last record of a job wins; a Put for an unknown job creates it; a Put for a known job (a compaction move) replaces its record, tube and body; an Update for an unknown job is ignored (its Put was in a garbage-collected segment, so the job was moved or deleted later); a Delete removes the job. Every record's id counts toward `next_id`, even ignored ones.
+
+`tube_order` mirrors the reference's tube list after replay (excluding `default`): a Put that creates a job appends its tube if no live job uses it yet, and a Delete that removes a tube's last live job swap-removes the tube (`ms_remove`). A move, and an Update or Delete of an unknown job, leave the list alone. After compaction has moved jobs and deleted old segments the surviving records differ from the reference's, so this order (like the job order) may differ from what the reference would produce.
 
 ## 8. Raft Replication (P3, `bstk-raft`)
 
@@ -252,7 +450,7 @@ Rules: 3 or 5 peers (1 allowed for tests); `-b` / `binlog` with `[cluster]` is a
 
 - **Owner-only replies (P4-T5a)**: every node applies every input, but builds replies only for its own connections. `Engine::set_local_conns(Some(LocalConns))` (the state machine sets it with the node id and `CONN_SEQ_BITS` on every engine it creates or restores) makes the engine's `reply` / `reply_with` helpers skip an `Outbox` entry for any other connection; the reply closures of the expensive replies (`stats*`, `list-tubes*`, `peek*`, `reserved` bodies) are not even run. Handlers already counted and mutated before building the reply (builders such as `build_stats_server` take `&self`), and all replies, including `tick`-driven ones (reserve timeouts, `DEADLINE_SOON`, a put waking a reserver), go through the same helpers, so nothing but the `Outbox` differs: a test applies random inputs over three node ids to one engine per scope and requires equal `EngineState` bytes and journals and, per node, exactly the full engine's replies for its connections. Why a runtime setting on the engine: an `Outbox` abstraction would change every engine call site and test, and a predicate in `EngineConfig` or `EngineState` would enter the snapshot payload (which must stay byte-identical on every node), so it is neither; it must be set again after `import_state` (the state machine does). `LocalConns` takes the node shift as a parameter so the engine does not learn the cluster's numbering. Dedup, `Applied` / `Closed` events and journal entries are untouched, and `forward.rs`, the proposer and the actor never saw non-local replies (the state machine's `route` already dropped them), so nothing downstream changes; `route` stays as the delivery guarantee.
 - **Fewer wake-ups (P4-T5b)**: at one connection, cluster CPU per operation was dominated by threads waking up, not by work (about two thirds system time). Per entry a follower handles three outside events (the AppendEntries carrying the entry, the log flush worker's callback, and the commit-only AppendEntries openraft 0.9 sends as soon as the commit index moves, `replication/mod.rs:671-685`), the leader about six (the client command, the flush callback, two responses per follower round); tokio's runtime metrics showed 6.6 worker parks per entry on a follower, 3.4 of them finding nothing to do. Changes, none of which touches what is replicated, synced or replied:
-  - *Read-only socket registration* (`bstk_raft::quiet_tcp::QuietTcp`, used for cluster connections in both directions and for client connections): tokio registers every `TcpStream` for write readiness too, and kqueue's write filter fires whenever the peer acknowledges data, so each frame written to an otherwise idle connection woke a worker that found nothing to do (a ping-pong test: 2.0 parks per round trip, 1.0 with read-only registration). `QuietTcp` registers reads only and writes directly; a write registration, on a duplicate descriptor, exists only while writes would block, and is dropped at the next write that succeeds at the first try. Registering reports the current state, so space freed between the failed write and the registration is not missed. Linux epoll reports write readiness only after the buffer was full, so the gain there should be smaller (not measured).
+  - *Read-only socket registration* (`bstk_net::QuietTcp`, used for cluster connections in both directions and for client connections): tokio registers every `TcpStream` for write readiness too, and kqueue's write filter fires whenever the peer acknowledges data, so each frame written to an otherwise idle connection woke a worker that found nothing to do (a ping-pong test: 2.0 parks per round trip, 1.0 with read-only registration). `QuietTcp` registers reads only and writes directly; a write registration, on a duplicate descriptor, exists only while writes would block, and is dropped at the next write that succeeds at the first try. Registering reports the current state, so space freed between the failed write and the registration is not missed. Linux epoll reports write readiness only after the buffer was full, so the gain there should be smaller (not measured).
   - *View watchers*: the actor, the proposer and the leader duties react to leader, term and role changes through openraft's `server_metrics()` (published only when they change) instead of `metrics()` (published on every Raft core loop iteration, several times per entry). `Core::{leader, is_leader, view}` read the same source, because openraft publishes it before the full metrics, so a task woken by it could still read stale full metrics. The actor marks its receiver changed once at start, so a change between `Actor::new` and the subscription is not missed.
   - *Leader duties* wait for applied-state changes only while leading (followers never propose `Tick`).
   - *Applied events are pulled*: the actor no longer wakes for each `ReplySink::applied`; it drains them whenever it wakes for anything else, before acting, and at least every 50 ms tick. Nothing waits on them alone: sending depends only on new inputs, forward results, view changes and rewinds, and the stall timer, isolation and shutdown checks run on the tick. Consequences: the forward queue's items leave it up to a tick later (bounded by the connections' one command in flight), and a resend triggered by an out-of-order apply can come up to a tick later.
@@ -281,6 +479,26 @@ Rules: 3 or 5 peers (1 allowed for tests); `-b` / `binlog` with `[cluster]` is a
 - **Real clients** (`clients/run-smoke.sh`) and an **engine oracle proptest** complement it.
 - Every known difference is recorded in `docs/COMPAT.md` with its reason.
 
+### 9.1 Chaos history checker (`tests/chaos`, `checker.rs`)
+
+The chaos harnesses (in-process on the simulated network, and multi-process with real servers behind pausable proxies; docs/PLAN.md §6.5) record every client operation and verify the history afterwards.
+
+**Global checks**
+- *Job ids are unique*: no two acknowledged puts got the same id.
+- *Ids increase in commit order*: if put A was acknowledged before put B was sent, A's id is lower (ids are allocated in log order).
+- *Job identity*: every put body is unique, so a `RESERVED` / `FOUND` reply names the put that created the job. The body must belong to a put that got that id, or to an unacknowledged put (which then evidently took effect, with that id). A body seen under two ids means one put created two jobs.
+- Replies outside the protocol vocabulary of the command are violations.
+
+**Per-job linearizability.** Each job's operations are checked against a single-server model of that job (a WGL-style depth-first search with memoization). The model's states are absent, ready, reserved(conn, deadline), delayed(until), buried and deleted. Every operation takes effect at one point inside `[send - slack, reply + slack]`; the points follow real time and each connection's program order. The point is modeled as the entry's engine time, which the leader stamps after the command was sent and before the reply; `slack` covers the difference between the clients' clock and engine time (clock skew between nodes, process start-up anchoring). The search places operations at their earliest possible points (`max(current point, send - slack)`): every timing constraint of the model is a lower bound, so placing earlier never loses a valid linearization.
+
+Spontaneous transitions, allowed but never required:
+- *TTR expiry*: reserved to ready at any point at or after the reservation's (or last touch's) point + TTR (TTR 0 counts as 1 s, as in the engine).
+- *Delay expiry*: delayed to ready at or after the put's / release's point + delay.
+- *Disconnect*: reserved(C) to ready once every acknowledged operation of C (on any job) could have taken effect: at or after the send time of C's last acknowledged operation, and only if the client closed or lost C at some point. There is no upper bound: after a kill -9 of the node holding C, the release happens only when the cluster drops that node's connections, long after the client saw its connection reset.
+- *Bulk kick*: a `kick` (acknowledged with a non-zero count, or unacknowledged) may have moved a buried or delayed job to ready at a point inside its interval (it does not name its jobs).
+
+Unacknowledged operations are optional: each took effect at a point after its send time, or never. An unacknowledged `reserve` may have reserved any job, so it is part of every job's history. When a job's search fails, the failure is classified (lost job, resurrected job, exclusive holding broken, or another inconsistency) and reported with the job's operations.
+
 ## 10. Changelog
 
 **v0.5 (P3 shipped)**: Raft replication (`bstk-raft`, cluster mode in the server), engine state export / import, cluster differential suites and chaos testing; the entries below record the changes made during P3's fix rounds.
@@ -294,13 +512,18 @@ Rules: 3 or 5 peers (1 allowed for tests); `-b` / `binlog` with `[cluster]` is a
 - `Engine::set_local_conns(Option<LocalConns>)`, `LocalConns::{new, owns}`; the cluster state machine builds replies only for connections whose `conn >> CONN_SEQ_BITS` is its node id. Not part of `EngineState` / `EngineConfig`; snapshot payload unchanged.
 
 **P4-T5b (fewer wake-ups)**
-- `bstk_raft::quiet_tcp::QuietTcp` (`new`, `get_ref`; `AsyncRead` / `AsyncWrite`): a TCP stream registered for read readiness only, used by the cluster dialer and listener and by the server's client connections. Cluster wire format and protocol version unchanged.
+- `bstk_net::QuietTcp` (`new`, `get_ref`; `AsyncRead` / `AsyncWrite`): a TCP stream registered for read readiness only, used by the cluster dialer and listener and by the server's client connections. Cluster wire format and protocol version unchanged.
 
 **P4-T5c (streamed snapshots)**
 - `bstk_raft::SnapshotFile` (module `snapshot_file`, `len`, `is_empty`; `AsyncRead` / `AsyncWrite` / `AsyncSeek`) replaces `SnapshotBuf` as `TypeConfig::SnapshotData`; `DEFAULT_MAX_SNAPSHOT_BYTES` moved to `snapshot_file` (same value, now a disk bound).
 - `Engine::state_view() -> EngineStateView<'_>` (opaque, `Serialize`, same bytes as `EngineState`); `EngineState`'s job records are boxed internally (encoding unchanged).
 - Snapshot file format version 2 (payload before meta); version 1 still read. Payload version (2) and cluster protocol version (3) unchanged.
 - `build_snapshot` logs the lock and total time at info.
+
+**P4-T8 (comment cleanup, `bstk-net`)**
+- New crate `bstk-net` (`crates/net`) with `bstk_net::QuietTcp` (moved from `bstk_raft::quiet_tcp`; same API); `bstk-server` and `bstk-raft` depend on it, so the server's client path no longer reaches `QuietTcp` through the Raft crate. Only tokio.
+- Removed the doc-only `bstk_engine::_api_doc` and `bstk_engine_oracle::_api_doc`; their per-method contracts now sit on the `Engine` methods.
+- Long design reasoning in code comments moved here: §4.6, §6.2, §7.1 to §7.3, §9.1. No behavior change.
 
 **P4-T6b (thread default per mode)**
 - `config::effective_threads(threads, cluster)` is replaced by `ResolvedConfig::effective_threads(&self, cluster)`: an explicit `threads` wins; else cluster 2; else 2 when any listener has `tls = true` or the binlog is enabled; else 1. New `config::DEFAULT_THREADS_STANDALONE_TLS_OR_BINLOG` (2); `DEFAULT_THREADS_STANDALONE` (1) now means no TLS listener and no binlog.

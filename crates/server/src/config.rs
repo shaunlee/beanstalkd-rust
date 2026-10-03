@@ -39,7 +39,6 @@ use bstk_store::{SyncPolicy, WalOptions};
 
 use crate::cli::Cli;
 
-/// Default cap on the number of per-tube metric series (`http.max_tube_series`).
 pub const DEFAULT_MAX_TUBE_SERIES: usize = 1000;
 
 /// Default `auth.timeout`: time an `auth = "token"` connection has, after
@@ -50,26 +49,19 @@ pub const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 /// TLS handshake or awaiting token authentication, across all listeners.
 pub const DEFAULT_MAX_PENDING_CONNECTIONS: usize = 1024;
 
-/// Smallest accepted `server.threads` / `--threads`.
 pub const MIN_THREADS: u16 = 1;
-/// Largest accepted `server.threads` / `--threads`.
 pub const MAX_THREADS: u16 = 256;
 
-/// Default tokio worker-thread count without `[cluster]`, no TLS listener
-/// and no binlog (chosen by measurement, P4-T2; see docs/DESIGN.md §3 and
-/// docs/BENCH.md "P4-T2: worker threads"). This is the count read by
-/// `engine_actor::run_task` (the actor's own message batching,
-/// `ACTOR_BATCH_LIMIT`, is a separate, unrelated knob).
+/// Default tokio worker-thread count without `[cluster]`, a TLS listener or
+/// the binlog (chosen by measurement, P4-T2; docs/DESIGN.md §3 and docs/BENCH.md
+/// "P4-T2: worker threads").
 pub const DEFAULT_THREADS_STANDALONE: usize = 1;
 /// Default tokio worker-thread count without `[cluster]` but with a TLS
 /// listener or the binlog: one worker measured below the P3 build there
 /// (docs/BENCH.md "P4-T6b: thread default per mode").
 pub const DEFAULT_THREADS_STANDALONE_TLS_OR_BINLOG: usize = 2;
-/// Default tokio worker-thread count with `[cluster]` (chosen by
-/// measurement, P4-T2). The cluster actor (`cluster::actor::Actor::run`)
-/// is a different code path with its own pre-existing message-draining
-/// loop (`MAX_DRAIN`); only the worker count changes here, not its
-/// batching.
+/// Default tokio worker-thread count with `[cluster]` (chosen by measurement,
+/// P4-T2).
 pub const DEFAULT_THREADS_CLUSTER: usize = 2;
 
 /// Default `http.snapshot_min_interval`: how old a cached engine snapshot
@@ -84,21 +76,14 @@ pub const MAX_TOKEN_LEN: usize = LINE_BUF_SIZE - "auth ".len() - "\r\n".len();
 /// checked there).
 pub const MAX_BINLOG_FILE_SIZE: u64 = bstk_store::MAX_FILE_SIZE;
 
-/// Exit status of `--check-config` for an invalid configuration.
 pub const EXIT_CONFIG: u8 = 1;
-
-// ---------------------------------------------------------------------------
-// Resolved configuration (what the server consumes)
-// ---------------------------------------------------------------------------
 
 /// Everything the server needs, validated and with CLI precedence applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedConfig {
-    /// The configuration file this came from, if any.
     pub source: Option<PathBuf>,
     /// Listening sockets, in file order (never empty).
     pub listeners: Vec<Listener>,
-    /// Certificate files; `Some` iff `[tls] cert` and `key` are set.
     pub tls: Option<TlsFiles>,
     /// Accepted tokens for `auth = "token"` listeners (deduplicated, in
     /// configuration order: `auth.tokens` first, then `auth.tokens_file`).
@@ -115,7 +100,6 @@ pub struct ResolvedConfig {
     /// `None`: use the mode's default (`ResolvedConfig::effective_threads`).
     pub threads: Option<u16>,
     pub binlog: BinlogSettings,
-    /// `None`: no HTTP listener.
     pub http: Option<HttpSettings>,
     pub log: LogSettings,
     /// Non-fatal problems found while loading (e.g. a tokens file readable
@@ -140,25 +124,19 @@ impl ResolvedConfig {
     }
 }
 
-/// One listening socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Listener {
     pub addr: SocketAddr,
-    /// Serve TLS (with `ResolvedConfig::tls`) instead of plaintext.
     pub tls: bool,
     pub auth: AuthMode,
 }
 
-/// How a listener authenticates clients.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {
-    /// No authentication (the protocol is unchanged).
     #[default]
     None,
-    /// `auth <token>` before any other command (TLS listeners only).
     Token,
-    /// A client certificate signed by `tls.client_ca` (TLS listeners only).
     Mtls,
 }
 
@@ -172,31 +150,23 @@ impl AuthMode {
     }
 }
 
-/// PEM files for TLS listeners (paths only; P2-T4 loads them).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsFiles {
-    /// Certificate chain.
     pub cert: PathBuf,
-    /// Private key.
     pub key: PathBuf,
     /// CA bundle for client certificates; set iff some listener uses
     /// `auth = "mtls"`.
     pub client_ca: Option<PathBuf>,
 }
 
-/// Write-ahead log settings, in the types `Wal::open` takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinlogSettings {
-    /// `-b` / `binlog.dir`; `None` disables the write-ahead log.
     pub dir: Option<PathBuf>,
-    /// `-s` / `binlog.file_size` (reported by `stats` even without a dir).
     pub file_size: u64,
-    /// `-f` / `-F` / `binlog.fsync`.
     pub sync: SyncPolicy,
 }
 
 impl BinlogSettings {
-    /// The options for `Wal::open`, or `None` without a binlog directory.
     pub fn wal_options(&self) -> Option<WalOptions> {
         self.dir.as_ref().map(|dir| WalOptions {
             dir: dir.clone(),
@@ -206,11 +176,9 @@ impl BinlogSettings {
     }
 }
 
-/// The opt-in HTTP listener (`/metrics`, `/healthz`, `/readyz`, `/admin`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HttpSettings {
     pub addr: SocketAddr,
-    /// Cap on per-tube metric series (and on the tubes `/admin` lists).
     pub max_tube_series: usize,
     /// Longest time a snapshot is reused by `/metrics` and `/admin`
     /// (zero: never reused).
@@ -223,7 +191,6 @@ pub struct LogSettings {
     pub format: LogFormat,
 }
 
-/// Log level, ordered from least to most verbose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
@@ -235,7 +202,6 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
-    /// The level for a `-V` count, as `cli::tracing_level`.
     pub fn from_verbosity(verbose: u8) -> LogLevel {
         match verbose {
             0 => LogLevel::Warn,
@@ -269,10 +235,8 @@ impl LogLevel {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
-    /// Human-readable lines (the default, as today).
     #[default]
     Text,
-    /// One JSON object per line.
     Json,
 }
 
@@ -285,7 +249,6 @@ impl LogFormat {
     }
 }
 
-/// Authentication tokens. `Debug` shows only how many there are.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Tokens(Vec<String>);
 
@@ -343,15 +306,13 @@ impl<'de> Deserialize<'de> for Tokens {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
 /// Why the configuration cannot be used. Messages never contain tokens.
 #[derive(Debug)]
 pub enum ConfigError {
-    /// A file (the configuration or `auth.tokens_file`) cannot be read.
-    Read { path: PathBuf, source: io::Error },
+    Read {
+        path: PathBuf,
+        source: io::Error,
+    },
     /// The configuration file is not valid TOML for the schema (syntax,
     /// wrong type, unknown key).
     Parse {
@@ -360,7 +321,6 @@ pub enum ConfigError {
         column: usize,
         message: String,
     },
-    /// A semantic error; the message names the offending key.
     Invalid(String),
 }
 
@@ -393,10 +353,6 @@ impl std::error::Error for ConfigError {
 fn invalid(message: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(message.into())
 }
-
-// ---------------------------------------------------------------------------
-// The file as written
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -501,11 +457,9 @@ struct RawPeer {
     addr: String,
 }
 
-/// The contents of `auth.tokens_file`. `Debug` hides them.
 struct TokensFile {
     path: PathBuf,
     contents: String,
-    /// Why its permissions are too open, if they are.
     mode_warning: Option<String>,
 }
 
@@ -519,8 +473,6 @@ impl fmt::Debug for TokensFile {
     }
 }
 
-/// A parsed (not yet validated) configuration file, with the contents of
-/// its `auth.tokens_file` once loaded.
 #[derive(Debug)]
 pub struct FileConfig {
     path: PathBuf,
@@ -529,8 +481,6 @@ pub struct FileConfig {
 }
 
 impl FileConfig {
-    /// Reads and parses the file at `path`, then reads its
-    /// `auth.tokens_file` (if any).
     pub fn load(path: &Path) -> Result<FileConfig, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
@@ -580,7 +530,6 @@ impl FileConfig {
         })
     }
 
-    /// `name` relative to the file's directory (absolute paths unchanged).
     fn relative(&self, name: &Path) -> PathBuf {
         self.path.parent().unwrap_or(Path::new("")).join(name)
     }
@@ -600,7 +549,6 @@ pub fn tokens_file_mode_warning(path: &Path, mode: u32) -> Option<String> {
     })
 }
 
-/// 1-based line and column (in characters) of byte `offset` in `text`.
 fn line_column(text: &str, offset: usize) -> (usize, usize) {
     let before = text.get(..offset).unwrap_or(text);
     let line = before.matches('\n').count() + 1;
@@ -608,10 +556,6 @@ fn line_column(text: &str, offset: usize) -> (usize, usize) {
     let column = before[line_start..].chars().count() + 1;
     (line, column)
 }
-
-// ---------------------------------------------------------------------------
-// Resolution
-// ---------------------------------------------------------------------------
 
 /// Loads `--config` (if given) and resolves it against the command line,
 /// ignoring `[cluster]` (the server uses `load_all`).
@@ -837,7 +781,6 @@ pub fn resolve(cli: &Cli, file: Option<FileConfig>) -> Result<ResolvedConfig, Co
         .into_iter()
         .collect();
 
-    // Per-listener requirements.
     for (i, l) in listeners.iter().enumerate() {
         let name = format!("listener[{i}] (\"{}\")", l.addr);
         if l.tls && tls.is_none() {
@@ -937,7 +880,6 @@ pub fn resolve(cli: &Cli, file: Option<FileConfig>) -> Result<ResolvedConfig, Co
     })
 }
 
-/// The configuration the command line alone gives (today's behavior).
 fn from_cli(cli: &Cli) -> ResolvedConfig {
     ResolvedConfig {
         source: None,
@@ -970,7 +912,6 @@ fn cli_listener(cli: &Cli) -> Listener {
     }
 }
 
-/// `IP:port` with an IP literal (`[v6]:port` for IPv6), like `-l` / `-p`.
 fn parse_addr(s: &str, key: &str) -> Result<SocketAddr, ConfigError> {
     s.parse().map_err(|_| {
         invalid(format!(
@@ -1044,12 +985,6 @@ fn check_token(token: &str) -> Result<(), String> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// --check-config
-// ---------------------------------------------------------------------------
-
-/// `--check-config`: loads and resolves the configuration and returns a
-/// short summary (no secrets) and the warnings.
 pub fn check(cli: &Cli) -> Result<(String, Vec<String>), ConfigError> {
     load_all(cli).map(|(config, cluster)| {
         let mut text = summary(&config, cluster.is_some());
@@ -1086,7 +1021,6 @@ pub fn summary(config: &ResolvedConfig, cluster: bool) -> String {
     use std::fmt::Write as _;
 
     let mut s = String::new();
-    // Writing into a String cannot fail.
     let _ = match &config.source {
         Some(path) => writeln!(s, "configuration OK: {}", path.display()),
         None => writeln!(s, "configuration OK: command line only"),

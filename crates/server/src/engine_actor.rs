@@ -1,36 +1,28 @@
 //! The engine actor: the sole owner and caller of the `Engine` (and, with
-//! `-b`, of the write-ahead log). Connection tasks talk to it through
-//! `EngineHandle`, an unbounded channel of `EngineMsg` (sending never
-//! blocks); replies go back over each connection's tokio unbounded channel.
+//! `-b`, of the write-ahead log). Connection tasks reach it through
+//! `EngineHandle`, an unbounded channel of `EngineMsg` (sending never blocks);
+//! replies return over each connection's tokio unbounded channel.
 //!
-//! Where it runs depends on `-b`:
-//! - With `-b`, on a dedicated OS thread fed by a std channel and woken by
-//!   `recv_timeout` at the earliest of the engine's next deadline and the
-//!   next interval fsync, so blocking file I/O and fsync never run on a
-//!   tokio worker.
-//! - Without `-b` it does no I/O at all, so it runs as a tokio task (a
-//!   `select!` over its channel and one re-armed timer), as before P1.
-//!   Measured on the P0 benchmarks, the OS thread costs 9-17% of
-//!   throughput without `-b`: every command then needs two cross-thread
-//!   wake-ups (worker -> actor thread -> worker), while a task is usually
-//!   woken on the same worker as the connection that sent the command.
-//!
-//! Both loops run the same per-message step (`Actor::on_message` /
+//! Placement (docs/DESIGN.md §3): with `-b`, a dedicated OS thread fed by a std
+//! channel and woken by `recv_timeout` at the earliest of the engine's next
+//! deadline and the next interval fsync, so file I/O never runs on a tokio
+//! worker. Without `-b` it does no I/O and runs as a tokio task, because the
+//! thread's two cross-thread wake-ups per command cost 9-17% throughput on the
+//! P0 benchmarks. Both loops run the same step (`Actor::on_message` /
 //! `Actor::on_timer`).
 //!
-//! Time discipline (docs/PLAN.md §4.2.1, docs/DESIGN.md §4.1): `now` for
-//! every engine call is the wall clock captured once at startup plus the
-//! monotonic time elapsed since then (`Clock`), read fresh right before
-//! that call. After every call we call `tick(now)` again; this resolves the
-//! DEADLINE_SOON-after-handle case documented in docs/COMPAT.md (engine
-//! item 5). Messages are processed one at a time, each followed by its own
+//! Time (docs/PLAN.md §4.2.1, docs/DESIGN.md §4.1): `now` for every engine
+//! call is the wall clock captured at startup plus the monotonic time elapsed
+//! since, read right before the call, and every call is followed by
+//! `tick(now)` (this resolves DEADLINE_SOON after a handle, docs/COMPAT.md
+//! engine item 5). Messages are processed one at a time, each with its own
 //! tick.
 //!
-//! Write before reply (docs/PLAN.md §4.2.4): after every engine call and
-//! its tick, the journal entries they produced are appended to the WAL
-//! (and, with `-f0`, fsynced by `append`) before any of their replies is
-//! released. Any WAL error is fatal: the pending replies are dropped and
-//! the process exits (fail-stop, docs/COMPAT.md D5).
+//! Write before reply (docs/PLAN.md §4.2.4): after each engine call and its
+//! tick, the journal entries they produced are appended to the WAL (fsynced by
+//! `append` with `-f0`) before any of their replies is released. A WAL error
+//! is fatal: pending replies are dropped and the process exits (fail-stop,
+//! docs/COMPAT.md D5).
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -50,17 +42,13 @@ pub const EXIT_WAL_FAILURE: i32 = 20;
 /// early is harmless: `tick` returns at once when nothing is due.
 const MAX_WAIT: Duration = Duration::from_secs(3600);
 
-/// P4-T2: upper bound on how many already-queued messages `run_task`
-/// drains with `try_recv` per wake-up before delivering. Only reachable
-/// without a WAL (`spawn` picks the dedicated-OS-thread path whenever one
-/// is configured), so `-b`'s per-message persist-before-reply order is
-/// unaffected. The P4-T1 spike found this has no measured effect on its
-/// own (the lever was the tokio worker-thread count) but is harmless, so
-/// it is kept.
+/// P4-T2: most already-queued messages `run_task` drains with `try_recv` per
+/// wake-up before delivering. Only reachable without a WAL (`-b` keeps its
+/// per-message persist-before-reply order). The P4-T1 spike measured no effect
+/// on its own (the lever was the worker-thread count) but it is harmless, so
+/// it stays.
 const ACTOR_BATCH_LIMIT: usize = 64;
 
-/// A message sent by a connection task (or the signal handler) to the
-/// engine actor.
 pub enum EngineMsg {
     /// A new connection was accepted. Must be sent before that connection's
     /// first `Command`, on the same channel, so ordering is preserved.
@@ -68,36 +56,41 @@ pub enum EngineMsg {
         conn: ConnId,
         reply_tx: tokio_mpsc::UnboundedSender<Response>,
     },
-    /// One fully-decoded command, sent only after the previous command on
-    /// this connection has received its reply.
-    Command { conn: ConnId, cmd: Command },
-    /// A put command line was accepted; its body is still to come
-    /// (`Frame::PutStarted`). Produces no reply.
-    PutStarted { conn: ConnId, too_big: bool },
-    /// A `put` rejected by the codec during framing (`Frame::PutRejected`).
-    PutRejected { conn: ConnId, why: PutRejection },
+    Command {
+        conn: ConnId,
+        cmd: Command,
+    },
+    PutStarted {
+        conn: ConnId,
+        too_big: bool,
+    },
+    PutRejected {
+        conn: ConnId,
+        why: PutRejection,
+    },
     /// The connection's socket reached EOF while a reply was outstanding
     /// (or has already reached EOF and another command was just
     /// dispatched). A no-op unless the connection is currently blocked in
     /// reserve.
-    HalfClose { conn: ConnId },
-    /// The connection is gone; release its jobs and forget it. Sent from a
-    /// drop guard so this fires on every exit path.
-    Disconnect { conn: ConnId },
-    /// SIGUSR1: enter (or, in principle, leave) drain mode.
+    HalfClose {
+        conn: ConnId,
+    },
+    Disconnect {
+        conn: ConnId,
+    },
     SetDraining(bool),
-    /// The HTTP listener wants a monitoring snapshot with at most
-    /// `max_tubes` tubes (`Engine::snapshot_limited`, which changes no
-    /// state and does work bounded by `max_tubes`). Like every message it
-    /// is followed by a tick, which is harmless: `tick` only does what is
-    /// already due.
+    /// The HTTP listener wants a monitoring snapshot with at most `max_tubes`
+    /// tubes (`Engine::snapshot_limited`: no state change, work bounded by
+    /// `max_tubes`).
     Snapshot {
         max_tubes: usize,
         reply: oneshot::Sender<Snapshot>,
     },
     /// SIGINT / SIGTERM: sync the WAL (unless `-F`), acknowledge on `done`
     /// and stop. Messages queued behind it are never processed.
-    Shutdown { done: oneshot::Sender<()> },
+    Shutdown {
+        done: oneshot::Sender<()>,
+    },
 }
 
 /// Handle used by connection tasks and the signal handlers to reach the
@@ -106,13 +99,10 @@ pub enum EngineMsg {
 /// called from async code (including `Drop`).
 #[derive(Clone)]
 pub enum EngineHandle {
-    /// The actor runs on its own OS thread (`-b`).
     Thread(mpsc::Sender<EngineMsg>),
-    /// The actor runs as a tokio task (no `-b`).
     Task(tokio_mpsc::UnboundedSender<EngineMsg>),
 }
 
-/// The actor has stopped; the message was not delivered.
 #[derive(Debug)]
 pub struct EngineGone;
 
@@ -153,10 +143,8 @@ impl Clock {
         self.anchor.saturating_add(elapsed)
     }
 
-    /// The `Instant` at which `now()` reaches `at`, or at most `MAX_WAIT`
-    /// from now: a far deadline (a `u32::MAX` second delay or TTR on top
-    /// of a wall-clock epoch) is never converted to an `Instant`, which
-    /// could overflow. Waking up early is harmless.
+    /// The `Instant` at which `now()` reaches `at`, capped at `MAX_WAIT` from now
+    /// so a far deadline never overflows an `Instant`.
     pub(crate) fn instant_at(&self, at: Nanos) -> Instant {
         let now = Instant::now();
         let cap = now + MAX_WAIT;
@@ -195,7 +183,6 @@ impl Log for Wal {
     }
 }
 
-/// The WAL plus the actor's bookkeeping around it.
 struct Binlog<L> {
     log: L,
     policy: SyncPolicy,
@@ -210,8 +197,6 @@ struct Binlog<L> {
     sync_at: Option<Instant>,
 }
 
-/// The engine, its optional WAL and the reply channels. Owned by the actor
-/// thread; every method runs one complete engine step.
 pub struct Actor<L> {
     clock: Clock,
     engine: Engine,
@@ -251,8 +236,6 @@ impl<L: Log> Actor<L> {
         }
     }
 
-    /// Starts the actor: on its own OS thread with a WAL, else as a task
-    /// on `runtime`.
     pub fn spawn(self, runtime: &tokio::runtime::Handle) -> std::io::Result<EngineHandle> {
         if self.binlog.is_some() {
             let (tx, rx) = mpsc::channel();
@@ -298,7 +281,6 @@ impl<L: Log> Actor<L> {
                         return;
                     }
                     Some(msg) => msg,
-                    // Every sender is gone: nothing left to serve.
                     None => return,
                 },
                 () = &mut sleep, if armed.is_some() => {
@@ -356,7 +338,6 @@ impl<L: Log> Actor<L> {
                 }
                 Ok(msg) => self.on_message(msg),
                 Err(RecvTimeoutError::Timeout) => self.on_timer(),
-                // Every sender is gone: nothing left to serve.
                 Err(RecvTimeoutError::Disconnected) => return,
             };
             if let Err(e) = res {
@@ -365,8 +346,6 @@ impl<L: Log> Actor<L> {
         }
     }
 
-    /// Waits for the next message, or times out when the engine's next
-    /// deadline or the interval fsync is due.
     fn recv(&self, rx: &mpsc::Receiver<EngineMsg>) -> Result<EngineMsg, RecvTimeoutError> {
         match self.next_wait() {
             Some(wait) => rx.recv_timeout(wait),
@@ -393,7 +372,6 @@ impl<L: Log> Actor<L> {
         }
     }
 
-    /// Runs one message through the engine, then tick, persist, deliver.
     pub fn on_message(&mut self, msg: EngineMsg) -> Result<(), WalError> {
         let now = self.clock.now();
         self.outbox.clear();
@@ -428,7 +406,6 @@ impl<L: Log> Actor<L> {
                 self.engine.set_draining(on);
             }
             EngineMsg::Snapshot { max_tubes, reply } => {
-                // The requester may have given up (timeout); that's fine.
                 let _ = reply.send(self.engine.snapshot_limited(now, max_tubes));
             }
             // Handled by the caller (`run` / `run_task`) before reaching
@@ -456,11 +433,9 @@ impl<L: Log> Actor<L> {
         self.engine.handle(now, conn, cmd, &mut self.outbox);
     }
 
-    /// The engine's deadline (or the interval fsync) is due.
     pub fn on_timer(&mut self) -> Result<(), WalError> {
         let now = self.clock.now();
         self.outbox.clear();
-        // `finish` ticks.
         if let Some(b) = self.binlog.as_mut()
             && let Some(at) = b.sync_at
         {
@@ -508,13 +483,11 @@ impl<L: Log> Actor<L> {
         Ok(())
     }
 
-    /// Graceful shutdown: make every write so far durable unless `-F`.
     fn shutdown(&mut self) -> Result<(), WalError> {
         let Some(b) = self.binlog.as_mut() else {
             return Ok(());
         };
         match b.policy {
-            // `append` already fsynced every write.
             SyncPolicy::Always | SyncPolicy::Never => Ok(()),
             // The store has no unconditional sync; a time one interval
             // ahead always passes its rate limit (it still skips the fsync
@@ -666,7 +639,6 @@ mod tests {
         h.actor.on_message(put(b"hello")).unwrap();
         assert_eq!(events(&h), vec![Ev::Reserve(MAX_TUBE_NAME_LEN, 5)]);
         assert_eq!(h.rx.try_recv().unwrap(), Response::OutOfMemory);
-        // The id was consumed at put time, as in the reference.
         h.actor
             .on_message(EngineMsg::Command {
                 conn: 1,
@@ -723,7 +695,6 @@ mod tests {
         assert_eq!(snap.tubes.len(), 1);
         assert_eq!(events(&h), vec![]);
         assert!(h.rx.try_recv().is_err(), "a snapshot sends no reply");
-        // A second snapshot sees exactly the same counters.
         let (reply, mut rx) = oneshot::channel();
         h.actor
             .on_message(EngineMsg::Snapshot {
@@ -734,8 +705,6 @@ mod tests {
         let again = rx.try_recv().unwrap();
         assert_eq!(again.server.cmd_stats, 0);
         assert_eq!(again.tubes, snap.tubes);
-        // A limited one has the same server stats and at most that many
-        // tubes.
         let (reply, mut rx) = oneshot::channel();
         h.actor
             .on_message(EngineMsg::Snapshot {
@@ -748,7 +717,6 @@ mod tests {
         assert_eq!(limited.server.cmd_put, 1);
         assert_eq!(limited.server.cmd_stats, 0);
         assert!(limited.tubes.is_empty());
-        // A requester that gave up is harmless.
         let (reply, rx) = oneshot::channel();
         drop(rx);
         h.actor
@@ -804,7 +772,6 @@ mod tests {
         h.actor.on_timer().unwrap();
         assert_eq!(events(&h), vec![Ev::Sync]);
         assert_eq!(h.actor.next_wait(), None);
-        // Shutdown forces one more sync attempt.
         h.actor.shutdown().unwrap();
         assert_eq!(events(&h), vec![Ev::Sync]);
     }
@@ -911,7 +878,6 @@ mod tests {
             }
         }
 
-        // Records the engine journaled (compaction moves excluded).
         let journaled_records = |a: &Actor<Probe<Wal>>| {
             let s = a.binlog.as_ref().unwrap().log.stats();
             s.records_written - s.records_migrated

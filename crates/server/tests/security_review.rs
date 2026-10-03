@@ -35,10 +35,6 @@ use common::p2::{BIN, Certs, ClientCert, ConfigServer, End, Proto, TlsStream, ge
 
 const TOKEN: &str = "s3cr3t-Token-4b1d";
 
-// ---------------------------------------------------------------------------
-// Shared config templates and helpers
-// ---------------------------------------------------------------------------
-
 /// Port 0: TLS + token auth; port 1: HTTP. `extra` is appended (it may
 /// add `[server]` keys, `auth.timeout` must go through `auth_timeout`).
 fn token_and_http(auth_timeout: &str, extra: &str) -> String {
@@ -92,10 +88,6 @@ fn wait_metric(http: SocketAddr, name: &str, ok: impl Fn(u64) -> bool) -> u64 {
     }
 }
 
-// ===========================================================================
-// F1: pre-auth connections time out, are counted, and are capped
-// ===========================================================================
-
 /// F1 (the review's "F2" PoC): a client that completes the TLS handshake
 /// but never authenticates is closed silently after `auth.timeout`. While
 /// it waits it shows as pending in `/metrics` (and `/admin`), not in
@@ -104,7 +96,6 @@ fn wait_metric(http: SocketAddr, name: &str, ok: impl Fn(u64) -> bool) -> u64 {
 fn f1_idle_pre_auth_connections_time_out_and_are_visible() {
     let (server, certs) = ConfigServer::start(&token_and_http("1s", ""), 2, &[]);
     let http = server.addr(1);
-    // The readiness probes of `ConfigServer::start` were pending briefly.
     wait_metric(http, "beanstalkd_pending_connections", |v| v == 0);
 
     const IDLE: usize = 10;
@@ -120,7 +111,6 @@ fn f1_idle_pre_auth_connections_time_out_and_are_visible() {
         "the stats object is unchanged"
     );
 
-    // `stats` does not know about them (it stays byte-compatible).
     let mut ok = connect_noauth(&server, &certs);
     assert_eq!(ok.cmd(&format!("auth {TOKEN}")), "AUTHENTICATED");
     let stats = ok.yaml("stats");
@@ -128,8 +118,6 @@ fn f1_idle_pre_auth_connections_time_out_and_are_visible() {
     assert_eq!(stat_of(&stats, "total-connections"), "1");
     assert!(!stats.contains("pending"), "{stats}");
 
-    // Each idle connection is closed, without a reply, once the timeout
-    // has passed.
     let t0 = Instant::now();
     for c in &mut idle {
         let (bytes, end) = c.read_to_end(Duration::from_secs(5));
@@ -145,7 +133,6 @@ fn f1_idle_pre_auth_connections_time_out_and_are_visible() {
         wait_metric(http, "beanstalkd_pending_connections", |v| v == 0),
         0
     );
-    // The authenticated connection was not affected.
     assert_eq!(ok.cmd("use default"), "USING default");
     assert_eq!(metric(http, "beanstalkd_auth_failures_total"), 0);
 }
@@ -157,7 +144,6 @@ fn f1_authenticated_connections_are_not_timed_out() {
     let http = server.addr(1);
     let mut c = connect_noauth(&server, &certs);
     assert_eq!(c.cmd(&format!("auth {TOKEN}")), "AUTHENTICATED");
-    // Several timeouts' worth of idleness, then more commands.
     std::thread::sleep(Duration::from_millis(1200));
     assert_eq!(c.put(b"still here"), "INSERTED 1");
     std::thread::sleep(Duration::from_millis(600));
@@ -186,19 +172,16 @@ fn f1_pending_cap_rejects_new_tls_connections_and_recovers() {
     let mut held: Vec<_> = (0..3).map(|_| connect_noauth(&server, &certs)).collect();
     wait_metric(http, "beanstalkd_pending_connections", |v| v == 3);
 
-    // Full: a new TLS connection is closed before its handshake.
     let t0 = Instant::now();
     assert!(
         common::p2::tls_connect(tls_addr, client.clone()).is_err(),
         "a TLS connection past the cap must be refused"
     );
-    // A flood of them is cheap to refuse, and not logged line by line.
     const FLOOD: u64 = 40;
     for _ in 0..FLOOD {
         let mut s = TcpStream::connect_timeout(&tls_addr, Duration::from_secs(2)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let mut buf = [0u8; 16];
-        // Closed by the server right away (EOF or reset).
         assert!(matches!(s.read(&mut buf), Ok(0) | Err(_)));
     }
     let rejected = wait_metric(http, "beanstalkd_pending_rejected_total", |v| {
@@ -220,7 +203,6 @@ fn f1_pending_cap_rejects_new_tls_connections_and_recovers() {
         server.stderr()
     );
 
-    // A wrong token frees its slot (and counts as a failure).
     let mut bad = held.pop().unwrap();
     assert_eq!(bad.cmd("auth not-the-token"), "UNAUTHORIZED");
     assert_eq!(
@@ -228,18 +210,14 @@ fn f1_pending_cap_rejects_new_tls_connections_and_recovers() {
         1
     );
     wait_metric(http, "beanstalkd_pending_connections", |v| v == 2);
-    // So does a client that goes away.
     drop(held.pop());
     wait_metric(http, "beanstalkd_pending_connections", |v| v == 1);
 
-    // Recovered: new clients get in and authenticate.
     for _ in 0..2 {
         let mut c = connect_noauth(&server, &certs);
         assert_eq!(c.cmd(&format!("auth {TOKEN}")), "AUTHENTICATED");
         assert_eq!(c.cmd("use default"), "USING default");
     }
-    // Authenticated connections are not pending: the one idle connection
-    // is all that counts.
     assert_eq!(metric(http, "beanstalkd_pending_connections"), 1);
     drop(held);
 }
@@ -274,7 +252,6 @@ addr = "127.0.0.1:{port2}"
     let http = server.addr(2);
     wait_metric(http, "beanstalkd_pending_connections", |v| v == 0);
 
-    // Many more established connections than the cap: none is pending.
     let mut open = Vec::new();
     for i in 0..4 {
         let mut t = server.tls(0, certs.client_config(ClientCert::None));
@@ -286,16 +263,12 @@ addr = "127.0.0.1:{port2}"
     }
     assert_eq!(metric(http, "beanstalkd_pending_connections"), 0);
 
-    // Two connections that never start their handshake fill the shared
-    // cap...
     let raw: Vec<_> = (0..2)
         .map(|_| TcpStream::connect_timeout(&server.addr(0), Duration::from_secs(2)).unwrap())
         .collect();
     wait_metric(http, "beanstalkd_pending_connections", |v| v == 2);
-    // ... so the mTLS listener refuses new connections too.
     let refused = common::p2::tls_connect(server.addr(1), certs.client_config(ClientCert::Valid))
         .and_then(|mut c| {
-            // TLS 1.3: a refusal may only show on the first read.
             c.send(b"use default\r\n");
             let (bytes, end) = c.read_to_end(Duration::from_secs(3));
             if bytes.is_empty() && end != End::Timeout {
@@ -307,14 +280,12 @@ addr = "127.0.0.1:{port2}"
     assert!(refused.is_err(), "{refused:?}");
     assert!(metric(http, "beanstalkd_pending_rejected_total") >= 1);
 
-    // Once they go away, both listeners accept again.
     drop(raw);
     wait_metric(http, "beanstalkd_pending_connections", |v| v == 0);
     let mut m = server.tls(1, certs.client_config(ClientCert::Valid));
     assert_eq!(m.cmd("use default"), "USING default");
     let mut t = server.tls(0, certs.client_config(ClientCert::None));
     assert_eq!(t.cmd("use default"), "USING default");
-    // The established connections were never affected.
     for c in &mut open {
         assert_eq!(c.cmd("use default"), "USING default");
     }
@@ -390,7 +361,6 @@ level = "error"
             http_port,
             certs,
         };
-        // Wait until both ports listen.
         let deadline = Instant::now() + Duration::from_secs(20);
         for port in [s.tls_port, s.http_port] {
             let addr: SocketAddr = ([127, 0, 0, 1], port).into();
@@ -436,7 +406,6 @@ fn f1_pre_auth_connections_cannot_exhaust_descriptors() {
             Err(_) => refused += 1,
         }
     }
-    // Plus raw TCP connections that never start a handshake.
     let mut held = Vec::new();
     for _ in 0..64 {
         if let Ok(s) = TcpStream::connect_timeout(&tls_addr, Duration::from_millis(100)) {
@@ -451,7 +420,6 @@ fn f1_pre_auth_connections_cannot_exhaust_descriptors() {
     assert!(refused > 0);
     std::thread::sleep(Duration::from_millis(500));
 
-    // /healthz still answers, and so does /metrics, which tells why.
     let healthz = raw_http(http_addr, "/healthz", Duration::from_secs(2));
     let healthz_ok = healthz.as_ref().is_some_and(|(b, _)| b.contains("200 OK"));
     assert!(
@@ -461,8 +429,6 @@ fn f1_pre_auth_connections_cannot_exhaust_descriptors() {
     assert!(metric(http_addr, "beanstalkd_pending_rejected_total") >= refused);
     assert!(metric(http_addr, "beanstalkd_pending_connections") <= MAX_PENDING as u64);
 
-    // And an authenticated client still gets in once some pending ones
-    // are gone.
     tls_held.truncate(MAX_PENDING / 2);
     drop(held);
     wait_metric(http_addr, "beanstalkd_pending_connections", |v| {
@@ -473,10 +439,6 @@ fn f1_pre_auth_connections_cannot_exhaust_descriptors() {
     assert_eq!(c.put(b"x"), "INSERTED 1");
     drop(tls_held);
 }
-
-// ===========================================================================
-// F3: /admin is capped, and snapshots are bounded and cached
-// ===========================================================================
 
 #[test]
 fn f3_admin_and_snapshot_are_bounded_by_max_tube_series() {
@@ -498,7 +460,6 @@ max_tube_series = 5
         assert_eq!(c.put(b"x"), format!("INSERTED {}", i + 1));
     }
 
-    // /metrics: 5 tubes * 5 states, flagged as truncated.
     let metrics = get(http_addr, "/metrics").body;
     let series = metrics
         .lines()
@@ -506,10 +467,8 @@ max_tube_series = 5
         .count();
     assert_eq!(series, 25);
     assert!(metrics.contains("\nbeanstalkd_tube_series_truncated 1\n"));
-    // The full count is still there.
     assert!(metrics.contains("\nbeanstalkd_current_tubes 301\n"));
 
-    // /admin: the first 5 tubes in list order, flagged as truncated.
     let admin = get(http_addr, "/admin").body;
     let doc: serde_json::Value = serde_json::from_str(&admin).unwrap();
     let names: Vec<&str> = doc["tubes"]
@@ -561,10 +520,6 @@ snapshot_min_interval = "3600s"
     }
 }
 
-// ===========================================================================
-// F4: slow HTTP clients no longer starve /healthz
-// ===========================================================================
-
 #[test]
 fn f4_slow_http_clients_do_not_starve_healthz() {
     const CONFIG: &str = r#"
@@ -578,7 +533,6 @@ addr = "127.0.0.1:{port1}"
     let http_addr = server.addr(1);
 
     for held in [64, 200] {
-        // Connections that never finish their headers.
         let mut slow = Vec::new();
         for _ in 0..held {
             let mut s = TcpStream::connect_timeout(&http_addr, Duration::from_millis(500)).unwrap();
@@ -598,17 +552,12 @@ addr = "127.0.0.1:{port1}"
             );
             assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
         }
-        // Monitoring still works alongside them.
         let (metrics, _) =
             raw_http(http_addr, "/metrics", Duration::from_millis(1500)).expect("metrics");
         assert!(metrics.contains("200 OK"), "{metrics}");
         drop(slow);
     }
 }
-
-// ===========================================================================
-// Properties that HOLD (regression tests)
-// ===========================================================================
 
 /// HOLD: before authentication, a `put` header is refused *at the header*
 /// (Frame::PutStarted), so the body is never read/buffered. An attacker
@@ -618,7 +567,6 @@ fn hold_pre_auth_put_body_is_not_buffered() {
     let (server, certs) = ConfigServer::start(&token_and_http("10s", ""), 2, &[]);
     let mut c = connect_noauth(&server, &certs);
 
-    // Announce a large body but send none of it.
     c.send(b"put 0 0 60 60000\r\n");
     let (bytes, end) = c.read_to_end(Duration::from_secs(3));
     assert_eq!(
@@ -637,9 +585,7 @@ fn hold_pre_auth_put_body_is_not_buffered() {
 fn hold_pre_auth_overlong_line_is_refused() {
     let (server, certs) = ConfigServer::start(&token_and_http("10s", ""), 2, &[]);
     let mut c = connect_noauth(&server, &certs);
-    // 4 KiB with no CRLF: far over the 224-byte line window.
     c.send(&vec![b'A'; 4096]);
-    // Now terminate a line so the decoder emits its verdict.
     c.send(b"\r\n");
     let (bytes, end) = c.read_to_end(Duration::from_secs(3));
     let text = String::from_utf8_lossy(&bytes);
@@ -652,11 +598,8 @@ fn hold_pre_auth_overlong_line_is_refused() {
     drop(server);
 }
 
-// ---------------------------------------------------------------------------
-// Minimal HTTP helper with a hard deadline (unlike common::p2::http, which
-// reads to EOF with a long per-read timeout).
-// ---------------------------------------------------------------------------
-
+/// Minimal HTTP helper with a hard deadline (`common::p2::http` reads to EOF
+/// with a long per-read timeout).
 fn raw_http(addr: SocketAddr, path: &str, deadline: Duration) -> Option<(String, Duration)> {
     let t0 = Instant::now();
     let mut s = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;

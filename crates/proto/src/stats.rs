@@ -43,8 +43,7 @@ pub struct StatsTube {
     pub pause_time_left: u64,
 }
 
-/// Server-wide stats. Field set and order follow STATS_FMT exactly; T1 may add
-/// fields if the reference has keys missing here (report it).
+/// Server-wide stats. Field set and order follow STATS_FMT exactly.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StatsServer {
     pub current_jobs_urgent: u64,

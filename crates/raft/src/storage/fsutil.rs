@@ -83,7 +83,6 @@ pub(crate) fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<(
     sync_dir(dir)
 }
 
-/// Append one framed record holding `payload` to `out`.
 pub(crate) fn encode_record(payload: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
     let len = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "record too large"))?;
@@ -96,21 +95,16 @@ pub(crate) fn encode_record(payload: &[u8], out: &mut Vec<u8>) -> io::Result<()>
     Ok(())
 }
 
-/// A framed record holding `payload`.
 pub(crate) fn record(payload: &[u8]) -> io::Result<Vec<u8>> {
     let mut out = Vec::with_capacity(payload.len() + REC_HEADER_LEN as usize);
     encode_record(payload, &mut out)?;
     Ok(out)
 }
 
-/// Why a record could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BadRecord {
-    /// Fewer bytes than a record header.
     ShortHeader,
-    /// A zero length.
     ZeroLength,
-    /// The length runs past the end of the data.
     ShortPayload,
     CrcMismatch,
 }

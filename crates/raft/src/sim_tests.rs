@@ -111,7 +111,6 @@ async fn sim_partitioned_leader_is_replaced_and_cannot_commit() {
         .expect("new leader");
     assert_ne!(new, old);
 
-    // The old leader cannot commit.
     let stale = Request {
         now: 999,
         op: Op::SetDraining(true),
@@ -124,11 +123,9 @@ async fn sim_partitioned_leader_is_replaced_and_cannot_commit() {
     assert!(!matches!(r, Ok(Ok(_))), "old leader committed: {r:?}");
     assert!(!applied(&sms, old).contains(&stale));
 
-    // The majority keeps committing.
     let idx = write(&c, &rest, req(100), Duration::from_secs(10)).await;
     assert_converged(&c, &sms, &rest, idx).await;
 
-    // Heal: everyone converges on the majority's log.
     net.heal();
     let idx = write(&c, &all, req(101), Duration::from_secs(10)).await;
     assert_converged(&c, &sms, &all, idx).await;
@@ -148,7 +145,6 @@ async fn sim_asymmetric_partition_of_leader() {
         .wait_for_leader(&all, Duration::from_secs(10))
         .await
         .expect("leader");
-    // The leader can receive but not send.
     for &o in &all {
         if o != old {
             net.block(old, o);
@@ -210,7 +206,6 @@ async fn sim_lossy_network_with_fault_schedule_converges() {
         let (s, n) = (schedule.clone(), net.clone());
         tokio::spawn(async move { s.run(&n).await })
     };
-    // Writes during the faults may or may not succeed.
     for i in 1..30 {
         let raft_ids = all.clone();
         if let Ok(l) = c
@@ -329,12 +324,10 @@ async fn sim_forwarding() {
         Ok(ForwardResponse::Accepted)
     );
     assert_eq!(rec.calls.load(Ordering::SeqCst), 1);
-    // Without a handler: NotLeader.
     assert_eq!(
         n2.forward(3, forward_from(2)).await,
         Ok(ForwardResponse::NotLeader { leader: None })
     );
-    // The same ownership checks as the TCP listener.
     let e = n2.forward(1, forward_from(3)).await.expect_err("rejected");
     assert!(matches!(e, ForwardError::Rejected(_)), "{e:?}");
     // A blocked link is unreachable; a lost response times out after the
@@ -351,13 +344,11 @@ async fn sim_forwarding() {
     assert_eq!(e, ForwardError::Timeout);
     assert_eq!(rec.calls.load(Ordering::SeqCst), 2);
     net.heal();
-    // Duplication delivers twice.
     net.set_duplicate(1.0);
     n2.forward(1, forward_from(2)).await.expect("forward");
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(rec.calls.load(Ordering::SeqCst), 4);
     net.set_duplicate(0.0);
-    // A paused target stalls until resumed.
     net.pause(1);
     let pending = {
         let n2 = n2.clone();
@@ -383,7 +374,6 @@ fn faulty(seed: u64) -> SimNetwork {
 fn sim_same_seed_same_faults() {
     let links = [(1, 2), (2, 1), (1, 3), (3, 1), (2, 3), (3, 2)];
     let (a, b, other) = (faulty(42), faulty(42), faulty(43));
-    // Different interleavings of the links give the same per-link faults.
     for _ in 0..200 {
         for &(f, t) in &links {
             a.next_decision(f, t);
@@ -402,7 +392,6 @@ fn sim_same_seed_same_faults() {
     }
     assert!(differs, "another seed gave the same faults");
 
-    // Schedules too.
     let s1 = FaultSchedule::generate(9, &[1, 2, 3], 50, Duration::from_millis(100));
     let s2 = FaultSchedule::generate(9, &[1, 2, 3], 50, Duration::from_millis(100));
     let s3 = FaultSchedule::generate(10, &[1, 2, 3], 50, Duration::from_millis(100));

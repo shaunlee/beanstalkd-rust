@@ -38,7 +38,6 @@ use crate::{
     Outbox, StaticSysInfo,
 };
 
-/// Connections that connect before the first random step.
 const PRECONNECTED: ConnId = 3;
 
 fn new_engine(journal: bool) -> Engine {
@@ -60,7 +59,6 @@ fn encode(s: &EngineState) -> Vec<u8> {
     postcard::to_allocvec(s).unwrap()
 }
 
-/// Turns random messages into engine inputs the way the server would.
 struct Driver {
     now: Nanos,
     ever_connected: HashSet<ConnId>,
@@ -74,7 +72,6 @@ impl Driver {
         }
     }
 
-    /// A driver for an engine restored from some state at time `now`.
     fn resume(e: &Engine, now: Nanos) -> Self {
         Driver {
             now,
@@ -175,7 +172,6 @@ impl Driver {
     }
 }
 
-/// Applies `input` to `e` and returns the replies and journal entries.
 fn apply(e: &mut Engine, now: Nanos, input: EngineInput) -> (Outbox, Vec<JournalEntry>) {
     let mut out = Outbox::new();
     e.apply_input(now, input, &mut out);
@@ -313,7 +309,6 @@ fn apply_input_matches_methods(steps: Vec<(Msg, bool)>, journal: bool) {
     }
 }
 
-/// A valid state after running `steps` (and the time it was taken at).
 fn state_after(steps: &[(Msg, bool)], journal: bool) -> (Engine, Nanos) {
     let mut d = Driver::new();
     let mut e = new_engine(journal);
@@ -336,10 +331,6 @@ fn keep_running(mut e: Engine, now: Nanos, steps: &[(Msg, bool)]) {
         }
     }
 }
-
-// ---------------------------------------------------------------------
-// Byte-level damage
-// ---------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 enum ByteEdit {
@@ -401,10 +392,6 @@ fn mutated_snapshot(steps: Vec<(Msg, bool)>, edits: Vec<ByteEdit>, more: Vec<(Ms
         keep_running(r, now, &more);
     }
 }
-
-// ---------------------------------------------------------------------
-// Field-level damage
-// ---------------------------------------------------------------------
 
 /// A targeted corruption of an `EngineState`. Each one, whenever it changes
 /// the state at all, breaks at least one invariant.
@@ -529,7 +516,6 @@ fn corruption() -> impl Strategy<Value = Corruption> {
     ]
 }
 
-/// Ids of the live tube slots.
 fn live_tubes(s: &EngineState) -> Vec<usize> {
     s.tubes
         .iter()
@@ -936,7 +922,6 @@ fn corrupt_field(steps: Vec<(Msg, bool)>, corruption: Corruption) {
     let mut s = original.clone();
     corrupt(&mut s, &corruption);
     if s == original {
-        // Nothing to corrupt in this state (e.g. no jobs).
         return;
     }
     let bytes = encode(&s);
@@ -946,7 +931,6 @@ fn corrupt_field(steps: Vec<(Msg, bool)>, corruption: Corruption) {
             r.export_state()
         );
     }
-    // The encoded form of a rejected state is rejected too.
     let decoded: Result<EngineState, _> = postcard::from_bytes(&bytes);
     if let Ok(d) = decoded {
         assert!(Engine::import_state(d, sys()).is_err());
@@ -1135,7 +1119,6 @@ fn restored_engine_keeps_reservations_waiters_and_pauses() {
     out.clear();
     let mut r = restore(&e);
     assert_eq!(r.next_deadline(), e.next_deadline());
-    // Job 1 (reserved by 2) times out at 10 s and goes to waiter 3.
     r.apply_input(10 * SEC + 1, EngineInput::Tick, &mut out);
     assert_eq!(
         out,
@@ -1193,7 +1176,6 @@ fn absurd_tube_slab_is_rejected() {
     assert!(Engine::import_state(s.clone(), sys()).is_ok());
     let mut big = s.clone();
     for _ in 0..3 {
-        // Grow the slab with consistent free slots.
         let n = big.tubes.len();
         big.tubes.extend((0..2000).map(|_| None));
         big.free_tube_ids.extend(n..n + 2000);
@@ -1201,10 +1183,6 @@ fn absurd_tube_slab_is_rejected() {
     let err = Engine::import_state(big, sys()).map(|_| ()).unwrap_err();
     assert!(err.to_string().contains("tube slab"), "{err}");
 }
-
-// ---------------------------------------------------------------------
-// Reply scope (`Engine::set_local_conns`)
-// ---------------------------------------------------------------------
 
 const NODE_SHIFT: u32 = 48;
 

@@ -240,6 +240,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstk-net"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "bstk-proto"
 version = "0.1.0"
 dependencies = [
@@ -254,6 +261,7 @@ name = "bstk-raft"
 version = "0.1.0"
 dependencies = [
  "bstk-engine",
+ "bstk-net",
  "bstk-proto",
  "bytes",
  "crc32c",
@@ -277,6 +285,7 @@ name = "bstk-server"
 version = "0.1.0"
 dependencies = [
  "bstk-engine",
+ "bstk-net",
  "bstk-proto",
  "bstk-raft",
  "bstk-store",

@@ -11,36 +11,27 @@
 //! | another method | 405 (with `Allow: GET`) |
 //! | a request with a body | 400 |
 //!
-//! It is started before the binlog replay, so `/healthz` and `/readyz`
-//! answer during recovery. Snapshots come from the engine actor
-//! (`EngineMsg::Snapshot`), so they are consistent with what `stats` and
-//! `stats-tube` would report at that moment, without changing any counter.
+//! Answers come from the engine actor (`EngineMsg::Snapshot`), consistent with
+//! what `stats` / `stats-tube` would report at that moment, without changing
+//! any counter. The listener starts before the binlog replay, so `/healthz`
+//! and `/readyz` answer during recovery.
 //!
-//! Engine work is bounded (P2 security review, finding F3): a snapshot
-//! holds at most `http.max_tube_series + 1` tubes (one more than is shown,
-//! to tell whether some were left out), and one snapshot is reused by
-//! `/metrics` and `/admin` for up to `http.snapshot_min_interval`, so the
-//! engine takes at most one snapshot per interval however often they are
-//! requested (concurrent requests that miss the cache share one snapshot).
+//! Bounds (P2 security review F3, F4; docs/DESIGN.md §6.1): a snapshot holds
+//! at most `http.max_tube_series + 1` tubes (one more than shown, to tell
+//! whether some were left out) and is reused by `/metrics` and `/admin` for up
+//! to `http.snapshot_min_interval`, so the engine takes at most one per
+//! interval (concurrent cache misses share one). At most [`MAX_CONNECTIONS`]
+//! connections are served at once, headers must arrive within
+//! [`HEADER_READ_TIMEOUT`], each connection serves one request and lives at
+//! most [`CONNECTION_TIMEOUT`], and bodies are never read. `/healthz` and
+//! `/readyz` are answered at once; `/metrics` and `/admin` first take one of
+//! [`MAX_SNAPSHOT_REQUESTS`] permits (held only while the response is built),
+//! so monitoring clients cannot hold up health checks.
 //!
-//! Resources are bounded (finding F4): at most [`MAX_CONNECTIONS`]
-//! connections are served at once (more wait in the listen backlog),
-//! request headers must arrive within [`HEADER_READ_TIMEOUT`], every
-//! connection is closed after one request (no keep-alive) and
-//! [`CONNECTION_TIMEOUT`] after it was accepted at the latest, and request
-//! bodies are never read. Requests are routed once their headers are
-//! parsed: `/healthz` and `/readyz` are answered at once, without waiting
-//! for anything else, while `/metrics` and `/admin` first take one of
-//! [`MAX_SNAPSHOT_REQUESTS`] permits (held only while the response is
-//! built, not while it is written), so monitoring clients can never hold
-//! up health checks.
-//!
-//! Residual risk: a client that keeps [`MAX_CONNECTIONS`] connections open
-//! without finishing their headers delays new connections, health checks
-//! included, by up to [`HEADER_READ_TIMEOUT`] per round (the backlog is
-//! served as those connections time out). The main mitigation is that the
-//! HTTP listener is off by default and its documented address is
-//! 127.0.0.1; expose it only to trusted networks.
+//! Residual risk: a client holding [`MAX_CONNECTIONS`] connections open
+//! without finishing their headers delays new ones, health checks included,
+//! by up to [`HEADER_READ_TIMEOUT`] per round. The listener is off by default
+//! and documented on 127.0.0.1; expose it only to trusted networks.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -65,36 +56,27 @@ use crate::engine_actor::{EngineHandle, EngineMsg};
 use crate::metrics::{self, ClusterInfo};
 use crate::pending::ServerCounters;
 
-/// Concurrent HTTP connections served; further ones wait to be accepted.
 pub const MAX_CONNECTIONS: usize = 256;
-/// Time allowed for a request's headers to arrive.
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(2);
-/// Concurrent `/metrics` and `/admin` requests being answered.
 pub const MAX_SNAPSHOT_REQUESTS: usize = 4;
-/// Upper bound on waiting for one of the [`MAX_SNAPSHOT_REQUESTS`] permits.
 const SNAPSHOT_PERMIT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Upper bound on a connection's lifetime.
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
-/// Upper bound on waiting for a snapshot from the engine actor.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 const JSON_CONTENT_TYPE: &str = "application/json";
 const TEXT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 
-/// What the endpoints need; shared by every HTTP connection.
 pub struct HttpState {
     /// Set once the engine is recovered and the listeners are bound: from
     /// then on the server is ready.
     engine: OnceLock<EngineHandle>,
     max_tube_series: usize,
     snapshot_min_interval: Duration,
-    /// Limits concurrent `/metrics` and `/admin` requests.
     snapshot_permits: Semaphore,
     /// The last snapshot and when it arrived. Held across the engine round
     /// trip, so concurrent cache misses wait for (and share) one snapshot.
     cache: Mutex<Option<(Instant, Arc<Snapshot>)>>,
-    /// Server-side counters (`/metrics`, `/admin` `"server_rs"`).
     counters: Arc<ServerCounters>,
     /// Cluster mode: readiness and the cluster figures. Set before
     /// `engine`.
@@ -128,8 +110,6 @@ impl HttpState {
     }
 }
 
-/// Accepts and serves HTTP connections until `stop` turns true (or its
-/// sender is gone).
 pub async fn serve(listener: TcpListener, state: Arc<HttpState>, mut stop: watch::Receiver<bool>) {
     let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
@@ -137,7 +117,6 @@ pub async fn serve(listener: TcpListener, state: Arc<HttpState>, mut stop: watch
             _ = stop.wait_for(|&s| s) => return,
             permit = Arc::clone(&permits).acquire_owned() => match permit {
                 Ok(p) => p,
-                // The semaphore is never closed.
                 Err(_) => return,
             },
         };
@@ -184,12 +163,10 @@ async fn route(state: &HttpState, req: &Request<Incoming>) -> Response<Full<Byte
             .insert(ALLOW, HeaderValue::from_static("GET"));
         return resp;
     }
-    // A GET has no body; refuse one rather than read it.
     if req.body().size_hint().upper() != Some(0) {
         return text(StatusCode::BAD_REQUEST, "request bodies are not accepted");
     }
     match path {
-        // Health checks never wait for anything.
         "/healthz" => text(StatusCode::OK, "ok"),
         "/readyz" => match state.engine.get() {
             Some(_) if state.cluster.get().is_none_or(|c| c.ready()) => {
@@ -213,7 +190,6 @@ async fn monitoring(state: &HttpState, prometheus: bool) -> Response<Full<Bytes>
         match tokio::time::timeout(SNAPSHOT_PERMIT_TIMEOUT, state.snapshot_permits.acquire()).await
         {
             Ok(Ok(permit)) => permit,
-            // Timed out (or, never, the semaphore was closed).
             _ => return text(StatusCode::SERVICE_UNAVAILABLE, BUSY),
         };
     let snap = match snapshot(state).await {
@@ -346,7 +322,6 @@ mod tests {
                         .map(|i| tube(&format!("t{i}")))
                         .collect();
                     let server = StatsServer {
-                        // Tells snapshots apart.
                         total_jobs: n,
                         ..StatsServer::default()
                     };
@@ -365,11 +340,9 @@ mod tests {
         let b = snapshot(&state).await.unwrap();
         assert_eq!(requests.load(Ordering::SeqCst), 1, "one engine snapshot");
         assert!(Arc::ptr_eq(&a, &b));
-        // Rendering both endpoints reuses it too.
         let _ = monitoring(&state, true).await;
         let _ = monitoring(&state, false).await;
         assert_eq!(requests.load(Ordering::SeqCst), 1);
-        // One more tube than the limit is asked for.
         assert_eq!(a.tubes.len(), 6);
     }
 

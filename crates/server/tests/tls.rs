@@ -34,7 +34,6 @@ key = "server.key"
 client_ca = "ca.pem"
 "#;
 
-/// The same TLS listeners without the plaintext one.
 const TLS_ONLY: &str = r#"
 [[listener]]
 addr = "127.0.0.1:{port0}"
@@ -64,7 +63,6 @@ fn put_reserve_delete_over_tls() {
     assert_eq!(header, "RESERVED 1 5");
     assert_eq!(body, b"hello");
     assert_eq!(c.cmd("delete 1"), "DELETED");
-    // The listener does not know `auth`: it stays an unknown command.
     assert_eq!(c.cmd("auth something"), "UNKNOWN_COMMAND");
     let stats = c.yaml("stats");
     assert_eq!(stat_of(&stats, "current-connections"), "1");
@@ -85,7 +83,6 @@ fn plaintext_client_on_a_tls_port_fails_cleanly() {
             "no protocol reply over a failed handshake: {text:?}"
         );
     }
-    // No trace in the engine: no connection, no command, no job id.
     let mut c = server.tls(0, certs.client_config(ClientCert::None));
     let stats = c.yaml("stats");
     assert_eq!(stat_of(&stats, "total-connections"), "1");
@@ -125,10 +122,8 @@ fn mtls_requires_a_client_certificate_from_the_configured_ca() {
 
     let mut c = server.tls(1, certs.client_config(ClientCert::Valid));
     assert_eq!(c.put(b"mtls"), "INSERTED 1");
-    // mTLS listeners do not recognize `auth` either.
     assert_eq!(c.cmd("auth token"), "UNKNOWN_COMMAND");
     let stats = c.yaml("stats");
-    // The rejected handshakes never reached the engine.
     assert_eq!(stat_of(&stats, "total-connections"), "1");
     assert_eq!(stat_of(&stats, "current-connections"), "1");
 
@@ -153,11 +148,9 @@ fn listeners_share_one_engine() {
     assert_eq!(h, "RESERVED 2 1");
     let stats = mtls.yaml("stats");
     assert_eq!(stat_of(&stats, "current-connections"), "3");
-    // Plus the startup probe on the plaintext port.
     assert_eq!(stat_of(&stats, "total-connections"), "4");
     drop(plain);
     drop(tls);
-    // The drop-guard Disconnect released the reserved jobs.
     std::thread::sleep(Duration::from_millis(200));
     let stats = mtls.yaml("stats");
     assert_eq!(stat_of(&stats, "current-connections"), "1");
@@ -169,7 +162,6 @@ fn close_notify_half_close_times_out_a_waiting_reserve() {
     let (server, certs) = start();
     let mut c = server.tls(0, certs.client_config(ClientCert::None));
     c.send(b"reserve\r\n");
-    // Half-close the TLS way: close_notify, then a TCP FIN.
     c.stream.conn.send_close_notify();
     while c.stream.conn.wants_write() {
         c.stream.conn.write_tls(&mut c.stream.sock).unwrap();
@@ -201,7 +193,6 @@ fn tcp_eof_without_close_notify_is_an_end_of_stream() {
 #[test]
 fn stalled_handshakes_do_not_block_other_clients() {
     let (server, certs) = start();
-    // Connections that never start a handshake.
     let idle: Vec<_> = (0..20).map(|_| server.plain(0)).collect();
     let mut c = server.tls(0, certs.client_config(ClientCert::None));
     assert_eq!(c.put(b"x"), "INSERTED 1");

@@ -1,49 +1,29 @@
 //! The dialing side of the cluster port: openraft's `RaftNetworkFactory` /
 //! `RaftNetwork` over TCP (optionally mutual TLS) and the forward client.
 //!
-//! One [`Network`] is shared (it is `Clone`) by openraft and by the owner's
-//! forwarding code. It keeps at most one connection per target node,
-//! dialed lazily on the first request. The connection is multiplexed:
-//! requests carry ids, so several callers (the replication stream, an
-//! election, forwarding) may have requests in flight at once; the listener
-//! answers them in order.
+//! One [`Network`] (it is `Clone`) is shared by openraft and the owner's
+//! forwarding code, with at most one multiplexed connection per target, dialed
+//! lazily; the listener answers requests in order.
 //!
-//! Failures:
-//! - dial failures (TCP, TLS, hello) are `Unreachable`, and further dials
-//!   to that target are refused (also `Unreachable`) until a backoff delay
-//!   has passed; the delay doubles per consecutive failure, from
-//!   `backoff_min` up to `backoff_max`. openraft backs off on `Unreachable`
-//!   using the same schedule ([`RaftNetwork::backoff`]).
-//! - a request without an answer within its timeout is `Timeout`. Only
-//!   that request fails: its pending slot is dropped (a late answer is
-//!   discarded by id) and the connection stays up for everyone else. The
-//!   connection is closed, and the next request re-dials, only when it is
-//!   stalled: a request goes unanswered (times out or is cancelled) while
-//!   requests have been outstanding with no response at all for longer
-//!   than `max(stall_timeout, 3 × that request's timeout)`. A peer that
-//!   stops answering on a live socket is thus detected, but one slow
-//!   request (a large AppendEntries, a forward waiting behind it) does not
-//!   fail the other users of the link.
-//! - a connection lost while a request is in flight is a `Network` error.
-//! - an AppendEntries batch of more than one entry whose frame exceeds
-//!   `append_budget` bytes (or `max_frame`) is `PayloadTooLarge` with an
-//!   entries hint scaled to fit the budget, so openraft splits it; a single
-//!   entry is always sent (up to `max_frame`).
+//! Failures (docs/DESIGN.md §8 "Dialer"):
+//! - dial failures are `Unreachable`; further dials to that target are refused
+//!   until a backoff delay (doubling from `backoff_min` to `backoff_max`, the
+//!   same schedule [`RaftNetwork::backoff`] gives openraft) has passed;
+//! - a request without an answer within its timeout is `Timeout` and fails
+//!   alone (its pending slot is dropped, a late answer is discarded by id); the
+//!   connection is closed only when stalled, so one slow request does not fail
+//!   the other users of the link;
+//! - a connection lost mid-request is a `Network` error;
+//! - an AppendEntries batch of more than one entry above `append_budget` (or
+//!   `max_frame`) is `PayloadTooLarge` with an entries hint, so openraft splits
+//!   it; a single entry is always sent.
 //!
-//! # Interaction with openraft's timeouts
-//!
-//! openraft 0.9 wraps every AppendEntries call in its own timeout of
-//! `heartbeat_interval` (and passes the same value as the RPC option's
-//! hard TTL), and drops the call future when it expires; vote requests
-//! are bounded the same way by the election timeout. A dropped call is
-//! accounted like a timed-out one (the pending slot is removed by a drop
-//! guard and counts towards stall detection), so a replication stream that
-//! keeps timing out on a large batch neither leaks slots nor tears down the
-//! connection that forwards and votes share with it. The byte budget keeps
-//! a batch small enough to cross the link within a heartbeat interval in
-//! the common case; a single entry near `-z` must still cross within one
-//! heartbeat interval, or its replication keeps timing out (the heartbeat
-//! must be set with the largest job body and the link speed in mind).
+//! openraft 0.9 bounds every AppendEntries by `heartbeat_interval` and drops
+//! the call future on expiry (votes: the election timeout). A dropped call
+//! counts like a timed-out one (a drop guard removes the slot and feeds stall
+//! detection), so a replication stream that keeps timing out neither leaks
+//! slots nor tears down the connection it shares with votes and forwards. A
+//! single entry near `-z` must still cross within one heartbeat interval.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -70,25 +50,22 @@ use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 
 use crate::forward::{ControlRequest, ControlResponse, ForwardError, ForwardTransport};
-use crate::quiet_tcp::QuietTcp;
 use crate::status::{NodeStatus, StatusTransport};
 use crate::wire::{
     self, ClientMsg, FrameError, Hello, PROTOCOL_VERSION, RpcRequest, RpcResponse, ServerHello,
     ServerMsg, WireError, WireFatal,
 };
 use crate::{ForwardRequest, ForwardResponse, NodeId, TypeConfig};
+use bstk_net::QuietTcp;
 
 /// Default [`NetworkConfig::append_budget`]: 1 MiB, about 10 ms on a
 /// 1 Gbit/s link, well inside the default 50 ms heartbeat interval.
 pub const DEFAULT_APPEND_BUDGET: usize = 1 << 20;
 
-/// Read buffer of a cluster connection (each side).
 pub(crate) const READ_BUF: usize = 16 * 1024;
 
-/// Settings of the dialing side.
 #[derive(Clone)]
 pub struct NetworkConfig {
-    /// This node's id (sent in the hello).
     pub node_id: NodeId,
     /// Cluster port address (`host:port`) of every peer. For Raft RPCs a
     /// target missing here is dialed at its openraft `BasicNode::addr`;
@@ -97,13 +74,11 @@ pub struct NetworkConfig {
     /// Mutual TLS (see [`crate::tls`]); `None` means plaintext, which the
     /// caller must have been configured for explicitly.
     pub tls: Option<Arc<ClientConfig>>,
-    /// Maximum frame payload, both directions.
     pub max_frame: usize,
     /// TCP connect + TLS handshake + hello.
     pub connect_timeout: Duration,
     pub append_timeout: Duration,
     pub vote_timeout: Duration,
-    /// Per snapshot chunk.
     pub snapshot_timeout: Duration,
     pub forward_timeout: Duration,
     /// Reconnect backoff after the first failed dial, doubled per further
@@ -161,7 +136,6 @@ impl NetworkConfig {
     }
 }
 
-/// The TCP/TLS cluster network (see the module docs). Cheap to clone.
 #[derive(Clone)]
 pub struct Network {
     inner: Arc<Inner>,
@@ -177,7 +151,6 @@ struct Peer {
     target: NodeId,
     addr: String,
     state: Mutex<DialState>,
-    /// When the last response from `target` arrived (any request kind).
     last_response: Arc<StdMutex<Option<std::time::Instant>>>,
 }
 
@@ -246,17 +219,12 @@ impl Drop for Slot<'_> {
     }
 }
 
-/// Why a call failed, before mapping to openraft's or forwarding's errors.
 #[derive(Debug)]
 enum CallError {
     Unreachable(String),
     Timeout(Duration),
     Network(String),
-    /// The encoded request (`len` bytes) exceeds the limit it was encoded
-    /// with.
-    TooLarge {
-        len: usize,
-    },
+    TooLarge { len: usize },
 }
 
 trait Io: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -310,7 +278,6 @@ impl Network {
         *lock(&p.last_response)
     }
 
-    /// Requests awaiting an answer on the current connection to `target`.
     #[cfg(test)]
     pub(crate) fn pending_len(&self, target: NodeId) -> usize {
         let Some(p) = lock(&self.inner.peers).get(&target).cloned() else {
@@ -322,8 +289,6 @@ impl Network {
             .unwrap_or(0)
     }
 
-    /// Sends a control request to `target` and waits for its answer (like
-    /// [`Network::forward`], no automatic resend).
     pub async fn control(
         &self,
         target: NodeId,
@@ -353,7 +318,6 @@ impl Network {
         }
     }
 
-    /// Sends `req` to `target` (see [`ForwardTransport::forward`]).
     pub async fn forward(
         &self,
         target: NodeId,
@@ -438,13 +402,10 @@ impl Network {
                 slot.answered();
                 r
             }
-            // `slot` is dropped here: the pending entry goes, and the
-            // connection is closed only if it is stalled.
             Err(_) => Err(CallError::Timeout(timeout)),
         }
     }
 
-    /// The live connection to `peer`, dialing if needed.
     async fn connect(&self, peer: &Peer) -> Result<Arc<Conn>, CallError> {
         let cfg = &self.inner.cfg;
         let mut st = peer.state.lock().await;
@@ -552,7 +513,6 @@ impl Network {
         }
     }
 
-    /// The backoff openraft applies after `Unreachable`.
     fn backoff_iter(&self) -> Backoff {
         let cfg = self.inner.cfg.clone();
         Backoff::new((1u32..).map(move |n| cfg.backoff_delay(n)))
@@ -615,10 +575,8 @@ async fn run_conn(
                 Ok(Some(ServerMsg::Response { id, body })) => {
                     let now = std::time::Instant::now();
                     *lock(last_response) = Some(now);
-                    // Absent if the caller timed out; the answer is dropped.
                     let mut p = lock(pending);
                     let tx = p.remove(&id);
-                    // Any response is progress (a late one included).
                     *lock(stalled_since) = if p.is_empty() { None } else { Some(now) };
                     drop(p);
                     if let Some(tx) = tx {
@@ -704,8 +662,6 @@ impl RaftNetworkFactory<TypeConfig> for Network {
     }
 }
 
-/// openraft's per-target client; shares the target's connection with every
-/// other user of the same [`Network`].
 pub struct PeerClient {
     net: Network,
     target: NodeId,
@@ -793,7 +749,6 @@ impl RaftNetwork<TypeConfig> for PeerClient {
         let cfg = &self.net.inner.cfg;
         let n = rpc.entries.len() as u64;
         let t = effective(cfg.append_timeout, &option);
-        // A single entry may use the whole frame; a batch only the budget.
         let limit = if n > 1 {
             cfg.append_budget.max(1)
         } else {
@@ -804,7 +759,6 @@ impl RaftNetwork<TypeConfig> for PeerClient {
             Ok(RpcResponse::AppendEntries(Ok(r))) => Ok(r),
             Ok(RpcResponse::AppendEntries(Err(e))) => Err(self.remote_err(e)),
             Ok(_) => Err(network_err("unexpected response kind".into())),
-            // openraft retries with at most this many entries.
             Err(CallError::TooLarge { len }) if n > 1 => Err(RPCError::PayloadTooLarge(
                 PayloadTooLarge::new_entries_hint(entries_hint(n, len, budget)),
             )),

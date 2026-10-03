@@ -43,7 +43,6 @@ pub(super) fn blank(term: u64, index: u64) -> Entry<TypeConfig> {
     }
 }
 
-/// A log entry whose size varies with `index`.
 pub(super) fn filler(term: u64, index: u64) -> Entry<TypeConfig> {
     let body = vec![b'x'; (index as usize * 7) % 50];
     normal(
@@ -78,7 +77,6 @@ pub(super) fn open_log(dir: &Path) -> LogStore {
     LogStore::open(dir, small_log_opts()).unwrap()
 }
 
-/// What a sink saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Ev {
     Applied(ConnId, u64),

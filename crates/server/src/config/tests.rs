@@ -27,7 +27,6 @@ fn resolved(args: &[&str], text: &str) -> ResolvedConfig {
     resolve_str(args, text).expect("valid configuration")
 }
 
-/// The error message for an invalid configuration.
 fn error(args: &[&str], text: &str) -> String {
     resolve_str(args, text)
         .expect_err("invalid configuration")
@@ -114,7 +113,6 @@ fn full_example_parses() {
             client_ca: Some(PathBuf::from("/etc/beanstalkd/ca/ca.pem")),
         })
     );
-    // Deduplicated, in order.
     let tokens: Vec<&[u8]> = c.tokens.iter().collect();
     assert_eq!(tokens, vec![TOKEN_A.as_bytes(), TOKEN_B.as_bytes()]);
     assert_eq!(c.max_job_size, 1000);
@@ -206,7 +204,6 @@ fn no_file_is_todays_command_line() {
     assert_eq!(DEFAULT_MAX_PENDING_CONNECTIONS, 1024);
     assert_eq!(c.binlog.wal_options(), None);
 
-    // Every flag passes through unchanged, quirks included.
     let args = [
         "-l",
         "127.0.0.1",
@@ -241,7 +238,6 @@ fn no_file_is_todays_command_line() {
     assert_eq!(c.max_job_size, cl.max_job_size);
     assert_eq!(c.binlog.sync, cl.sync);
 
-    // An empty file changes nothing either (except naming the source).
     let mut c = resolved(&args, "");
     c.source = None;
     assert_eq!(c, resolve(&cl, None).expect("flags"));
@@ -276,7 +272,6 @@ fn unknown_keys_are_rejected_everywhere() {
         ("[binlog]\nbogus = 1\n", 2),
         ("[http]\nbogus = 1\n", 2),
         ("[log]\nbogus = 1\n", 2),
-        // A singular [listener] table instead of [[listener]].
         ("[listener]\naddr = \"127.0.0.1:1\"\n", 1),
     ];
     for (text, line) in cases {
@@ -345,7 +340,6 @@ fn tls_listener_needs_cert_and_key() {
     let e = error(&[], "[tls]\nclient_ca = \"ca.pem\"\n");
     assert!(e.contains("tls.client_ca"), "{e}");
     assert!(resolved(&[], &format!("{l}{TLS}")).listeners[0].tls);
-    // [tls] without any TLS listener is accepted (and unused).
     assert!(resolved(&[], TLS).tls.is_some());
 }
 
@@ -415,17 +409,14 @@ fn invalid_tokens_are_rejected_without_echoing_them() {
             assert!(!e.contains(token), "{e}");
         }
     }
-    // The longest token that fits a protocol line is accepted.
     let max = "y".repeat(MAX_TOKEN_LEN);
     assert_eq!(MAX_TOKEN_LEN, 217);
     assert_eq!(("auth ".len() + max.len() + 2), bstk_proto::LINE_BUF_SIZE);
     let c = resolved(&[], &format!("[auth]\ntokens = [\"{max}\"]\n"));
     assert_eq!(c.tokens.iter().next(), Some(max.as_bytes()));
-    // Non-ASCII tokens without whitespace are fine.
     resolved(&[], "[auth]\ntokens = [\"jeton-\u{e9}t\u{e9}\"]\n");
 }
 
-/// A TOML basic string for `s` (escaping what TOML requires).
 fn toml_string(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
@@ -459,7 +450,6 @@ fn duplicate_and_overlapping_listeners_are_rejected() {
     for (a, b) in [
         ("127.0.0.1:11300", "127.0.0.1:11301"),
         ("127.0.0.1:11300", "127.0.0.2:11300"),
-        // Ephemeral ports never collide.
         ("127.0.0.1:0", "127.0.0.1:0"),
     ] {
         assert_eq!(resolved(&[], &two(a, b)).listeners.len(), 2, "{a} {b}");
@@ -510,7 +500,6 @@ fn http_settings() {
     };
     assert_eq!(interval("250ms"), Some(Duration::from_millis(250)));
     assert_eq!(interval("2s"), Some(Duration::from_secs(2)));
-    // Zero disables the snapshot cache.
     assert_eq!(interval("0s"), Some(Duration::ZERO));
     for bad in ["", "1", "1m", "-1s", "1.5s", "never"] {
         let e = error(
@@ -539,12 +528,10 @@ fn http_settings() {
 
 #[test]
 fn http_addr_must_differ_from_listeners() {
-    // Against the default -l / -p listener.
     let e = error(&[], "[http]\naddr = \"0.0.0.0:11300\"\n");
     assert!(e.contains("http.addr") && e.contains("listener[0]"), "{e}");
     let e = error(&["-p", "9180"], "[http]\naddr = \"127.0.0.1:9180\"\n");
     assert!(e.contains("http.addr"), "{e}");
-    // Against file listeners.
     let e = error(
         &[],
         "[[listener]]\naddr = \"127.0.0.1:1\"\n[[listener]]\naddr = \"127.0.0.1:2\"\n\
@@ -644,7 +631,6 @@ fn threads_values() {
         let e = error(&[], &format!("[server]\nthreads = {bad}\n"));
         assert!(e.contains("server.threads"), "{bad}: {e}");
     }
-    // `--threads` overrides the file, like `-z` overrides `max_job_size`.
     assert_eq!(
         resolved(&["--threads", "3"], "[server]\nthreads = 8\n").threads,
         Some(3)
@@ -672,7 +658,6 @@ fn effective_threads_by_mode() {
         );
         assert_eq!(c.effective_threads(true), DEFAULT_THREADS_CLUSTER);
     }
-    // A certificate alone does not make a plaintext listener TLS.
     assert_eq!(
         resolved(&[], TLS).effective_threads(false),
         DEFAULT_THREADS_STANDALONE
@@ -690,7 +675,6 @@ fn effective_threads_by_mode() {
         DEFAULT_THREADS_STANDALONE_TLS_OR_BINLOG
     );
 
-    // An explicit setting wins in every mode, even below the default.
     assert_eq!(
         resolved(&["--threads", "1", "-b", "/tmp/wal"], &tls).effective_threads(false),
         1
@@ -717,7 +701,6 @@ fn tokens_file_mode_warnings() {
         assert!(w.contains(&format!("{:04o}", loose & 0o7777)), "{w}");
     }
 
-    // Through `load`: a group/world-readable file warns but still works.
     let dir = tempfile::tempdir().expect("tempdir");
     let tokens = dir.path().join("tokens.txt");
     std::fs::write(&tokens, format!("{TOKEN_A}\n")).expect("write");
@@ -808,7 +791,6 @@ fn command_line_overrides_the_file() {
     let file = "[server]\nmax_job_size = 1000\n[binlog]\ndir = \"wal\"\nfsync = \"always\"\n\
                 file_size = 8192\n[log]\nlevel = \"info\"\n";
 
-    // File values apply when the flags are absent.
     let c = resolved(&[], file);
     assert_eq!(c.max_job_size, 1000);
     assert_eq!(c.binlog.dir, Some(PathBuf::from("/etc/beanstalkd/wal")));
@@ -816,25 +798,21 @@ fn command_line_overrides_the_file() {
     assert_eq!(c.binlog.file_size, 8192);
     assert_eq!(c.log.level, LogLevel::Info);
 
-    // -z (even when equal to the default, and with -z's clamping).
     assert_eq!(resolved(&["-z", "7"], file).max_job_size, 7);
     assert_eq!(resolved(&["-z", "65535"], file).max_job_size, 65535);
     assert_eq!(
         resolved(&["-z", "-1"], file).max_job_size,
         MAX_JOB_SIZE_LIMIT
     );
-    // -b (relative to the working directory, not the file).
     assert_eq!(
         resolved(&["-b", "other"], file).binlog.dir,
         Some(PathBuf::from("other"))
     );
-    // -s
     assert_eq!(resolved(&["-s", "4097"], file).binlog.file_size, 4097);
     assert_eq!(
         resolved(&["-s", "10485760"], file).binlog.file_size,
         10_485_760
     );
-    // -f / -F, with their argument-order interplay.
     let sync = |args: &[&str]| resolved(args, file).binlog.sync;
     assert_eq!(
         sync(&["-f", "10"]),
@@ -851,14 +829,12 @@ fn command_line_overrides_the_file() {
     );
     let never = "[binlog]\nfsync = \"never\"\n";
     assert_eq!(resolved(&["-f0"], never).binlog.sync, SyncPolicy::Always);
-    // -V only raises the level.
     let level = |args: &[&str], text: &str| resolved(args, text).log.level;
     assert_eq!(level(&["-V"], file), LogLevel::Info);
     assert_eq!(level(&["-VV"], file), LogLevel::Debug);
     assert_eq!(level(&["-VVV"], file), LogLevel::Trace);
     let trace = "[log]\nlevel = \"trace\"\n";
     assert_eq!(level(&["-V"], trace), LogLevel::Trace);
-    // Without -V the file may lower the level below today's default.
     let quiet = "[log]\nlevel = \"error\"\n";
     assert_eq!(level(&[], quiet), LogLevel::Error);
     assert_eq!(level(&["-V"], quiet), LogLevel::Info);
@@ -879,7 +855,6 @@ fn listen_flags_conflict_with_listener_entries() {
             "{args:?}: {e}"
         );
     }
-    // Without [[listener]], -l / -p still define the listener.
     let c = resolved(
         &["-l", "127.0.0.1", "-p", "7"],
         "[server]\nmax_job_size = 1\n",
@@ -892,7 +867,6 @@ fn listen_flags_conflict_with_listener_entries() {
             auth: AuthMode::None
         }]
     );
-    // An explicitly empty listener array counts as none.
     assert_eq!(
         resolved(&["-p", "7"], "listener = []\n").listeners[0]
             .addr
@@ -943,7 +917,6 @@ fn load_resolves_paths_and_reads_tokens_file() {
         })
     );
 
-    // A bad line is reported by file and line number, without its value.
     std::fs::write(
         conf_dir.join("secrets/tokens.txt"),
         format!("{TOKEN_A}\n\nbad token-value\n"),
@@ -958,7 +931,6 @@ fn load_resolves_paths_and_reads_tokens_file() {
     );
     assert!(!e.contains("token-value") && !e.contains(TOKEN_A), "{e}");
 
-    // A missing tokens file (or config file) is a read error naming it.
     std::fs::remove_file(conf_dir.join("secrets/tokens.txt")).expect("rm");
     let e = load(&cli(&["--config", conf_arg])).expect_err("missing tokens file");
     assert!(
@@ -1095,12 +1067,10 @@ fn run_check_exit_status_and_output() {
         "{err}"
     );
 
-    // -l / -p against [[listener]] is caught too.
     let (status, _, err) = run(&["--check-config", "--config", bad, "-p", "1"]);
     assert_eq!(status, EXIT_CONFIG);
     assert!(err.contains("-l / -p"), "{err}");
 
-    // Without --config, the command line alone is checked.
     let (status, out, _) = run(&["--check-config", "-p", "1234"]);
     assert_eq!(status, 0);
     assert!(out.contains("listener 0.0.0.0:1234"), "{out}");

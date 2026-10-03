@@ -114,7 +114,6 @@ fn truncation_at_every_offset_of_the_final_records() {
             assert_eq!(r.jobs, m.expected_jobs(), "cut {cut} zero {zero_fill}");
             assert_eq!(r.next_id, m.max_id + 1, "cut {cut}");
             drop(wal);
-            // The torn tail was truncated: reopening is still fine.
             let (_wal, r2) = Wal::open(opts(d.path(), 4096)).unwrap();
             assert_eq!(r2.jobs, r.jobs);
         }
@@ -208,7 +207,6 @@ fn crc_error_in_earlier_segment_is_corrupt() {
         Wal::open(opts(d.path(), 4096)),
         Err(WalError::Corrupt(_))
     ));
-    // Unmodified copy is fine.
     let d = copy_dir(t.path());
     let (_wal, r) = Wal::open(opts(d.path(), 4096)).unwrap();
     assert_eq!(r.jobs.len(), 100);
@@ -220,9 +218,7 @@ fn crc_error_in_earlier_segment_is_corrupt() {
 struct MidCompaction {
     before: tempfile::TempDir,
     model: Model,
-    /// Deleted segments.
     deleted: Vec<u64>,
-    /// Current segment before and after, with offsets.
     pos_before: (u64, u64),
     pos_after: (u64, u64),
     after: tempfile::TempDir,
@@ -367,7 +363,6 @@ fn moved_job_replays_at_its_new_position() {
     let t = tmp();
     let (mut wal, _) = Wal::open(opts(t.path(), 4096)).unwrap();
     write(&mut wal, &[put(1, "first", b"one")]);
-    // Fill a few segments, then put job 2.
     let mut id = 10;
     while wal.stats().current_index < 4 {
         write(&mut wal, &[put(id, "t", &[0; 200])]);
@@ -427,7 +422,6 @@ fn churn_keeps_disk_usage_bounded() {
             model.apply(&d);
         }
         if i % 1000 == 0 {
-            // Some updates of long-lived jobs.
             let u = buried((i / 1000) % 20 + 1, (i / 1000) as u32);
             wal.append(std::slice::from_ref(&u)).unwrap();
             model.apply(&u);

@@ -13,13 +13,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// A client connection of the harness (not a server `ConnId`).
 pub type ConnKey = u64;
 pub type JobId = u64;
-/// Index of an operation in [`History::ops`].
 pub type OpId = usize;
 
-/// The commands the workloads use (all in the `default` tube).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Cmd {
     /// `body` must be unique across the run: the checker identifies jobs
@@ -51,7 +48,6 @@ pub enum Cmd {
 }
 
 impl Cmd {
-    /// The job a command names, if any.
     pub fn target(&self) -> Option<JobId> {
         match *self {
             Cmd::Delete(id)
@@ -65,7 +61,6 @@ impl Cmd {
         }
     }
 
-    /// The protocol line (without the put body).
     pub fn line(&self) -> String {
         match self {
             Cmd::Put {
@@ -88,7 +83,6 @@ impl Cmd {
     }
 }
 
-/// A job's state as `stats-job` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobStateName {
     Ready,
@@ -109,20 +103,12 @@ impl JobStateName {
     }
 }
 
-/// A reply, as far as the checker cares.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Reply {
     Inserted(JobId),
-    /// `BURIED <id>`: a put that could not be enqueued.
     BuriedId(JobId),
-    Reserved {
-        id: JobId,
-        body: Vec<u8>,
-    },
-    Found {
-        id: JobId,
-        body: Vec<u8>,
-    },
+    Reserved { id: JobId, body: Vec<u8> },
+    Found { id: JobId, body: Vec<u8> },
     Deleted,
     Released,
     Buried,
@@ -132,17 +118,11 @@ pub enum Reply {
     KickedJob,
     TimedOut,
     DeadlineSoon,
-    /// `OK` to `stats-job`.
-    JobStats {
-        id: JobId,
-        state: JobStateName,
-    },
-    /// Anything else (the text of the reply line); always a violation.
+    JobStats { id: JobId, state: JobStateName },
     Other(String),
 }
 
 impl Reply {
-    /// Parses a `stats-job` YAML body.
     pub fn from_stats_yaml(yaml: &[u8]) -> Reply {
         let text = String::from_utf8_lossy(yaml);
         let mut id = None;
@@ -166,7 +146,6 @@ pub struct OpRecord {
     pub conn: ConnKey,
     pub cmd: Cmd,
     pub send: Duration,
-    /// `None`: no reply (the connection was lost or timed out).
     pub reply: Option<(Duration, Reply)>,
 }
 
@@ -189,7 +168,6 @@ pub struct ConnRecord {
     pub closed: Option<Duration>,
 }
 
-/// A whole run's operations.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct History {
     pub ops: Vec<OpRecord>,
@@ -231,7 +209,6 @@ impl History {
         }
     }
 
-    /// A readable dump of the operations of `conns` (all if empty).
     pub fn dump(&self) -> String {
         let mut s = String::new();
         for (i, o) in self.ops.iter().enumerate() {
@@ -247,7 +224,6 @@ impl History {
     }
 }
 
-/// One line describing an operation.
 pub fn describe(o: &OpRecord) -> String {
     let reply = match &o.reply {
         None => "no reply".to_string(),
@@ -270,7 +246,6 @@ fn short_reply(r: &Reply) -> String {
     }
 }
 
-/// A thread-safe [`History`] shared by a run's clients.
 #[derive(Clone, Default)]
 pub struct Recorder(Arc<Mutex<History>>);
 

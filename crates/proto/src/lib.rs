@@ -1,11 +1,9 @@
 //! beanstalkd wire protocol: command parsing, response encoding, stats YAML.
 //!
-//! INTERFACE CONTRACT (owned by the lead): the public types in this file
-//! (`Command`, `Response`, `Frame`, `TubeName`, stats structs) and the public
-//! function signatures must not change without lead approval. Implementations
-//! live in the submodules.
-//!
-//! Ground truth for all behavior is `.ref/beanstalkd/prot.c`.
+//! The public types here (`Command`, `Response`, `Frame`, `TubeName`, stats
+//! structs) are the interface contract with the engine and server: change
+//! them only with the lead's approval. Ground truth for behavior is
+//! `.ref/beanstalkd/prot.c`.
 
 use bytes::Bytes;
 
@@ -31,7 +29,6 @@ pub const URGENT_THRESHOLD: u32 = 1024;
 
 pub type JobId = u64;
 
-/// A validated tube name (1..=200 bytes of `NAME_CHARS`, not starting with '-').
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
@@ -229,7 +226,6 @@ pub enum PutRejection {
 }
 
 impl PutRejection {
-    /// The reply the client receives for this rejection.
     pub fn response(self) -> Response {
         match self {
             PutRejection::JobTooBig => Response::JobTooBig,

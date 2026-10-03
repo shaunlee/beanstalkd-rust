@@ -180,7 +180,6 @@ impl Args {
     }
 }
 
-/// Delay of the jobs created by `--delayed-tubes`: far beyond any run.
 const DELAYED_JOB_SECS: u32 = 3600;
 /// Connections used to create the `--delayed-tubes` jobs and to delete
 /// them afterwards.
@@ -188,14 +187,10 @@ const SETUP_CONNS: usize = 8;
 /// Concurrent connection attempts while opening `--idle-conns` (the
 /// listen backlog is small on macOS).
 const CONNECT_CONCURRENCY: usize = 32;
-/// Retries per idle connection attempt.
 const CONNECT_RETRIES: u64 = 50;
-/// How long the server may take to register every idle connection.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(60);
-/// Commands pipelined per write during setup and cleanup.
 const SETUP_BATCH: usize = 256;
 
-/// What one connection task reports back.
 #[derive(Default)]
 struct TaskResult {
     rec: Recorder,
@@ -253,13 +248,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// The `handshake-burst` scenario: repeatedly connects, runs one cheap
-/// command (`use bench-burst`) and closes, at `--rate` attempts per second
-/// with up to `--conns` in flight, until `--duration` elapses. Reports
-/// handshake-completion latency (measured right after the TLS handshake,
-/// before the command) and attempted/completed/failed counts; there is no
-/// server-emptiness check (`use` creates no job and no tube state worth
-/// checking).
+/// The `handshake-burst` scenario: connects, runs one cheap command (`use
+/// bench-burst`) and closes, at `--rate` attempts per second with up to
+/// `--conns` in flight, until `--duration` elapses. Reports handshake
+/// latency and attempted/completed/failed counts; there is no server-emptiness
+/// check (`use` leaves nothing behind).
 async fn run_burst(args: &Args) -> Result<()> {
     let target = Arc::new(args.target()?);
     let deadline = Instant::now() + Duration::from_secs(args.duration);
@@ -284,12 +277,10 @@ async fn run_burst(args: &Args) -> Result<()> {
                     s.attempt();
                     let t0 = Instant::now();
                     match Client::connect(&target).await {
-                        // Recorded right after the handshake completes
-                        // (before the one cheap command), so this is
-                        // handshake-completion latency, not round-trip
-                        // latency. `use bench-burst` is UNKNOWN/USING with
-                        // no job data and no stats YAML rendering, unlike
-                        // `stats` (the heaviest read-only command).
+                        // Recorded right after the handshake, before the one cheap command, so this
+                        // is handshake-completion latency, not round-trip latency. `use bench-burst`
+                        // renders no job data or stats YAML, unlike `stats` (the heaviest read-only
+                        // command).
                         Ok(mut c) => {
                             s.record(t0.elapsed());
                             match c.call("use bench-burst").await {
@@ -380,7 +371,6 @@ async fn run(args: &Args) -> Result<()> {
     // the number of tubes, which slows down its accept loop.
     let idle = open_idle(&args.addr, args.idle_conns).await?;
     if args.idle_conns > 0 {
-        // Accepted connections reach the server's stats asynchronously.
         let want = args.idle_conns as u64;
         let give_up = Instant::now() + SETUP_TIMEOUT;
         loop {
@@ -400,7 +390,6 @@ async fn run(args: &Args) -> Result<()> {
     }
     let delayed_ids = make_delayed_tubes(&target, args.delayed_tubes, tag, &body).await?;
 
-    // Connect and configure every client before starting the clock.
     let mut clients = Vec::with_capacity(args.conns);
     for i in 0..args.conns {
         let mut c = Client::connect(&target).await?;
@@ -536,7 +525,6 @@ fn raise_nofile_limit(want: usize) {
     }
 }
 
-/// Opens `n` connections that are only held open (never used).
 async fn open_idle(addr: &str, n: usize) -> Result<Vec<tokio::net::TcpStream>> {
     let mut idle = Vec::with_capacity(n);
     let mut left = n;
@@ -624,7 +612,6 @@ async fn make_delayed_tubes(
     Ok(ids)
 }
 
-/// Deletes the given jobs (pipelined, over `SETUP_CONNS` connections).
 async fn delete_ids(target: &Arc<Target>, ids: &[u64]) -> Result<()> {
     let mut set: JoinSet<Result<()>> = JoinSet::new();
     for k in 0..SETUP_CONNS.min(ids.len()) {
@@ -645,7 +632,6 @@ async fn delete_ids(target: &Arc<Target>, ids: &[u64]) -> Result<()> {
     Ok(())
 }
 
-/// Measured window: only ops completed before the deadline count.
 fn in_window(deadline: Instant) -> bool {
     Instant::now() < deadline
 }

@@ -104,9 +104,6 @@ fn stats_server_yaml_golden() {
     let yaml = s.to_yaml();
     let text = String::from_utf8(yaml.to_vec()).expect("valid utf8");
 
-    // Spot-check ordering and a handful of representative lines rather
-    // than the entire (long) blob, to keep the test readable while still
-    // pinning down field order and exact formatting.
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines[0], "---");
     assert_eq!(lines[1], "current-jobs-urgent: 0");
@@ -123,8 +120,6 @@ fn stats_server_yaml_golden() {
     assert!(text.ends_with("platform: \"x86_64\"\n"));
     assert!(!text.ends_with("\r\n")); // the trailing \r\n is added by Response::Ok, not here
 
-    // Order check: cmd-put must come right after current-jobs-buried, and
-    // job-timeouts right after cmd-pause-tube, matching STATS_FMT exactly.
     let idx_buried = lines
         .iter()
         .position(|l| l.starts_with("current-jobs-buried"))

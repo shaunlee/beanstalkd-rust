@@ -1,58 +1,16 @@
-//! The history checker (docs/PLAN.md §6.5).
+//! The history checker (docs/PLAN.md §6.5; the model and its rules are in
+//! docs/DESIGN.md §9.1).
 //!
-//! # Global checks
-//!
-//! - **Job ids are unique**: no two acknowledged puts got the same id.
-//! - **Ids increase in commit order**: if put A was acknowledged before
-//!   put B was sent, A's id is lower (ids are allocated in log order).
-//! - **Job identity**: every put body is unique, so a `RESERVED` / `FOUND`
-//!   reply names the put that created the job. The body must belong to a
-//!   put that got that id, or to an unacknowledged put (which then
-//!   evidently took effect, with that id). A body seen under two ids means
-//!   one put created two jobs.
-//! - Replies outside the protocol vocabulary of the command are
-//!   violations.
-//!
-//! # Per-job linearizability
-//!
-//! Each job's operations are checked against a single-server model of that
-//! job (a WGL-style depth-first search with memoization). The model's
-//! states are absent, ready, reserved(conn, deadline), delayed(until),
-//! buried and deleted. Every operation takes effect at one point inside
-//! `[send − slack, reply + slack]`; the points follow real time and each
-//! connection's program order. The point is modeled as the entry's engine
-//! time, which the leader stamps after the command was sent and before the
-//! reply; `slack` covers the difference between the clients' clock and
-//! engine time (clock skew between nodes, process start-up anchoring).
-//!
-//! The search places operations at their earliest possible points
-//! (`max(current point, send − slack)`): every timing constraint of the
-//! model is a lower bound, so placing earlier never loses a valid
-//! linearization.
-//!
-//! Spontaneous transitions, allowed but never required:
-//! - **TTR expiry**: reserved → ready at any point at or after the
-//!   reservation's (or last touch's) point + TTR (TTR 0 counts as 1 s, as
-//!   in the engine);
-//! - **delay expiry**: delayed → ready at or after the put's / release's
-//!   point + delay;
-//! - **disconnect**: reserved(C) → ready once every acknowledged operation
-//!   of C (on any job) could have taken effect: at or after the send time
-//!   of C's last acknowledged operation, and only if the client closed or
-//!   lost C at some point. There is no upper bound: after a kill -9 of the
-//!   node holding C, the release happens only when the cluster drops that
-//!   node's connections, long after the client saw its connection reset;
-//! - **bulk kick**: a `kick` (acknowledged with a non-zero count, or
-//!   unacknowledged) may have moved a buried or delayed job to ready at a
-//!   point inside its interval (it does not name its jobs).
-//!
-//! Unacknowledged operations are optional: each took effect at a point
-//! after its send time, or never. An unacknowledged `reserve` may have
-//! reserved any job; it is part of every job's history.
-//!
-//! When a job's search fails, the failure is classified (lost job,
-//! resurrected job, exclusive holding broken, or another inconsistency)
-//! and reported with the job's operations.
+//! Global checks (unique ids, ids increasing in commit order, job identity by
+//! unique put body, replies within the command's vocabulary) run first. Then
+//! each job's operations are searched against a single-server model of that
+//! job (WGL-style depth-first search with memoization), every operation
+//! taking effect at one point inside `[send - slack, reply + slack]`. The
+//! search places operations at their earliest possible points, which never
+//! loses a valid linearization because every timing constraint of the model is
+//! a lower bound. Spontaneous transitions (TTR expiry, delay expiry,
+//! disconnect, bulk kick) are allowed but never required, and unacknowledged
+//! operations are optional.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -82,25 +40,18 @@ pub enum ViolationKind {
     /// An acknowledged `INSERTED` job is gone although no delete could have
     /// removed it.
     LostJob,
-    /// An acknowledged `DELETED` job was observed again.
     Resurrected,
-    /// Two acknowledged puts got the same id.
     DuplicateId,
-    /// Ids are not increasing in commit (real-time) order.
     IdOrder,
-    /// One put created two jobs (its body seen under two ids).
     DuplicateJob,
     /// A connection kept acting on a job another connection reserved
     /// after it.
     ExclusiveHolding,
-    /// Replies not explained by any single-server execution.
     Inconsistent,
-    /// A reply outside the command's vocabulary.
     UnexpectedReply,
     /// The harness broke a rule the checker relies on (duplicate bodies,
     /// operations after an unacknowledged one on the same connection).
     Harness,
-    /// The per-job search exceeded its budget (not verified).
     SearchLimit,
 }
 
@@ -123,10 +74,8 @@ impl std::fmt::Display for Violation {
 #[derive(Debug, Clone, Default)]
 pub struct Report {
     pub violations: Vec<Violation>,
-    /// Jobs checked (acknowledged or identified by body).
     pub jobs: usize,
     pub ops: usize,
-    /// Search states visited, over all jobs.
     pub states: u64,
 }
 
@@ -150,7 +99,6 @@ impl Report {
     }
 }
 
-/// Checks `h` (see the module docs).
 pub fn check(h: &History, cfg: &CheckConfig) -> Report {
     let mut rep = Report {
         ops: h.ops.len(),
@@ -192,7 +140,6 @@ fn check_program_order(h: &History, v: &mut Vec<Violation>) {
     }
 }
 
-/// Whether `r` is a possible reply to `c` at all.
 fn in_vocabulary(c: &Cmd, r: &Reply) -> bool {
     use Reply as R;
     match c {
@@ -236,7 +183,6 @@ fn check_vocabulary(h: &History, v: &mut Vec<Violation>) {
 }
 
 struct Identities {
-    /// Every known job and the put that created it.
     job_put: BTreeMap<JobId, OpId>,
 }
 
@@ -326,7 +272,6 @@ fn identify_jobs(h: &History, v: &mut Vec<Violation>) -> Identities {
             }
         }
     }
-    // Replies about jobs no put explains.
     for (i, o) in h.ops.iter().enumerate() {
         if let (Some(t), Some(r)) = (o.cmd.target(), o.acked())
             && !job_put.contains_key(&t)
@@ -344,7 +289,6 @@ fn identify_jobs(h: &History, v: &mut Vec<Violation>) -> Identities {
 }
 
 fn check_id_order(h: &History, v: &mut Vec<Violation>) {
-    // (send, reply, id, op) of acknowledged puts.
     let mut puts: Vec<(Duration, Duration, JobId, OpId)> = h
         .ops
         .iter()
@@ -386,7 +330,6 @@ fn check_id_order(h: &History, v: &mut Vec<Violation>) {
     }
 }
 
-/// Send time of every connection's last acknowledged operation.
 fn last_acked_send(h: &History) -> HashMap<ConnKey, Duration> {
     let mut m = HashMap::new();
     for o in &h.ops {
@@ -397,10 +340,6 @@ fn last_acked_send(h: &History) -> HashMap<ConnKey, Duration> {
     }
     m
 }
-
-// ---------------------------------------------------------------------------
-// Per-job search
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum JobState {
@@ -429,13 +368,10 @@ enum Act {
 #[derive(Debug, Clone)]
 struct Elem {
     conn: ConnKey,
-    /// Earliest point (send − slack).
     lo: Duration,
-    /// Latest point (reply + slack); `None`: unbounded.
     hi: Option<Duration>,
     required: bool,
     act: Act,
-    /// The reply; `None` if unacknowledged.
     want: Option<Reply>,
 }
 
@@ -573,7 +509,6 @@ struct Key {
 
 struct Search {
     conns: Vec<Vec<Elem>>,
-    /// Bulk kicks: (lo, hi).
     kicks: Vec<(Duration, Option<Duration>)>,
     /// Earliest points of the unacknowledged `reserve`s of closed
     /// connections that have nothing else to do with this job, ascending.
@@ -590,7 +525,6 @@ struct Search {
     limited: bool,
 }
 
-/// The mutable part of a search state.
 struct Pos {
     cur: Vec<u16>,
     kicks: Vec<bool>,
@@ -602,7 +536,6 @@ impl Search {
         if self.limited {
             return false;
         }
-        // Every remaining required element must fit after the next point.
         let mut bound: Option<Duration> = None;
         let mut remaining = false;
         for (ci, c) in self.conns.iter().enumerate() {
@@ -635,7 +568,6 @@ impl Search {
             return false;
         }
 
-        // Operations at the connections' cursors: required ones first.
         for pass_required in [true, false] {
             for ci in 0..self.conns.len() {
                 let i = pos.cur[ci] as usize;
@@ -682,7 +614,6 @@ impl Search {
             }
         }
 
-        // Spontaneous transitions.
         match js {
             JobState::Reserved { conn: PHANTOM, .. } => {
                 if self.dfs(pos, JobState::Ready, lo) {
@@ -783,7 +714,6 @@ fn check_job(
         };
         let required = o.reply.is_some() || i == put;
         if !required && matches!(act, Act::Peek | Act::StatsJob) {
-            // No effect either way.
             continue;
         }
         let hi = o.reply_time().map(|t| t + slack);
@@ -802,7 +732,6 @@ fn check_job(
             },
         ));
     }
-    // Optional operations sent after every required one ends cannot matter.
     for list in per_conn.values_mut() {
         list.retain(|(_, e)| e.required || e.lo <= last_required);
     }
@@ -888,7 +817,6 @@ fn check_job(
     s.states
 }
 
-/// Why a job's history has no linearization (a best guess for the report).
 fn classify(h: &History, job: JobId, ops: &[OpId]) -> ViolationKind {
     let ops: Vec<&OpRecord> = ops.iter().map(|&i| &h.ops[i]).collect();
     let observed = |o: &OpRecord| {
@@ -906,7 +834,6 @@ fn classify(h: &History, job: JobId, ops: &[OpId]) -> ViolationKind {
             )
         )
     };
-    // Acknowledged delete, then the job seen again.
     for d in &ops {
         if d.cmd == Cmd::Delete(job)
             && let Some((t, Reply::Deleted)) = &d.reply
@@ -915,7 +842,6 @@ fn classify(h: &History, job: JobId, ops: &[OpId]) -> ViolationKind {
             return ViolationKind::Resurrected;
         }
     }
-    // Two holders: A reserved, B reserved later, then A acted as holder.
     for a in &ops {
         let Some((ta, Reply::Reserved { .. })) = &a.reply else {
             continue;
@@ -939,7 +865,6 @@ fn classify(h: &History, job: JobId, ops: &[OpId]) -> ViolationKind {
             }
         }
     }
-    // Gone without any delete that could explain it.
     let any_delete = ops
         .iter()
         .any(|o| o.cmd == Cmd::Delete(job) && o.acked() != Some(&Reply::NotFound));

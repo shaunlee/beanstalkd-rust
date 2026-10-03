@@ -4,17 +4,15 @@
 //! # Startup
 //!
 //! Each node gets its own client, HTTP and cluster ports (claimed like the
-//! single-server ports, see [`crate::server`]) and its own data directory;
-//! every node bootstraps the cluster with `--cluster-init`. Every node gets
-//! the case's `!args` (never `-b`: the Raft log replaces the binlog, and
-//! `-b` with `[cluster]` is a configuration error). The cluster is ready
-//! when every node answers `/readyz` with 200 and one node's `/admin`
-//! reports `cluster.role == "leader"` and `cluster.ready`. The harness
-//! then picks the node every client connection of the case goes to (the
-//! *client node*, see [`ClusterTarget`]) and sends it exactly one
-//! plaintext `quit` probe, the same single probe connection a
-//! single server gets (so `total-connections` agrees). Readiness itself
-//! is polled over HTTP only, which never counts as a connection.
+//! single-server ports, see [`crate::server`]) and data directory, and
+//! bootstraps with `--cluster-init`; every node gets the case's `!args` but
+//! never `-b` (a configuration error with `[cluster]`). The cluster is ready
+//! when every node answers `/readyz` with 200 and one node's `/admin` reports
+//! `cluster.role == "leader"` and `cluster.ready` (polled over HTTP only,
+//! which never counts as a connection). The harness then picks the *client
+//! node* ([`ClusterTarget`]) and sends it one plaintext `quit` probe, the same
+//! single probe connection a single server gets, so `total-connections`
+//! agrees.
 //!
 //! # `restart` / `crash`
 //!
@@ -57,7 +55,6 @@ use crate::conn::{ClientTransport, ConnHandle, Target, close_in_order};
 use crate::dsl::StopMode;
 use crate::server::{TempDir, claim_free_port, probe_ready, release_port};
 
-/// Number of nodes of a harness cluster.
 pub const CLUSTER_SIZE: u64 = 3;
 
 /// How long a cluster may take to become ready (elections under several
@@ -70,10 +67,8 @@ const START_ATTEMPTS: u32 = 3;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
 
-/// Which node the case's client connections go to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterTarget {
-    /// The leader (as of the cluster's start or last restart).
     Leader,
     /// A follower: the lowest-id follower at the cluster's start, kept
     /// after a restart unless it became the leader.
@@ -91,7 +86,7 @@ impl ClusterTarget {
 
 /// Cases that cannot run against a cluster, with the reason. Each reason
 /// is checked by the cluster suites: the case must fail to start with
-/// `refusal` in the error (see [`check_excluded`]).
+/// `refusal` in the error (see `check_excluded`).
 pub struct Exclusion {
     pub case: &'static str,
     /// A substring of the harness error the case must produce.
@@ -118,7 +113,6 @@ pub const EXCLUDED_CASES: &[Exclusion] = &[
     },
 ];
 
-/// The exclusion for the case at `path`, if any.
 pub fn exclusion_for(path: &Path) -> Option<&'static Exclusion> {
     let stem = path.file_stem()?.to_str()?;
     EXCLUDED_CASES.iter().find(|e| e.case == stem)
@@ -172,7 +166,6 @@ impl Node {
         self.child.as_ref().map(Child::id)
     }
 
-    /// The exit status, if the node has exited (and is then reaped).
     fn exited(&mut self) -> Option<String> {
         let child = self.child.as_mut()?;
         match child.try_wait() {
@@ -192,7 +185,6 @@ impl Node {
         }
     }
 
-    /// SIGTERM via kill(1) (keeps this crate free of `unsafe` and libc).
     fn term(&self) -> Result<(), String> {
         let Some(pid) = self.pid() else {
             return Ok(());
@@ -209,7 +201,6 @@ impl Node {
         }
     }
 
-    /// Wait for the node to exit; SIGKILL it after `timeout`.
     fn wait_exit(&mut self, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         while self.child.is_some() {
@@ -239,7 +230,6 @@ impl Node {
         http_get(self.http_addr(), "/readyz").is_some_and(|(status, _)| status == 200)
     }
 
-    /// `/admin`'s `cluster.role == "leader" && cluster.ready`.
     fn is_ready_leader(&self) -> bool {
         let Some((200, body)) = http_get(self.http_addr(), "/admin") else {
             return false;
@@ -275,7 +265,6 @@ pub struct ClusterProcess {
     extra_args: Vec<String>,
     target: ClusterTarget,
     nodes: Vec<Node>,
-    /// Index of the client node in `nodes`.
     client: usize,
     // Dropped after the nodes have been killed (`Drop::drop` runs first).
     dir: TempDir,
@@ -394,7 +383,6 @@ impl ClusterProcess {
         Ok(c)
     }
 
-    /// The last lines of every node's log, for error messages.
     fn logs(&self) -> String {
         self.nodes
             .iter()
@@ -479,7 +467,6 @@ impl ClusterProcess {
         }
     }
 
-    /// The node the case's connections go to (1-based id).
     pub fn client_node_id(&self) -> u64 {
         self.nodes[self.client].id
     }

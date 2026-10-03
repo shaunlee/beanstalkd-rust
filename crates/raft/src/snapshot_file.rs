@@ -1,48 +1,27 @@
 //! [`SnapshotFile`]: openraft's `SnapshotData`, the payload of a snapshot
-//! file being sent or received (P4-T5c: snapshots are streamed to and from
-//! files, never held in memory; docs/DESIGN.md §8).
+//! file being sent or received (P4-T5c; docs/DESIGN.md §8 "Streamed
+//! snapshots"). It is a window `[base, base + len)` of a file in the snapshot
+//! directory (the payload of a `.snap` file, see `storage::snapshot`);
+//! positions are relative to the window.
 //!
-//! A `SnapshotFile` is a window `[base, base + len)` of a file in the
-//! snapshot directory (the payload of a `.snap` file, see
-//! `storage::snapshot`); positions are relative to the window.
+//! Sending: the file's checksum is verified as the payload is read in order,
+//! so a damaged file fails the read that completes the payload (and keeps
+//! failing). A file shorter than its layout fails with `UnexpectedEof`: the
+//! length is checked against the file size only when the store opens, so a
+//! file truncated afterwards would otherwise make openraft send empty chunks
+//! forever.
 //!
-//! Sending: openraft reads chunks at increasing offsets (and restarts from
-//! 0 after a `SnapshotMismatch`). The checksum of the file is verified as
-//! the payload is read in order, so a file whose bytes were damaged fails
-//! the read that completes the payload instead of reaching the follower
-//! (once failed, the file keeps failing). A file shorter than its layout
-//! claims fails with `UnexpectedEof`; the length is checked against the
-//! file size only when the store opens, so a file truncated afterwards
-//! would otherwise make openraft send empty chunks forever.
+//! Receiving (openraft 0.9 seeks to a chunk's offset whenever it differs from
+//! the end of the previous chunk, then writes it): a chunk may start at or
+//! before the current length (a retransmit, or a restart from 0 with the same
+//! id; writing discards everything from the write position on) but never
+//! beyond it, so there are no gaps. Growth is capped by
+//! [`DEFAULT_MAX_SNAPSHOT_BYTES`]. Each write waits until the file has taken
+//! it, and after a failed write every write fails until a seek, so the file
+//! never differs from the chunks accepted. A rejected chunk surfaces as a
+//! storage error of that `install_snapshot` call; the leader retries.
 //!
-//! Receiving: openraft 0.9 seeks to each chunk's offset whenever it
-//! differs from the end of the previous chunk, then writes the chunk
-//! (`Streaming::receive`). The receiver:
-//! - never leaves a gap: seeking beyond the bytes received so far is an
-//!   error, so a chunk whose offset is past the current length is rejected
-//!   (nothing is written);
-//! - lets a chunk start at or before the current length: that is the
-//!   sender retransmitting a chunk after a timeout (same offset) or
-//!   restarting the snapshot from offset 0 with the same id. Writing
-//!   discards everything from the write position on, then appends;
-//! - refuses to grow beyond a maximum size ([`DEFAULT_MAX_SNAPSHOT_BYTES`]);
-//! - reports a write error at the write that caused it (each write waits
-//!   until the file has taken it) and then refuses every write until a
-//!   seek, so the file never differs from the chunks accepted;
-//! - writes to a temporary file that is removed when the `SnapshotFile` is
-//!   dropped (a stream replaced by another snapshot id, a failed install),
-//!   unless the install made it the current snapshot; a crash leaves only a
-//!   `.tmp` file, removed when the store reopens.
-//!
-//! A rejected chunk surfaces as a storage error of that `install_snapshot`
-//! call on the receiving node (openraft's core is not affected); the
-//! leader sees a remote error and retries. openraft keeps the receiving
-//! state after a rejected chunk, so the temporary file stays until a
-//! different snapshot id arrives, the stream completes or the process
-//! exits: at most one file.
-//!
-//! The file is a `tokio::fs::File`, so chunk reads and writes run on
-//! tokio's blocking pool rather than on a runtime worker.
+//! The file is a `tokio::fs::File`, so chunk I/O runs on tokio's blocking pool.
 
 use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -51,19 +30,14 @@ use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-/// Default maximum size of a received snapshot payload: 4 GiB.
-///
-/// A snapshot is the serialized engine state of the leader, which every
-/// node holds in memory anyway, so a legitimate snapshot is bounded by
-/// what the leader holds (job bodies dominate). The cap only has to stop a
-/// faulty or compromised peer from streaming without end; it bounds the
-/// disk space of the temporary file in the snapshot directory (a received
-/// snapshot is no longer buffered in memory). Set too low it would stop a
-/// wiped node from ever rejoining, so the default is generous. Configure
-/// it with [`crate::storage::ClusterStateMachine::set_max_snapshot_bytes`].
+/// Default maximum size of a received snapshot payload: 4 GiB. A legitimate
+/// snapshot is bounded by the state the leader holds; the cap only stops a
+/// faulty or compromised peer from streaming without end, so it bounds the
+/// disk used by the temporary file. A cap too low would stop a wiped node from
+/// ever rejoining, hence generous. Configure with
+/// [`crate::storage::ClusterStateMachine::set_max_snapshot_bytes`].
 pub const DEFAULT_MAX_SNAPSHOT_BYTES: u64 = 4 << 30;
 
-/// A file removed on drop unless [`TempPath::keep`] is called.
 #[derive(Debug)]
 pub(crate) struct TempPath(Option<PathBuf>);
 
@@ -76,7 +50,6 @@ impl TempPath {
         self.0.as_deref().unwrap_or(Path::new(""))
     }
 
-    /// The file stays (it was renamed into place).
     pub(crate) fn keep(mut self) {
         self.0 = None;
     }
@@ -93,21 +66,16 @@ impl Drop for TempPath {
     }
 }
 
-/// Checksum verification of a payload read in order (see the module docs).
 #[derive(Debug)]
 pub(crate) struct CrcCheck {
-    /// CRC-32C state after the payload bytes checked so far.
     pub(crate) crc: u32,
-    /// Bytes the file's checksum covers after the payload.
     pub(crate) suffix: Vec<u8>,
     pub(crate) expect: u32,
 }
 
-/// The payload of a snapshot file (see the module docs).
 #[derive(Debug)]
 pub struct SnapshotFile {
     file: tokio::fs::File,
-    /// File offset of payload byte 0.
     base: u64,
     /// Payload bytes present: the bytes written and kept, or the window of
     /// a file being sent.
@@ -135,7 +103,6 @@ pub struct SnapshotFile {
     seeking: bool,
 }
 
-/// The file behind a [`SnapshotFile`], ready to be decoded.
 #[derive(Debug)]
 pub(crate) struct Payload {
     pub(crate) file: std::fs::File,
@@ -151,7 +118,6 @@ fn invalid(msg: String) -> io::Error {
 }
 
 impl SnapshotFile {
-    /// The complete payload `[base, base + len)` of `file`, for sending.
     pub(crate) fn reader(
         mut file: std::fs::File,
         base: u64,
@@ -202,7 +168,6 @@ impl SnapshotFile {
         self.len == 0
     }
 
-    /// Waits for pending writes and hands over the file.
     pub(crate) async fn into_payload(mut self) -> io::Result<Payload> {
         let temp = if self.max.is_some() {
             self.temp.take()
@@ -418,7 +383,6 @@ impl SnapshotFile {
         Ok((file, TempPath::new(path)))
     }
 
-    /// A complete snapshot holding `bytes`.
     pub(crate) fn from_bytes(bytes: &[u8]) -> io::Result<Self> {
         let (mut file, temp) = Self::temp_file()?;
         io::Write::write_all(&mut file, bytes)?;
@@ -427,13 +391,11 @@ impl SnapshotFile {
         Ok(s)
     }
 
-    /// An empty receiver of at most `max` bytes.
     pub(crate) fn temp_receiver(max: u64) -> io::Result<Self> {
         let (file, temp) = Self::temp_file()?;
         Ok(Self::receiver(file, temp, 0, max))
     }
 
-    /// The whole payload.
     pub(crate) async fn read_all(&mut self) -> io::Result<Vec<u8>> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         self.seek(SeekFrom::Start(0)).await?;
@@ -458,15 +420,12 @@ mod tests {
         b.write_all(b"hello ").await.expect("chunk 1");
         b.write_all(b"world").await.expect("chunk 2");
         assert_eq!(bytes(&mut b).await, b"hello world");
-        // Retransmit of chunk 2 (seek back to its offset).
         b.seek(SeekFrom::Start(6)).await.expect("seek back");
         b.write_all(b"world").await.expect("again");
         assert_eq!(bytes(&mut b).await, b"hello world");
-        // Restart from 0 with other data: the old tail is gone.
         b.seek(SeekFrom::Start(0)).await.expect("restart");
         b.write_all(b"abc").await.expect("restart chunk");
         assert_eq!(bytes(&mut b).await, b"abc");
-        // Seeking to the end is fine.
         b.seek(SeekFrom::Start(3)).await.expect("end");
         b.write_all(b"d").await.expect("append");
         assert_eq!(bytes(&mut b).await, b"abcd");
@@ -496,7 +455,6 @@ mod tests {
         let e = b.write_all(b"9").await.expect_err("over");
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert_eq!(b.len(), 8);
-        // A complete snapshot cannot grow.
         let mut s = SnapshotFile::from_bytes(b"xyz").expect("snapshot");
         s.seek(SeekFrom::End(0)).await.expect("end");
         assert!(s.write_all(b"!").await.is_err());
@@ -542,7 +500,6 @@ mod tests {
         let (mut f, temp) = SnapshotFile::temp_file().expect("file");
         io::Write::write_all(&mut f, &payload).expect("write");
         let mut good = SnapshotFile::reader(f, 0, 10, Some(check(expect))).expect("reader");
-        // Re-reads and restarts are fine.
         let mut buf = [0u8; 4];
         good.read_exact(&mut buf).await.expect("chunk");
         good.seek(SeekFrom::Start(2)).await.expect("back");
@@ -558,7 +515,6 @@ mod tests {
         bad.read_exact(&mut buf).await.expect("not complete yet");
         let e = bad.read_to_end(&mut Vec::new()).await.expect_err("damaged");
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
-        // Reading it again does not pass.
         bad.seek(SeekFrom::Start(0)).await.expect("restart");
         let e = bad
             .read_to_end(&mut Vec::new())
@@ -592,12 +548,10 @@ mod tests {
         let (f, temp) = SnapshotFile::temp_file().expect("file");
         let path = temp.path().to_path_buf();
         drop(f);
-        // A handle that cannot write.
         let ro = std::fs::File::open(&path).expect("read-only");
         let mut b = SnapshotFile::receiver(ro, temp, 0, 100);
         assert!(b.write_all(b"abc").await.is_err());
         assert_eq!((b.pos, b.len()), (0, 0));
-        // Without a seek the next write must not run at an unknown position.
         let e = b.write_all(b"abc").await.expect_err("blocked");
         assert!(e.to_string().contains("failed write"), "{e}");
         assert!(b.into_payload().await.is_err());

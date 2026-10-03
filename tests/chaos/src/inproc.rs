@@ -20,34 +20,31 @@
 //!
 //! # Owner emulation (test code, deliberately minimal)
 //!
-//! Per node incarnation: connection ids above the durable reservation,
-//! `highest_local` and a time floor (as the server), one
-//! ordered queue of `(conn, seq, input)` (`Connect` at seq 1, a put as
-//! `PutStarted` then `Command::Put`, `Disconnect` on close); the leader
-//! proposes all its unsent queued items, and every forward it receives,
-//! as `Op::Batch` entries (`bstk_raft::split_batches`) with
-//! `client_write_ff`, a follower forwards them in batches to the leader
-//! over the simulated network (one batch in flight); an item leaves the queue when the state machine reports it
-//! applied; everything unapplied is resent after a leader or term change,
-//! a failed forward, or a stall. The leader stamps `now = max(clock, last
-//! applied now, last stamped)` and proposes `Tick` at `next_deadline()`.
-//! A (re)started node waits until it has caught up, has `DropNode(self,
-//! highest_local)` committed through the current leader, and only then
-//! accepts connections, numbered above an emulated durable reservation
-//! (the server's `conn-ids` file, lost with a wipe) and above everything
+//! Per node incarnation this follows the server's cluster actor
+//! (docs/DESIGN.md §8 "Forward queue"): one ordered queue of `(conn, seq,
+//! input)` (`Connect` at seq 1, a put as `PutStarted` then `Command::Put`,
+//! `Disconnect` on close); the leader proposes its unsent items, and every
+//! forward it receives, as `Op::Batch` entries (`bstk_raft::split_batches`)
+//! with `client_write_ff`; a follower forwards them to the leader in batches
+//! over the simulated network (one in flight); an item leaves the queue when
+//! the state machine reports it applied; everything unapplied is resent after
+//! a leader or term change, a failed forward or a stall. The leader stamps
+//! `now = max(clock, last applied now, last stamped)` and proposes `Tick` at
+//! `next_deadline()`. A (re)started node waits until it has caught up, has
+//! `DropNode(self, highest_local)` committed through the current leader, and
+//! only then accepts connections, numbered above an emulated durable
+//! reservation (the `conn-ids` file, lost with a wipe) and above everything
 //! the state has seen for the node.
 //!
-//! A wiped node (and one restarted while its emulated rejoin marker is
-//! still set) runs in **rejoin mode**, as the server does. Before it starts
-//! Raft it asks the other nodes for their status over the simulated
-//! network (`bstk_raft::status::probe`, answered from each running node's
-//! log store) until a majority of the cluster among them answered, which
-//! needs that many of them reachable (it waits otherwise, in the
-//! background: the fault schedule goes on), and persists the highest vote
-//! with the log store's `save_vote`. Then it starts Raft with elections off
-//! (`runtime_config().elect(false)`) and its vote gate closed
-//! (`SimNetwork::set_vote_gate`) until it has applied the `DropNode(self)`
-//! a leader proposed for it after it started; then it clears the marker,
+//! A wiped node (and one restarted while its emulated rejoin marker is still
+//! set) runs in **rejoin mode**, as the server does (docs/DESIGN.md §8
+//! "Rejoin"): it probes the other nodes over the simulated network
+//! (`bstk_raft::status::probe`) until a majority of the cluster among them
+//! answered (it waits in the background otherwise: the fault schedule goes
+//! on), persists the highest vote with `save_vote`, then starts Raft with
+//! elections off (`runtime_config().elect(false)`) and its vote gate closed
+//! (`SimNetwork::set_vote_gate`) until it has applied the `DropNode(self)` a
+//! leader proposed for it after it started; then it clears the marker,
 //! re-enables elections and opens the gate.
 //!
 //! # Faults
@@ -108,7 +105,6 @@ use crate::checker::{self, CheckConfig, Report};
 use crate::history::{Cmd, ConnKey, History, JobId, Recorder, Reply};
 use crate::workload::{ClientState, Known, WorkloadConfig};
 
-/// Engine time at the start of a run (any wall-like value).
 const ANCHOR: Nanos = 1_700_000_000_000_000_000;
 /// A wiped incarnation (no emulated `conn-ids` reservation) starts its
 /// connection numbers this far above the highest local number the state
@@ -126,16 +122,13 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// One run's parameters (all derived from the seed by [`RunConfig::from_seed`]).
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub seed: u64,
     pub nodes: u64,
     pub clients: usize,
-    /// Virtual duration of the workload under faults.
     pub duration: Duration,
     pub fault_steps: usize,
-    /// Largest absolute clock skew injected (ms).
     pub max_skew_ms: u64,
     /// Include wiped-node rejoins in the schedule (on unless
     /// `BSTK_CHAOS_NO_WIPE` is set). A wiped node restarts in rejoin mode
@@ -164,20 +157,16 @@ impl RunConfig {
     }
 }
 
-/// A fault of the in-process schedule.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fault {
     Net(FaultAction),
-    /// Cut the network into these two sides (both directions).
     Split(Vec<NodeId>, Vec<NodeId>),
     Crash(NodeId),
     CrashLeader,
     CrashAll,
     Restart(NodeId),
     RestartAll,
-    /// Crash, empty the data directory, restart.
     Wipe(NodeId),
-    /// Clock offset of a node (ms, may be negative).
     Skew(NodeId, i64),
 }
 
@@ -204,7 +193,6 @@ pub fn generate_faults(
             1 => Fault::Net(FaultAction::Block(pick(&mut r), pick(&mut r))),
             2 | 3 => Fault::Net(FaultAction::Isolate(pick(&mut r), nodes.to_vec())),
             4 => {
-                // A random split: a minority on one side.
                 let mut v = nodes.to_vec();
                 for i in (1..v.len()).rev() {
                     let j = r.range(0, i as u64) as usize;
@@ -253,15 +241,9 @@ pub fn generate_faults(
     out
 }
 
-// ---------------------------------------------------------------------------
-// Ledger: what every node applied
-// ---------------------------------------------------------------------------
-
 #[derive(Default)]
 struct Ledger {
-    /// Index → (serialized entry, first node that applied it).
     entries: BTreeMap<u64, (Vec<u8>, NodeId)>,
-    /// Applied index → (engine state hash, first node).
     states: BTreeMap<u64, (u64, NodeId)>,
     problems: Vec<String>,
     snapshot_installs: u64,
@@ -310,7 +292,6 @@ fn state_hash(h: &StateHandle) -> Option<u64> {
     Some(s.finish())
 }
 
-/// `ClusterStateMachine` plus recording into the [`Ledger`].
 struct RecSm {
     inner: ClusterStateMachine,
     handle: StateHandle,
@@ -378,13 +359,8 @@ impl RaftStateMachine<TypeConfig> for RecSm {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Nodes
-// ---------------------------------------------------------------------------
-
 type ReplyTx = mpsc::UnboundedSender<Response>;
 
-/// The reply sink of one node incarnation.
 struct Sink {
     clients: Arc<Mutex<HashMap<ConnId, ReplyTx>>>,
     applied: mpsc::UnboundedSender<(ConnId, u64)>,
@@ -416,7 +392,6 @@ enum OwnerMsg {
     Input(ConnId, EngineInput),
 }
 
-/// One running incarnation of a node.
 struct NodeInc {
     id: NodeId,
     raft: Raft<TypeConfig>,
@@ -429,7 +404,6 @@ struct NodeInc {
     queue_len: AtomicU64,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     run: Arc<RunShared>,
-    /// In rejoin mode: the closed vote gate, opened when it ends.
     rejoin: Option<Arc<VoteGate>>,
 }
 
@@ -453,7 +427,6 @@ impl NodeInc {
     }
 }
 
-/// Leader side of forwarding.
 struct Fwd(Arc<NodeInc>);
 
 impl ForwardHandler for Fwd {
@@ -487,7 +460,6 @@ fn local_of(conn: ConnId) -> u64 {
     conn & ((1 << CONN_SEQ_BITS) - 1)
 }
 
-/// The owner emulation of one incarnation (see the module docs).
 async fn owner(
     inc: Arc<NodeInc>,
     mut rx: mpsc::UnboundedReceiver<OwnerMsg>,
@@ -565,7 +537,6 @@ async fn owner(
             }
             _ = tick.tick() => {
                 if cursor > 0 && front_since.elapsed() >= STALL {
-                    // Prune what can no longer apply, then resend.
                     let st = &inc.state;
                     let highest = st.highest_local(inc.id);
                     queue.retain(|i| {
@@ -577,7 +548,6 @@ async fn owner(
                     epoch += 1;
                     inflight = false;
                 }
-                // Leader duty: Tick at the next deadline.
                 if inc.is_leader()
                     && let Some(d) = inc.state.next_deadline()
                     && inc.run.clock(inc.id) >= d
@@ -636,10 +606,6 @@ async fn owner(
     }
 }
 
-// ---------------------------------------------------------------------------
-// The run
-// ---------------------------------------------------------------------------
-
 struct RunShared {
     net: SimNetwork,
     raft_cfg: Arc<openraft::Config>,
@@ -657,7 +623,6 @@ struct RunShared {
     problems: Mutex<Vec<String>>,
     events: Mutex<Vec<String>>,
     faults: Mutex<BTreeMap<String, u64>>,
-    /// Every connection id handed out (ids must never be reused).
     used_conns: Mutex<BTreeSet<ConnId>>,
     /// Nodes whose (emulated) rejoin marker is set: wiped, and not yet
     /// done rejoining. Survives crashes; cleared when the rejoin ends.
@@ -666,7 +631,6 @@ struct RunShared {
     /// server's `conn-ids` file): above every local number handed out.
     /// Lost with a wipe.
     conn_ids: Mutex<BTreeMap<NodeId, u64>>,
-    /// History keys of client connections.
     next_key: AtomicU64,
 }
 
@@ -675,7 +639,6 @@ impl RunShared {
         self.t0.elapsed()
     }
 
-    /// Node `id`'s clock (engine nanoseconds).
     fn clock(&self, id: NodeId) -> Nanos {
         let base = ANCHOR.saturating_add(self.elapsed().as_nanos() as u64);
         let skew = self.skew.get(&id).map_or(0, |s| s.load(Ordering::Relaxed));
@@ -686,7 +649,6 @@ impl RunShared {
         lock(&self.nodes).get(&id).cloned()
     }
 
-    /// Nodes running, or still probing their peers before they start Raft.
     fn running(&self) -> Vec<NodeId> {
         let mut ids: BTreeSet<NodeId> = lock(&self.nodes).keys().copied().collect();
         ids.extend(lock(&self.starting).keys().copied());
@@ -712,7 +674,6 @@ impl RunShared {
         lock(&self.events).push(format!("{t:?} {e}"));
     }
 
-    /// Crashes node `id`: drops every handle without `shutdown`.
     fn crash(&self, id: NodeId) {
         if let Some((_, task)) = lock(&self.starting).remove(&id) {
             task.abort();
@@ -771,7 +732,6 @@ impl RunShared {
             delivered: self.delivered.clone(),
         });
         if wipe {
-            // Wait for the lock, then empty the directory.
             let s = self.open_storage(id, sink.clone()).await?;
             drop(s);
             let dir = self.dirs.get(&id).ok_or("no data dir")?;
@@ -806,7 +766,6 @@ impl RunShared {
         Ok(())
     }
 
-    /// Rejoin: the probe-and-adopt step of the server, then `launch`.
     async fn rejoin(
         self: &Arc<Self>,
         id: NodeId,
@@ -912,7 +871,6 @@ impl RunShared {
     }
 }
 
-/// A node's opened storage and client plumbing, before Raft starts.
 struct Parts {
     log: storage::LogStore,
     sm: ClusterStateMachine,
@@ -1004,7 +962,6 @@ async fn startup(inc: Arc<NodeInc>) {
     }
 }
 
-/// A client connection to a node.
 struct SimConn {
     conn: ConnId,
     rx: mpsc::UnboundedReceiver<Response>,
@@ -1136,7 +1093,6 @@ pub fn to_reply(cmd: &Cmd, r: Response) -> Reply {
     }
 }
 
-/// Op timeout: longer than any reserve timeout.
 fn op_timeout(cmd: &Cmd) -> Duration {
     match cmd {
         Cmd::ReserveWithTimeout(t) => Duration::from_secs(u64::from(*t) + 5),
@@ -1144,7 +1100,6 @@ fn op_timeout(cmd: &Cmd) -> Duration {
     }
 }
 
-/// One workload client: connects to random nodes until `until`.
 async fn client(
     run: Arc<RunShared>,
     rec: Recorder,
@@ -1189,7 +1144,6 @@ async fn client(
     }
 }
 
-/// Applies one fault.
 async fn apply_fault(run: &Arc<RunShared>, f: &Fault) {
     let kind = match f {
         Fault::Net(a) => format!("{a:?}"),
@@ -1238,8 +1192,6 @@ async fn apply_fault(run: &Arc<RunShared>, f: &Fault) {
             }
         }
         Fault::Wipe(id) => {
-            // Never more rejoining nodes than a majority can spare: the
-            // nodes with their data must still form a quorum.
             let n = run.ids.len();
             let spare = n - (n / 2 + 1);
             let others = lock(&run.rejoin_marker)
@@ -1265,11 +1217,9 @@ async fn apply_fault(run: &Arc<RunShared>, f: &Fault) {
     }
 }
 
-/// The result of one seed.
 #[derive(Debug)]
 pub struct Outcome {
     pub cfg: RunConfig,
-    /// Everything that went wrong (empty: passed).
     pub failures: Vec<String>,
     pub report: Report,
     pub events: Vec<String>,
@@ -1438,7 +1388,6 @@ pub async fn run(cfg: RunConfig) -> Outcome {
     }
 }
 
-/// Waits for `f` (polled every 20 ms) for at most `within`.
 async fn wait_until(within: Duration, mut f: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + within;
     loop {
@@ -1480,7 +1429,6 @@ async fn drive(run: &Arc<RunShared>, cfg: &RunConfig, rec: &Recorder) {
         return;
     }
 
-    // Workload under faults.
     let start = Instant::now();
     let until = start + cfg.duration;
     let known: Arc<Mutex<Known>> = Arc::default();
@@ -1510,7 +1458,6 @@ async fn drive(run: &Arc<RunShared>, cfg: &RunConfig, rec: &Recorder) {
         apply_fault(run, f).await;
     }
 
-    // Heal and restart everything.
     tokio::time::sleep_until(until).await;
     run.event("heal".into());
     run.net.heal();
@@ -1549,7 +1496,6 @@ async fn drive(run: &Arc<RunShared>, cfg: &RunConfig, rec: &Recorder) {
     }
     tokio::time::sleep(Duration::from_secs(u64::from(cfg.work.ttr.1) + 2)).await;
     verify(run, rec).await;
-    // Converge: every node applied the same last index.
     let target = lock(&run.nodes)
         .values()
         .filter_map(|n| n.state.last_applied().map(|l| l.index))
@@ -1611,7 +1557,6 @@ async fn verify(run: &Arc<RunShared>, rec: &Recorder) {
             }
         }
     }
-    // Drain.
     while ok {
         let cmd = Cmd::ReserveWithTimeout(0);
         let op = rec.begin(key, cmd.clone(), run.elapsed());
@@ -1677,7 +1622,6 @@ fn cluster_view(run: &RunShared) -> String {
     s
 }
 
-/// Capture sink of the replay.
 #[derive(Default)]
 struct Capture {
     delivered: Mutex<BTreeMap<ConnId, Vec<Response>>>,

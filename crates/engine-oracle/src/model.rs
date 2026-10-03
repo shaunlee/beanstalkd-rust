@@ -131,13 +131,11 @@ pub(crate) struct ConnState {
     pub(crate) pending_put: Option<PendingPut>,
 }
 
-/// Header-time state of an in-flight put (see `ConnState::pending_put`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingPut {
     /// The job id `make_job` already allocated; `None` for an oversized
     /// put, which the reference only counts before discarding its body.
     pub(crate) id: Option<JobId>,
-    /// `created_at` as set by `make_job` at header time.
     pub(crate) created_at: Nanos,
 }
 

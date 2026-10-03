@@ -2,7 +2,7 @@
 //! stats-job, stats-tube) so that differential comparisons ignore fields
 //! that legitimately vary between two separate server processes/runs.
 //!
-//! See docs/DESIGN.md section 8.
+//! See docs/DESIGN.md §9.
 
 /// YAML keys whose values are masked in any `OK` response body. None of
 /// these names appears in more than one of the stats formats.
@@ -61,13 +61,11 @@ const CLUSTER_MASKED_KEYS: &[&str] = &[
 
 const MASKED_VALUE: &str = "<masked>";
 
-/// Which optional masks apply to a case.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MaskMode {
     /// The servers run with a binlog directory: also mask
-    /// [`BINLOG_MASKED_KEYS`].
+    /// `BINLOG_MASKED_KEYS`.
     pub binlog: bool,
-    /// Server B is a cluster: also mask [`CLUSTER_MASKED_KEYS`].
     pub cluster: bool,
 }
 
@@ -79,7 +77,6 @@ pub fn mask_response(resp: &[u8]) -> Vec<u8> {
     mask_response_with(resp, MaskMode::default())
 }
 
-/// Like [`mask_response`], additionally applying the masks enabled by `mode`.
 pub fn mask_response_with(resp: &[u8], mode: MaskMode) -> Vec<u8> {
     let Some(line_end) = find(resp, b"\r\n") else {
         return resp.to_vec();
@@ -189,14 +186,13 @@ mod tests {
         assert!(masked_str.contains("platform: <masked>"));
         assert!(masked_str.contains("current-jobs-ready: 0"));
 
-        // The declared length in the OK line must match the masked body length.
         let line_end = masked.iter().position(|&b| b == b'\r').expect("crlf");
         let declared: usize = std::str::from_utf8(&masked[3..line_end])
             .expect("utf8")
             .parse()
             .expect("number");
         let body_start = line_end + 2;
-        let actual_body_len = masked.len() - body_start - 2; // minus trailing \r\n
+        let actual_body_len = masked.len() - body_start - 2;
         assert_eq!(declared, actual_body_len);
     }
 
@@ -208,7 +204,6 @@ mod tests {
         assert!(masked.contains("age: <masked>"));
         assert!(masked.contains("time-left: <masked>"));
         assert!(masked.contains("state: reserved"));
-        // The job id is deterministic and must still be compared.
         assert!(masked.contains("---\nid: 1\n"));
     }
 
@@ -302,7 +297,6 @@ mod tests {
         assert!(masked.contains("file: <masked>\n"));
         assert!(masked.contains("---\nid: 7\n"));
         assert!(masked.contains("reserves: 2\n"));
-        // A differing file number compares equal only in binlog mode.
         let other = ok_response(&body.replace("file: 3", "file: 9"));
         assert_eq!(
             mask_response_with(&ok_response(body), BINLOG),

@@ -124,7 +124,6 @@ struct SmData {
     snapshots_built: u64,
 }
 
-/// Records applied requests; cloning shares the state (for inspection).
 #[derive(Clone, Default)]
 pub struct MemSm {
     inner: Arc<Mutex<SmData>>,

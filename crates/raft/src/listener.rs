@@ -1,52 +1,36 @@
-//! The accepting side of the cluster port.
+//! The accepting side of the cluster port (docs/DESIGN.md §8 "Listener").
 //!
-//! Per connection: (TLS handshake, which requires a client certificate
-//! from the cluster CA), then the dialer's hello within
-//! `handshake_timeout`. The hello must name this node as `to`, use this
-//! protocol version, and come `from` a configured peer; with TLS the
-//! client certificate must also be valid for `bstk-node-<from>`
-//! ([`crate::tls::verify_peer_identity`]). Otherwise the listener answers
-//! `Rejected` and closes; no request is read before the hello is accepted.
+//! Per connection: TLS handshake (a client certificate from the cluster CA is
+//! required), then the dialer's hello within `handshake_timeout`. The hello
+//! must name this node as `to`, use this protocol version, and come `from` a
+//! configured peer (with TLS the certificate must also be valid for
+//! `bstk-node-<from>`, [`crate::tls::verify_peer_identity`]); otherwise the
+//! listener answers `Rejected` and closes. No request is read before the hello
+//! is accepted.
 //!
-//! Requests on one connection are served strictly in order, one at a time:
-//! openraft keeps at most one request in flight per replication stream,
-//! and the other users of a link (a vote round, forwarding in the opposite
-//! direction of replication) are light, so pipelining buys little and
-//! in-order serving keeps per-connection memory to one frame (at most
-//! `max_frame` bytes) plus one response. It also preserves the order of
-//! forwards from one owner.
+//! Requests on one connection are served strictly in order: openraft keeps one
+//! request in flight per replication stream and the other users of a link are
+//! light, so pipelining buys little, per-connection memory stays at one frame
+//! (at most `max_frame`) plus one response, and the order of forwards from one
+//! owner is preserved.
 //!
-//! # Connection budgets
-//!
-//! Unauthenticated and authenticated connections use separate budgets, so
-//! that connections that never complete the handshake cannot keep the
-//! peers out:
-//! - connections still in the TLS handshake or hello are limited to
-//!   `max_handshakes` in total and `max_handshakes_per_ip` per source
-//!   address; beyond either, new connections are closed at accept. Each has
-//!   `handshake_timeout` to finish.
-//! - an authenticated connection holds the slot of its peer: each
-//!   configured peer has exactly one, and an accepted hello from a peer
-//!   closes that peer's older connection (the dialer keeps one connection
-//!   per target and only dials again once it gave the old one up).
-//!
-//! # Service
+//! Unauthenticated and authenticated connections use separate budgets so that
+//! connections that never finish the handshake cannot keep the peers out:
+//! handshakes are limited by `max_handshakes` and `max_handshakes_per_ip`, and
+//! an authenticated connection holds its peer's single slot (a newer hello
+//! from the same peer closes the older connection).
 //!
 //! Status probes ([`RpcRequest::Status`]) are answered from
-//! [`ListenerConfig::status`] (the log store) at any time. Everything else
-//! needs the node's Raft and forward handler: with [`ClusterListener::spawn`]
-//! they are there from the start; with [`ClusterListener::spawn_deferred`]
-//! they are installed later through the returned [`ServiceSlot`] (a node
-//! that probes its peers before it starts Raft must answer their probes
-//! meanwhile). Until then Raft RPCs, forwards and control requests are
-//! refused ([`NOT_STARTED`]); a Vote RPC is checked against the vote gate
-//! first, so it is counted as refused by a closed gate.
+//! [`ListenerConfig::status`] at any time. With
+//! [`ClusterListener::spawn_deferred`] the Raft node and forward handler are
+//! installed later through the returned [`ServiceSlot`]; until then Raft RPCs,
+//! forwards and control requests are refused ([`NOT_STARTED`]); a Vote RPC
+//! is checked against the vote gate first, so it is counted as refused by a
+//! closed gate.
 //!
-//! Rejections (at accept, failed handshakes and hellos) are logged at most
-//! about once a second, with a count of the ones not logged. A rejected
-//! hello is answered with a generic reason ([`REJECT_HELLO`],
-//! [`REJECT_VERSION`], [`REJECT_MAX_JOB_SIZE`]); the details are only
-//! logged locally.
+//! Rejections are logged at most about once a second; a rejected hello gets a
+//! generic reason ([`REJECT_HELLO`], [`REJECT_VERSION`],
+//! [`REJECT_MAX_JOB_SIZE`]) and the details are only logged locally.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
@@ -64,27 +48,20 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
 
 use crate::forward::{ForwardHandler, check_control, check_forward};
-use crate::quiet_tcp::QuietTcp;
 use crate::status::StatusSource;
 use crate::wire::{
     self, ClientMsg, FrameError, PROTOCOL_VERSION, RpcRequest, RpcResponse, ServerHello, ServerMsg,
     WireError,
 };
 use crate::{NodeId, TypeConfig};
+use bstk_net::QuietTcp;
 
-/// A switch that keeps this node out of elections (see
-/// [`ListenerConfig::vote_gate`]).
-///
-/// While the gate is closed, every inbound Vote RPC is answered with
-/// [`WireError::Rejected`] without reaching Raft, so this node grants no
-/// vote (and does not update its term from the candidate); each refusal is
-/// counted. A node that rejoins with an empty data directory keeps the gate
-/// closed until it has caught up with the cluster, so that it cannot help
-/// elect a leader that lacks entries it had acknowledged before it lost
-/// them. AppendEntries, InstallSnapshot, forwards and control requests are
-/// not affected. The gate starts in the state given to [`VoteGate::new`]
-/// (`VoteGate::default()` is closed) and may be flipped any number of
-/// times.
+/// Keeps this node out of elections (see [`ListenerConfig::vote_gate`]): while
+/// closed, every inbound Vote RPC is answered with [`WireError::Rejected`]
+/// without reaching Raft (no vote is granted, the term is not updated) and
+/// counted. A rejoining node keeps it closed until it has caught up
+/// (docs/DESIGN.md §8 "Rejoin"). Other requests are unaffected.
+/// `VoteGate::default()` is closed.
 #[derive(Debug, Default)]
 pub struct VoteGate {
     open: AtomicBool,
@@ -100,12 +77,10 @@ impl VoteGate {
         }
     }
 
-    /// Lets Vote RPCs through again.
     pub fn open(&self) {
         self.open.store(true, Ordering::Release);
     }
 
-    /// Refuses Vote RPCs from now on.
     pub fn close(&self) {
         self.open.store(false, Ordering::Release);
     }
@@ -114,7 +89,6 @@ impl VoteGate {
         self.open.load(Ordering::Acquire)
     }
 
-    /// Vote RPCs refused so far.
     pub fn refused(&self) -> u64 {
         self.refused.load(Ordering::Relaxed)
     }
@@ -129,20 +103,16 @@ impl VoteGate {
     }
 }
 
-/// The reason sent with a refused Vote RPC.
 pub const VOTE_GATE_CLOSED: &str = "this node does not vote yet";
 
-/// Settings of the cluster listener.
 #[derive(Clone)]
 pub struct ListenerConfig {
-    /// This node's id; hellos must be addressed to it.
     pub node_id: NodeId,
     /// Node ids allowed to connect (the configured peers).
     pub peers: BTreeSet<NodeId>,
     /// Mutual TLS (see [`crate::tls`]); `None` means plaintext, which the
     /// caller must have been configured for explicitly.
     pub tls: Option<Arc<ServerConfig>>,
-    /// Maximum frame payload, both directions.
     pub max_frame: usize,
     /// Inbound connections in the TLS handshake or hello at once.
     pub max_handshakes: usize,
@@ -191,7 +161,6 @@ pub struct ClusterListener {
     task: Option<JoinHandle<()>>,
 }
 
-/// The Raft node and forward handler a listener serves requests with.
 struct Service<H> {
     raft: Raft<TypeConfig>,
     handler: Arc<H>,
@@ -220,7 +189,6 @@ pub const NOT_STARTED: &str = "raft is not running on this node yet";
 pub const NO_STATUS: &str = "status probes are not served by this node";
 
 impl ClusterListener {
-    /// Serves `listener`: Raft RPCs go to `raft`, forwards to `handler`.
     pub fn spawn<H: ForwardHandler>(
         listener: TcpListener,
         cfg: ListenerConfig,
@@ -255,8 +223,6 @@ impl ClusterListener {
         self.local_addr
     }
 
-    /// Stops accepting, closes all connections and waits for the accept
-    /// task to end.
     pub async fn shutdown(mut self) {
         if let Some(task) = self.task.take() {
             task.abort();
@@ -282,7 +248,6 @@ pub const REJECT_VERSION: &str = "unsupported protocol version";
 /// configuration error).
 pub const REJECT_MAX_JOB_SIZE: &str = "max_job_size mismatch (every node must use the same -z)";
 
-/// Logs at most about once per interval; counts what it suppressed.
 struct RateLimit {
     state: StdMutex<(Option<std::time::Instant>, u64)>,
 }
@@ -311,7 +276,6 @@ impl RateLimit {
     }
 }
 
-/// State shared by the accept loop and the connections.
 struct Shared {
     cfg: ListenerConfig,
     handshakes: Arc<Semaphore>,
@@ -353,7 +317,6 @@ impl Shared {
     }
 }
 
-/// A handshake slot: a global permit plus the per-address count.
 struct HandshakeSlot {
     shared: Arc<Shared>,
     ip: IpAddr,

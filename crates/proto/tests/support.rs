@@ -12,7 +12,6 @@ use proptest::prelude::*;
 const NAME_CHARS: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-+/;.$_()";
 
-/// A valid tube name (1..=200 bytes of `NAME_CHARS`, not starting with `-`).
 pub fn valid_tube_name() -> impl Strategy<Value = String> {
     let first = (0..NAME_CHARS.len())
         .filter(|&i| NAME_CHARS[i] != b'-')
@@ -83,8 +82,6 @@ pub fn arb_command() -> impl Strategy<Value = Command> {
     ]
 }
 
-/// The reverse of `parse_line`/`ServerCodec`: encodes a `Command` exactly
-/// as a well-behaved client would send it on the wire.
 pub fn encode_command(cmd: &Command) -> Vec<u8> {
     match cmd {
         Command::Put {

@@ -1,31 +1,28 @@
 //! Multi-process chaos harness: N real `beanstalkd-rs` processes in cluster
 //! mode (`insecure_plaintext`), every directed cluster link through a
-//! [`Proxy`], a seeded random fault schedule, a client workload recorded
-//! for the history checker, then heal and verify.
+//! [`Proxy`], a seeded random fault schedule, a client workload recorded for
+//! the history checker, then heal and verify.
 //!
-//! Each node's `[[cluster.peer]]` address for another node is the proxy of
-//! that directed link (its own entry is its real cluster port), so Raft
-//! RPCs, forwards and control requests from A to B all cross the proxy
-//! `A → B` (checked at startup: every link must carry traffic).
+//! Each node's `[[cluster.peer]]` address for another node is the proxy of that
+//! directed link (its own entry is its real cluster port), so Raft RPCs,
+//! forwards and control requests from A to B all cross the proxy `A → B`
+//! (checked at startup: every link must carry traffic).
 //!
-//! Faults: kill -9 (a node, the leader, all), SIGSTOP / SIGCONT (a node or
-//! the leader), proxy partitions (isolate a node, cut a pair, one-way cut,
-//! stall either direction of a link), added latency, and wiping a node's
-//! data directory before a restart (off with `BSTK_CHAOS_NO_WIPE`). Every
-//! initial node starts with `--cluster-init`; a wiped node restarts without
-//! it and rejoins in the server's rejoin mode. A wipe is skipped when it
-//! would leave fewer nodes with their data than a quorum. Clock skew is not
-//! injected: the server anchors its engine clock to `SystemTime` at start
-//! with no way to offset it.
+//! Faults: kill -9 (a node, the leader, all), SIGSTOP / SIGCONT, proxy
+//! partitions (isolate a node, cut a pair, one-way cut, stall either direction
+//! of a link), added latency, and wiping a node's data directory before a
+//! restart (off with `BSTK_CHAOS_NO_WIPE`; skipped when it would leave fewer
+//! nodes with their data than a quorum). A wiped node restarts without
+//! `--cluster-init` and rejoins in the server's rejoin mode. Clock skew is not
+//! injected: the server anchors its engine clock to `SystemTime` at start with
+//! no way to offset it.
 //!
-//! After the schedule: heal every link, SIGCONT and restart every node,
-//! wait until all are ready, let the workload finish, wait for every TTR
-//! and `DropNode`, then verify (`peek` / `stats-job` every job ever seen,
-//! kick everything, drain), check that every node's replicated counters
-//! agree, scan the node logs for panics, and run the history checker.
-//!
-//! Processes are tracked and killed (SIGKILL, which also ends stopped
-//! processes) when the run ends or fails, including on panic (`Drop`).
+//! After the schedule: heal every link, SIGCONT and restart every node, wait
+//! until all are ready, let the workload finish, wait for every TTR and
+//! `DropNode`, then verify (`peek` / `stats-job` every job ever seen, kick
+//! everything, drain), check that every node's replicated counters agree, scan
+//! the node logs for panics, and run the history checker. Processes are killed
+//! (SIGKILL) when the run ends or fails, including on panic (`Drop`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -75,7 +72,6 @@ pub struct MpConfig {
     pub seed: u64,
     pub nodes: u64,
     pub clients: usize,
-    /// Duration of the fault schedule (the workload runs throughout).
     pub duration: Duration,
     pub node_timeout: &'static str,
     pub snapshot_every: u64,
@@ -116,18 +112,12 @@ pub enum MpFault {
     Stop(u64),
     StopLeader,
     Cont(u64),
-    /// Sever every link to and from the node.
     Isolate(u64),
     IsolateLeader,
-    /// Sever both directions between two nodes.
     Cut(u64, u64),
-    /// Sever one directed link.
     OneWay(u64, u64),
-    /// Stall a directed link (up = requests, down = responses).
     Stall(u64, u64, bool, bool),
-    /// Latency on every link (ms).
     Latency(u64),
-    /// Heal every link (`true`: reset the connections).
     Heal(bool),
     Wipe(u64),
 }
@@ -237,7 +227,6 @@ impl Node {
         self.stopped = false;
     }
 
-    /// Whether the process exited on its own (reaps it).
     fn exited(&mut self) -> Option<std::process::ExitStatus> {
         let st = self.child.as_mut()?.try_wait().ok()??;
         self.child = None;
@@ -245,7 +234,6 @@ impl Node {
     }
 }
 
-/// A running cluster; `Drop` kills every process.
 struct Cluster {
     bin: PathBuf,
     dir: PathBuf,
@@ -383,7 +371,6 @@ impl Cluster {
             .is_some_and(|(s, _)| s == 200)
     }
 
-    /// The ready leader, per `/admin`.
     async fn leader(&self) -> Option<u64> {
         for n in &self.nodes {
             if n.child.is_none() || n.stopped {
@@ -416,7 +403,6 @@ impl Cluster {
     }
 }
 
-/// The result of one multi-process run.
 #[derive(Debug)]
 pub struct MpOutcome {
     pub cfg: MpConfig,
@@ -426,7 +412,6 @@ pub struct MpOutcome {
     pub history: History,
     pub dir: Option<PathBuf>,
     pub wall: Duration,
-    /// Faults applied, by kind.
     pub faults: BTreeMap<String, u64>,
 }
 
@@ -491,7 +476,6 @@ impl Shared {
     }
 }
 
-/// Runs one multi-process chaos run (on a multi-thread tokio runtime).
 pub async fn run(cfg: MpConfig) -> MpOutcome {
     let t0 = Instant::now();
     let sh = Arc::new(Shared {
@@ -519,7 +503,6 @@ pub async fn run(cfg: MpConfig) -> MpOutcome {
     if let Some(mut c) = cluster {
         dir = Some(c.dir.clone());
         drive(&mut c, &cfg, &sh, &rec).await;
-        // Panics anywhere in the nodes' logs.
         for n in &c.nodes {
             let text = std::fs::read_to_string(&n.log).unwrap_or_default();
             if let Some(line) = text.lines().find(|l| l.contains("panicked")) {
@@ -585,7 +568,6 @@ async fn start_cluster(cfg: &MpConfig, attempt: u64, sh: &Shared) -> Result<Clus
     let dir = c.dir.clone();
     let res = start_nodes(c, sh).await;
     if res.is_err() && cfg.base_dir.is_some() {
-        // Keep only a failed run's logs, not a failed start's.
         let _ = std::fs::remove_dir_all(&dir);
     }
     res
@@ -593,7 +575,6 @@ async fn start_cluster(cfg: &MpConfig, attempt: u64, sh: &Shared) -> Result<Clus
 
 async fn start_nodes(mut c: Cluster, sh: &Shared) -> Result<Cluster, String> {
     let bin = c.bin.clone();
-    // Every initial node bootstraps with `--cluster-init`.
     for i in 0..c.nodes.len() {
         c.nodes[i].start(&bin, true)?;
     }
@@ -615,7 +596,6 @@ async fn start_nodes(mut c: Cluster, sh: &Shared) -> Result<Cluster, String> {
         }
         return Err(format!("the cluster did not become ready:{tails}"));
     }
-    // The leader's links carry traffic: the nodes use the proxies.
     tokio::time::sleep(Duration::from_millis(300)).await;
     let Some(l) = c.leader().await else {
         return Err("no leader after startup".into());
@@ -793,7 +773,6 @@ fn restart(c: &mut Cluster, bin: &Path, id: u64, wipe: bool, sh: &Shared) {
     }
 }
 
-/// Op timeout: longer than any reserve timeout plus a node timeout.
 fn op_timeout(cmd: &Cmd) -> Duration {
     match cmd {
         Cmd::ReserveWithTimeout(t) => Duration::from_secs(u64::from(*t) + 5),
@@ -884,7 +863,6 @@ async fn drive(c: &mut Cluster, cfg: &MpConfig, sh: &Arc<Shared>, rec: &Recorder
     }
     tokio::time::sleep_until(until.into()).await;
 
-    // Heal everything.
     sh.event("heal: links, SIGCONT, restart".into());
     for p in c.proxies.values() {
         p.heal(false);
@@ -929,7 +907,6 @@ async fn drive(c: &mut Cluster, cfg: &MpConfig, sh: &Arc<Shared>, rec: &Recorder
     for cl in clients {
         let _ = cl.await;
     }
-    // Every TTR, every close and DropNode has taken effect.
     tokio::time::sleep(Duration::from_secs(u64::from(cfg.work.ttr.1) + 3)).await;
     verify(c, sh, rec).await;
     compare_replicas(c, sh).await;
@@ -1001,7 +978,6 @@ async fn verify(c: &Cluster, sh: &Shared, rec: &Recorder) {
     }
 }
 
-/// Replicated `stats` fields, which every node must agree on.
 const REPLICATED: &[&str] = &[
     "current-jobs-urgent",
     "current-jobs-ready",
@@ -1021,7 +997,6 @@ const REPLICATED: &[&str] = &[
 ];
 
 async fn compare_replicas(c: &Cluster, sh: &Shared) {
-    // Wait until every node applied the same index.
     let ids: Vec<u64> = c.nodes.iter().map(|n| n.id).collect();
     let same = wait_for(Duration::from_secs(20), || async {
         let mut idx = BTreeSet::new();

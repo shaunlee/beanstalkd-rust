@@ -28,30 +28,25 @@
 //!
 //! # Operations
 //!
-//! - `append`: one positioned write per segment touched (under the lock),
-//!   then the callback is handed to the flusher (group commit, see
-//!   `flusher`), which `fdatasync`s every segment written since its last
-//!   sync in one call per file and then invokes all the callbacks it
-//!   covered, in order; `append` itself never syncs the current segment.
-//!   A segment that is rolled over is synced inline before the next one is
-//!   created (once per `segment_size`), so only the last segment can have
-//!   an unsynced, possibly torn, tail. Indexes must continue the log;
-//!   entries at or below the purge marker are skipped (a snapshot already
-//!   covers them). Entries are readable as soon as `append` returns,
-//!   before they are durable (openraft reads its own log).
-//! - `truncate`, `purge` and `save_vote` first wait for the flusher to
-//!   finish every queued sync (a barrier), so no acknowledgement is
-//!   pending for data they cut off, and nothing they remove is synced
-//!   later; then they run synchronously and are durable when they return.
-//! - `truncate(i)`: remove later segments (newest first), then cut the
-//!   segment holding `i` at its record; sync.
-//! - `purge(id)`: persist the purge marker first, then delete the segments
-//!   that only hold entries at or below it (oldest first). Entries at or
-//!   below the marker left in a surviving segment are ignored.
+//! - `append`: one positioned write per segment touched (under the lock), then
+//!   the callback goes to the flusher (group commit, `flusher.rs`); `append`
+//!   never syncs the current segment. A segment that is rolled over is synced
+//!   inline before the next is created, so only the last segment can have an
+//!   unsynced, possibly torn, tail. Indexes must continue the log; entries at
+//!   or below the purge marker are skipped (a snapshot covers them). Entries
+//!   are readable as soon as `append` returns, before they are durable
+//!   (openraft reads its own log).
+//! - `truncate`, `purge` and `save_vote` first wait for the flusher (a
+//!   barrier), then run synchronously and are durable when they return.
+//! - `truncate(i)`: remove later segments (newest first), cut the segment
+//!   holding `i` at its record; sync.
+//! - `purge(id)`: persist the marker first, then delete the segments that only
+//!   hold entries at or below it (oldest first); such entries left in a
+//!   surviving segment are ignored.
 //!
-//! Reads go through `pread` on the segment files; only record offsets are
-//! kept in memory. All state is behind one mutex; openraft serializes
-//! writes, and readers (replication tasks) take the mutex briefly.
+//! Reads use `pread` on the segment files; only record offsets are kept in
+//! memory. State is behind one mutex: openraft serializes writes, and readers
+//! take it briefly.
 
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
@@ -80,7 +75,6 @@ const VOTE_FILE: &str = "vote";
 const PURGED_FILE: &str = "purged";
 const COMMITTED_FILE: &str = "committed";
 
-/// Log store tuning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogOptions {
     /// A new segment is started when the current one would grow past this
@@ -104,11 +98,8 @@ impl Default for LogOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LogMetrics {
     pub segments: u64,
-    /// Total size of the segment files.
     pub bytes: u64,
-    /// Index of the first entry present, if any.
     pub first_index: Option<u64>,
-    /// Index of the last entry present, if any.
     pub last_index: Option<u64>,
     pub last_purged_index: Option<u64>,
 }
@@ -123,9 +114,7 @@ struct Segment {
     path: PathBuf,
     /// Shared so that the flusher can sync it without the lock.
     file: Arc<File>,
-    /// Offset of each record; record `k` holds index `first + k`.
     offsets: Vec<u64>,
-    /// End of the last record (= file length).
     end: u64,
 }
 
@@ -134,7 +123,6 @@ impl Segment {
         self.first + self.offsets.len() as u64
     }
 
-    /// Byte range of record `k`.
     fn range(&self, k: usize) -> (u64, u64) {
         let start = self.offsets[k];
         let end = self.offsets.get(k + 1).copied().unwrap_or(self.end);
@@ -149,7 +137,6 @@ struct Inner {
     opts: LogOptions,
     segs: Vec<Segment>,
     purged: Option<Sid>,
-    /// Id of the last entry present above `purged`.
     last_entry: Option<Sid>,
     vote: Option<Vote<NodeId>>,
     committed: Option<Sid>,
@@ -210,7 +197,6 @@ fn decode<T: serde::de::DeserializeOwned>(b: &[u8]) -> io::Result<T> {
     postcard::from_bytes(b).map_err(|e| invalid(format!("decode: {e}")))
 }
 
-/// Read a single-record file holding a postcard value; `None` if absent.
 fn read_value_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, OpenError> {
     match fsutil::read_record_file(path) {
         Ok(None) => Ok(None),
@@ -222,7 +208,6 @@ fn read_value_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option
     }
 }
 
-/// Result of scanning one segment file.
 struct Scanned {
     seg: Segment,
     last: Option<Sid>,
@@ -434,7 +419,6 @@ impl LogStore {
         })
     }
 
-    /// The flush queue (tests).
     #[cfg(test)]
     pub(crate) fn flusher(&self) -> &Flusher {
         &self.flusher
@@ -460,7 +444,6 @@ impl Inner {
         }
     }
 
-    /// Index of the first entry present, if any.
     fn first_live(&self) -> Option<u64> {
         let last = self.last_entry?;
         let first = self.segs.first()?.first;
@@ -468,7 +451,6 @@ impl Inner {
         (lo <= last.index).then_some(lo)
     }
 
-    /// The index the next appended entry must have, if constrained.
     fn next_index(&self) -> Option<u64> {
         match (self.last_entry, self.purged) {
             (Some(l), _) => Some(l.index + 1),
@@ -477,7 +459,6 @@ impl Inner {
         }
     }
 
-    /// Segment position and record number of `index` (must be present).
     fn locate(&self, index: u64) -> Option<(usize, usize)> {
         let p = self.segs.partition_point(|s| s.first <= index);
         let si = p.checked_sub(1)?;
@@ -500,7 +481,6 @@ impl Inner {
             let want = usize::try_from(hi - idx)
                 .unwrap_or(usize::MAX)
                 .min(n_in_seg);
-            // Records k .. k+cnt, bounded by max_bytes (at least one).
             let mut cnt = 0;
             let start = seg.offsets[k];
             let mut end = start;
@@ -571,8 +551,6 @@ impl Inner {
         Ok(())
     }
 
-    /// Write `buf` (records at `offs`, relative to the buffer) to the end
-    /// of the last segment.
     fn flush(&mut self, buf: &mut Vec<u8>, offs: &mut Vec<u64>) -> io::Result<()> {
         if buf.is_empty() {
             return Ok(());
@@ -660,8 +638,6 @@ impl Inner {
         Ok(unsynced.map(|si| self.segs[si].file.clone()))
     }
 
-    /// Delete leading segments holding only entries at or below the purge
-    /// marker, oldest first.
     fn drop_purged_segments(&mut self) -> io::Result<()> {
         let Some(p) = self.purged else {
             return Ok(());
@@ -721,7 +697,6 @@ impl Inner {
         Ok(())
     }
 
-    /// Whether an entry below `since` is still present.
     fn first_live_below(&self, since: u64) -> Option<u64> {
         let first = self.segs.first()?.first;
         let lo = self.purged.map_or(first, |p| first.max(p.index + 1));

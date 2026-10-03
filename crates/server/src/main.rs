@@ -1,46 +1,35 @@
 //! beanstalkd-rs: network front-end for bstk-engine.
 //!
-//! Architecture (see docs/DESIGN.md §3, §6): one accept loop per listener
-//! and one task per connection (`conn`) on a tokio runtime, and one engine
-//! actor that is the sole owner of `bstk_engine::Engine` and, with `-b`,
-//! of the write-ahead log (`engine_actor::Actor`). With `-b` the actor
-//! runs on a dedicated OS thread; without it, as a tokio task (see
-//! `engine_actor` for why). An optional HTTP listener (`http`) serves
-//! health, readiness and monitoring endpoints.
+//! Architecture (docs/DESIGN.md §3, §6): one accept loop per listener and one
+//! task per connection (`conn`) on a tokio runtime, and one engine actor that
+//! solely owns `bstk_engine::Engine` and, with `-b`, the write-ahead log
+//! (`engine_actor::Actor`; a dedicated OS thread with `-b`, otherwise a tokio
+//! task). An optional HTTP listener (`http`) serves health, readiness and
+//! monitoring endpoints.
 //!
-//! Startup:
-//! 1. parse flags; `--check-config` validates the configuration (including
-//!    the TLS files), prints a summary and exits;
-//! 2. load `--config` (if any) and resolve it against the flags; set up
-//!    logging per `[log]`; load the TLS certificates;
-//! 3. bind every listener (like the reference, a port error comes before
-//!    any binlog work);
-//! 4. bind and start the HTTP listener, if configured (`/readyz` is 503
-//!    until step 6);
-//! 5. with a binlog, lock and replay it and rebuild the engine from it;
-//! 6. start the accept loops (the server is now ready).
+//! Startup order (docs/DESIGN.md §6.1): flags, `--config`, logging, TLS
+//! certificates; bind every listener (like the reference, a port error comes
+//! before any binlog work); start HTTP (`/readyz` is 503 until the engine is
+//! up); replay the binlog and rebuild the engine; start the accept loops.
+//! The reference also accepts only after `srv_acquire_wal`, so neither
+//! drains its listen backlog during recovery.
+//! `--check-config` validates the configuration, including the TLS files,
+//! prints a summary and exits. Without a configuration file the server is the
+//! P1 server: one plaintext listener from `-l` / `-p`, no HTTP listener.
 //!
-//! (The reference already serves the listening socket from its event loop
-//! only after `srv_acquire_wal`, so the difference is just that our listen
-//! backlog is not drained during recovery either.) Without a configuration
-//! file this is exactly the P1 behavior: one plaintext listener from
-//! `-l` / `-p`, no HTTP listener.
-//!
-//! Cluster mode (`[cluster]`, see `cluster`): step 3 also binds the
-//! cluster port, and step 5 instead opens the Raft storage, starts Raft
-//! and waits until this node is caught up with a leader and has closed out
-//! its previous process's connections (`cluster::start`). The connection
+//! Cluster mode (`[cluster]`, see `cluster`): binding also covers the cluster
+//! port, and instead of the binlog step the node opens the Raft storage,
+//! starts Raft and waits until it is caught up with a leader and has closed
+//! out its previous process's connections (`cluster::start`). The connection
 //! tasks are the same; their `EngineMsg`s go to the cluster actor.
-//! Without `[cluster]` nothing of it runs.
 //!
-//! Exit statuses: 0 after SIGINT / SIGTERM, and for a valid
-//! `--check-config`; 1 for a startup error (invalid configuration, TLS
-//! files, socket, binlog replay or I/O, `--cluster-init` on a data
-//! directory with state); 5 for a usage error (`-u`); 10 when another
-//! process holds the binlog (or cluster data) directory lock (as the
-//! reference); 20 after a binlog write, fsync or compaction error while
-//! serving (`engine_actor::EXIT_WAL_FAILURE`); clap's usage errors exit
-//! with 2.
+//! Exit statuses: 0 after SIGINT / SIGTERM and for a valid `--check-config`;
+//! 1 for a startup error (invalid configuration, TLS files, socket, binlog
+//! replay or I/O, `--cluster-init` on a data directory with state); 5 for a
+//! usage error (`-u`); 10 when another process holds the binlog (or cluster
+//! data) directory lock, as the reference; 20 after a binlog write, fsync or
+//! compaction error while serving (`engine_actor::EXIT_WAL_FAILURE`); clap's
+//! usage errors exit with 2.
 
 mod auth;
 mod cli;
@@ -188,12 +177,8 @@ fn main() -> ExitCode {
         },
     };
 
-    // SIGINT / SIGTERM set this; every accept loop and the HTTP listener
-    // stop on it.
     let (stop_tx, stop_rx) = watch::channel(false);
 
-    // Pending TLS connections and authentication counters (only TLS
-    // listeners touch them; the HTTP listener exports them).
     let counters = ServerCounters::new(config.max_pending_connections);
 
     // Started before the binlog replay, so /healthz and /readyz answer
@@ -257,7 +242,6 @@ fn main() -> ExitCode {
     ))
 }
 
-/// `[cluster.tls]`, loaded (`None` with `insecure_plaintext`).
 fn load_cluster_tls(
     c: &config::ClusterSettings,
 ) -> Result<Option<bstk_raft::tls::ClusterTls>, String> {
@@ -270,7 +254,6 @@ fn load_cluster_tls(
         .transpose()
 }
 
-/// The engine configuration (`-z`, `-s`), shared by both modes.
 fn engine_config(config: &ResolvedConfig) -> EngineConfig {
     EngineConfig {
         max_job_size: config.max_job_size,
@@ -321,14 +304,10 @@ async fn start_cluster(args: cluster::StartArgs<'_>) -> Result<cluster::ClusterN
     }
 }
 
-/// What `serve` hands to the connections of every listener.
 struct ConnSettings {
     max_job_size: u32,
-    /// `auth.timeout` (token listeners only).
     auth_timeout: std::time::Duration,
-    /// Accepted tokens (token listeners only).
     tokens: Arc<TokenSet>,
-    /// Pending-connection accounting (TLS listeners only).
     counters: Arc<ServerCounters>,
 }
 
@@ -379,16 +358,13 @@ pub(crate) fn listen(addr: SocketAddr) -> io::Result<TcpListener> {
     socket.listen(1024)
 }
 
-/// How connections on a bound listener are served.
 enum Kind {
     Plain,
     Tls { acceptor: TlsAcceptor, auth: Auth },
 }
 
-/// Authentication on a TLS listener (the tokens are attached in `serve`).
 #[derive(Clone, Copy)]
 enum Auth {
-    /// None beyond the handshake (`auth = "none"` or `"mtls"`).
     Handshake,
     Token,
 }
@@ -398,7 +374,6 @@ struct Bound {
     kind: Kind,
 }
 
-/// Binds every configured listener, in order.
 fn bind_listeners(
     runtime: &tokio::runtime::Runtime,
     config: &ResolvedConfig,
@@ -563,7 +538,6 @@ async fn serve(
             }
         });
     }
-    // Every listener is bound and the engine is recovered: ready.
     if let Some((state, task)) = http {
         if let Some(c) = &cluster {
             state.set_cluster(c.info());
@@ -589,8 +563,6 @@ async fn serve(
         }
     }
 
-    // Stop accepting everywhere (the listening sockets close as their
-    // tasks end), then shut the engine down.
     let _ = stop_tx.send(true);
     for task in tasks {
         let _ = task.await;
@@ -664,8 +636,6 @@ async fn accept_plain(
                 tokio::spawn(serve);
             }
             Some(close) => {
-                // Dropping the connection future closes the socket and
-                // sends `Disconnect` (its guard).
                 tokio::spawn(async move {
                     tokio::select! {
                         () = serve => {}
@@ -700,8 +670,6 @@ async fn accept_tls(
             }
         };
         let Some(pending) = shared.counters.try_acquire() else {
-            // Too many pending connections: close this one (counted and
-            // logged, rate-limited, by `try_acquire`).
             drop(stream);
             continue;
         };
