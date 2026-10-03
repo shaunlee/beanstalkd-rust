@@ -28,10 +28,10 @@ pub mod tls;
 pub mod wire;
 
 // Storage: log store, state machine, snapshots (P3-T2).
-pub mod snapshot_buf;
+pub mod snapshot_file;
 pub mod storage;
 
-pub use snapshot_buf::SnapshotBuf;
+pub use snapshot_file::SnapshotFile;
 
 use bstk_engine::{ConnId, EngineInput, Nanos};
 use serde::{Deserialize, Serialize};
@@ -174,8 +174,9 @@ openraft::declare_raft_types!(
         R = Applied,
         NodeId = NodeId,
         Node = openraft::BasicNode,
-        // Bounded, gap-free receive buffer (see `snapshot_buf`).
-        SnapshotData = SnapshotBuf,
+        // A snapshot file's payload; received chunks are bounded and
+        // gap-free (see `snapshot_file`).
+        SnapshotData = SnapshotFile,
 );
 
 /// Owner → leader: inputs of the owner's connections, in order.

@@ -31,8 +31,9 @@ use bstk_proto::{
 use crate::model::{ConnState, JobRec, JobState, PendingPut, TubeId, TubeState};
 use crate::ms::Ms;
 use crate::{
-    BinlogStats, ConnId, EngineConfig, EngineInput, EngineState, JobRecord, JournalEntry,
-    LocalConns, NANOS_PER_SEC, Nanos, Outbox, RecordState, Recovery, StateError, SysInfo,
+    BinlogStats, ConnId, EngineConfig, EngineInput, EngineState, EngineStateView, JobRecord,
+    JournalEntry, LocalConns, NANOS_PER_SEC, Nanos, Outbox, RecordState, Recovery, StateError,
+    SysInfo,
 };
 
 /// `SAFETY_MARGIN` in conn.c: 1 second.
@@ -532,7 +533,7 @@ impl Engine {
             local_conns: _,
         } = self;
 
-        let mut jobs: Vec<JobRec> = jobs.values().map(|j| (**j).clone()).collect();
+        let mut jobs: Vec<Box<JobRec>> = jobs.values().cloned().collect();
         jobs.sort_unstable_by_key(|j| j.id);
         let mut tube_ids: Vec<(TubeName, TubeId)> =
             tube_ids.iter().map(|(n, &id)| (n.clone(), id)).collect();
@@ -557,6 +558,131 @@ impl Engine {
             delay_heads: delay_heads.clone(),
             pauses: pauses.clone(),
             dispatchable: dispatchable.clone(),
+            ready_ct: *ready_ct,
+            urgent_ct: *urgent_ct,
+            reserved_ct: *reserved_ct,
+            buried_ct: *buried_ct,
+            delayed_ct: *delayed_ct,
+            waiting_ct: *waiting_ct,
+            total_jobs_ct: *total_jobs_ct,
+            timeout_ct: *timeout_ct,
+            cur_conns: *cur_conns,
+            tot_conns: *tot_conns,
+            cur_producers: *cur_producers,
+            cur_workers: *cur_workers,
+            cmd_put: *cmd_put,
+            cmd_peek: *cmd_peek,
+            cmd_peek_ready: *cmd_peek_ready,
+            cmd_peek_delayed: *cmd_peek_delayed,
+            cmd_peek_buried: *cmd_peek_buried,
+            cmd_reserve: *cmd_reserve,
+            cmd_reserve_with_timeout: *cmd_reserve_with_timeout,
+            cmd_delete: *cmd_delete,
+            cmd_release: *cmd_release,
+            cmd_use: *cmd_use,
+            cmd_watch: *cmd_watch,
+            cmd_ignore: *cmd_ignore,
+            cmd_bury: *cmd_bury,
+            cmd_kick: *cmd_kick,
+            cmd_touch: *cmd_touch,
+            cmd_stats: *cmd_stats,
+            cmd_stats_job: *cmd_stats_job,
+            cmd_stats_tube: *cmd_stats_tube,
+            cmd_list_tubes: *cmd_list_tubes,
+            cmd_list_tube_used: *cmd_list_tube_used,
+            cmd_list_tubes_watched: *cmd_list_tubes_watched,
+            cmd_pause_tube: *cmd_pause_tube,
+            binlog: *binlog,
+        }
+    }
+
+    /// P4-T5c: the state of `export_state`, borrowed: it serializes to the
+    /// same bytes (a test checks this) without copying the engine. Only
+    /// the three hash maps need sorting, through vectors of references.
+    pub fn state_view(&self) -> EngineStateView<'_> {
+        // Exhaustive destructuring: a new `Engine` field fails to compile
+        // here until the view serializes it, or the snapshot would silently
+        // lose it.
+        let Engine {
+            cfg,
+            sys: _,
+            start,
+            draining,
+            next_job_id,
+            next_list_seq,
+            jobs,
+            tubes,
+            free_tube_ids,
+            tube_ids,
+            tube_order,
+            conns,
+            conn_ticks,
+            delay_heads,
+            pauses,
+            dispatchable,
+            ready_ct,
+            urgent_ct,
+            reserved_ct,
+            buried_ct,
+            delayed_ct,
+            waiting_ct,
+            total_jobs_ct,
+            timeout_ct,
+            cur_conns,
+            tot_conns,
+            cur_producers,
+            cur_workers,
+            cmd_put,
+            cmd_peek,
+            cmd_peek_ready,
+            cmd_peek_delayed,
+            cmd_peek_buried,
+            cmd_reserve,
+            cmd_reserve_with_timeout,
+            cmd_delete,
+            cmd_release,
+            cmd_use,
+            cmd_watch,
+            cmd_ignore,
+            cmd_bury,
+            cmd_kick,
+            cmd_touch,
+            cmd_stats,
+            cmd_stats_job,
+            cmd_stats_tube,
+            cmd_list_tubes,
+            cmd_list_tube_used,
+            cmd_list_tubes_watched,
+            cmd_pause_tube,
+            journal: _,
+            binlog,
+            local_conns: _,
+        } = self;
+
+        let mut jobs: Vec<&JobRec> = jobs.values().map(|j| &**j).collect();
+        jobs.sort_unstable_by_key(|j| j.id);
+        let mut tube_ids: Vec<(&TubeName, TubeId)> =
+            tube_ids.iter().map(|(n, &id)| (n, id)).collect();
+        tube_ids.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut conns: Vec<(ConnId, &ConnState)> = conns.iter().map(|(&id, c)| (id, c)).collect();
+        conns.sort_unstable_by_key(|&(id, _)| id);
+
+        EngineStateView {
+            cfg,
+            start: *start,
+            draining: *draining,
+            next_job_id: *next_job_id,
+            jobs,
+            next_list_seq: *next_list_seq,
+            tubes,
+            free_tube_ids,
+            tube_ids,
+            tube_order,
+            conns,
+            conn_ticks,
+            delay_heads,
+            pauses,
+            dispatchable,
             ready_ct: *ready_ct,
             urgent_ct: *urgent_ct,
             reserved_ct: *reserved_ct,
@@ -663,7 +789,7 @@ impl Engine {
                 return Err(err(format!("jobs not strictly ascending at id {}", j.id)));
             }
             prev = Some(j.id);
-            jobs.insert(j.id, Box::new(j));
+            jobs.insert(j.id, j);
         }
         let mut tube_ids: HashMap<TubeName, TubeId> = HashMap::with_capacity(tube_id_list.len());
         let mut prev: Option<TubeName> = None;

@@ -9,7 +9,8 @@
 //!
 //! * `round_trip_*`: export at a random point (and after every step),
 //!   encode with postcard, decode, import, and continue: the restored
-//!   engine must be indistinguishable from the original.
+//!   engine must be indistinguishable from the original, and the borrowed
+//!   `state_view` must encode to the same bytes as the export.
 //! * `independent_engines_*`: two engines (each with its own `HashMap`
 //!   seeds) given the same inputs stay identical, including the snapshot
 //!   bytes.
@@ -216,6 +217,11 @@ fn restore(e: &Engine) -> Engine {
     let s = e.export_state();
     assert_eq!(e.export_state(), s, "export_state is not repeatable");
     let bytes = encode(&s);
+    assert_eq!(
+        postcard::to_stdvec(&e.state_view()).unwrap(),
+        bytes,
+        "state_view encodes differently from export_state"
+    );
     let decoded: EngineState = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(decoded, s, "postcard round trip changed the state");
     let r = match Engine::import_state(decoded, sys()) {

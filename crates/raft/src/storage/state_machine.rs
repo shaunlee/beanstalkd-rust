@@ -42,12 +42,15 @@
 //! local connection of the old and the new state.
 
 use std::collections::BTreeMap;
-use std::io;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use bstk_engine::{
-    ConnId, Engine, EngineConfig, EngineInput, EngineState, LocalConns, Nanos, Outbox, SysInfo,
+    ConnId, Engine, EngineConfig, EngineInput, EngineState, EngineStateView, LocalConns, Nanos,
+    Outbox, SysInfo,
 };
 use bstk_proto::Response;
 use openraft::storage::RaftStateMachine;
@@ -59,9 +62,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use super::OpenError;
-use super::snapshot::SnapshotStore;
-use crate::snapshot_buf::DEFAULT_MAX_SNAPSHOT_BYTES;
-use crate::{Applied, CONN_SEQ_BITS, NodeId, Op, Request, SnapshotBuf, TypeConfig, owner_of};
+use super::snapshot::{HEADER_LEN, SnapshotStore};
+use crate::snapshot_file::DEFAULT_MAX_SNAPSHOT_BYTES;
+use crate::{Applied, CONN_SEQ_BITS, NodeId, Op, Request, SnapshotFile, TypeConfig, owner_of};
 
 type Sid = LogId<NodeId>;
 type SResult<T> = Result<T, StorageError<NodeId>>;
@@ -118,7 +121,10 @@ pub(crate) struct SmMeta {
     pub(crate) highest_local: BTreeMap<NodeId, u64>,
 }
 
-/// Snapshot data as transferred between nodes.
+/// Snapshot data as transferred between nodes. Written from
+/// [`SnapshotPayloadRef`] and read field by field (`restore_from`); the
+/// owned form is what tests build and inspect.
+#[cfg(test)]
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct SnapshotPayload {
     pub(crate) version: u32,
@@ -126,9 +132,20 @@ pub(crate) struct SnapshotPayload {
     pub(crate) engine: EngineState,
 }
 
+/// [`SnapshotPayload`] borrowed from the live state: encodes to the same
+/// bytes (postcard structs are their fields in order, and
+/// `EngineStateView` encodes as `EngineState`).
+#[derive(Serialize)]
+struct SnapshotPayloadRef<'a> {
+    version: u32,
+    meta: &'a SmMeta,
+    engine: EngineStateView<'a>,
+}
+
 /// Bumped whenever the encoding of `EngineState` or `SmMeta` changes
 /// (postcard is positional, so old and new layouts do not decode as each
-/// other). 2: P4-T3 buried / reservation maps.
+/// other). 2: P4-T3 buried / reservation maps. (P4-T5c streams the same
+/// encoding to and from files; the version did not change.)
 pub(crate) const PAYLOAD_VERSION: u32 = 2;
 
 /// Every engine of this state machine builds replies only for its own
@@ -224,30 +241,230 @@ fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-/// Decode a snapshot payload and rebuild the engine, checking that the
-/// metadata agrees with the engine state and that the snapshot's engine
+/// Bytes beyond `-z` a single decoded item (job body, tube name) may take:
+/// the decoder's scratch buffer is bounded by `-z` plus this.
+const DECODE_MARGIN: usize = 64 << 10;
+
+/// A postcard input flavor over a buffered reader (P4-T5c: payloads are
+/// decoded from the file, not from a copy in memory). Byte strings are
+/// copied through a scratch buffer of at most `limit` bytes, so a hostile
+/// length cannot allocate more; borrowing from the input is not supported
+/// (nothing in the payload borrows: `Bytes` and `String` take owned
+/// copies). The first I/O error is kept, as postcard only reports
+/// "unexpected end".
+struct ReadFlavor<R> {
+    r: R,
+    scratch: Vec<u8>,
+    limit: usize,
+    consumed: u64,
+    err: Option<io::Error>,
+}
+
+impl<R: BufRead> ReadFlavor<R> {
+    fn fill(&mut self, n: usize) -> postcard::Result<()> {
+        if n > self.limit {
+            self.err.get_or_insert_with(|| {
+                invalid(format!(
+                    "snapshot item of {n} bytes exceeds the limit of {}",
+                    self.limit
+                ))
+            });
+            return Err(postcard::Error::DeserializeUnexpectedEnd);
+        }
+        if self.scratch.len() < n {
+            self.scratch.resize(n, 0);
+        }
+        match self.r.read_exact(&mut self.scratch[..n]) {
+            Ok(()) => {
+                self.consumed += n as u64;
+                Ok(())
+            }
+            Err(e) => {
+                self.err.get_or_insert(e);
+                Err(postcard::Error::DeserializeUnexpectedEnd)
+            }
+        }
+    }
+}
+
+impl<'de, R: BufRead + 'de> postcard::de_flavors::Flavor<'de> for ReadFlavor<R> {
+    type Remainder = Self;
+    type Source = ();
+
+    fn pop(&mut self) -> postcard::Result<u8> {
+        self.fill(1)?;
+        Ok(self.scratch[0])
+    }
+
+    fn try_take_n(&mut self, _ct: usize) -> postcard::Result<&'de [u8]> {
+        self.err
+            .get_or_insert_with(|| invalid("snapshot payload: borrowed data is not supported"));
+        Err(postcard::Error::DeserializeUnexpectedEnd)
+    }
+
+    fn try_take_n_temp<'a>(&'a mut self, ct: usize) -> postcard::Result<&'a [u8]>
+    where
+        'de: 'a,
+    {
+        self.fill(ct)?;
+        Ok(&self.scratch[..ct])
+    }
+
+    fn finalize(self) -> postcard::Result<Self> {
+        Ok(self)
+    }
+}
+
+/// Lets the snapshot payload be checksummed in the same pass that decodes
+/// it, instead of a second read of a file that can be GiB.
+struct CrcReader<R> {
+    r: R,
+    crc: u32,
+}
+
+impl<R: Read> Read for CrcReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.r.read(buf)?;
+        self.crc = crc32c::crc32c_append(self.crc, &buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Counts and checksums what is written through it, keeping the first
+/// error (postcard reports any as "buffer full").
+struct CrcWriter<W> {
+    w: W,
+    crc: u32,
+    len: u64,
+    err: Option<io::Error>,
+}
+
+impl<W: Write> Write for CrcWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.w.write(buf) {
+            Ok(n) => {
+                self.crc = crc32c::crc32c_append(self.crc, &buf[..n]);
+                self.len += n as u64;
+                Ok(n)
+            }
+            Err(e) => {
+                let copy = io::Error::new(e.kind(), e.to_string());
+                self.err.get_or_insert(e);
+                Err(copy)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
+}
+
+/// Encode the payload of `engine` and `meta` into `f` at its position;
+/// returns the payload's length and CRC-32C.
+fn write_payload(f: &File, meta: &SmMeta, engine: &Engine) -> io::Result<(u64, u32)> {
+    let w = CrcWriter {
+        w: f,
+        crc: 0,
+        len: 0,
+        err: None,
+    };
+    let payload = SnapshotPayloadRef {
+        version: PAYLOAD_VERSION,
+        meta,
+        engine: engine.state_view(),
+    };
+    let mut bw = BufWriter::with_capacity(1 << 16, w);
+    let res = postcard::to_io(&payload, &mut bw).map(|_| ());
+    let flushed = bw.flush();
+    let w = bw.into_inner().map_err(|e| e.into_error())?;
+    if let Some(e) = w.err {
+        return Err(e);
+    }
+    res.map_err(|e| invalid(format!("encode snapshot: {e}")))?;
+    flushed?;
+    Ok((w.len, w.crc))
+}
+
+/// Decode the payload of `len` bytes that `r` is positioned at and
+/// rebuild the engine (see [`check_restored`]); returns it with the
+/// payload's CRC-32C, continued from `crc_seed`. The payload must be
+/// exactly `len` bytes. Peak memory is the restored state plus one
+/// pointer per job and the scratch buffer (`-z` plus a margin).
+fn restore_from(
+    r: impl Read,
+    len: u64,
+    crc_seed: u32,
+    cfg: &EngineConfig,
+    sys: &SysFactory,
+    node: NodeId,
+) -> io::Result<(Engine, SmMeta, u32)> {
+    let reader = BufReader::with_capacity(
+        1 << 16,
+        CrcReader {
+            r: r.take(len),
+            crc: crc_seed,
+        },
+    );
+    let flavor = ReadFlavor {
+        r: reader,
+        scratch: Vec::new(),
+        limit: cfg.max_job_size as usize + DECODE_MARGIN,
+        consumed: 0,
+        err: None,
+    };
+    let mut de = postcard::Deserializer::from_flavor(flavor);
+    let decoded = (|| {
+        // The version is the first field: check it before decoding the
+        // rest, whose layout depends on it.
+        let version = u32::deserialize(&mut de)?;
+        if version != PAYLOAD_VERSION {
+            return Ok(Err(invalid(format!(
+                "unsupported snapshot payload version {version}"
+            ))));
+        }
+        let meta = SmMeta::deserialize(&mut de)?;
+        let state = EngineState::deserialize(&mut de)?;
+        Ok(Ok((meta, state)))
+    })();
+    let mut flavor = de
+        .finalize()
+        .map_err(|e| invalid(format!("snapshot payload: {e}")))?;
+    let (meta, state) = match decoded {
+        Ok(r) => r?,
+        Err(e) => {
+            let e: postcard::Error = e;
+            return Err(flavor
+                .err
+                .take()
+                .unwrap_or_else(|| invalid(format!("snapshot payload: {e}"))));
+        }
+    };
+    if flavor.consumed != len {
+        return Err(invalid(format!(
+            "snapshot payload has {} bytes after its end",
+            len - flavor.consumed
+        )));
+    }
+    let crc = flavor.r.into_inner().crc;
+    let (engine, meta) = check_restored(state, meta, cfg, sys, node)?;
+    Ok((engine, meta, crc))
+}
+
+/// Rebuild the engine from a decoded payload, checking that the metadata
+/// agrees with the engine state and that the snapshot's engine
 /// configuration agrees with the local one (`cfg`): the snapshot must not
 /// change this node's `-z` (the engine answers `JOB_TOO_BIG` by it, so a
 /// difference would make nodes diverge), and it must not turn the journal
 /// on (cluster mode has no binlog).
-fn restore(
-    payload: &[u8],
+fn check_restored(
+    state: EngineState,
+    meta: SmMeta,
     cfg: &EngineConfig,
     sys: &SysFactory,
     node: NodeId,
 ) -> io::Result<(Engine, SmMeta)> {
-    // The version is the first field: check it before decoding the rest,
-    // whose layout depends on it.
-    let (version, _) = postcard::take_from_bytes::<u32>(payload)
-        .map_err(|e| invalid(format!("snapshot payload: {e}")))?;
-    if version != PAYLOAD_VERSION {
-        return Err(invalid(format!(
-            "unsupported snapshot payload version {version}"
-        )));
-    }
-    let p: SnapshotPayload =
-        postcard::from_bytes(payload).map_err(|e| invalid(format!("snapshot payload: {e}")))?;
-    let mut engine = Engine::import_state(p.engine, sys()).map_err(|e| invalid(e.to_string()))?;
+    let mut engine = Engine::import_state(state, sys()).map_err(|e| invalid(e.to_string()))?;
     engine.set_local_conns(Some(local_conns(node)));
     let theirs = engine.config();
     if theirs.max_job_size != cfg.max_job_size {
@@ -261,32 +478,43 @@ fn restore(
         return Err(invalid("snapshot engine has the journal enabled"));
     }
     let conns = engine.conn_ids();
-    if !conns.iter().copied().eq(p.meta.next_seq.keys().copied()) {
+    if !conns.iter().copied().eq(meta.next_seq.keys().copied()) {
         return Err(invalid(
             "snapshot connection metadata does not match the engine connections",
         ));
     }
-    for (&c, &seq) in &p.meta.next_seq {
-        let highest = p.meta.highest_local.get(&owner_of(c)).copied();
+    for (&c, &seq) in &meta.next_seq {
+        let highest = meta.highest_local.get(&owner_of(c)).copied();
         if seq < 2 || highest.is_none_or(|h| local_of(c) > h) {
             return Err(invalid(format!(
                 "snapshot connection {c} has inconsistent metadata"
             )));
         }
     }
-    if !p.meta.started && !conns.is_empty() {
+    if !meta.started && !conns.is_empty() {
         return Err(invalid("snapshot has connections but no started engine"));
     }
-    Ok((engine, p.meta))
+    Ok((engine, meta))
 }
 
-fn encode_payload(engine: EngineState, meta: SmMeta) -> io::Result<Vec<u8>> {
-    postcard::to_allocvec(&SnapshotPayload {
-        version: PAYLOAD_VERSION,
-        meta,
-        engine,
-    })
-    .map_err(|e| invalid(format!("encode snapshot: {e}")))
+/// The checksum comes out of the decode pass for free; it also guards a
+/// file that changed after `SnapshotStore::open` verified it.
+fn restore_current(
+    snaps: &SnapshotStore,
+    cfg: &EngineConfig,
+    sys: &SysFactory,
+    node: NodeId,
+) -> io::Result<Option<(super::snapshot::Meta, Engine, SmMeta)>> {
+    let Some((meta, mut f, layout)) = snaps.open_current()? else {
+        return Ok(None);
+    };
+    f.seek(SeekFrom::Start(layout.payload_off))?;
+    let (engine, sm_meta, crc) =
+        restore_from(&mut f, layout.payload_len, layout.crc_seed, cfg, sys, node)?;
+    if !layout.crc_matches(crc) {
+        return Err(invalid("snapshot checksum mismatch"));
+    }
+    Ok(Some((meta, engine, sm_meta)))
 }
 
 /// openraft state machine (see the module docs). Also the snapshot builder.
@@ -312,19 +540,22 @@ impl ClusterStateMachine {
         let snaps = SnapshotStore::open(dir)?;
         let mut cfg = opts.engine;
         cfg.journal = false;
-        let core = match snaps.load_current()? {
-            Some((meta, payload)) => {
-                let (engine, sm_meta) =
-                    restore(&payload, &cfg, &opts.sys, opts.node_id).map_err(|e| {
-                        OpenError::Corrupt(format!("snapshot {}: {e}", meta.snapshot_id))
-                    })?;
-                Core {
-                    engine,
-                    meta: sm_meta,
-                    last_applied: meta.last_log_id,
-                    membership: meta.last_membership,
+        let restored = restore_current(&snaps, &cfg, &opts.sys, opts.node_id).map_err(|e| {
+            let id = snaps.current_meta().map(|m| m.snapshot_id.clone());
+            match e.kind() {
+                io::ErrorKind::InvalidData => {
+                    OpenError::Corrupt(format!("snapshot {}: {e}", id.unwrap_or_default()))
                 }
+                _ => OpenError::Io(e),
             }
+        })?;
+        let core = match restored {
+            Some((meta, engine, sm_meta)) => Core {
+                engine,
+                meta: sm_meta,
+                last_applied: meta.last_log_id,
+                membership: meta.last_membership,
+            },
             None => Core {
                 engine: new_engine(0, cfg.clone(), (opts.sys)(), opts.node_id),
                 meta: SmMeta::default(),
@@ -563,18 +794,29 @@ impl StateHandle {
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for ClusterStateMachine {
+    /// Encodes the state straight into a temporary file in the snapshot
+    /// directory while holding the state lock (docs/DESIGN.md §8,
+    /// "Streamed snapshots"); syncing and renaming happen after it is
+    /// released.
     async fn build_snapshot(&mut self) -> SResult<Snapshot<TypeConfig>> {
-        let (state, sm_meta, last_applied, membership) = {
+        let started = Instant::now();
+        let (mut f, temp) = self
+            .snaps()?
+            .temp_file()
+            .map_err(|e| snap_err(None, ErrorVerb::Write, e))?;
+        let (encoded, last_applied, membership, locked) = {
             let c = self.shared.lock()?;
+            let locked = Instant::now();
+            let encoded = write_payload(&f, &c.meta, &c.engine);
             (
-                c.engine.export_state(),
-                c.meta.clone(),
+                encoded,
                 c.last_applied,
                 c.membership.clone(),
+                locked.elapsed(),
             )
         };
-        let payload =
-            encode_payload(state, sm_meta).map_err(|e| snap_err(None, ErrorVerb::Write, e))?;
+        let (payload_len, payload_crc) =
+            encoded.map_err(|e| snap_err(None, ErrorVerb::Write, e))?;
         let mut snaps = self.snaps()?;
         let last = last_applied.map_or_else(|| "none".to_string(), |l| l.to_string());
         let meta = SnapshotMeta {
@@ -582,12 +824,32 @@ impl RaftSnapshotBuilder<TypeConfig> for ClusterStateMachine {
             last_membership: membership,
             snapshot_id: snaps.new_id(&last),
         };
-        snaps
-            .save(&meta, &payload, false)
-            .map_err(|e| snap_err(Some(&meta), ErrorVerb::Write, e))?;
+        let werr = |e| snap_err(Some(&meta), ErrorVerb::Write, e);
+        // A reader of the file as written, also when the build is dropped
+        // for being older than the current snapshot (openraft only reads
+        // the meta of a built snapshot).
+        let reader = File::open(temp.path()).map_err(werr)?;
+        let stored = snaps
+            .commit(&mut f, temp, &meta, payload_len, payload_crc, false)
+            .map_err(werr)?;
+        drop(snaps);
+        tracing::info!(
+            "built snapshot {} ({payload_len} bytes){}: state locked for {:.1} ms, {:.1} ms in all",
+            meta.snapshot_id,
+            if stored {
+                ""
+            } else {
+                ", older than the current one, dropped"
+            },
+            locked.as_secs_f64() * 1e3,
+            started.elapsed().as_secs_f64() * 1e3
+        );
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(SnapshotBuf::from_vec(payload)),
+            snapshot: Box::new(
+                SnapshotFile::reader(reader, HEADER_LEN, payload_len, None)
+                    .map_err(|e| snap_err(None, ErrorVerb::Read, e))?,
+            ),
         })
     }
 }
@@ -637,26 +899,56 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> SResult<Box<SnapshotBuf>> {
-        Ok(Box::new(SnapshotBuf::receiver(self.max_snapshot_bytes)))
+    async fn begin_receiving_snapshot(&mut self) -> SResult<Box<SnapshotFile>> {
+        let (f, temp) = self
+            .snaps()?
+            .temp_file()
+            .map_err(|e| snap_err(None, ErrorVerb::Write, e))?;
+        Ok(Box::new(SnapshotFile::receiver(
+            f,
+            temp,
+            HEADER_LEN,
+            self.max_snapshot_bytes,
+        )))
     }
 
+    /// Decodes and validates the received file before it becomes the
+    /// current snapshot; a rejected one is removed with its temporary file.
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<NodeId, BasicNode>,
-        snapshot: Box<SnapshotBuf>,
+        snapshot: Box<SnapshotFile>,
     ) -> SResult<()> {
-        let payload = snapshot.into_inner();
-        let (engine, sm_meta) = restore(
-            &payload,
+        let rerr = |e| snap_err(Some(meta), ErrorVerb::Read, e);
+        let werr = |e| snap_err(Some(meta), ErrorVerb::Write, e);
+        let mut p = snapshot.into_payload().await.map_err(rerr)?;
+        let (mut file, temp) = match p.temp.take() {
+            Some(temp) => (p.file, temp),
+            // A complete snapshot, not a received one (only openraft's
+            // storage test suite does this): store a copy.
+            None => {
+                let (mut f, temp) = self.snaps()?.temp_file().map_err(werr)?;
+                p.file.seek(SeekFrom::Start(p.base)).map_err(rerr)?;
+                let n = io::copy(&mut (&p.file).take(p.len), &mut f).map_err(werr)?;
+                if n != p.len {
+                    return Err(rerr(invalid("snapshot file is shorter than its payload")));
+                }
+                (f, temp)
+            }
+        };
+        file.seek(SeekFrom::Start(HEADER_LEN)).map_err(rerr)?;
+        let (engine, sm_meta, crc) = restore_from(
+            &mut file,
+            p.len,
+            0,
             &self.shared.cfg,
             &self.shared.sys,
             self.shared.node_id,
         )
-        .map_err(|e| snap_err(Some(meta), ErrorVerb::Read, e))?;
+        .map_err(rerr)?;
         self.snaps()?
-            .save(meta, &payload, true)
-            .map_err(|e| snap_err(Some(meta), ErrorVerb::Write, e))?;
+            .commit(&mut file, temp, meta, p.len, crc, true)
+            .map_err(werr)?;
         let node = self.shared.node_id;
         let (events, info) = {
             let mut c = self.shared.lock()?;
@@ -685,13 +977,21 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
 
     async fn get_current_snapshot(&mut self) -> SResult<Option<Snapshot<TypeConfig>>> {
         let snaps = self.snaps()?;
-        match snaps.load_current() {
-            Ok(None) => Ok(None),
-            Ok(Some((meta, payload))) => Ok(Some(Snapshot {
-                meta,
-                snapshot: Box::new(SnapshotBuf::from_vec(payload)),
-            })),
-            Err(e) => Err(snap_err(snaps.current_meta(), ErrorVerb::Read, e)),
-        }
+        let opened = snaps.open_current().and_then(|c| {
+            c.map(|(meta, f, layout)| {
+                SnapshotFile::reader(
+                    f,
+                    layout.payload_off,
+                    layout.payload_len,
+                    Some(layout.check()),
+                )
+                .map(|data| Snapshot {
+                    meta,
+                    snapshot: Box::new(data),
+                })
+            })
+            .transpose()
+        });
+        opened.map_err(|e| snap_err(snaps.current_meta(), ErrorVerb::Read, e))
     }
 }

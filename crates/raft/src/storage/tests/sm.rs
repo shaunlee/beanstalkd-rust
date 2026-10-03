@@ -839,14 +839,15 @@ fn snapshot_install_continue_equals_uninterrupted() {
     let k = 260;
     let mut a = node(2);
     apply_batched(&mut a.sm, 1, &reqs[..k], &[5]);
-    let snap = block_on(a.sm.get_snapshot_builder())
+    let mut snap = block_on(a.sm.get_snapshot_builder())
         .build_snapshot()
         .pipe(block_on)
         .unwrap();
     assert_eq!(snap.meta.last_log_id, Some(lid(1, k as u64)));
-    let cur = block_on(a.sm.get_current_snapshot()).unwrap().unwrap();
+    let mut cur = block_on(a.sm.get_current_snapshot()).unwrap().unwrap();
     assert_eq!(cur.meta, snap.meta);
-    assert_eq!(cur.snapshot.as_slice(), snap.snapshot.as_slice());
+    let bytes = payload(&mut snap);
+    assert_eq!(payload(&mut cur), bytes);
 
     // Reference node that never snapshots.
     let mut c = node(2);
@@ -861,8 +862,7 @@ fn snapshot_install_continue_equals_uninterrupted() {
 
     // Fresh node installs.
     let mut b = node(2);
-    let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
-    *rx = crate::SnapshotBuf::from_vec(snap.snapshot.as_slice().to_vec());
+    let rx = receive(&mut b.sm, &bytes);
     block_on(b.sm.install_snapshot(&snap.meta, rx)).unwrap();
     assert_eq!(state_bytes(&b.sm), state_bytes(&a.sm));
     assert_eq!(
@@ -908,8 +908,7 @@ fn snapshot_install_continue_equals_uninterrupted() {
     );
     assert_eq!(state_bytes(&re), {
         let mut fresh = node(2);
-        let mut rx = block_on(fresh.sm.begin_receiving_snapshot()).unwrap();
-        *rx = crate::SnapshotBuf::from_vec(snap.snapshot.as_slice().to_vec());
+        let rx = receive(&mut fresh.sm, &bytes);
         block_on(fresh.sm.install_snapshot(&snap.meta, rx)).unwrap();
         state_bytes(&fresh.sm)
     });
@@ -919,6 +918,24 @@ fn snapshot_install_continue_equals_uninterrupted() {
     apply_batched(&mut re, k as u64 + 1, &reqs[k..], &[64]);
     assert_eq!(state_bytes(&re), sc);
     assert_eq!(re.handle().meta(), meta_a);
+}
+
+/// The payload of a snapshot.
+fn payload(s: &mut openraft::Snapshot<TypeConfig>) -> Vec<u8> {
+    block_on(s.snapshot.read_all()).unwrap()
+}
+
+/// A receiver that got `bytes` as chunks.
+fn receive(sm: &mut ClusterStateMachine, bytes: &[u8]) -> Box<crate::SnapshotFile> {
+    use tokio::io::AsyncWriteExt;
+    let mut rx = block_on(sm.begin_receiving_snapshot()).unwrap();
+    block_on(async {
+        for c in bytes.chunks(4096) {
+            rx.write_all(c).await.unwrap();
+        }
+        rx.shutdown().await.unwrap();
+    });
+    rx
 }
 
 trait Pipe: Sized {
@@ -1026,15 +1043,14 @@ fn install_rejects_invalid_snapshots() {
     let reqs = workload(300, 11);
     let mut a = node(1);
     apply(&mut a.sm, entries(1, &reqs));
-    let snap = build(&mut a.sm).unwrap();
-    let good = snap.snapshot.as_slice().to_vec();
+    let mut snap = build(&mut a.sm).unwrap();
+    let good = payload(&mut snap);
 
     let mut b = node(1);
     apply(&mut b.sm, entries(1, &reqs[..10]));
     let before = state_bytes(&b.sm);
     let install = |b: &mut Node, bytes: Vec<u8>| {
-        let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
-        *rx = crate::SnapshotBuf::from_vec(bytes);
+        let rx = receive(&mut b.sm, &bytes);
         block_on(b.sm.install_snapshot(&snap.meta, rx))
     };
 
@@ -1206,8 +1222,7 @@ fn snapshot_engine_config_must_match_the_local_one() {
             meta: crate::storage::state_machine::SmMeta::default(),
             engine: engine.export_state(),
         };
-        let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
-        *rx = crate::SnapshotBuf::from_vec(postcard::to_allocvec(&p).unwrap());
+        let rx = receive(&mut b.sm, &postcard::to_allocvec(&p).unwrap());
         let meta = openraft::SnapshotMeta {
             last_log_id: Some(lid(1, 5)),
             last_membership: StoredMembership::default(),
@@ -1249,4 +1264,217 @@ fn received_snapshot_is_bounded() {
     block_on(rx.write_all(&[7; 16])).expect("up to the maximum");
     assert!(block_on(rx.write_all(&[7])).is_err());
     assert_eq!(rx.len(), 16);
+}
+
+/// The payload of the current `.snap` file in `dir`.
+fn stored_payload(dir: &Path) -> Vec<u8> {
+    let name = snap_files(dir)
+        .into_iter()
+        .rfind(|n| n.ends_with(".snap"))
+        .unwrap();
+    crate::storage::snapshot::read_payload(&dir.join(name)).unwrap()
+}
+
+/// P4-T5c: a snapshot encoded from the live state (streamed to the file)
+/// is byte-identical to the owned `SnapshotPayload` encoding used before,
+/// on every node fed the same entries, and in the stored file of the
+/// node that installs it.
+#[test]
+fn streamed_payloads_are_byte_identical() {
+    let reqs = workload(400, 21);
+    let mut ns: Vec<Node> = (1..=3).map(node).collect();
+    let mut payloads = Vec::new();
+    for (i, n) in ns.iter_mut().enumerate() {
+        apply_batched(&mut n.sm, 1, &reqs, &[1 + i, 5]);
+        let mut snap = build(&mut n.sm).unwrap();
+        let p = payload(&mut snap);
+        assert_eq!(stored_payload(n._dir.path()), p);
+        let owned = SnapshotPayload {
+            version: crate::storage::state_machine::PAYLOAD_VERSION,
+            meta: n.sm.handle().meta(),
+            engine: n.sm.handle().export_state().unwrap(),
+        };
+        assert_eq!(postcard::to_allocvec(&owned).unwrap(), p);
+        payloads.push((snap.meta, p));
+    }
+    assert!(payloads.iter().all(|(_, p)| *p == payloads[0].1));
+
+    let mut b = node(2);
+    let rx = receive(&mut b.sm, &payloads[0].1);
+    block_on(b.sm.install_snapshot(&payloads[0].0, rx)).unwrap();
+    assert_eq!(stored_payload(b._dir.path()), payloads[0].1);
+    assert_eq!(state_bytes(&b.sm), state_bytes(&ns[0].sm));
+    let mut cur = block_on(b.sm.get_current_snapshot()).unwrap().unwrap();
+    assert_eq!(payload(&mut cur), payloads[0].1);
+}
+
+/// A receive that is abandoned (dropped, as when openraft replaces the
+/// stream with another snapshot id) or fails (a gap, past the maximum, an
+/// invalid payload) leaves no file behind once dropped and the current
+/// snapshot untouched.
+#[test]
+fn abandoned_or_rejected_receives_leave_no_garbage() {
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+    let reqs = workload(300, 8);
+    let mut a = node(1);
+    apply(&mut a.sm, entries(1, &reqs));
+    let mut snap = build(&mut a.sm).unwrap();
+    let good = payload(&mut snap);
+
+    let mut b = node(1);
+    let dir = b._dir.path().to_path_buf();
+    apply(&mut b.sm, entries(1, &reqs[..50]));
+    let first = build(&mut b.sm).unwrap().meta;
+    let files = snap_files(&dir);
+    let current = stored_payload(&dir);
+    let unchanged = |b: &mut Node| {
+        assert_eq!(snap_files(&dir), files);
+        assert_eq!(stored_payload(&dir), current);
+        assert_eq!(
+            block_on(b.sm.get_current_snapshot()).unwrap().unwrap().meta,
+            first
+        );
+    };
+
+    // Dropped half way (the leader went away, or a new stream began).
+    let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
+    block_on(rx.write_all(&good[..good.len() / 2])).unwrap();
+    assert!(snap_files(&dir).iter().any(|n| n.ends_with(".tmp")));
+    drop(rx);
+    unchanged(&mut b);
+
+    // A chunk past the end (a gap) and one past the maximum.
+    let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
+    block_on(rx.write_all(&good[..100])).unwrap();
+    assert!(block_on(rx.seek(std::io::SeekFrom::Start(101))).is_err());
+    drop(rx);
+    b.sm.set_max_snapshot_bytes(64);
+    let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
+    assert!(block_on(rx.write_all(&good[..65])).is_err());
+    drop(rx);
+    b.sm.set_max_snapshot_bytes(crate::snapshot_file::DEFAULT_MAX_SNAPSHOT_BYTES);
+    unchanged(&mut b);
+
+    // Complete but invalid: install fails and removes it.
+    let rx = receive(&mut b.sm, &good[..good.len() - 1]);
+    assert!(block_on(b.sm.install_snapshot(&snap.meta, rx)).is_err());
+    let mut bad = good.clone();
+    bad.push(0);
+    let rx = receive(&mut b.sm, &bad);
+    let e = block_on(b.sm.install_snapshot(&snap.meta, rx)).expect_err("trailing byte");
+    assert!(e.to_string().contains("after its end"), "{e}");
+    unchanged(&mut b);
+
+    // A retransmitted chunk and a restart from 0 still install.
+    let mut rx = block_on(b.sm.begin_receiving_snapshot()).unwrap();
+    block_on(async {
+        rx.write_all(&[9; 300]).await.unwrap();
+        rx.seek(std::io::SeekFrom::Start(0)).await.unwrap();
+        rx.write_all(&good[..200]).await.unwrap();
+        rx.seek(std::io::SeekFrom::Start(100)).await.unwrap();
+        rx.write_all(&good[100..]).await.unwrap();
+        rx.shutdown().await.unwrap();
+    });
+    block_on(b.sm.install_snapshot(&snap.meta, rx)).unwrap();
+    assert_eq!(state_bytes(&b.sm), state_bytes(&a.sm));
+    assert_eq!(stored_payload(&dir), good);
+    assert_eq!(snap_files(&dir).len(), 1, "{:?}", snap_files(&dir));
+}
+
+/// A process that dies while receiving leaves a temporary file; reopening
+/// removes it and keeps the current snapshot.
+#[test]
+fn restart_mid_receive() {
+    use tokio::io::AsyncWriteExt;
+    let reqs = workload(200, 4);
+    let mut a = node(1);
+    let dir = a._dir.path().to_path_buf();
+    apply(&mut a.sm, entries(1, &reqs[..120]));
+    let first = build(&mut a.sm).unwrap().meta;
+    apply(&mut a.sm, entries(121, &reqs[120..]));
+    let mut rx = block_on(a.sm.begin_receiving_snapshot()).unwrap();
+    block_on(rx.write_all(&[1; 5000])).unwrap();
+    block_on(rx.flush()).unwrap();
+    // No destructor runs in a crash.
+    std::mem::forget(rx);
+    drop(a.sm);
+    assert!(snap_files(&dir).iter().any(|n| n.ends_with(".tmp")));
+
+    let sink = Arc::new(RecSink::default());
+    let mut sm = open_sm(&dir, 1, sink);
+    assert!(snap_files(&dir).iter().all(|n| n.ends_with(".snap")));
+    assert_eq!(
+        block_on(sm.get_current_snapshot()).unwrap().unwrap().meta,
+        first
+    );
+    apply(&mut sm, entries(121, &reqs[120..]));
+    let mut fresh = node(1);
+    apply(&mut fresh.sm, entries(1, &reqs));
+    assert_eq!(state_bytes(&sm), state_bytes(&fresh.sm));
+}
+
+/// A snapshot file written before P4-T5c (file version 1: meta before
+/// payload) is still read, and the next snapshot is written as version 2.
+#[test]
+fn version_1_snapshot_files_are_read() {
+    let reqs = workload(300, 13);
+    let mut a = node(1);
+    apply(&mut a.sm, entries(1, &reqs[..200]));
+    let mut snap = build(&mut a.sm).unwrap();
+    let p = payload(&mut snap);
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path()).unwrap();
+    let v1 = dir.path().join(format!("{:020}.snap", 7));
+    crate::storage::snapshot::write_v1(&v1, &snap.meta, &p).unwrap();
+    let sink = Arc::new(RecSink::default());
+    let mut sm = open_sm(dir.path(), 1, sink.clone());
+    assert_eq!(state_bytes(&sm), state_bytes(&a.sm));
+    let mut cur = block_on(sm.get_current_snapshot()).unwrap().unwrap();
+    assert_eq!(cur.meta, snap.meta);
+    assert_eq!(payload(&mut cur), p);
+
+    // A damaged version 1 file refuses to open.
+    drop(sm);
+    let mut bytes = std::fs::read(&v1).unwrap();
+    let n = bytes.len();
+    bytes[n - 3] ^= 4;
+    std::fs::write(&v1, &bytes).unwrap();
+    assert!(matches!(
+        ClusterStateMachine::open(dir.path(), sm_opts(1, Arc::new(RecSink::default()))),
+        Err(crate::storage::OpenError::Corrupt(_))
+    ));
+    bytes[n - 3] ^= 4;
+    std::fs::write(&v1, &bytes).unwrap();
+
+    let mut sm = open_sm(dir.path(), 1, sink);
+    apply(&mut sm, entries(201, &reqs[200..]));
+    build(&mut sm).unwrap();
+    let files = snap_files(dir.path());
+    assert_eq!(files, vec![format!("{:020}.snap", 8)]);
+    let head = std::fs::read(dir.path().join(&files[0])).unwrap();
+    assert_eq!(&head[8..12], &2u32.to_le_bytes());
+}
+
+/// A current snapshot damaged after it was opened fails the read that
+/// completes it, so it does not reach a follower.
+#[test]
+fn a_damaged_snapshot_is_not_sent() {
+    use std::os::unix::fs::FileExt;
+    let mut a = node(1);
+    let dir = a._dir.path().to_path_buf();
+    apply(&mut a.sm, entries(1, &workload(100, 2)));
+    build(&mut a.sm).unwrap();
+    let name = snap_files(&dir).pop().unwrap();
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(dir.join(&name))
+        .unwrap();
+    let mut b = [0u8; 1];
+    f.read_exact_at(&mut b, 40).unwrap();
+    f.write_all_at(&[b[0] ^ 1], 40).unwrap();
+    let mut cur = block_on(a.sm.get_current_snapshot()).unwrap().unwrap();
+    let e = block_on(cur.snapshot.read_all()).expect_err("damaged");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
 }

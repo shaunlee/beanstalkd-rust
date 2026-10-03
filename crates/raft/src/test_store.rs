@@ -2,7 +2,7 @@
 //! tests (test code only; the real storage is `crate::storage`, P3-T2).
 //! The state machine records every applied `Request` in order.
 
-use crate::SnapshotBuf;
+use crate::SnapshotFile;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::RangeBounds;
@@ -151,10 +151,12 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSm {
                 d.snapshots_built
             ),
         };
-        d.snapshot = Some((meta.clone(), data.clone()));
+        let file = SnapshotFile::from_bytes(&data)
+            .map_err(|e| StorageIOError::write_snapshot(None, &e))?;
+        d.snapshot = Some((meta.clone(), data));
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(SnapshotBuf::from_vec(data)),
+            snapshot: Box::new(file),
         })
     }
 }
@@ -200,18 +202,23 @@ impl RaftStateMachine<TypeConfig> for MemSm {
         self.clone()
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> Result<Box<SnapshotBuf>, StorageError<NodeId>> {
-        Ok(Box::new(SnapshotBuf::receiver(
-            crate::snapshot_buf::DEFAULT_MAX_SNAPSHOT_BYTES,
-        )))
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> Result<Box<SnapshotFile>, StorageError<NodeId>> {
+        SnapshotFile::temp_receiver(crate::snapshot_file::DEFAULT_MAX_SNAPSHOT_BYTES)
+            .map(Box::new)
+            .map_err(|e| StorageIOError::write_snapshot(None, &e).into())
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<NodeId, openraft::BasicNode>,
-        snapshot: Box<SnapshotBuf>,
+        mut snapshot: Box<SnapshotFile>,
     ) -> Result<(), StorageError<NodeId>> {
-        let data = snapshot.into_inner();
+        let data = snapshot
+            .read_all()
+            .await
+            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         let applied: Vec<Request> = postcard::from_bytes(&data)
             .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         let mut d = lock(&self.inner);
@@ -225,9 +232,14 @@ impl RaftStateMachine<TypeConfig> for MemSm {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        Ok(lock(&self.inner).snapshot.as_ref().map(|(m, d)| Snapshot {
-            meta: m.clone(),
-            snapshot: Box::new(SnapshotBuf::from_vec(d.clone())),
+        let Some((meta, d)) = lock(&self.inner).snapshot.clone() else {
+            return Ok(None);
+        };
+        let file =
+            SnapshotFile::from_bytes(&d).map_err(|e| StorageIOError::read_snapshot(None, &e))?;
+        Ok(Some(Snapshot {
+            meta,
+            snapshot: Box::new(file),
         }))
     }
 }

@@ -260,8 +260,12 @@ pub struct EngineState {
     pub(crate) draining: bool,
 
     pub(crate) next_job_id: bstk_proto::JobId,
-    /// Sorted by id (strictly ascending).
-    pub(crate) jobs: Vec<model::JobRec>,
+    /// Sorted by id (strictly ascending). Boxed as in `Engine`, so
+    /// `import_state` moves each record instead of copying it, and a
+    /// decoded state holds no second copy of the job table (serde encodes
+    /// a `Box` as its contents, so the bytes are those of the records).
+    #[allow(clippy::vec_box)]
+    pub(crate) jobs: Vec<Box<model::JobRec>>,
     /// Next key for `TubeState::buried` / `ConnState::reserved`.
     pub(crate) next_list_seq: u64,
 
@@ -278,6 +282,72 @@ pub struct EngineState {
     pub(crate) delay_heads: std::collections::BTreeSet<(Nanos, model::TubeId)>,
     pub(crate) pauses: std::collections::BTreeSet<(Nanos, model::TubeId)>,
     pub(crate) dispatchable: std::collections::BTreeSet<model::TubeId>,
+
+    pub(crate) ready_ct: u64,
+    pub(crate) urgent_ct: u64,
+    pub(crate) reserved_ct: u64,
+    pub(crate) buried_ct: u64,
+    pub(crate) delayed_ct: u64,
+    pub(crate) waiting_ct: u64,
+    pub(crate) total_jobs_ct: u64,
+    pub(crate) timeout_ct: u64,
+
+    pub(crate) cur_conns: u32,
+    pub(crate) tot_conns: u32,
+    pub(crate) cur_producers: u32,
+    pub(crate) cur_workers: u32,
+
+    pub(crate) cmd_put: u64,
+    pub(crate) cmd_peek: u64,
+    pub(crate) cmd_peek_ready: u64,
+    pub(crate) cmd_peek_delayed: u64,
+    pub(crate) cmd_peek_buried: u64,
+    pub(crate) cmd_reserve: u64,
+    pub(crate) cmd_reserve_with_timeout: u64,
+    pub(crate) cmd_delete: u64,
+    pub(crate) cmd_release: u64,
+    pub(crate) cmd_use: u64,
+    pub(crate) cmd_watch: u64,
+    pub(crate) cmd_ignore: u64,
+    pub(crate) cmd_bury: u64,
+    pub(crate) cmd_kick: u64,
+    pub(crate) cmd_touch: u64,
+    pub(crate) cmd_stats: u64,
+    pub(crate) cmd_stats_job: u64,
+    pub(crate) cmd_stats_tube: u64,
+    pub(crate) cmd_list_tubes: u64,
+    pub(crate) cmd_list_tube_used: u64,
+    pub(crate) cmd_list_tubes_watched: u64,
+    pub(crate) cmd_pause_tube: u64,
+
+    pub(crate) binlog: BinlogStats,
+}
+
+/// A borrowed view of the engine state that serializes to exactly the
+/// bytes of `Engine::export_state` (P4-T5c streamed snapshots, docs/DESIGN.md
+/// §8): the state machine encodes snapshots from it, so no copy of the
+/// state is made. Opaque; produced by `Engine::state_view`.
+#[derive(Debug, serde::Serialize)]
+pub struct EngineStateView<'a> {
+    pub(crate) cfg: &'a EngineConfig,
+    pub(crate) start: Nanos,
+    pub(crate) draining: bool,
+
+    pub(crate) next_job_id: bstk_proto::JobId,
+    pub(crate) jobs: Vec<&'a model::JobRec>,
+    pub(crate) next_list_seq: u64,
+
+    pub(crate) tubes: &'a [Option<model::TubeState>],
+    pub(crate) free_tube_ids: &'a [model::TubeId],
+    pub(crate) tube_ids: Vec<(&'a bstk_proto::TubeName, model::TubeId)>,
+    pub(crate) tube_order: &'a ms::Ms<model::TubeId>,
+
+    pub(crate) conns: Vec<(ConnId, &'a model::ConnState)>,
+
+    pub(crate) conn_ticks: &'a std::collections::BTreeSet<(Nanos, ConnId)>,
+    pub(crate) delay_heads: &'a std::collections::BTreeSet<(Nanos, model::TubeId)>,
+    pub(crate) pauses: &'a std::collections::BTreeSet<(Nanos, model::TubeId)>,
+    pub(crate) dispatchable: &'a std::collections::BTreeSet<model::TubeId>,
 
     pub(crate) ready_ct: u64,
     pub(crate) urgent_ct: u64,
@@ -393,6 +463,8 @@ impl std::error::Error for StateError {}
 ///     pub fn config(&self) -> &EngineConfig;
 ///     /// P3: full state for a snapshot; no side effects.
 ///     pub fn export_state(&self) -> EngineState;
+///     /// P4-T5c: the same state, borrowed; serializes to the same bytes.
+///     pub fn state_view(&self) -> EngineStateView<'_>;
 ///     /// P3: rebuild from a snapshot, validating every invariant
 ///     /// (indexes, counters, references); never panics on bad input.
 ///     pub fn import_state(state: EngineState, sys: Box<dyn SysInfo>) -> Result<Engine, StateError>;

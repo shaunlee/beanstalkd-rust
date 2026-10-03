@@ -2,7 +2,8 @@
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`). The newest numbers
-are from task P4-T5b (cluster wake-ups at low load), first below, then
+are from task P4-T5c (snapshot memory), first below, then P4-T5b
+(cluster wake-ups at low load), then
 P4-T4 (footprint: memory per job, binlog bytes per operation). P4-T2 (tokio worker-thread count and its
 default, the lever the P4-T1 spike found for CPU efficiency) follows,
 then P3-FD (Raft cluster mode after batched proposals and group commit,
@@ -10,6 +11,111 @@ and the standalone regression check), then P2-T5 (TLS / mTLS), then
 P1-T5 (write-ahead log, `-b`), then the T6b section (engine performance
 fix); the T6 first pass, whose profile motivated T6b, is kept at the
 end.
+
+## P4-T5c: snapshot memory
+
+### Summary
+
+- **Target** (docs/PLAN.md §7.5): snapshot peak memory at most 1.5x the
+  state size. *State size* here is the postcard payload of the snapshot
+  (the `payload_len` field of the `.snap` header): the bytes a leader
+  streams to a follower. *Extra* is a node's peak physical footprint
+  during the operation minus its settled footprint holding the same
+  state before it.
+- **Result**: every phase now needs one pointer per job plus a few MiB
+  of buffers, 0.04–0.17x the state size; before, 1–5x. Lock hold time of
+  a build is about unchanged (it was `export_state`'s copy, now it is the
+  encode into the page cache), shorter for small jobs, slightly longer for
+  the mixed state; see docs/DESIGN.md §8 "Streamed snapshots (P4-T5c)".
+- **Retention**: with the default macOS allocator, a node kept about
+  500 MiB more after its first build of a 145 MiB payload (freed large
+  blocks stay dirty in malloc's cache); now 1–9 MiB.
+
+### Results (P4-T5c)
+
+3 nodes on loopback, `MallocLargeCache=0` (see Method), 2 runs per row,
+both runs shown (min–max). MiB of physical footprint.
+
+Mixed state: 1,000,000 jobs × 16 B + 100,000 × 1 KiB in `default`;
+payload 145.5 MiB, live footprint of the state 355.7–356.0 MiB.
+
+| phase | before (HEAD 6671480) | after | before / after vs payload |
+|---|---:|---:|---:|
+| (a) build, extra on each node | 327.3–327.4 | 8.5 | 2.25x / 0.06x |
+| (b) send to a wiped follower, extra on the leader | 151.4–151.6 | 6.0–6.1 | 1.04x / 0.04x |
+| (c) receive + install on the wiped follower, peak over the state | 289.2–289.3 | 6.3–6.5 | 1.99x / 0.04x |
+| (d) restart from its own snapshot, peak over the state | 286.3–286.4 | 6.2–6.3 | 1.97x / 0.04x |
+| build: state lock held (ms, max of 3 nodes) | 160–212 | 197–289 | |
+| build: total (ms) | 274–488 | 197–290 | |
+| (c) wiped node start to caught up (s) | 1.42–1.78 | 1.15–1.43 | |
+| (d) restart to ready (s) | 1.03–1.23 | 0.72–0.83 | |
+| retained after the build, default allocator | 499–501 | 1.0–8.5 | |
+
+Small jobs only: 2,000,000 jobs × 16 B; payload 89.6 MiB, live footprint
+475.8–476.0 MiB (the engine holds about 5.3x the payload).
+
+| phase | before | after | before / after vs payload |
+|---|---:|---:|---:|
+| (a) build | 452.2–452.5 | 15.4 | 5.05x / 0.17x |
+| (b) send | 95.8 | 5.8–6.1 | 1.07x / 0.07x |
+| (c) install | 347.5–347.7 | 13.4 | 3.88x / 0.15x |
+| (d) restart | 347.5–347.6 | 13.5–13.6 | 3.88x / 0.15x |
+| build: state lock held (ms) | 487–504 | 304–361 | |
+| build: total (ms) | 723–746 | 304–362 | |
+
+Where it went before: (a) `export_state` (a copy of every job record,
+bodies shared), the payload `Vec` grown by doubling, and a second copy
+of it for the file; (b) the whole file read into memory per send; (c)
+the received buffer, the decoded `EngineState` whose job vector was
+copied into the job table, and the file copy; (d) the file read twice
+(once to verify), then the same decode. After: (a) a vector of
+references to sort the jobs (8 B per job: 8.5 MiB for 1.1 M jobs, 15.4
+for 2 M); (b) openraft's 3 MiB chunk plus tokio's file buffer; (c), (d)
+a vector of boxed records (8 B per job) and the decoder's buffers.
+
+Lock times are from a log line each node writes per build (for "before",
+a scratch copy of HEAD with the same line added around
+`export_state`); all three nodes build at the same moment on one host,
+so they compete for CPU. In isolation (one process, the mixed state, 3
+runs): `export_state` 115–187 ms; `state_view` encoded straight to a
+file 138–175 ms; `state_view` encoded into a `Vec` 114–131 ms.
+
+### Method and commands (P4-T5c)
+
+`bench/snapshot_mem.py` (new): per run, a fresh 3-node cluster
+(`snapshot_every` above the load, info logging), the jobs put through the
+leader over 32 connections, then every node restarted with
+`snapshot_every` 2,000 entries above its log, so each phase starts from a
+settled process holding only the state. (a) single `use` commands until
+every node has a snapshot; (b)+(c) kill -9 a follower, delete its data
+directory, restart it (it rejoins; the leader's log is purged below the
+snapshot, so it gets the snapshot); (d) kill -9 the other follower and
+restart it. A thread samples `ri_phys_footprint` (`proc_pid_rusage`,
+which counts compressed pages, unlike `ps`) of each node every 3 ms;
+for the restarted processes the kernel's lifetime maximum is used too.
+
+`MallocLargeCache=0` in the nodes' environment turns off macOS malloc's
+cache of freed large blocks; with the cache, the first operation's
+leftovers hide the next operation's peak (for HEAD: the 500 MiB kept
+after the build absorbed the 145 MiB file read of the send, which then
+showed as +3 to +7 MiB). `--large-cache` keeps the default, used for the
+"retained" row.
+
+```sh
+cargo build --release -p bstk-server   # HEAD copied aside first
+python3 bench/snapshot_mem.py --bin $BIN --scratch $DIR --reps 2
+python3 bench/snapshot_mem.py --bin $BIN --scratch $DIR --reps 2 --large-cache
+python3 bench/snapshot_mem.py --bin $BIN --scratch $DIR --reps 1 --small 2000000 --large 0
+```
+
+### Environment (P4-T5c)
+
+Same machine and toolchain as P4-T5b (Apple M6, 12 cores, 34 GiB,
+macOS 27.0, rustc 1.98.1, release with `debug = 1`), openraft 0.9.25,
+plaintext cluster traffic on loopback, data directories under
+`/private/tmp` (APFS). An OrbStack VM of another user was running
+throughout; footprint numbers repeated within 0.1 MiB across runs except
+the default-allocator rows.
 
 ## P4-T5b: cluster wake-ups at low load
 

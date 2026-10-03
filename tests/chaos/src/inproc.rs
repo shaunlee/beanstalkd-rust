@@ -355,14 +355,14 @@ impl RaftStateMachine<TypeConfig> for RecSm {
         self.inner.get_snapshot_builder().await
     }
 
-    async fn begin_receiving_snapshot(&mut self) -> SResult<Box<bstk_raft::SnapshotBuf>> {
+    async fn begin_receiving_snapshot(&mut self) -> SResult<Box<bstk_raft::SnapshotFile>> {
         self.inner.begin_receiving_snapshot().await
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<NodeId, BasicNode>,
-        snapshot: Box<bstk_raft::SnapshotBuf>,
+        snapshot: Box<bstk_raft::SnapshotFile>,
     ) -> SResult<()> {
         self.inner.install_snapshot(meta, snapshot).await?;
         let mut l = lock(&self.ledger);

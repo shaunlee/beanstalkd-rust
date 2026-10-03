@@ -21,8 +21,9 @@
 //! AppendEntries entries ([`MAX_APPEND_ENTRIES`]), forward items
 //! ([`MAX_FORWARD_ITEMS`]), the items of an `Op::Batch` in a log entry or
 //! a control request ([`MAX_BATCH_ITEMS`]), and the node sets of memberships
-//! ([`MAX_MEMBERS`], [`MAX_JOINT_CONFIGS`]). A request beyond a limit is a
-//! decode error, which closes the connection. A status probe and its
+//! ([`MAX_MEMBERS`], [`MAX_JOINT_CONFIGS`]); the text a snapshot's meta
+//! carries is limited too ([`MAX_SNAPSHOT_ID_LEN`], [`MAX_NODE_ADDR_LEN`]).
+//! A request beyond a limit is a decode error, which closes the connection. A status probe and its
 //! answer ([`RpcRequest::Status`], [`RpcResponse::Status`]) have a fixed
 //! size (no collections), so they need no bound of their own.
 
@@ -81,6 +82,17 @@ pub const MAX_MEMBERS: usize = 256;
 
 /// Most configs in one (joint) membership; openraft uses at most two.
 pub const MAX_JOINT_CONFIGS: usize = 4;
+
+/// Longest snapshot id accepted from a peer, in bytes. The meta of an
+/// installed snapshot is stored with it and must stay below the store's
+/// limit for reading a snapshot file back (`MAX_META_LEN`); ours are
+/// `<last log id>-<seq>`.
+pub const MAX_SNAPSHOT_ID_LEN: usize = 256;
+
+/// Longest node address accepted from a peer in a membership, in bytes
+/// (also bounds the meta of a snapshot: [`MAX_MEMBERS`] of them stay below
+/// the store's `MAX_META_LEN`).
+pub const MAX_NODE_ADDR_LEN: usize = 1024;
 
 /// First frame on a connection, from the dialer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +295,7 @@ mod bounded {
 
     use super::{
         MAX_APPEND_ENTRIES, MAX_BATCH_ITEMS, MAX_FORWARD_ITEMS, MAX_JOINT_CONFIGS, MAX_MEMBERS,
+        MAX_NODE_ADDR_LEN, MAX_SNAPSHOT_ID_LEN,
     };
     use crate::forward::ControlRequest;
     use crate::{ForwardRequest, NodeId, Op, Request, TypeConfig};
@@ -356,6 +369,45 @@ mod bounded {
             }
             Ok(m)
         }
+    }
+
+    /// A string of at most `max` bytes.
+    struct StrVisitor {
+        max: usize,
+    }
+
+    impl Visitor<'_> for StrVisitor {
+        type Value = String;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "a string of at most {} bytes", self.max)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<String, E> {
+            if v.len() > self.max {
+                return Err(de::Error::invalid_length(v.len(), &self));
+            }
+            Ok(v.to_owned())
+        }
+    }
+
+    fn snapshot_id<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        d.deserialize_str(StrVisitor {
+            max: MAX_SNAPSHOT_ID_LEN,
+        })
+    }
+
+    /// Mirror of `BasicNode`.
+    #[derive(Deserialize)]
+    struct NodeWire {
+        #[serde(deserialize_with = "node_addr")]
+        addr: String,
+    }
+
+    fn node_addr<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        d.deserialize_str(StrVisitor {
+            max: MAX_NODE_ADDR_LEN,
+        })
     }
 
     fn entries<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<EntryWire>, D::Error> {
@@ -436,10 +488,13 @@ mod bounded {
     }
 
     fn nodes<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<NodeId, BasicNode>, D::Error> {
-        d.deserialize_map(MapVisitor {
+        let m: BTreeMap<NodeId, NodeWire> = d.deserialize_map(MapVisitor {
             max: MAX_MEMBERS,
             _kv: PhantomData,
-        })
+        })?;
+        Ok(m.into_iter()
+            .map(|(id, n)| (id, BasicNode::new(n.addr)))
+            .collect())
     }
 
     #[derive(Deserialize)]
@@ -513,6 +568,7 @@ mod bounded {
     struct MetaWire {
         last_log_id: Option<LogId<NodeId>>,
         last_membership: StoredWire,
+        #[serde(deserialize_with = "snapshot_id")]
         snapshot_id: String,
     }
 
@@ -1109,6 +1165,64 @@ mod tests {
         );
         assert!(matches!(
             decode_msg(&snap(MAX_MEMBERS as u64 + 1)),
+            Err(FrameError::Decode(_))
+        ));
+    }
+
+    /// The text in a snapshot's meta and in memberships is bounded, so a
+    /// peer cannot make a follower store a meta its own store refuses to
+    /// read back.
+    #[test]
+    fn decoding_bounds_meta_text() {
+        let snap = |id: usize, addr: usize| ClientMsg::Request {
+            id: 3,
+            body: RpcRequest::InstallSnapshot(InstallSnapshotRequest {
+                vote: Vote::new_committed(3, 1),
+                meta: SnapshotMeta {
+                    last_log_id: Some(LogId::new(CommittedLeaderId::new(3, 1), 9)),
+                    last_membership: openraft::StoredMembership::new(
+                        Some(LogId::new(CommittedLeaderId::new(3, 1), 1)),
+                        openraft::Membership::new(
+                            vec![[1].into()],
+                            std::collections::BTreeMap::from([(
+                                1,
+                                openraft::BasicNode::new("a".repeat(addr)),
+                            )]),
+                        ),
+                    ),
+                    snapshot_id: "i".repeat(id),
+                },
+                offset: 0,
+                data: vec![],
+                done: false,
+            }),
+        };
+        let ok = snap(MAX_SNAPSHOT_ID_LEN, MAX_NODE_ADDR_LEN);
+        assert_eq!(
+            format!("{:?}", decode_msg(&ok).expect("at the limits")),
+            format!("{ok:?}")
+        );
+        assert!(matches!(
+            decode_msg(&snap(MAX_SNAPSHOT_ID_LEN + 1, 1)),
+            Err(FrameError::Decode(_))
+        ));
+        assert!(matches!(
+            decode_msg(&snap(1, MAX_NODE_ADDR_LEN + 1)),
+            Err(FrameError::Decode(_))
+        ));
+        // The same address limit holds for a membership entry.
+        let long = Entry {
+            log_id: LogId::new(CommittedLeaderId::new(3, 1), 1),
+            payload: EntryPayload::Membership(openraft::Membership::new(
+                vec![[1].into()],
+                std::collections::BTreeMap::from([(
+                    1,
+                    openraft::BasicNode::new("a".repeat(MAX_NODE_ADDR_LEN + 1)),
+                )]),
+            )),
+        };
+        assert!(matches!(
+            decode_msg(&append_with(vec![long])),
             Err(FrameError::Decode(_))
         ));
     }
