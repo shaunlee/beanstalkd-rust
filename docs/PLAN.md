@@ -201,7 +201,10 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 | P1 | Write-ahead log; see §4 | see §4.5 |
 | P2 | Operability; see §5 | see §5.5 |
 | P3 | Raft replication; see §6 (done) | see §6.6 |
-| P4 | Performance; see §7 | see §7.5 |
+| P4 | Performance; see §7 (done) | see §7.5 |
+| P5 | Production readiness: Linux validation, CI, packaging, operations guide, hardening; see §8 | see §8.5 |
+| P6 | Dynamic cluster membership (add, remove, replace a node online) | planned when P5 is accepted |
+| later | openraft 0.10 (cluster CPU targets of §7.5), once it leaves alpha | — |
 
 ## 4. P1: Write-Ahead Log (detailed plan)
 
@@ -453,3 +456,55 @@ Only one agent at a time edits the server's wiring (T4); T1–T3 work in separat
 - [ ] Cluster: CPU per operation at 100 connections ≤ 15 µs (was 20); one-connection CPU per operation at least halved; snapshot peak memory ≤ 1.5x the state size — **partly met**: snapshot peak 0.04–0.17x (P4-T5c); CPU per operation 17.4–17.8 µs (P3 measured 24–26 on the same loaded machine) and one connection 0.55–0.77x of P3: not met, cause and next step in BENCH P4-T6
 - [x] All differential suites, chaos acceptance (≥ 1,000 in-process seeds, ≥ 100 multi-process runs) and smoke tests green
 - [x] `docs/BENCH.md`, `docs/DESIGN.md` updated
+
+## 8. P5: Production Readiness (detailed plan)
+
+### 8.1 Scope
+
+- **Linux is the deployment target, but P0–P4 were measured on macOS.** Validate correctness and performance on Linux (x86_64 and aarch64), including behavior that differs by OS: epoll vs kqueue (`QuietTcp`, P4-T5b), `fdatasync` and directory sync, file locking of the binlog and data directories, `SO_REUSEADDR`, signal handling.
+- **Continuous integration** on every push: the quality gate, the differential suites against the reference built in CI, and a chaos sample; a scheduled longer chaos run.
+- **Packaging**: release binaries, a container image, a systemd unit, example configurations for standalone, `-b`, TLS and cluster.
+- **Operations guide**: install, configure, TLS and tokens, cluster bootstrap, node loss and replacement (wipe and rejoin), backup and restore, upgrades, monitoring and alerts, known limitations.
+- **Hardening**: dependency audit, fuzzing of every decoder that reads untrusted bytes, resource limits under hostile clients.
+- **Out of scope**: dynamic membership (P6), openraft 0.10, new protocol features. No client-visible behavior change unless a Linux-only bug forces one.
+
+### 8.2 Facts checked before planning
+
+- No CI exists (`.github/` absent); the repository is public, so GitHub Actions runners are free.
+- Linux runs so far: P4-T5b/T5c ran `bstk-raft`, `bstk-server` and chaos tests in a `rust:1.98.1-slim` aarch64 container; the differential suites and benchmarks never ran on Linux.
+- openraft 0.10 is still alpha (`0.10.0-alpha.36`); P4's cluster CPU targets wait for it.
+- Release artifacts, container image and service files do not exist; `README.md` documents only a build-and-run line.
+
+### 8.3 Design decisions
+
+1. **CI layout** (GitHub Actions; third-party actions pinned by commit SHA; toolchain via `dtolnay/rust-toolchain` at 1.98, which is also the MSRV): `check` job (fmt, clippy `-D warnings`, build, tests) on `ubuntu-latest` (x86_64), `ubuntu-24.04-arm` (aarch64) and `macos-latest`; the reference beanstalkd is built by `scripts/build-ref.sh` and cached by the reference commit (`25085c5`) and the hash of `scripts/build-ref.sh`; a chaos job with 200 in-process seeds and 5 multi-process runs per push; a scheduled weekly job with 1,000 seeds and 50 multi-process runs (`timeout-minutes` sized for a 2-core runner); `cargo deny` as a separate job so audit failures do not mask test results. Timing-sensitive tests must not flake on shared runners: any test that does gets its timing fixed, not retried blindly (the port-race retry in `tests/common/p2.rs` is harness setup, not a test retry).
+2. **Release workflow** builds `beanstalkd-rs` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (and musl static builds if they pass the suite) and `aarch64-apple-darwin` on a `v*` tag, with checksums. Creating a tag and publishing a release is the user's decision; P5 only prepares the workflow and verifies it with a dry run (workflow_dispatch without publishing).
+3. **Container image**: multi-stage `Dockerfile`, minimal runtime image, non-root user, `/data` volume, healthcheck on `/healthz` when HTTP is enabled; built and smoke-tested locally and in CI, not pushed to any registry.
+4. **systemd unit**: `Type=notify` only if cheap to support, otherwise `simple`; hardening (`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths` for the data directory, `LimitNOFILE`); `SIGTERM` graceful shutdown as already implemented.
+5. **Fuzzing** with `cargo-fuzz` (nightly, outside the workspace gate) for the client protocol decoder (`bstk-proto`), the binlog record reader (`bstk-store`), the cluster wire decoder and snapshot decoder (`bstk-raft`); each target runs for a fixed budget locally and on the weekly CI job; crashes become regression tests.
+6. **Dependency audit** with `cargo deny` (advisories, licenses, duplicate versions) in CI.
+
+### 8.4 Tasks (sequential: one subagent at a time; the lead picks each subagent's model)
+
+Order: T1, T3, T4, T5, T6, T2, T7.
+
+
+| ID | Task | Owner |
+|---|---|---|
+| P5-T1 | Linux validation in an aarch64 container (native on this machine; x86_64 under Rosetta would test the emulator, so x86_64 is validated by P5-T3's native runners): full `scripts/check.sh` including the differential suites with the reference built in the container, chaos acceptance sample, smoke tests; fix any Linux-only failure | subagent |
+| P5-T2 | Linux benchmarks (run last: the most load-sensitive task): standalone, `-b`, TLS and cluster matrix vs the reference inside a Linux container on this machine, ratios only (the container host is the shared VM; absolute Linux figures need real hardware); per-mode thread defaults; `QuietTcp` epoll vs kqueue A/B against plain `TcpStream` (P4-T5b predicted a smaller gain on Linux) | subagent |
+| P5-T3 | CI: `check`, differential, chaos and `cargo deny` jobs per §8.3; fix flaky tests found on runners | subagent |
+| P5-T4 | Packaging: release workflow (dry run only), `Dockerfile` (needs only `bstk-server`, not `.ref/`), systemd unit, example configurations, workspace version aligned with the `v*` tag scheme, user-facing `CHANGELOG.md` seeded from DESIGN §10 | subagent |
+| P5-T5 | Operations guide `docs/OPERATIONS.md` and a README rewrite (install, quick start, links) | subagent |
+| P5-T6 | Hardening: fuzz targets for the four untrusted-bytes surfaces (`bstk-proto` decoder, `bstk-store` record reader, `bstk-raft` wire bounded deserializers, snapshot payload decoder) with a fixed budget; resource-limit tests (many idle connections, slow readers, oversized lines and bodies, auth floods) on Linux, adding only what P2's security work does not already cover | subagent |
+| P5-T7 | P5 acceptance | lead |
+
+### 8.5 Acceptance
+
+- [ ] `scripts/check.sh`, all differential suites, chaos (≥ 1,000 in-process seeds, ≥ 50 multi-process runs) and smoke tests green on Linux aarch64 (container) and x86_64 (CI runners)
+- [ ] Linux benchmark ratios recorded in `docs/BENCH.md`; the P4 standalone ratios (efficiency ≥ 0.8x, throughput ≥ 1.0x the reference at 10 and 100 connections) hold on Linux, or the gap is explained
+- [ ] CI green on main for every job, with no retried tests, over at least 5 consecutive pushes
+- [ ] Release workflow dry run produces binaries and checksums for every target; the container image passes the smoke tests; the systemd unit passes `systemd-analyze verify` and starts and stops a server cleanly under systemd (a privileged systemd container)
+- [ ] `docs/OPERATIONS.md` covers every item in §8.1; every command in it was run
+- [ ] Each fuzz target ran its budget without an open crash; `cargo deny` clean or each exception justified
+- [ ] No client-visible behavior change (differential suites unchanged)
