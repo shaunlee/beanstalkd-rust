@@ -1,0 +1,26 @@
+# Replay places a tube at its first full record even if that job was deleted later: job 2 creates a before job 3 creates b, and deleting job 2 does not free a (job 4 holds it), so the list is default, b, a before the restart and default, a, b after it.
+!binlog
+@a send "use b\r\n"
+@a recv
+@b send "put 0 0 60 1\r\n1\r\n"
+@b recv
+@c send "use a\r\n"
+@c recv
+@c send "put 0 0 60 1\r\n2\r\n"
+@c recv
+@a send "put 0 0 60 1\r\n3\r\n"
+@a recv
+@c send "put 0 0 60 1\r\n4\r\n"
+@c recv
+@a send "delete 2\r\n"
+@a recv
+@a send "list-tubes\r\n"
+@a recv
+crash
+@a send "list-tubes\r\n"
+@a recv
+restart
+@a send "list-tubes\r\n"
+@a recv
+@a send "stats-tube a\r\n"
+@a recv

@@ -926,7 +926,7 @@ fn recover_next_id_and_counters() {
 fn journal_replay_round_trip_matches_reference_restart() {
     // Mirrors a scenario run against the reference with `-b`, killed with
     // SIGKILL and restarted on the same directory. Expected values are the
-    // reference's, except `list-tubes` (see below).
+    // reference's.
     let t0 = 1_000 * SEC;
     let mut e = engine(t0, true);
     e.connect(t0, 1);
@@ -1084,6 +1084,31 @@ fn journal_replay_round_trip_matches_reference_restart() {
 }
 
 #[test]
+fn deleted_jobs_put_still_places_its_tube_after_replay() {
+    // Live `list-tubes` is [default, b, a] (conn 1's `use b` came first),
+    // but replay creates `a` at job 2's put, before job 3 creates `b`.
+    // Deleting job 2 does not free `a` (job 4 holds it), so the reference
+    // restarts with [default, a, b] (docs/COMPAT.md Binlog item 4; compat
+    // case binlog_list_tubes_order_keeps_deleted_jobs_slot).
+    let t0 = SEC;
+    let mut e = engine(t0, true);
+    for c in 0..3 {
+        e.connect(t0, c);
+    }
+    cmd(&mut e, t0, 0, Command::Use(tube("b")));
+    assert_eq!(put(&mut e, t0, 1, 0, 0, 1, "x"), 1);
+    cmd(&mut e, t0, 2, Command::Use(tube("a")));
+    assert_eq!(put(&mut e, t0, 2, 0, 0, 1, "x"), 2);
+    assert_eq!(put(&mut e, t0, 0, 0, 0, 1, "x"), 3);
+    assert_eq!(put(&mut e, t0, 2, 0, 0, 1, "x"), 4);
+    cmd(&mut e, t0, 0, Command::Delete(2));
+    assert_eq!(names(&e), vec!["default", "b", "a"]);
+
+    let r = recover(t0, true, replay(&journal(&mut e)));
+    assert_eq!(names(&r), vec!["default", "a", "b"]);
+}
+
+#[test]
 fn reserved_at_crash_reverts_to_last_journaled_state() {
     // Reference-confirmed: a job reserved when the server dies comes back
     // in the state of its last record, with that record's counters.
@@ -1214,6 +1239,14 @@ fn run_restart(steps: Vec<(crate::oracle_tests::Msg, bool)>, restart: Restart) {
     let mut p = Pair::new(true);
     let mut persisted: HashMap<JobId, Persisted> = HashMap::new();
     let mut seq = 0usize;
+    // The reference's replay tube list, kept from the harness's own entries:
+    // a job's full record appends its tube if absent (`tube_find_or_make`),
+    // and a delete that frees a tube's last job swap-removes it (`job_free`
+    // -> `tube_dref` -> `ms_remove`, file.c `readrec`). A deleted job's tube
+    // therefore keeps the slot it took at the job's put if another job
+    // still holds it.
+    let mut replay_tubes: Vec<TubeName> = Vec::new();
+    let mut replay_refs: HashMap<TubeName, usize> = HashMap::new();
     let mut max_put_id: JobId = 0;
     let mut journal_all: Vec<JournalEntry> = Vec::new();
     let mut before = snapshot(&p.new);
@@ -1230,6 +1263,13 @@ fn run_restart(steps: Vec<(crate::oracle_tests::Msg, bool)>, restart: Restart) {
             match entry {
                 JournalEntry::Put { record, tube, body } => {
                     max_put_id = max_put_id.max(record.id);
+                    if tube.as_str() != "default" {
+                        let refs = replay_refs.entry(tube.clone()).or_default();
+                        if *refs == 0 {
+                            replay_tubes.push(tube.clone());
+                        }
+                        *refs += 1;
+                    }
                     persisted.insert(
                         record.id,
                         Persisted {
@@ -1245,7 +1285,14 @@ fn run_restart(steps: Vec<(crate::oracle_tests::Msg, bool)>, restart: Restart) {
                     persisted.get_mut(&r.id).unwrap().record = r.clone();
                 }
                 JournalEntry::Delete(id) => {
-                    persisted.remove(id);
+                    let gone = persisted.remove(id).unwrap();
+                    if let Some(refs) = replay_refs.get_mut(&gone.tube) {
+                        *refs -= 1;
+                        if *refs == 0 {
+                            let pos = replay_tubes.iter().position(|t| *t == gone.tube).unwrap();
+                            replay_tubes.swap_remove(pos);
+                        }
+                    }
                 }
             }
         }
@@ -1300,6 +1347,7 @@ fn run_restart(steps: Vec<(crate::oracle_tests::Msg, bool)>, restart: Restart) {
     crate::engine::proptests::check_invariants(&r);
 
     let mut tubes: Vec<TubeName> = vec![TubeName::default_tube()];
+    tubes.extend(replay_tubes);
     let mut want_jobs: HashMap<JobId, StatsJob> = HashMap::new();
     let mut tube_counts: HashMap<TubeName, [u64; 4]> = HashMap::new(); // urgent, ready, delayed, buried
     let mut buried: HashMap<TubeName, Vec<JobId>> = HashMap::new();
@@ -1307,9 +1355,12 @@ fn run_restart(steps: Vec<(crate::oracle_tests::Msg, bool)>, restart: Restart) {
     let mut next_delay: Option<Nanos> = None;
     for pj in &order {
         let rd = &pj.record;
-        if !tubes.contains(&pj.tube) {
-            tubes.push(pj.tube.clone());
-        }
+        assert!(
+            tubes.contains(&pj.tube),
+            "live job {} in tube {}",
+            rd.id,
+            pj.tube
+        );
         let counts = tube_counts.entry(pj.tube.clone()).or_default();
         let (state, time_left, buries) = match rd.state {
             RecordState::Buried => {
@@ -1404,8 +1455,17 @@ fn run_restart(steps: Vec<(crate::oracle_tests::Msg, bool)>, restart: Restart) {
     assert_eq!(put(&mut r, now2, 1, 1, 0, 1, "n"), max_put_id + 1);
 }
 
+/// An explicit `cases` overrides proptest's own `PROPTEST_CASES` handling,
+/// so honor the variable here for long local runs.
+fn restart_cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_500)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 1_500, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: restart_cases(), ..ProptestConfig::default() })]
 
     #[test]
     fn journal_replay_recovers_expected_state(

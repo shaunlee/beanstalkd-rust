@@ -874,9 +874,10 @@ impl Engine {
     /// reserved state never appears in a record (in the reference only
     /// compaction writes one, and `readrec` maps it to ready).
     ///
-    /// While replaying, the reference also creates the tube of a deleted job and
-    /// destroys it again, which can reorder `list-tubes`; `Recovery` carries only
-    /// live jobs, so that is not reproduced.
+    /// `Recovery::tube_order` is the reference's `tubes` order after replaying
+    /// every record, deleted jobs included (file.c `readrec`: a full record
+    /// calls `tube_find_or_make`; a delete record's `job_free` drops the tube
+    /// ref and `tube_free` swap-removes it once unreferenced).
     pub fn recover(
         now: Nanos,
         cfg: EngineConfig,
