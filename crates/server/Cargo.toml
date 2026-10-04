@@ -44,5 +44,12 @@ serde_json = "1"
 tempfile = "3.27.0"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 
+[features]
+# Test-only membership changes for the integration tests (P6-T1,
+# `cluster::test_hooks`): never enabled in a shipped build, and reachable
+# only through a command file in the data directory, not the wire, HTTP or
+# the command line. `scripts/check.sh` runs the membership tests with it.
+test-hooks = []
+
 [lints]
 workspace = true

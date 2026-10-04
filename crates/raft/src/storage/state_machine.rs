@@ -16,7 +16,10 @@
 //! - `Op::Tick` and `Op::SetDraining` map to engine inputs; `Op::DropNode {
 //!   node, up_to_local }` disconnects `node`'s connections with a local number
 //!   `<= up_to_local`, in ascending order.
-//! - Blank and membership entries only update the metadata.
+//! - Blank and membership entries only update the metadata; a membership
+//!   entry also raises [`StateHandle::highest_member`] to its highest node id
+//!   (voters and learners), so ids are never reused (docs/DESIGN.md §8,
+//!   "Membership-driven networking").
 //!
 //! # Reply routing
 //!
@@ -107,6 +110,37 @@ pub(crate) struct SmMeta {
     pub(crate) last_now: Nanos,
     pub(crate) next_seq: BTreeMap<ConnId, u64>,
     pub(crate) highest_local: BTreeMap<NodeId, u64>,
+    /// The highest node id that has ever appeared in an applied membership
+    /// entry (0: none). Since payload version 3; derived from the
+    /// snapshot's membership when an older payload is restored.
+    pub(crate) highest_member: NodeId,
+}
+
+/// [`SmMeta`] as encoded in payload version 2 (postcard is positional, so
+/// the old layout needs its own type).
+#[derive(Deserialize)]
+struct SmMetaV2 {
+    started: bool,
+    last_now: Nanos,
+    next_seq: BTreeMap<ConnId, u64>,
+    highest_local: BTreeMap<NodeId, u64>,
+}
+
+impl SmMetaV2 {
+    fn upgrade(self) -> SmMeta {
+        SmMeta {
+            started: self.started,
+            last_now: self.last_now,
+            next_seq: self.next_seq,
+            highest_local: self.highest_local,
+            highest_member: 0,
+        }
+    }
+}
+
+/// The highest node id of `m` (voters and learners of every config), or 0.
+fn highest_node(m: &openraft::Membership<NodeId, BasicNode>) -> NodeId {
+    m.nodes().map(|(&id, _)| id).max().unwrap_or(0)
 }
 
 /// Snapshot data as transferred between nodes. Written from
@@ -133,8 +167,10 @@ struct SnapshotPayloadRef<'a> {
 /// Bumped whenever the encoding of `EngineState` or `SmMeta` changes
 /// (postcard is positional, so old and new layouts do not decode as each
 /// other). 2: P4-T3 buried / reservation maps. (P4-T5c streams the same
-/// encoding to and from files; the version did not change.)
-pub(crate) const PAYLOAD_VERSION: u32 = 2;
+/// encoding to and from files; the version did not change.) 3: P6-T1
+/// `SmMeta::highest_member`. Version 2 is still read.
+pub(crate) const PAYLOAD_VERSION: u32 = 3;
+const PAYLOAD_VERSION_V2: u32 = 2;
 
 /// Every engine of this state machine builds replies only for its own
 /// node's connections (docs/DESIGN.md §8a).
@@ -376,6 +412,8 @@ fn write_payload(f: &File, meta: &SmMeta, engine: &Engine) -> io::Result<(u64, u
 /// payload's CRC-32C, continued from `crc_seed`. The payload must be
 /// exactly `len` bytes. Peak memory is the restored state plus one
 /// pointer per job and the scratch buffer (`-z` plus a margin).
+/// `membership` is the snapshot's: `highest_member` is at least its
+/// highest node id (the only source for a version 2 payload).
 fn restore_from(
     r: impl Read,
     len: u64,
@@ -383,6 +421,7 @@ fn restore_from(
     cfg: &EngineConfig,
     sys: &SysFactory,
     node: NodeId,
+    membership: &Membership,
 ) -> io::Result<(Engine, SmMeta, u32)> {
     let reader = BufReader::with_capacity(
         1 << 16,
@@ -403,12 +442,15 @@ fn restore_from(
         // The version is the first field: check it before decoding the
         // rest, whose layout depends on it.
         let version = u32::deserialize(&mut de)?;
-        if version != PAYLOAD_VERSION {
-            return Ok(Err(invalid(format!(
-                "unsupported snapshot payload version {version}"
-            ))));
-        }
-        let meta = SmMeta::deserialize(&mut de)?;
+        let meta = match version {
+            PAYLOAD_VERSION => SmMeta::deserialize(&mut de)?,
+            PAYLOAD_VERSION_V2 => SmMetaV2::deserialize(&mut de)?.upgrade(),
+            _ => {
+                return Ok(Err(invalid(format!(
+                    "unsupported snapshot payload version {version}"
+                ))));
+            }
+        };
         let state = EngineState::deserialize(&mut de)?;
         Ok(Ok((meta, state)))
     })();
@@ -432,7 +474,10 @@ fn restore_from(
         )));
     }
     let crc = flavor.r.into_inner().crc;
-    let (engine, meta) = check_restored(state, meta, cfg, sys, node)?;
+    let (engine, mut meta) = check_restored(state, meta, cfg, sys, node)?;
+    meta.highest_member = meta
+        .highest_member
+        .max(highest_node(membership.membership()));
     Ok((engine, meta, crc))
 }
 
@@ -494,8 +539,15 @@ fn restore_current(
         return Ok(None);
     };
     f.seek(SeekFrom::Start(layout.payload_off))?;
-    let (engine, sm_meta, crc) =
-        restore_from(&mut f, layout.payload_len, layout.crc_seed, cfg, sys, node)?;
+    let (engine, sm_meta, crc) = restore_from(
+        &mut f,
+        layout.payload_len,
+        layout.crc_seed,
+        cfg,
+        sys,
+        node,
+        &meta.last_membership,
+    )?;
     if !layout.crc_matches(crc) {
         return Err(invalid("snapshot checksum mismatch"));
     }
@@ -743,6 +795,25 @@ impl StateHandle {
             .and_then(|c| c.meta.next_seq.get(&conn).map(|s| s - 1))
     }
 
+    /// Every node that owns at least one connection in the state, with its
+    /// highest local number so far (cheap: one range lookup per node ever
+    /// seen, not a pass over the connections).
+    pub fn connection_owners(&self) -> BTreeMap<NodeId, u64> {
+        let Some(c) = self.core() else {
+            return BTreeMap::new();
+        };
+        c.meta
+            .highest_local
+            .iter()
+            .filter(|&(&n, _)| {
+                let first = n << CONN_SEQ_BITS;
+                let last = first | ((1 << CONN_SEQ_BITS) - 1);
+                c.meta.next_seq.range(first..=last).next().is_some()
+            })
+            .map(|(&n, &h)| (n, h))
+            .collect()
+    }
+
     /// Highest local connection number of `node` connected so far (0 if
     /// none). A node must number new connections above this.
     pub fn highest_local(&self, node: NodeId) -> u64 {
@@ -753,6 +824,14 @@ impl StateHandle {
 
     pub fn membership(&self) -> Option<Membership> {
         self.core().map(|c| c.membership.clone())
+    }
+
+    /// The highest node id that was ever a member (voter or learner) in an
+    /// applied membership entry, 0 if none. Replicated: the same on every
+    /// node at the same applied index. A removed node's id is at or below
+    /// it, so a guard refusing ids up to it never readmits one.
+    pub fn highest_member(&self) -> NodeId {
+        self.core().map_or(0, |c| c.meta.highest_member)
     }
 
     pub fn export_state(&self) -> Option<EngineState> {
@@ -852,6 +931,7 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
                 let duplicate = match ent.payload {
                     EntryPayload::Blank => false,
                     EntryPayload::Membership(m) => {
+                        c.meta.highest_member = c.meta.highest_member.max(highest_node(&m));
                         c.membership = StoredMembership::new(Some(ent.log_id), m);
                         false
                     }
@@ -916,6 +996,7 @@ impl RaftStateMachine<TypeConfig> for ClusterStateMachine {
             &self.shared.cfg,
             &self.shared.sys,
             self.shared.node_id,
+            &meta.last_membership,
         )
         .map_err(rerr)?;
         self.snaps()?

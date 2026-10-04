@@ -2,11 +2,14 @@
 //!
 //! Per connection: TLS handshake (a client certificate from the cluster CA is
 //! required), then the dialer's hello within `handshake_timeout`. The hello
-//! must name this node as `to`, use this protocol version, and come `from` a
-//! configured peer (with TLS the certificate must also be valid for
-//! `bstk-node-<from>`, [`crate::tls::verify_peer_identity`]); otherwise the
-//! listener answers `Rejected` and closes. No request is read before the hello
-//! is accepted.
+//! must name this node as `to`, use this protocol version, come `from` a node
+//! whose identity the connection proves (with TLS the certificate must be
+//! valid for `bstk-node-<from>`, [`crate::tls::verify_peer_identity`]), and
+//! that node must be allowed ([`PeerAllowlist`]: the effective membership once
+//! the node has one, the config seeds before); otherwise the listener answers
+//! `Rejected` and closes. No request is read before the hello is accepted.
+//! Identity is checked before membership, so only an authenticated node
+//! learns that it is not a member ([`REJECT_NOT_MEMBER`]).
 //!
 //! Requests on one connection are served strictly in order: openraft keeps one
 //! request in flight per replication stream and the other users of a link are
@@ -29,13 +32,13 @@
 //! closed gate.
 //!
 //! Rejections are logged at most about once a second; a rejected hello gets a
-//! generic reason ([`REJECT_HELLO`], [`REJECT_VERSION`],
+//! generic reason ([`REJECT_HELLO`], [`REJECT_NOT_MEMBER`], [`REJECT_VERSION`],
 //! [`REJECT_MAX_JOB_SIZE`]) and the details are only logged locally.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
@@ -108,7 +111,8 @@ pub const VOTE_GATE_CLOSED: &str = "this node does not vote yet";
 #[derive(Clone)]
 pub struct ListenerConfig {
     pub node_id: NodeId,
-    /// Node ids allowed to connect (the configured peers).
+    /// Node ids allowed to connect at first (the config seeds); replaced
+    /// at runtime through [`ClusterListener::allowlist`].
     pub peers: BTreeSet<NodeId>,
     /// Mutual TLS (see [`crate::tls`]); `None` means plaintext, which the
     /// caller must have been configured for explicitly.
@@ -116,7 +120,8 @@ pub struct ListenerConfig {
     pub max_frame: usize,
     /// Inbound connections in the TLS handshake or hello at once.
     pub max_handshakes: usize,
-    /// Of those, from one source IP address.
+    /// Of those, from one source IP address. A floor: an allowlist of `n`
+    /// peers raises it to `2 × n` ([`PeerAllowlist::set`]).
     pub max_handshakes_per_ip: usize,
     /// TLS handshake plus hello.
     pub handshake_timeout: Duration,
@@ -159,6 +164,51 @@ impl ListenerConfig {
 pub struct ClusterListener {
     local_addr: SocketAddr,
     task: Option<JoinHandle<()>>,
+    shared: Arc<Shared>,
+}
+
+/// Replaces the set of nodes a listener accepts (see the module docs).
+/// Cloneable; keeps the listener's bookkeeping alive, not its task.
+#[derive(Clone)]
+pub struct PeerAllowlist {
+    shared: Arc<Shared>,
+}
+
+impl PeerAllowlist {
+    /// From now on only `peers` may connect: hellos from other nodes get
+    /// [`REJECT_NOT_MEMBER`], and the live connection of every node not in
+    /// `peers` is closed. The per-address handshake budget becomes
+    /// `max(configured, 2 × peers)`.
+    pub fn set(&self, peers: BTreeSet<NodeId>) {
+        let sh = &self.shared;
+        let per_ip = sh
+            .cfg
+            .max_handshakes_per_ip
+            .max(peers.len().saturating_mul(2));
+        sh.per_ip_limit.store(per_ip, Ordering::Relaxed);
+        let mut allowed = lock(&sh.allowed);
+        // Under the `allowed` lock, as `register` checks it: a connection
+        // registered concurrently is either refused there or closed here.
+        for (&peer, (_, close)) in lock(&sh.peers).iter() {
+            if !peers.contains(&peer) {
+                tracing::warn!(
+                    peer,
+                    "cluster peer is no longer allowed: closing its connection"
+                );
+                close.notify_one();
+            }
+        }
+        *allowed = peers;
+    }
+
+    pub fn get(&self) -> BTreeSet<NodeId> {
+        lock(&self.shared.allowed).clone()
+    }
+
+    /// The current per-address handshake budget.
+    pub fn handshakes_per_ip(&self) -> usize {
+        self.shared.per_ip_limit.load(Ordering::Relaxed)
+    }
 }
 
 struct Service<H> {
@@ -209,11 +259,22 @@ impl ClusterListener {
     ) -> io::Result<(Self, ServiceSlot<H>)> {
         let local_addr = listener.local_addr()?;
         let slot = Arc::new(OnceLock::new());
-        let task = tokio::spawn(accept_loop(listener, cfg, slot.clone()));
+        let shared = Arc::new(Shared {
+            handshakes: Arc::new(Semaphore::new(cfg.max_handshakes)),
+            per_ip_limit: AtomicUsize::new(cfg.max_handshakes_per_ip),
+            allowed: StdMutex::new(cfg.peers.clone()),
+            cfg,
+            per_ip: StdMutex::new(HashMap::new()),
+            peers: StdMutex::new(HashMap::new()),
+            next_gen: AtomicU64::new(1),
+            rejects: RateLimit::new(),
+        });
+        let task = tokio::spawn(accept_loop(listener, shared.clone(), slot.clone()));
         Ok((
             ClusterListener {
                 local_addr,
                 task: Some(task),
+                shared,
             },
             ServiceSlot { slot },
         ))
@@ -221,6 +282,13 @@ impl ClusterListener {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// The handle that replaces the set of nodes this listener accepts.
+    pub fn allowlist(&self) -> PeerAllowlist {
+        PeerAllowlist {
+            shared: self.shared.clone(),
+        }
     }
 
     pub async fn shutdown(mut self) {
@@ -239,9 +307,13 @@ impl Drop for ClusterListener {
     }
 }
 
-/// Generic reason sent for a rejected hello (wrong target, unknown peer,
-/// certificate not valid for the claimed id).
+/// Generic reason sent for a rejected hello (wrong target, certificate not
+/// valid for the claimed id).
 pub const REJECT_HELLO: &str = "hello rejected";
+/// Reason sent to an authenticated node that is not allowed (not in the
+/// effective membership, or not a config seed before this node has a
+/// membership); the dialer logs it as such.
+pub const REJECT_NOT_MEMBER: &str = "not a member of this cluster";
 /// Reason sent for a hello with another protocol version.
 pub const REJECT_VERSION: &str = "unsupported protocol version";
 /// Reason sent for a hello with another `-z` (the dialer logs it as a
@@ -279,6 +351,10 @@ impl RateLimit {
 struct Shared {
     cfg: ListenerConfig,
     handshakes: Arc<Semaphore>,
+    /// Handshakes allowed per source address (see [`PeerAllowlist::set`]).
+    per_ip_limit: AtomicUsize,
+    /// Nodes allowed to connect. Lock order: `allowed`, then `peers`.
+    allowed: StdMutex<BTreeSet<NodeId>>,
     per_ip: StdMutex<HashMap<IpAddr, usize>>,
     /// The authenticated connection of each peer: generation and closer.
     peers: StdMutex<HashMap<NodeId, (u64, Arc<Notify>)>>,
@@ -298,15 +374,26 @@ impl Shared {
     }
 
     /// Makes `peer`'s new connection the current one, closing the older
-    /// one; returns its generation and the notification that closes it.
-    fn register(&self, peer: NodeId) -> (u64, Arc<Notify>) {
+    /// one; returns its generation and the notification that closes it, or
+    /// `None` if `peer` is no longer allowed (the allowlist changed after
+    /// its hello was accepted).
+    fn register(&self, peer: NodeId) -> Option<(u64, Arc<Notify>)> {
+        let allowed = lock(&self.allowed);
+        if !allowed.contains(&peer) {
+            return None;
+        }
         let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
         let close = Arc::new(Notify::new());
         let old = lock(&self.peers).insert(peer, (generation, close.clone()));
+        drop(allowed);
         if let Some((_, old)) = old {
             old.notify_one();
         }
-        (generation, close)
+        Some((generation, close))
+    }
+
+    fn is_allowed(&self, peer: NodeId) -> bool {
+        lock(&self.allowed).contains(&peer)
     }
 
     fn unregister(&self, peer: NodeId, generation: u64) {
@@ -332,7 +419,7 @@ impl HandshakeSlot {
             .map_err(|_| "too many handshakes in progress")?;
         let mut per_ip = lock(&shared.per_ip);
         let n = per_ip.entry(ip).or_insert(0);
-        if *n >= shared.cfg.max_handshakes_per_ip {
+        if *n >= shared.per_ip_limit.load(Ordering::Relaxed) {
             return Err("too many handshakes in progress from this address");
         }
         *n += 1;
@@ -358,17 +445,9 @@ impl Drop for HandshakeSlot {
 
 async fn accept_loop<H: ForwardHandler>(
     listener: TcpListener,
-    cfg: ListenerConfig,
+    shared: Arc<Shared>,
     service: Arc<OnceLock<Service<H>>>,
 ) {
-    let shared = Arc::new(Shared {
-        handshakes: Arc::new(Semaphore::new(cfg.max_handshakes)),
-        cfg,
-        per_ip: StdMutex::new(HashMap::new()),
-        peers: StdMutex::new(HashMap::new()),
-        next_gen: AtomicU64::new(1),
-        rejects: RateLimit::new(),
-    });
     // Owned here so that aborting this task aborts every connection.
     let mut conns = JoinSet::new();
     loop {
@@ -482,10 +561,18 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     H: ForwardHandler,
 {
-    let (generation, close) = shared.register(peer);
+    let Some((generation, close)) = shared.register(peer) else {
+        return Err(Phase::Serve(format!(
+            "node {peer} is no longer allowed (membership changed during its hello)"
+        )));
+    };
     let r = tokio::select! {
         r = serve(io, peer, &shared.cfg, service) => r,
-        () = close.notified() => Err("replaced by a newer connection of the same peer".into()),
+        () = close.notified() => Err(if shared.is_allowed(peer) {
+            "replaced by a newer connection of the same peer".into()
+        } else {
+            format!("node {peer} is no longer allowed (not a member)")
+        }),
     };
     shared.unregister(peer, generation);
     r.map_err(Phase::Serve)
@@ -511,7 +598,9 @@ where
         Ok(None) => return Err("closed before hello".into()),
         Err(e) => return Err(format!("hello: {e}")),
     };
-    // (details for the local log, generic reason for the peer)
+    // (details for the local log, generic reason for the peer). Identity
+    // before membership: only a node that proved its id learns that it is
+    // not a member.
     let verdict: Result<(), (String, &str)> = if h.version != PROTOCOL_VERSION {
         Err((
             format!("unsupported protocol version {}", h.version),
@@ -522,10 +611,17 @@ where
             format!("hello for node {}, this is node {}", h.to, cfg.node_id),
             REJECT_HELLO,
         ))
-    } else if h.from == cfg.node_id || !cfg.peers.contains(&h.from) {
+    } else if h.from == cfg.node_id {
         Err((
-            format!("node {} is not a configured peer", h.from),
+            format!("hello from this node's own id {}", h.from),
             REJECT_HELLO,
+        ))
+    } else if let Err(e) = identity(h.from) {
+        Err((e, REJECT_HELLO))
+    } else if !shared.is_allowed(h.from) {
+        Err((
+            format!("node {} is not a member of the cluster", h.from),
+            REJECT_NOT_MEMBER,
         ))
     } else if h.max_job_size != cfg.max_job_size {
         let reason = format!(
@@ -536,7 +632,7 @@ where
         tracing::error!(from = h.from, %addr, "cluster hello rejected: {reason}");
         Err((reason, REJECT_MAX_JOB_SIZE))
     } else {
-        identity(h.from).map_err(|e| (e, REJECT_HELLO))
+        Ok(())
     };
     let answer = match &verdict {
         Ok(()) => ServerHello::Accepted {

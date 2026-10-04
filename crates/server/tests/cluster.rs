@@ -1763,3 +1763,357 @@ fn single_node_cannot_rejoin() {
     assert_eq!(st.code(), Some(1), "{err}");
     assert!(err.contains("cannot rejoin"), "{err}");
 }
+
+/// P6-T1: membership changes through the test-only hook (feature
+/// `test-hooks`, `cluster::test_hooks`; run by `scripts/check.sh` as
+/// `cargo test -p bstk-server --features test-hooks --test cluster membership::`).
+/// Nothing reachable by an operator changes membership before P6-T4.
+#[cfg(feature = "test-hooks")]
+mod membership {
+    use super::*;
+
+    impl Cluster {
+        /// Configures node `n + 1` (not started, not a member) with `peers`
+        /// as its `[[cluster.peer]]` list (ids of this cluster, plus `extra`
+        /// unbound entries to make a valid count); the existing nodes'
+        /// configs are left alone, so they know it only from the membership.
+        fn configure_extra_node(&mut self, peers: &[u64], extra: &[u64], opts: &Opts) -> usize {
+            let id = self.nodes.len() as u64 + 1;
+            let (client, http, cluster) = (claim_port(), claim_port(), claim_port());
+            let dir = self._dir.path().to_path_buf();
+            let mut lines = String::new();
+            for &p in peers {
+                let port = if p == id {
+                    cluster
+                } else {
+                    self.nodes[p as usize - 1].cluster
+                };
+                lines.push_str(&format!(
+                    "[[cluster.peer]]\nid = {p}\naddr = \"127.0.0.1:{port}\"\n"
+                ));
+            }
+            for &p in extra {
+                // A claimed port nobody listens on.
+                lines.push_str(&format!(
+                    "[[cluster.peer]]\nid = {p}\naddr = \"127.0.0.1:{}\"\n",
+                    claim_port()
+                ));
+            }
+            let node = Node {
+                id,
+                client,
+                http,
+                cluster,
+                data_dir: dir.join(format!("data{id}")),
+                config: dir.join(format!("node{id}.toml")),
+                log: dir.join(format!("node{id}.log")),
+                child: None,
+                starts: 0,
+            };
+            write_node_config(&node, opts, &lines);
+            self.nodes.push(node);
+            self.nodes.len() - 1
+        }
+
+        /// Runs a membership command on node `i` (the leader) through the
+        /// test hook; returns the log index of its (last) entry.
+        fn hook(&self, i: usize, cmd: &str) -> Result<u64, String> {
+            let n = &self.nodes[i];
+            let out = n.data_dir.join("test-membership.out");
+            let _ = std::fs::remove_file(&out);
+            let tmp = n.data_dir.join("test-membership.cmd.tmp");
+            std::fs::write(&tmp, cmd).unwrap();
+            std::fs::rename(&tmp, n.data_dir.join("test-membership.cmd")).unwrap();
+            let answer = wait_for(Duration::from_secs(30), || {
+                std::fs::read_to_string(&out).ok()
+            })
+            .unwrap_or_else(|| panic!("no answer to {cmd:?} from node {}", n.id));
+            let _ = std::fs::remove_file(&out);
+            match answer.split_once(' ') {
+                Some(("ok", index)) => Ok(index.trim().parse().unwrap()),
+                _ => Err(answer),
+            }
+        }
+
+        /// Waits until every running node in `among` applied `index`.
+        fn wait_applied(&self, among: &[usize], index: u64) {
+            for &i in among {
+                wait_for(Duration::from_secs(20), || {
+                    let a = self.nodes[i].admin()?;
+                    (a["cluster"]["applied_index"].as_u64()? >= index).then_some(())
+                })
+                .unwrap_or_else(|| panic!("node {} never applied {index}", self.nodes[i].id));
+            }
+        }
+    }
+
+    fn write_node_config(n: &Node, opts: &Opts, peers: &str) {
+        let text = format!(
+            "[[listener]]\naddr = \"127.0.0.1:{}\"\n\
+             [http]\naddr = \"127.0.0.1:{}\"\nsnapshot_min_interval = \"0s\"\n\
+             [cluster]\nnode_id = {}\nlisten = \"127.0.0.1:{}\"\n\
+             data_dir = \"{}\"\nnode_timeout = \"{}\"\nsnapshot_every = {}\n\
+             insecure_plaintext = true\n{peers}",
+            n.client,
+            n.http,
+            n.id,
+            n.cluster,
+            n.data_dir.display(),
+            opts.node_timeout,
+            opts.snapshot_every,
+        );
+        std::fs::write(&n.config, text).unwrap();
+    }
+
+    fn rejected_hellos(n: &Node, from: u64) -> usize {
+        n.log_text()
+            .matches(&format!("hello from node {from} rejected"))
+            .count()
+    }
+
+    /// Grow 3 -> 4: add a learner (its address is known to the others only
+    /// from the membership), start it, it catches up and serves clients;
+    /// promote it; the cluster then needs it for a quorum after losing a
+    /// node, so every other node accepted its hello.
+    #[test]
+    fn learner_added_then_promoted_serves_clients() {
+        let opts = Opts {
+            node_timeout: "2s",
+            ..Opts::default()
+        };
+        let mut c = Cluster::start(3, &opts);
+        let l = c.leader();
+        // Node 4's config: every current node, itself, and one unbound id
+        // (a config has 1, 3 or 5 entries).
+        let n4 = c.configure_extra_node(&[1, 2, 3, 4], &[5], &opts);
+        let addr4 = format!("127.0.0.1:{}", c.nodes[n4].cluster);
+        let idx = c.hook(l, &format!("add-learner 4 {addr4}")).unwrap();
+        c.wait_applied(&[0, 1, 2], idx);
+        // Without --cluster-init and without state: started after it was
+        // added (the runbook order), it catches up as a rejoining node.
+        c.nodes[n4].start(&[]);
+        assert!(
+            c.nodes[n4].wait_ready(Duration::from_secs(30)),
+            "the learner never became ready"
+        );
+        let mut on_leader = c.nodes[l].connect();
+        let mut on_learner = c.nodes[n4].connect();
+        let job = inserted(&on_learner.put(b"via-learner"));
+        assert_eq!(reserve(&mut on_leader, "reserve-with-timeout 5"), job);
+        assert_eq!(on_leader.cmd(&format!("delete {job}")), "DELETED");
+
+        let idx = c.hook(l, "change-membership 1,2,3,4").unwrap();
+        c.wait_applied(&[0, 1, 2, n4], idx);
+        let job = inserted(&on_learner.put(b"via-voter"));
+        assert_eq!(reserve(&mut on_leader, "reserve-with-timeout 5"), job);
+        for i in 0..3 {
+            assert_eq!(rejected_hellos(&c.nodes[i], 4), 0, "node {}", i + 1);
+        }
+
+        // Four voters: losing the leader leaves exactly a quorum (3), so the
+        // new leader needs node 4's vote, and node 4 must accept its log.
+        c.nodes[l].kill9();
+        let nl = c.leader();
+        assert_ne!(nl, l);
+        let mut on_new = c.nodes[nl].connect();
+        let job = inserted(&on_new.put(b"after-failover"));
+        let mut again = c.nodes[n4].connect();
+        assert_eq!(reserve(&mut again, "reserve-with-timeout 10"), job);
+    }
+
+    /// A member missing from a node's config is reached through its
+    /// membership address and admitted through the membership allowlist:
+    /// node 4's config lacks node `f2`, and after the leader is gone only
+    /// `f2` and node 4 remain as voters, so the vote and then the
+    /// replication or forwards between them must use the membership.
+    #[test]
+    fn member_missing_from_config_is_reached_through_the_membership() {
+        let opts = Opts {
+            node_timeout: "2s",
+            ..Opts::default()
+        };
+        let mut c = Cluster::start(3, &opts);
+        let l = c.leader();
+        let fs = c.followers(l);
+        let (f1, f2) = (fs[0], fs[1]);
+        let (lid, f1id, f2id) = (c.nodes[l].id, c.nodes[f1].id, c.nodes[f2].id);
+        // The leader must be a seed: a node without a membership accepts
+        // only its seeds (until P6-T3's Join mode).
+        let n4 = c.configure_extra_node(&[lid, f1id, 4], &[], &opts);
+        let addr4 = format!("127.0.0.1:{}", c.nodes[n4].cluster);
+        let idx = c.hook(l, &format!("add-learner 4 {addr4}")).unwrap();
+        c.wait_applied(&[0, 1, 2], idx);
+        c.nodes[n4].start(&[]);
+        assert!(c.nodes[n4].wait_ready(Duration::from_secs(30)));
+        let idx = c.hook(l, "change-membership 1,2,3,4").unwrap();
+        c.wait_applied(&[0, 1, 2, n4], idx);
+        let idx = c
+            .hook(l, &format!("change-membership {lid},{f2id},4"))
+            .unwrap();
+        c.wait_applied(&[l, f2, n4], idx);
+
+        c.nodes[l].kill9();
+        let nl = wait_for(Duration::from_secs(15), || {
+            [f2, n4].into_iter().find(|&i| {
+                c.nodes[i].admin().is_some_and(|a| {
+                    a["cluster"]["role"] == "leader" && a["cluster"]["ready"] == true
+                })
+            })
+        })
+        .expect("no leader among the two remaining voters");
+        let other = if nl == f2 { n4 } else { f2 };
+        assert!(c.nodes[other].wait_ready(Duration::from_secs(15)));
+        let mut on_4 = c.nodes[n4].connect();
+        let mut on_f2 = c.nodes[f2].connect();
+        let a = inserted(&on_4.put(b"from-4"));
+        assert_eq!(reserve(&mut on_f2, "reserve-with-timeout 10"), a);
+        let b = inserted(&on_f2.put(b"from-f2"));
+        assert_eq!(reserve(&mut on_4, "reserve-with-timeout 10"), b);
+        assert_eq!(rejected_hellos(&c.nodes[n4], f2id), 0);
+        assert_eq!(rejected_hellos(&c.nodes[f2], 4), 0);
+    }
+
+    /// Removing a follower that holds a reservation: the leader drops the
+    /// non-member's connections at once (the job goes back to ready), the
+    /// removed node's hellos are refused with the specific reason, and it
+    /// isolates (closes its clients).
+    #[test]
+    fn removed_follower_is_dropped_rejected_and_isolates() {
+        let opts = Opts {
+            node_timeout: "1s",
+            ..Opts::default()
+        };
+        let mut c = Cluster::start(3, &opts);
+        let l = c.leader();
+        let fs = c.followers(l);
+        let (f, keep) = (fs[0], fs[1]);
+        let fid = c.nodes[f].id;
+
+        let mut on_leader = c.nodes[l].connect();
+        let job = inserted(&on_leader.put(b"x"));
+        let mut worker = c.nodes[f].connect();
+        assert_eq!(reserve(&mut worker, "reserve-with-timeout 5"), job);
+        let mut waiter = c.nodes[l].connect();
+        waiter.send(b"reserve-with-timeout 30\r\n");
+
+        let voters = format!("{},{}", c.nodes[l].id, c.nodes[keep].id);
+        let removed = Instant::now();
+        c.hook(l, &format!("change-membership {voters}")).unwrap();
+        let (id, _) = read_reserved(&mut waiter);
+        assert_eq!(id, job);
+        let took = removed.elapsed();
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        let a = c.nodes[l].admin().unwrap();
+        assert!(
+            a["cluster"]["drop_node_proposals"].as_u64().unwrap() >= 1,
+            "{a}"
+        );
+
+        worker
+            .stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let (_, end) = worker.read_to_end(Duration::from_secs(10));
+        assert!(
+            matches!(end, End::Closed | End::Error(_)),
+            "the removed node's client was not closed: {end:?}"
+        );
+        wait_for(Duration::from_secs(10), || {
+            (c.nodes[f].admin()?["cluster"]["isolated"] == true).then_some(())
+        })
+        .expect("the removed node did not isolate");
+        wait_for(Duration::from_secs(10), || {
+            c.nodes[f]
+                .log_text()
+                .contains("this node is not a member of the cluster")
+                .then_some(())
+        })
+        .expect("the removed node never logged the specific rejection");
+        wait_for(Duration::from_secs(10), || {
+            (rejected_hellos(&c.nodes[l], fid) + rejected_hellos(&c.nodes[keep], fid) > 0)
+                .then_some(())
+        })
+        .expect("nobody rejected the removed node's hello");
+        assert!(
+            c.nodes[l]
+                .log_text()
+                .contains(&format!("node {fid} is not a member of the cluster")),
+        );
+
+        // The two remaining voters keep serving.
+        let mut on_keep = c.nodes[keep].connect();
+        let second = inserted(&on_keep.put(b"y"));
+        assert_eq!(
+            on_leader.stat(&format!("stats-job {second}"), "state"),
+            "ready"
+        );
+        assert_eq!(on_leader.stat("stats", "current-connections"), "3");
+    }
+
+    /// A member that is in no other node's config moves to a new address
+    /// (`SetNodes`, no config override anywhere): the leader follows the
+    /// membership and reaches it there.
+    #[test]
+    fn address_change_through_set_nodes_is_followed() {
+        let opts = Opts::default();
+        let mut c = Cluster::start(3, &opts);
+        let l = c.leader();
+        let n4 = c.configure_extra_node(&[1, 2, 3, 4], &[5], &opts);
+        let addr4 = format!("127.0.0.1:{}", c.nodes[n4].cluster);
+        let idx = c.hook(l, &format!("add-learner 4 {addr4}")).unwrap();
+        c.wait_applied(&[0, 1, 2], idx);
+        c.nodes[n4].start(&[]);
+        assert!(c.nodes[n4].wait_ready(Duration::from_secs(30)));
+
+        // Stop it, move it, tell the membership, restart it.
+        c.nodes[n4].stop(Signal::SIGTERM);
+        let old = c.nodes[n4].cluster;
+        let new = claim_port();
+        c.nodes[n4].cluster = new;
+        let text = std::fs::read_to_string(&c.nodes[n4].config).unwrap();
+        std::fs::write(
+            &c.nodes[n4].config,
+            text.replace(&format!(":{old}\""), &format!(":{new}\"")),
+        )
+        .unwrap();
+        let idx = c.hook(l, &format!("set-nodes 4=127.0.0.1:{new}")).unwrap();
+        c.wait_applied(&[0, 1, 2], idx);
+        c.nodes[n4].start(&[]);
+        assert!(
+            c.nodes[n4].wait_ready(Duration::from_secs(30)),
+            "the moved node never caught up at its new address"
+        );
+        c.wait_applied(&[n4], idx);
+        let mut on_leader = c.nodes[l].connect();
+        let mut on_moved = c.nodes[n4].connect();
+        let job = inserted(&on_moved.put(b"moved"));
+        assert_eq!(reserve(&mut on_leader, "reserve-with-timeout 5"), job);
+        release(old);
+    }
+
+    /// Shrinking to a single voter: `leader_reachable` counts the
+    /// membership's voters, not the config's peers, so the last voter keeps
+    /// serving after the removed nodes are gone.
+    #[test]
+    fn shrunk_to_one_voter_keeps_serving() {
+        let opts = Opts {
+            node_timeout: "1s",
+            ..Opts::default()
+        };
+        let mut c = Cluster::start(3, &opts);
+        let l = c.leader();
+        let lid = c.nodes[l].id;
+        let idx = c.hook(l, &format!("change-membership {lid}")).unwrap();
+        c.wait_applied(&[l], idx);
+        for f in c.followers(l) {
+            c.nodes[f].kill9();
+        }
+        std::thread::sleep(Duration::from_secs(3));
+        let a = c.nodes[l].admin().unwrap();
+        assert_eq!(a["cluster"]["isolated"], false, "{a}");
+        assert_eq!(a["cluster"]["role"], "leader", "{a}");
+        let mut client = c.nodes[l].connect();
+        let job = inserted(&client.put(b"alone"));
+        assert_eq!(reserve(&mut client, "reserve-with-timeout 5"), job);
+    }
+}

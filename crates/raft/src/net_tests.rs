@@ -28,7 +28,7 @@ use crate::client::{Network, NetworkConfig, PeerClient};
 use crate::forward::{
     ControlRequest, ControlResponse, ForwardError, ForwardHandler, ForwardTransport,
 };
-use crate::listener::{ClusterListener, ListenerConfig, VoteGate};
+use crate::listener::{ClusterListener, ListenerConfig, REJECT_HELLO, REJECT_NOT_MEMBER, VoteGate};
 use crate::test_store::{MemLog, MemSm};
 use crate::tls::{ClusterTls, cluster_tls_from_pem, node_dns_name};
 use crate::wire::{self, ClientMsg, Hello, PROTOCOL_VERSION, ServerHello, ServerMsg};
@@ -475,13 +475,15 @@ async fn forward_from_another_node_is_rejected() {
 async fn hello_from_unknown_or_misaddressed_node_is_rejected() {
     let (node, _) = single_target(None, None).await;
     let addr = node.addr.to_string();
+    // (Plaintext proves no identity, so a stranger learns why.)
     let net9 = Network::new(net_config(9, [(1, addr.clone())].into(), None));
     let e = net9
         .forward(1, forward_from(9))
         .await
         .expect_err("rejected");
     assert!(
-        matches!(e, ForwardError::Unreachable(ref m) if m.contains("rejected: hello rejected")),
+        matches!(e, ForwardError::Unreachable(ref m)
+            if m.contains(&format!("rejected: {REJECT_NOT_MEMBER}"))),
         "{e:?}"
     );
     let net2 = Network::new(net_config(2, [(5, addr.clone())].into(), None));
@@ -1659,4 +1661,148 @@ async fn status_probes_are_answered_before_raft_runs() {
     );
     l.shutdown().await;
     let _ = raft.shutdown().await;
+}
+
+/// Sends a hello from `from` to node 1 and returns the listener's answer.
+async fn hello_answer(addr: SocketAddr, from: NodeId) -> Option<ServerMsg> {
+    let mut s = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let f = wire::encode(
+        &ClientMsg::Hello(Hello {
+            version: PROTOCOL_VERSION,
+            from,
+            to: 1,
+            max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
+        }),
+        wire::DEFAULT_MAX_FRAME,
+    )
+    .expect("encode");
+    wire::write_frame(&mut s, &f).await.expect("hello");
+    wire::read_frame(&mut s, wire::DEFAULT_MAX_FRAME)
+        .await
+        .expect("answer")
+}
+
+fn rejected_with(a: &Option<ServerMsg>, reason: &str) -> bool {
+    matches!(a, Some(ServerMsg::Hello(ServerHello::Rejected { reason: r })) if r == reason)
+}
+
+/// P6-T1: replacing the allowlist closes the live connections of nodes
+/// that left, answers their hellos with the specific reason, admits new
+/// members, and sizes the per-address handshake budget by the membership.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn allowlist_update_closes_departed_peers_and_admits_new_ones() {
+    let (l, raft, addr) = lone_listener(|_| {}).await;
+    let allow = l.allowlist();
+    assert_eq!(allow.get(), [1, 2, 3].into());
+    assert_eq!(allow.handshakes_per_ip(), 6);
+    let mut peer2 = raw_hello(addr, 2).await;
+    let mut peer3 = raw_hello(addr, 3).await;
+    assert!(rejected_with(
+        &hello_answer(addr, 4).await,
+        REJECT_NOT_MEMBER
+    ));
+
+    // 3 removed, 4 and 5 added (a joint configuration names them all).
+    allow.set([1, 2, 4, 5, 6].into());
+    assert!(
+        closes(&mut peer3).await,
+        "a removed peer kept its connection"
+    );
+    assert!(raw_forward(&mut peer2, 2).await);
+    assert!(rejected_with(
+        &hello_answer(addr, 3).await,
+        REJECT_NOT_MEMBER
+    ));
+    let mut peer4 = raw_hello(addr, 4).await;
+    assert!(raw_forward(&mut peer4, 4).await);
+    assert_eq!(allow.handshakes_per_ip(), 10);
+    // Shrinking never goes below the configured budget.
+    allow.set([1, 2].into());
+    assert_eq!(allow.handshakes_per_ip(), 6);
+    assert!(closes(&mut peer4).await);
+    l.shutdown().await;
+    let _ = raft.shutdown().await;
+}
+
+/// P6-T1: identity is checked before membership, so only a node that proves
+/// its id is told that it is not a member; anyone else gets the generic
+/// reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mtls_identity_is_checked_before_membership() {
+    let pki = Pki::new("cluster CA");
+    let (node, _) = single_target(Some(&pki.node(1)), None).await;
+    let addr = node.addr.to_string();
+    // Node 9 with its own certificate: authenticated, not a member.
+    let tls9 = pki.node(9);
+    let net9 = Network::new(net_config(9, [(1, addr.clone())].into(), Some(&tls9)));
+    let e = net9.status(1).await.expect_err("rejected");
+    assert!(
+        matches!(e, ForwardError::Unreachable(ref m) if m.contains(REJECT_NOT_MEMBER)),
+        "{e:?}"
+    );
+    // Node 2's certificate claiming id 9: the identity check fails first.
+    let tls2 = pki.node(2);
+    let net9 = Network::new(net_config(9, [(1, addr.clone())].into(), Some(&tls2)));
+    let e = net9.status(1).await.expect_err("rejected");
+    assert!(
+        matches!(e, ForwardError::Unreachable(ref m)
+            if m.contains(&format!("rejected: {REJECT_HELLO}"))),
+        "{e:?}"
+    );
+    assert_eq!(node.handler.calls(), 0);
+    shutdown(vec![node]).await;
+}
+
+/// P6-T1 address book: a target without a config address is dialed at its
+/// membership address; a config address overrides the membership's; a
+/// changed address replaces the connection slot without losing the
+/// target's last response time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn address_book_prefers_overrides_then_membership() {
+    let (node, _) = single_target(None, None).await;
+    let addr = node.addr.to_string();
+    let dead = "127.0.0.1:1".to_string();
+
+    let net = Network::new(net_config(2, BTreeMap::new(), None));
+    assert_eq!(net.address(1), None);
+    let e = net
+        .forward(1, forward_from(2))
+        .await
+        .expect_err("no address");
+    assert!(matches!(e, ForwardError::Unreachable(_)), "{e:?}");
+    net.set_members([(1, addr.clone()), (2, dead.clone())].into());
+    assert_eq!(net.address(1).as_deref(), Some(addr.as_str()));
+    net.forward(1, forward_from(2))
+        .await
+        .expect("membership address");
+    let heard = net.last_response(1).expect("answered");
+
+    // The membership moves node 1 to a dead address: the slot follows it.
+    net.set_members([(1, dead.clone())].into());
+    let e = net.forward(1, forward_from(2)).await.expect_err("moved");
+    assert!(
+        matches!(e, ForwardError::Unreachable(ref m) if m.contains(&dead)),
+        "{e:?}"
+    );
+    assert_eq!(net.last_response(1), Some(heard), "liveness lost on a move");
+    net.set_members([(1, addr.clone())].into());
+    net.forward(1, forward_from(2)).await.expect("moved back");
+
+    // A config override wins over the membership address.
+    let over = Network::new(net_config(2, [(1, addr.clone())].into(), None));
+    over.set_members([(1, dead.clone())].into());
+    assert_eq!(over.address(1).as_deref(), Some(addr.as_str()));
+    over.forward(1, forward_from(2)).await.expect("override");
+
+    // Raft RPCs use openraft's address only when the book has none, and
+    // resolve on every call (a client created before a move follows it).
+    let raft_net = Network::new(net_config(2, BTreeMap::new(), None));
+    let mut c = client_to(&raft_net, 1, &addr).await;
+    c.vote(vote_req(1, 2), option())
+        .await
+        .expect("BasicNode address");
+    raft_net.set_members([(1, dead.clone())].into());
+    let e = c.vote(vote_req(2, 2), option()).await.expect_err("moved");
+    assert!(matches!(e, RPCError::Unreachable(_)), "{e:?}");
+    shutdown(vec![node]).await;
 }

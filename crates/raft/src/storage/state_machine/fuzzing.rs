@@ -38,7 +38,15 @@ fn encode(meta: &SmMeta, engine: &Engine) -> Vec<u8> {
 }
 
 fn restore(payload: &[u8]) -> io::Result<(Engine, SmMeta)> {
-    let (engine, meta, _) = restore_from(payload, payload.len() as u64, 0, &cfg(), &sys(), NODE)?;
+    let (engine, meta, _) = restore_from(
+        payload,
+        payload.len() as u64,
+        0,
+        &cfg(),
+        &sys(),
+        NODE,
+        &Default::default(),
+    )?;
     Ok((engine, meta))
 }
 

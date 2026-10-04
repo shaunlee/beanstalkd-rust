@@ -1446,3 +1446,133 @@ fn a_damaged_snapshot_is_not_sent() {
     let e = block_on(cur.snapshot.read_all()).expect_err("damaged");
     assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
 }
+
+fn membership_entry(index: u64, configs: &[&[NodeId]], learners: &[NodeId]) -> Entry<TypeConfig> {
+    let configs: Vec<std::collections::BTreeSet<NodeId>> = configs
+        .iter()
+        .map(|c| c.iter().copied().collect())
+        .collect();
+    let mut nodes: BTreeMap<NodeId, BasicNode> = configs
+        .iter()
+        .flatten()
+        .map(|&id| (id, BasicNode::new(format!("n{id}"))))
+        .collect();
+    for &l in learners {
+        nodes.insert(l, BasicNode::new(format!("n{l}")));
+    }
+    Entry {
+        log_id: lid(1, index),
+        payload: EntryPayload::Membership(Membership::new(configs, nodes)),
+    }
+}
+
+/// P6-T1: the highest node id that was ever a member (voter or learner,
+/// either half of a joint configuration) only grows, is the same on every
+/// node, and survives snapshots and restarts.
+#[test]
+fn highest_member_id_is_recorded_from_membership_entries() {
+    let mut a = node(1);
+    let h = a.sm.handle();
+    assert_eq!(h.highest_member(), 0);
+    apply(&mut a.sm, vec![membership_entry(1, &[&[1, 2, 3]], &[])]);
+    assert_eq!(h.highest_member(), 3);
+    // Learner 7 added, then removed again: 7 stays.
+    apply(&mut a.sm, vec![membership_entry(2, &[&[1, 2, 3]], &[7])]);
+    assert_eq!(h.highest_member(), 7);
+    apply(&mut a.sm, vec![membership_entry(3, &[&[1, 2, 3]], &[])]);
+    assert_eq!(h.highest_member(), 7);
+    // A joint configuration naming 9 in its new half.
+    apply(
+        &mut a.sm,
+        vec![membership_entry(4, &[&[1, 2, 3], &[1, 2, 9]], &[])],
+    );
+    apply(&mut a.sm, vec![membership_entry(5, &[&[1, 2, 3]], &[])]);
+    assert_eq!(h.highest_member(), 9);
+    apply(&mut a.sm, entries(6, &workload(50, 3)));
+
+    // Snapshot round trip: installed elsewhere, and reopened from disk.
+    let mut snap = build(&mut a.sm).unwrap();
+    let bytes = payload(&mut snap);
+    assert_eq!(bytes[0], 3, "payload version");
+    let mut b = node(2);
+    let rx = receive(&mut b.sm, &bytes);
+    block_on(b.sm.install_snapshot(&snap.meta, rx)).unwrap();
+    assert_eq!(b.sm.handle().highest_member(), 9);
+    assert_eq!(b.sm.handle().meta(), a.sm.handle().meta());
+    let dir = a._dir.path().to_path_buf();
+    drop(a.sm);
+    let re = open_sm(&dir, 1, Arc::new(RecSink::default()));
+    assert_eq!(re.handle().highest_member(), 9);
+}
+
+/// P6-T1: a version 2 payload (written before `highest_member` existed) is
+/// still read; the value comes from the snapshot's membership, on install
+/// and on reopening the stored snapshot.
+#[test]
+fn version_2_payload_restores_highest_member_from_the_membership() {
+    #[derive(serde::Serialize)]
+    struct MetaV2 {
+        started: bool,
+        last_now: u64,
+        next_seq: BTreeMap<ConnId, u64>,
+        highest_local: BTreeMap<NodeId, u64>,
+    }
+    #[derive(serde::Serialize)]
+    struct PayloadV2 {
+        version: u32,
+        meta: MetaV2,
+        engine: bstk_engine::EngineState,
+    }
+    let mut a = node(1);
+    apply(&mut a.sm, entries(1, &workload(80, 4)));
+    let m = a.sm.handle().meta();
+    let v2 = PayloadV2 {
+        version: 2,
+        meta: MetaV2 {
+            started: m.started,
+            last_now: m.last_now,
+            next_seq: m.next_seq.clone(),
+            highest_local: m.highest_local.clone(),
+        },
+        engine: a.sm.handle().export_state().unwrap(),
+    };
+    let bytes = postcard::to_allocvec(&v2).unwrap();
+    let membership = membership_entry(1, &[&[1, 2, 5]], &[6]);
+    let EntryPayload::Membership(mem) = membership.payload else {
+        unreachable!()
+    };
+    let meta = openraft::SnapshotMeta {
+        last_log_id: Some(lid(1, 80)),
+        last_membership: StoredMembership::new(Some(lid(1, 1)), mem),
+        snapshot_id: "v2".into(),
+    };
+    let mut b = node(2);
+    let rx = receive(&mut b.sm, &bytes);
+    block_on(b.sm.install_snapshot(&meta, rx)).unwrap();
+    assert_eq!(b.sm.handle().highest_member(), 6);
+    assert_eq!(state_bytes(&b.sm), state_bytes(&a.sm));
+    let restored = b.sm.handle().meta();
+    assert_eq!(restored.next_seq, m.next_seq);
+    assert_eq!(restored.highest_local, m.highest_local);
+
+    let dir = b._dir.path().to_path_buf();
+    drop(b.sm);
+    let re = open_sm(&dir, 2, Arc::new(RecSink::default()));
+    assert_eq!(re.handle().highest_member(), 6);
+    assert_eq!(state_bytes(&re), state_bytes(&a.sm));
+}
+
+#[test]
+fn connection_owners_lists_nodes_with_open_connections() {
+    let mut n = node(1);
+    let (a, b, c) = (conn_id(1, 4), conn_id(2, 9), conn_id(3, 2));
+    let reqs = [
+        req(S, c_in(1, EngineInput::Connect(a))),
+        req(S, c_in(1, EngineInput::Connect(b))),
+        req(S, c_in(1, EngineInput::Connect(c))),
+        req(S, c_in(2, EngineInput::Disconnect(c))),
+    ];
+    apply(&mut n.sm, entries(1, &reqs));
+    let owners = n.sm.handle().connection_owners();
+    assert_eq!(owners, [(1, 4), (2, 9)].into());
+}

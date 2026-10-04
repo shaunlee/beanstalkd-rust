@@ -16,7 +16,17 @@
 //!   leader proposes `DropNode { node: peer, up_to_local }` with the highest
 //!   local number the state has seen for it, at most once per silence period.
 //!   The bound keeps a late commit from closing connections the node accepted
-//!   after a restart.
+//!   after a restart. The peers checked are the effective membership's (voters
+//!   and learners), not the config's.
+//! - **Non-member owners** (docs/DESIGN.md §8, "Membership-driven
+//!   networking"): every node that owns connections in the replicated state
+//!   but is not in the effective membership (removed, or never added) gets a
+//!   `DropNode` at once, checked whenever this loop wakes (a membership change
+//!   wakes it), and again whenever its highest local number grows past the
+//!   bound last proposed: forwards it sent before it was removed may still be
+//!   proposed after that `DropNode` and open connections above its bound. A
+//!   proposal is repeated at most every [`NON_MEMBER_RETRY`] while its
+//!   connections remain.
 //!
 //! # Readiness ([`readiness`])
 //!
@@ -35,6 +45,10 @@ use super::Core;
 
 pub const TICK_RETRY: Duration = Duration::from_millis(500);
 const PERIOD: Duration = Duration::from_millis(100);
+/// How soon a non-member's `DropNode` is proposed again with the same
+/// bound while its connections remain (a proposal lost to a leader change
+/// is covered by the new leader, which starts afresh).
+pub const NON_MEMBER_RETRY: Duration = Duration::from_secs(1);
 
 pub async fn leader_duties(core: Arc<Core>) {
     let mut info = core.state.subscribe();
@@ -47,11 +61,24 @@ pub async fn leader_duties(core: Arc<Core>) {
     // (deadline, applied index, when) of the last Tick proposed.
     let mut last_tick: Option<(u64, Option<u64>, Instant)> = None;
     let mut dropped: BTreeSet<NodeId> = BTreeSet::new();
+    // Non-member owner -> (bound last proposed, when).
+    let mut outsiders: HashMap<NodeId, (u64, Instant)> = HashMap::new();
+    // (membership log id, when) of the last non-member check: run at once
+    // after a membership change, else every PERIOD (this loop also wakes
+    // for every applied entry).
+    let mut members_checked: Option<(Option<openraft::LogId<NodeId>>, Instant)> = None;
     loop {
         let leading = core.is_leader();
         let mut wait_for = None;
         if leading {
             leader_since.get_or_insert_with(Instant::now);
+            let mlog = *core.membership().log_id();
+            if members_checked.is_none_or(|(l, at)| l != mlog || at.elapsed() >= PERIOD) {
+                members_checked = Some((mlog, Instant::now()));
+                if drop_non_members(&core, &mut outsiders).await.is_err() {
+                    return;
+                }
+            }
             if let Some(d) = core.state.next_deadline() {
                 if core.clock.now() >= d {
                     let applied = core.applied_index();
@@ -73,6 +100,8 @@ pub async fn leader_duties(core: Arc<Core>) {
             leader_since = None;
             last_tick = None;
             dropped.clear();
+            outsiders.clear();
+            members_checked = None;
         }
         if let Some(at) = wait_for {
             sleep.as_mut().reset(at);
@@ -92,10 +121,49 @@ pub async fn leader_duties(core: Arc<Core>) {
     }
 }
 
+/// Proposes `DropNode` for connection owners outside the effective
+/// membership (see the module docs). `Err`: Raft has stopped.
+async fn drop_non_members(
+    core: &Core,
+    outsiders: &mut HashMap<NodeId, (u64, Instant)>,
+) -> Result<(), super::RaftStopped> {
+    let m = core.membership();
+    let owners = core.state.connection_owners();
+    outsiders.retain(|n, _| owners.contains_key(n));
+    for (node, highest) in owners {
+        if node == core.id || super::membership::is_member(&m, node) {
+            continue;
+        }
+        let due = outsiders
+            .get(&node)
+            .is_none_or(|&(bound, at)| highest > bound || at.elapsed() >= NON_MEMBER_RETRY);
+        if !due {
+            continue;
+        }
+        tracing::warn!(
+            node,
+            up_to_local = highest,
+            "connections of a node outside the membership: proposing DropNode"
+        );
+        core.propose(Op::DropNode {
+            node,
+            up_to_local: highest,
+        })
+        .await?;
+        core.status
+            .drop_node_proposals
+            .fetch_add(1, Ordering::Relaxed);
+        outsiders.insert(node, (highest, Instant::now()));
+    }
+    Ok(())
+}
+
 async fn liveness(core: &Core, leader_since: Instant, dropped: &mut BTreeSet<NodeId>) {
     let silence = core.node_timeout.saturating_mul(2);
     let mut owners: Option<HashMap<NodeId, usize>> = None;
-    for &peer in &core.peers {
+    let members: Vec<NodeId> = core.membership().nodes().map(|(&n, _)| n).collect();
+    dropped.retain(|n| members.contains(n));
+    for peer in members {
         if peer == core.id {
             continue;
         }

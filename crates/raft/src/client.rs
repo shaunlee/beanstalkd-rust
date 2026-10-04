@@ -67,9 +67,11 @@ pub(crate) const READ_BUF: usize = 16 * 1024;
 #[derive(Clone)]
 pub struct NetworkConfig {
     pub node_id: NodeId,
-    /// Cluster port address (`host:port`) of every peer. For Raft RPCs a
-    /// target missing here is dialed at its openraft `BasicNode::addr`;
-    /// forwarding needs an entry.
+    /// Local address overrides (`host:port`, the `[[cluster.peer]]` list):
+    /// a target listed here is always dialed at this address. Any other
+    /// target is dialed at its address in the membership
+    /// ([`Network::set_members`]), or for Raft RPCs at openraft's
+    /// `BasicNode::addr` (see [`Network`]).
     pub peers: BTreeMap<NodeId, String>,
     /// Mutual TLS (see [`crate::tls`]); `None` means plaintext, which the
     /// caller must have been configured for explicitly.
@@ -136,6 +138,13 @@ impl NetworkConfig {
     }
 }
 
+/// The dialer, with its address book (docs/DESIGN.md §8,
+/// "Membership-driven networking"): a target's address is its config
+/// override ([`NetworkConfig::peers`]) if it has one, else its address in
+/// the membership last given to [`Network::set_members`], else (Raft RPCs
+/// only) the `BasicNode::addr` openraft passes. When a target's resolved
+/// address changes, its connection slot is replaced, so the next request
+/// dials the new address.
 #[derive(Clone)]
 pub struct Network {
     inner: Arc<Inner>,
@@ -144,6 +153,11 @@ pub struct Network {
 struct Inner {
     cfg: NetworkConfig,
     peers: StdMutex<HashMap<NodeId, Arc<Peer>>>,
+    /// Membership addresses (see [`Network::set_members`]).
+    members: StdMutex<BTreeMap<NodeId, String>>,
+    /// Per target, not per slot: replacing a slot after an address change
+    /// must not make the target look silent to the leader's liveness check.
+    last_response: StdMutex<HashMap<NodeId, Arc<StdMutex<Option<std::time::Instant>>>>>,
     next_id: AtomicU64,
 }
 
@@ -152,6 +166,24 @@ struct Peer {
     addr: String,
     state: Mutex<DialState>,
     last_response: Arc<StdMutex<Option<std::time::Instant>>>,
+    /// A "not a member" rejection was logged; cleared by an accepted hello
+    /// (logged once per change, not once per dial).
+    not_member_logged: AtomicBool,
+}
+
+/// Where `target` is dialed: the config override, else the membership
+/// address, else `fallback` (openraft's `BasicNode::addr`).
+fn resolve<'a>(
+    overrides: &'a BTreeMap<NodeId, String>,
+    members: &'a BTreeMap<NodeId, String>,
+    target: NodeId,
+    fallback: Option<&'a str>,
+) -> Option<&'a str> {
+    overrides
+        .get(&target)
+        .or_else(|| members.get(&target))
+        .map(String::as_str)
+        .or(fallback)
 }
 
 #[derive(Default)]
@@ -240,6 +272,8 @@ impl Network {
             inner: Arc::new(Inner {
                 cfg,
                 peers: StdMutex::new(HashMap::new()),
+                members: StdMutex::new(BTreeMap::new()),
+                last_response: StdMutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
             }),
         }
@@ -249,24 +283,57 @@ impl Network {
         &self.inner.cfg
     }
 
-    /// The shared connection slot for `target`; created on first use with
-    /// the configured address, or `fallback` if none is configured.
-    fn peer(&self, target: NodeId, fallback: Option<&str>) -> Option<Arc<Peer>> {
+    /// Replaces the membership addresses (every node of the effective
+    /// membership, voters and learners). Slots whose resolved address
+    /// changes are replaced on their next use; a slot of a node that left
+    /// is dropped (its connection closes once no request uses it).
+    pub fn set_members(&self, members: BTreeMap<NodeId, String>) {
         let mut peers = lock(&self.inner.peers);
-        if let Some(p) = peers.get(&target) {
+        peers.retain(|id, p| {
+            resolve(&self.inner.cfg.peers, &members, *id, None).is_some_and(|a| a == p.addr)
+        });
+        *lock(&self.inner.members) = members;
+    }
+
+    /// The address `target` is dialed at for forwards, control requests
+    /// and status probes (`None`: unknown).
+    pub fn address(&self, target: NodeId) -> Option<String> {
+        let members = lock(&self.inner.members);
+        resolve(&self.inner.cfg.peers, &members, target, None).map(str::to_string)
+    }
+
+    /// The shared connection slot for `target`, at the address it resolves
+    /// to (see [`Network`]); replaced if that address changed.
+    fn peer(&self, target: NodeId, fallback: Option<&str>) -> Option<Arc<Peer>> {
+        let addr = {
+            let members = lock(&self.inner.members);
+            resolve(&self.inner.cfg.peers, &members, target, fallback)?.to_string()
+        };
+        let mut peers = lock(&self.inner.peers);
+        if let Some(p) = peers.get(&target)
+            && p.addr == addr
+        {
             return Some(p.clone());
         }
-        let addr = match self.inner.cfg.peers.get(&target) {
-            Some(a) => a.clone(),
-            None => fallback?.to_string(),
-        };
+        let last_response = lock(&self.inner.last_response)
+            .entry(target)
+            .or_default()
+            .clone();
         let p = Arc::new(Peer {
             target,
             addr,
             state: Mutex::new(DialState::default()),
-            last_response: Arc::new(StdMutex::new(None)),
+            last_response,
+            not_member_logged: AtomicBool::new(false),
         });
-        peers.insert(target, p.clone());
+        if let Some(old) = peers.insert(target, p.clone()) {
+            tracing::info!(
+                target_node = target,
+                old = %old.addr,
+                new = %p.addr,
+                "cluster peer address changed"
+            );
+        }
         Some(p)
     }
 
@@ -274,8 +341,8 @@ impl Network {
     /// arrived from `target` over this network, if ever. On a leader the
     /// heartbeats make this a liveness signal for every follower.
     pub fn last_response(&self, target: NodeId) -> Option<std::time::Instant> {
-        let p = lock(&self.inner.peers).get(&target).cloned()?;
-        *lock(&p.last_response)
+        let r = lock(&self.inner.last_response).get(&target).cloned()?;
+        *lock(&r)
     }
 
     #[cfg(test)]
@@ -296,7 +363,7 @@ impl Network {
     ) -> Result<ControlResponse, ForwardError> {
         let Some(peer) = self.peer(target, None) else {
             return Err(ForwardError::Unreachable(format!(
-                "node {target} has no configured address"
+                "node {target} has no known address"
             )));
         };
         let t = self.inner.cfg.forward_timeout;
@@ -325,7 +392,7 @@ impl Network {
     ) -> Result<ForwardResponse, ForwardError> {
         let Some(peer) = self.peer(target, None) else {
             return Err(ForwardError::Unreachable(format!(
-                "node {target} has no configured address"
+                "node {target} has no known address"
             )));
         };
         let t = self.inner.cfg.forward_timeout;
@@ -480,6 +547,7 @@ impl Network {
                 max_job_size,
             }))) if version == PROTOCOL_VERSION && node_id == peer.target => {
                 if max_job_size == cfg.max_job_size {
+                    peer.not_member_logged.store(false, Ordering::Relaxed);
                     Ok(io)
                 } else {
                     let m = format!(
@@ -499,7 +567,16 @@ impl Network {
             Ok(Some(ServerMsg::Hello(ServerHello::Rejected { reason }))) => {
                 // Peer-supplied text: escaped and truncated before use.
                 let reason = wire::sanitize(&reason);
-                if reason.starts_with("max_job_size mismatch") {
+                if reason == crate::listener::REJECT_NOT_MEMBER {
+                    if !peer.not_member_logged.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            target_node = peer.target,
+                            "cluster peer refused this node: this node is not a member of the \
+                             cluster according to node {} (removed, or not added yet)",
+                            peer.target
+                        );
+                    }
+                } else if reason.starts_with("max_job_size mismatch") {
                     tracing::error!(
                         target_node = peer.target,
                         "cluster peer refused this node: {reason}"
@@ -610,7 +687,7 @@ impl Network {
     pub async fn status(&self, target: NodeId) -> Result<NodeStatus, ForwardError> {
         let Some(peer) = self.peer(target, None) else {
             return Err(ForwardError::Unreachable(format!(
-                "node {target} has no configured address"
+                "node {target} has no known address"
             )));
         };
         let t = self.inner.cfg.forward_timeout;
@@ -657,15 +734,19 @@ impl RaftNetworkFactory<TypeConfig> for Network {
         PeerClient {
             net: self.clone(),
             target,
-            peer: self.peer(target, Some(&node.addr)),
+            addr: node.addr.clone(),
         }
     }
 }
 
+/// Resolves its target's slot on every request rather than once: openraft
+/// may keep a replication stream (and its client) across a membership
+/// change that moves the target to another address.
 pub struct PeerClient {
     net: Network,
     target: NodeId,
-    peer: Option<Arc<Peer>>,
+    /// openraft's `BasicNode::addr`, used only if the address book has none.
+    addr: String,
 }
 
 type RpcErr<E = openraft::error::Infallible> = RPCError<NodeId, BasicNode, RaftError<NodeId, E>>;
@@ -677,13 +758,13 @@ impl PeerClient {
         timeout: Duration,
         limit: usize,
     ) -> Result<RpcResponse, CallError> {
-        let Some(peer) = &self.peer else {
+        let Some(peer) = self.net.peer(self.target, Some(&self.addr)) else {
             return Err(CallError::Unreachable(format!(
                 "node {} has no address",
                 self.target
             )));
         };
-        self.net.call(peer, body, timeout, limit).await
+        self.net.call(&peer, body, timeout, limit).await
     }
 
     fn call_err<E: std::error::Error>(&self, action: RPCTypes, e: CallError) -> RpcErr<E> {

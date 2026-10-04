@@ -32,6 +32,9 @@
 //!   requests (on the leader it proposes, elsewhere it answers `NotLeader`).
 //! - [`duties`] runs the time-driven work: `Tick` proposals and node liveness
 //!   (`DropNode`) on the leader, and readiness on every node.
+//! - [`membership`] makes the effective Raft membership the authority for
+//!   peer addresses and the listener allowlist once the node has one; the
+//!   config's `[[cluster.peer]]` list is seeds plus local address overrides.
 //!
 //! # Startup ([`start`])
 //!
@@ -67,7 +70,11 @@ pub mod actor;
 pub mod durable;
 pub mod duties;
 pub mod handler;
+pub mod membership;
 pub mod proposer;
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub mod test_hooks;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -253,7 +260,6 @@ pub struct Core {
     clock: Clock,
     stamped: AtomicU64,
     node_timeout: Duration,
-    peers: BTreeSet<NodeId>,
     clients: Arc<Clients>,
     status: Status,
     /// Keeps `client_write_ff` receivers until they resolve (openraft
@@ -446,6 +452,16 @@ impl Core {
         }
     }
 
+    /// The effective membership (the latest in this node's log).
+    fn membership(&self) -> Arc<membership::Membership> {
+        self.server.borrow().membership_config.clone()
+    }
+
+    /// Whether `node` is a voter or learner of the effective membership.
+    fn is_member(&self, node: NodeId) -> bool {
+        membership::is_member(&self.server.borrow().membership_config, node)
+    }
+
     fn owns_connections(&self, node: NodeId) -> bool {
         self.state.conn_ids().iter().any(|&c| owner_of(c) == node)
     }
@@ -526,15 +542,13 @@ impl Core {
     /// this node, a quorum acknowledged it within `node_timeout`.
     fn leader_reachable(&self) -> bool {
         let m = self.metrics.borrow();
-        match m.current_leader {
-            None => false,
-            Some(l) if l == self.id => {
-                self.peers.len() == 1
-                    || m.millis_since_quorum_ack
-                        .is_some_and(|ms| u128::from(ms) <= self.node_timeout.as_millis())
-            }
-            Some(_) => true,
-        }
+        leader_reachable(
+            self.id,
+            m.current_leader,
+            membership::voter_count(&m.membership_config),
+            m.millis_since_quorum_ack,
+            self.node_timeout,
+        )
     }
 
     fn snapshot_bytes(&self) -> u64 {
@@ -606,6 +620,27 @@ impl Core {
         self.status.rejoining.store(false, Ordering::Release);
         tracing::warn!("rejoin complete: this node votes and stands for election again");
         Ok(())
+    }
+}
+
+/// See [`Core::leader_reachable`]. A single voter needs no acknowledgement
+/// (openraft refreshes `millis_since_quorum_ack` only when its core loop
+/// runs); the count is the effective membership's, not the config's.
+fn leader_reachable(
+    id: NodeId,
+    leader: Option<NodeId>,
+    voters: usize,
+    millis_since_quorum_ack: Option<u64>,
+    node_timeout: Duration,
+) -> bool {
+    match leader {
+        None => false,
+        Some(l) if l == id => {
+            voters == 1
+                || millis_since_quorum_ack
+                    .is_some_and(|ms| u128::from(ms) <= node_timeout.as_millis())
+        }
+        Some(_) => true,
     }
 }
 
@@ -899,6 +934,9 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
     net_cfg.backoff_max = Duration::from_millis(500);
     let net = Network::new(net_cfg);
 
+    // The config seeds: whom startup probes ask (bootstrap and rejoin
+    // still use them, P6-T3 moves rejoin to the current voters), and whom
+    // the listener accepts until this node has a membership.
     let peers: BTreeSet<NodeId> = c.peers.keys().copied().collect();
     let mut mode = match (marked, c.init, had_state) {
         (true, true, _) => {
@@ -917,11 +955,14 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
     // status probes only. Its vote gate stays closed unless the mode says
     // otherwise.
     let gate = Arc::new(VoteGate::new(false));
-    let mut lcfg = ListenerConfig::new(
-        id,
-        peers.clone(),
-        args.tls.as_ref().map(|t| t.server.clone()),
-    );
+    // Until Raft runs (status probes only), the seeds plus the snapshot's
+    // membership; `membership::watch` switches to the effective membership
+    // from the log once Raft runs.
+    let mut initial: BTreeSet<NodeId> = peers.clone();
+    if let Some(m) = state.membership() {
+        initial.extend(membership::addresses(&m).into_keys());
+    }
+    let mut lcfg = ListenerConfig::new(id, initial, args.tls.as_ref().map(|t| t.server.clone()));
     lcfg.max_job_size = args.engine.max_job_size;
     lcfg.vote_gate = Some(gate.clone());
     lcfg.status = Some(Arc::new(log.clone()));
@@ -986,7 +1027,6 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         clock,
         stamped: AtomicU64::new(0),
         node_timeout: c.node_timeout,
-        peers,
         clients,
         status: Status {
             committed: AtomicU64::new(u64::MAX),
@@ -1021,13 +1061,25 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
     // the readiness monitor and the leader's duties are needed while this
     // node catches up).
     let (engine_tx, engine_rx) = mpsc::unbounded_channel();
+    let actor = tokio::spawn(actor::Actor::new(core.clone()).run(engine_rx, events_rx));
     let mut tasks = vec![
+        actor,
         tokio::spawn(proposer::run(core.clone(), proposer_rx)),
-        tokio::spawn(actor::Actor::new(core.clone()).run(engine_rx, events_rx)),
         tokio::spawn(duties::leader_duties(core.clone())),
         tokio::spawn(duties::readiness(core.clone())),
         reaper_task,
+        tokio::spawn(membership::watch(
+            core.clone(),
+            listener.allowlist(),
+            peers.clone(),
+            c.peers.clone(),
+        )),
     ];
+    #[cfg(feature = "test-hooks")]
+    tasks.push(tokio::spawn(test_hooks::run(
+        core.clone(),
+        c.data_dir.clone(),
+    )));
     let abort_all = |tasks: &mut Vec<tokio::task::JoinHandle<()>>| {
         for t in tasks.drain(..) {
             t.abort();
@@ -1079,6 +1131,8 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         conn_ids,
         listener: Some(listener),
         tasks: {
+            // The actor ends by itself on `EngineMsg::Shutdown`; `shutdown`
+            // aborts only the others.
             let actor = tasks.remove(0);
             drop(actor);
             tasks
@@ -1107,5 +1161,25 @@ pub fn check_init(data_dir: &Path) -> Result<(), String> {
             "--cluster-init: cannot inspect {}: {e}",
             data_dir.display()
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leader_reachable_uses_the_voter_count() {
+        let t = Duration::from_secs(1);
+        // A follower: reachable while it names a leader.
+        assert!(leader_reachable(2, Some(1), 3, None, t));
+        assert!(!leader_reachable(2, None, 3, None, t));
+        // A single voter needs no acknowledgement, whatever the config says.
+        assert!(leader_reachable(1, Some(1), 1, None, t));
+        // Several voters (a cluster grown from one node): only with a
+        // recent quorum acknowledgement.
+        assert!(!leader_reachable(1, Some(1), 2, None, t));
+        assert!(!leader_reachable(1, Some(1), 2, Some(1001), t));
+        assert!(leader_reachable(1, Some(1), 2, Some(1000), t));
     }
 }
