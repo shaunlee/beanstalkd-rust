@@ -1,11 +1,6 @@
 
-@put 0 0 60 1
-x
-put 0 100 60 1
-y
-reserve
-pause-tube default 2
+@put 0 0 60 5
+hello
 reserve
 release 1 0 0
-kick-job 2
-stats-tube default
+peek-ready

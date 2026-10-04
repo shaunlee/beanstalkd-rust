@@ -1,5 +1,10 @@
 
-@put 0 0 1 5
-hello
-reserve
-reserve
+@reserve
+put 0 0 60 1
+a
+stats-job 1
+stats-job 1
+stats
+put 0 0 60 1
+b
+reserve-with-timeout 0

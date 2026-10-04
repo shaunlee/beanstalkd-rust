@@ -1,5 +1,9 @@
 
-@put 0 0 60 5
-hello
+@put 0 0 1 1
+x
 reserve
-release 1
+release 1 0 0
+touch 1
+bury 1 0
+stats-job 1
+stats

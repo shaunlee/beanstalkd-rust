@@ -8,5 +8,5 @@ use default
 put 0 0 1 5
 short
 reserve
-reserve-with-timeout 0
+reserve
 stats

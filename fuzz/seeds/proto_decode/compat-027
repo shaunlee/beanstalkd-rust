@@ -1,0 +1,17 @@
+
+@put 0 0 60 1
+a
+put 0 0 60 1
+b
+reserve
+release 1 3 30
+stats-job 1
+put 0 0 60 1
+c
+delete 2
+peek-ready
+peek 2
+stats-job 1
+stats-job 3
+kick 5
+stats-job 1

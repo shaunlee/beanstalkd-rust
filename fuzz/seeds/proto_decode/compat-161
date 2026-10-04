@@ -1,5 +1,2 @@
 
-@put 0 0 60 5
-hello
-reserve
-reserve-job 1
+@reserve-job 999

@@ -3,10 +3,8 @@
 a
 put 0 0 60 1
 b
+delete 1
+delete 2
+stats
 put 0 0 60 1
 c
-delete 3
-peek 3
-put 0 0 60 1
-d
-stats-job 4

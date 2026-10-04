@@ -1,2 +1,16 @@
 
-@stats-tube nosuchtube
+@use t
+use t
+watch t
+watch t
+ignore default
+watch t
+reserve
+reserve-with-timeout 10
+stats-tube t
+stats-tube default
+stats
+put 0 0 60 1
+x
+stats-tube t
+stats

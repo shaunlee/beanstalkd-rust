@@ -1,17 +1,2 @@
 
-@use a
-put 0 0 60 3
-ina
-use b
-put 0 0 60 3
-inb
-watch a
-watch b
-reserve
-reserve
-watch b
-ignore default
-watch a
-ignore default
-reserve
-reserve
+@delete 999

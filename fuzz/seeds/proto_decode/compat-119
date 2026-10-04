@@ -1,2 +1,4 @@
 
-@peek-ready
+@put 0 0 60 5
+hello
+peek-ready

@@ -1,2 +1,6 @@
 
-@reserve-with-timeout 5
+@put 0 0 60 1
+x
+reserve
+reserve
+stats-job 1

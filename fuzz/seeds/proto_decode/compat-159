@@ -1,6 +1,4 @@
 
-@put 0 0 60 1
-x
-pause-tube default 10
+@put 0 0 60 5
+hello
 reserve-job 1
-reserve-with-timeout 0

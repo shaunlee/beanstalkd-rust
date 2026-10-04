@@ -1,8 +1,22 @@
 
-@use Foo
+@use a-+/;.$_()Z9
 put 0 0 60 1
 x
-use foo
+use 9lives
+use (paren)
+use $dollar
+use +plus
+use /slash
+use ;semi
+use .dot
+use _under
+use )
+use a b
+use a*b
+use aé
+use -x
+use a	b
+watch 9lives
+stats-tube a-+/;.$_()Z9
 list-tubes
-stats-tube FOO
-stats-tube Foo
+list-tubes-watched

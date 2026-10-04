@@ -1,2 +1,4 @@
 
-@ignore default
+@watch foo
+ignore default
+list-tubes-watched

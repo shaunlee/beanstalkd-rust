@@ -1,4 +1,5 @@
 
-@put 0 0 60 20
-01234567890123456789
-stats-tube default
+@pause-tube default 1
+reserve
+put 0 0 60 1
+x

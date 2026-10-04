@@ -1,5 +1,11 @@
 
-@pause-tube default 1
-reserve
-put 0 0 60 1
-x
+@put 00 00 060 01
+a
+put  1  0  60  1
+b
+put +1 0 60 1
+put 1 0 60 -1
+put 1	0 60 1
+put 1 0 60 1 
+c
+stats

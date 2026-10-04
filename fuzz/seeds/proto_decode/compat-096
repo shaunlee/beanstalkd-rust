@@ -1,6 +1,2 @@
 
-@put 0 0 60 0
-
-put 0 0 60 1
-x
-stats
+@stats

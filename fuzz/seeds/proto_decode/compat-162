@@ -1,18 +1,5 @@
 
 @put 0 0 60 5
-ready
-put 0 100 60 7
-delayed
-put 0 0 60 6
-buried
-reserve-job 3
-bury 3 7
-reserve-job 2
-stats-job 2
-reserve-job 3
-stats-job 3
+hello
+reserve
 reserve-job 1
-reserve-job 1
-reserve-job 999
-stats
-stats

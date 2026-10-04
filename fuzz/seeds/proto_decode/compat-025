@@ -1,9 +1,10 @@
 
-@put 3 0 60 5
-hello
+@put 0 0 60 3
+abc
 reserve
-stats-job 1
+release 1 7 1
+reserve
+reserve
 stats-job 1
 stats
 reserve-with-timeout 0
-stats-job 1

@@ -1,8 +1,11 @@
 
-@watch t
-pause-tube t 100
-stats-tube t
-ignore t
-stats-tube t
-watch t
-stats-tube t
+@put 0 0 60 1
+x
+reserve
+release 1 0 0
+bury 1 0
+touch 1
+delete 1
+stats-job 1
+stats
+delete 1

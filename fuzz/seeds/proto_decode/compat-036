@@ -1,12 +1,5 @@
 
-@use p
-put 0 0 60 6
-paused
-pause-tube p 10
-watch p
-use default
-put 0 0 1 5
-short
+@put 0 0 1 5
+hello
 reserve
 reserve
-stats

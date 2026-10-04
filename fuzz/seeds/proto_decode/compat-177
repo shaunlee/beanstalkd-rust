@@ -1,6 +1,4 @@
 
-@put 5 0 60 5
+@put 0 0 60 5
 hello
-stats-job 1
-reserve
-stats-job 1
+stats

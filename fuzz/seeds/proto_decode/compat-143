@@ -1,5 +1,15 @@
 
-@put 0 0 60 1
+@put 0 0 60 20
+01234567890123456789
+stats
+put 0 0 60 1 junk
 x
-stats-job 1
+stats
+put a 0 60 1
+stats
+put 0 0 60 1
+abcstats
+put 0 0 60 1
+x
+stats-job 2
 stats

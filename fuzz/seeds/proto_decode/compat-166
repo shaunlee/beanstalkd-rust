@@ -1,7 +1,11 @@
 
-@reserve
+@list-tube-used
+list-tube-used
+list-tube-used
+list-tube-used
+reserve-with-timeout 1
 reserve
-put 0 0 60 5
-first
-put 0 0 60 6
-second
+reserve-with-timeout 1
+stats-tube default
+put 0 0 60 1
+x

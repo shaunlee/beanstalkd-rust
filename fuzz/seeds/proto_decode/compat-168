@@ -1,5 +1,2 @@
 
-@reserve-with-timeout 1000000
-stats-tube default
-stats-tube default
-stats
+@reserve-with-timeout 1

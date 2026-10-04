@@ -1,11 +1,2 @@
 
-@put 0 0 60 2
-j1
-put 0 0 60 2
-j2
-reserve
-bury 1 0
-reserve
-bury 2 0
-kick 0
-stats-tube default
+@ignore default

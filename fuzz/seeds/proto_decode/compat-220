@@ -1,9 +1,11 @@
 
-@watch a
-watch a
-ignore zzz
-list-tubes
-ignore a
-ignore a
+@use tubeA
+put 100 0 60 5
+AAAAA
+use tubeB
+put 1 0 60 5
+BBBBB
+watch tubeA
+watch tubeB
 ignore default
-stats
+reserve

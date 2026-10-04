@@ -4,10 +4,6 @@ list-tube-used
 list-tube-used
 list-tube-used
 list-tube-used
-reserve
-reserve
-reserve
-reserve
 put 0 0 60 4
 job1
 put 0 0 60 4
@@ -16,3 +12,16 @@ put 0 0 60 4
 job3
 put 0 0 60 4
 job4
+reserve
+bury 1 0
+reserve
+bury 2 0
+reserve
+bury 3 0
+reserve
+bury 4 0
+reserve
+reserve
+reserve
+reserve
+kick 4

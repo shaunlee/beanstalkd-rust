@@ -1,8 +1,2 @@
 
-@put 0 0 60 5
-hello
-put 0 0 60 5
-world
-reserve
-delete 1
-stats
+@stats-job 999

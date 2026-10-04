@@ -1,7 +1,4 @@
 
-@watch a
-watch b
-watch x
-watch y
-list-tubes
+@use foo
+watch bar
 list-tubes

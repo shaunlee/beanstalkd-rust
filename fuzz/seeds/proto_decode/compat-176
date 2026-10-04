@@ -1,4 +1,11 @@
 
-@put 0 0 60 5
-hello
+@use foo
+put 0 0 60 1
+a
+put 0 0 60 1
+b
 stats
+list-tubes
+peek 1
+put 0 0 60 1
+c

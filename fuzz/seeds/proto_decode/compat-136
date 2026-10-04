@@ -1,11 +1,7 @@
 
-@put 00 00 060 01
-a
-put  1  0  60  1
-b
-put +1 0 60 1
-put 1 0 60 -1
-put 1	0 60 1
-put 1 0 60 1 
-c
+@put 0 0 60 1
+abc
+put 0 0 60 2
+ab
+list-tube-used
 stats

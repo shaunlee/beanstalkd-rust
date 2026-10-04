@@ -1,9 +1,13 @@
 
-@use foo
-put 0 0 60 5
-hello
-reserve-job 1
-delete 1
+@watch t1
+watch keep1
+watch t2
+watch t3
+watch keep2
+watch t4
+use t5
+watch keep3
+watch t6
 list-tubes
-use default
 list-tubes
+list-tubes-watched

@@ -1,12 +1,6 @@
 
-@put 5 0 60 3
-foo
-put 1 0 60 3
-bar
-put 5 0 60 3
-baz
-reserve
-delete 2
-reserve
-delete 1
-reserve
+@put 0 0 60 10
+012stats
+3456789
+put 0 0 60 1
+x

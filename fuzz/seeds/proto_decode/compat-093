@@ -1,2 +1,4 @@
 
-@stats
+@watch foo
+watch bar
+list-tubes-watched

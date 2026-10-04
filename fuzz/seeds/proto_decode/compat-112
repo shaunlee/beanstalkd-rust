@@ -1,5 +1,7 @@
 
-@pause-tube default 0
-reserve-with-timeout 5
+@pause-tube default 100
+reserve
 put 0 0 60 1
 x
+pause-tube default 0
+stats-tube default

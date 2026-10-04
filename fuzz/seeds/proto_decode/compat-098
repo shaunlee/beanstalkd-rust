@@ -1,11 +1,17 @@
 
 @put 0 0 60 1
 x
-reserve
-release 1 0 0
-bury 1 0
-touch 1
-delete 1
-stats-job 1
-stats
-delete 1
+peek 18446744073709551615
+peek 18446744073709551616
+peek  1
+peek 1 
+peek 01
+stats-job 00001
+delete 1 
+bury 1
+release 1 2
+touch  1
+kick-job 18446744073709551616
+reserve-job   1
+release 1   5    0
+delete	1

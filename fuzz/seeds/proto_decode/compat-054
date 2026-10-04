@@ -1,4 +1,6 @@
 
-@put 0 0 60 3
-abc
-peek 1
+@list-tubes
+list-tube-used
+stats
+
+list-tube-used

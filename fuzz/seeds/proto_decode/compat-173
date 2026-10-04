@@ -1,4 +1,2 @@
 
-@put 0 0 60 5
-hello
-reserve-with-timeout 0
+@reserve-with-timeout 0

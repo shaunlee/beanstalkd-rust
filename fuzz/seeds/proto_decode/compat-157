@@ -1,5 +1,4 @@
 
-@put 0 0 60 5
+@reserve
+put 0 0 60 5
 hello
-reserve
-reserve

@@ -1,2 +1,8 @@
 
-@frobnicate
+@use Foo
+put 0 0 60 1
+x
+use foo
+list-tubes
+stats-tube FOO
+stats-tube Foo

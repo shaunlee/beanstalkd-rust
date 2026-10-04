@@ -1,5 +1,7 @@
 
-@pause-tube default 2
-reserve
-put 0 0 60 5
-hello
+@pause-tube -foo 5
+pause-tube aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 5
+pause-tube 5
+pause-tube default x
+stats
+stats-tube default

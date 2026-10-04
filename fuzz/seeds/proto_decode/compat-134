@@ -1,3 +1,7 @@
 
-@put 0 0 60 5
-helloXX
+@put 0 2 60 5
+hello
+peek-ready
+peek-delayed
+peek-ready
+peek-delayed

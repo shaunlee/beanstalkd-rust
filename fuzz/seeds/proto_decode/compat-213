@@ -5,28 +5,18 @@ list-tube-used
 list-tube-used
 list-tube-used
 list-tube-used
-list-tube-used
 reserve
 reserve
 reserve
 reserve
 reserve
-reserve
-put 0 0 60 2
-j1
-put 0 0 60 2
-j2
-reserve
-reserve
-put 0 0 60 2
-j3
-put 0 0 60 2
-j4
-put 0 0 60 2
-j5
-put 0 0 60 2
-j6
-put 0 0 60 2
-j7
-put 0 0 60 2
-j8
+put 0 0 60 4
+job1
+put 0 0 60 4
+job2
+put 0 0 60 4
+job3
+put 0 0 60 4
+job4
+put 0 0 60 4
+job5

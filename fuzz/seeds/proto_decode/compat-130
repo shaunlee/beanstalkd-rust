@@ -1,5 +1,8 @@
 
 @put 0 0 60 5
-heput 0 0 60 1
+hestats
+put 0 0 60 1
 x
+llo
+peek 1
 stats

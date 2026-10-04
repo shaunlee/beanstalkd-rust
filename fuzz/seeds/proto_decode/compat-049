@@ -1,14 +1,18 @@
 
-@watch a
-watch b
-watch b
-ignore default
+@put 0 0 60 1
+a
+put 0 0 60 1
+b
+put 0 0 60 1
+c
 reserve
 reserve
-use a
-put 5 0 60 2
-a5
-use b
-put 9 0 60 2
-b9
-stats
+release 1 0 0
+reserve
+reserve
+list-tube-used
+list-tube-used
+list-tube-used
+reserve
+reserve
+reserve

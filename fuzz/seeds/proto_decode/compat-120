@@ -1,12 +1,2 @@
 
-@put 5 0 60 3
-abc
-reserve
-touch 1
-release 1 7 0
-reserve
-bury 1 2
-kick 1
-reserve
-delete 1
-stats-job 1
+@peek-ready

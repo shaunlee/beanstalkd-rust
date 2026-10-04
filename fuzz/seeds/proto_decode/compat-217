@@ -1,20 +1,13 @@
 
-@watch a
-list-tube-used
+@list-tube-used
 list-tube-used
 list-tube-used
 list-tube-used
 reserve
 reserve
 reserve
-reserve
-use a
-put 0 0 60 5
-froma
-use default
 put 0 0 60 2
-d1
+j1
 put 0 0 60 2
-d2
-put 0 0 60 2
-d3
+j2
+stats-tube default

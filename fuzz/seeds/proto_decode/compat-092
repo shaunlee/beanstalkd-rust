@@ -1,4 +1,11 @@
 
-@watch foo
-watch bar
-list-tubes-watched
+@use jobs
+put 0 0 60 1
+x
+use other
+list-tubes
+use default
+list-tubes
+delete 1
+list-tubes
+stats-tube jobs

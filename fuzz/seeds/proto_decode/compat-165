@@ -1,11 +1,9 @@
 
-@list-tube-used
-list-tube-used
-list-tube-used
-list-tube-used
-reserve-with-timeout 1
-reserve
-reserve-with-timeout 1
-stats-tube default
+@reserve
+quit
 put 0 0 60 1
 x
+stats-job 1
+reserve-with-timeout 1
+quit
+stats

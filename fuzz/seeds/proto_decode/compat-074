@@ -1,5 +1,10 @@
 
 @put 0 100 60 5
-hello
+delay
+put 0 0 60 5
+ready
+reserve
+bury 2 0
 kick 10
-peek-ready
+peek-delayed
+peek-buried

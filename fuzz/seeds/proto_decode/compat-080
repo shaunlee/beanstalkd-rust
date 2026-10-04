@@ -1,22 +1,11 @@
 
-@put 0 0 60 2
-j1
-put 0 0 60 2
-j2
-put 0 0 60 2
-j3
-put 0 0 60 2
-j4
-reserve
+@use a
+put 0 0 60 1
+x
+reserve-job 1
 bury 1 0
+use default
+watch a
 reserve
-bury 2 0
-reserve
-bury 3 0
-reserve
-bury 4 0
-kick -0
-kick -4294967295
-kick -1
-kick -
-stats-tube default
+kick-job 1
+stats-job 1

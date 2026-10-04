@@ -1,25 +1,2 @@
 
-@put 5 0 60 1
-a
-put 5 0 60 1
-b
-put 4 100 60 1
-c
-put 1 50 60 1
-d
-peek-ready
-peek-delayed
-reserve-job 1
-bury 1 0
-reserve-job 2
-bury 2 0
-put 0 0 60 1
-e
-reserve-job 5
-bury 5 0
-peek-buried
-kick-job 1
-peek-buried
-kick 1
-peek-buried
-peek-ready
+@peek 999

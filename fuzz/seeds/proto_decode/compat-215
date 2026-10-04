@@ -1,17 +1,24 @@
 
-@list-tube-used
-list-tube-used
-list-tube-used
-list-tube-used
-list-tube-used
+@watch a
+ignore default
+watch a
+watch b
+watch b
+ignore default
+list-tubes-watched
+use b
 reserve
 reserve
 reserve
 reserve
+put 0 0 60 4
+tob1
+put 0 0 60 4
+tob2
+use a
+put 0 0 60 4
+toa1
+use default
+put 0 0 60 5
+todef
 stats
-put 0 0 60 2
-j1
-put 0 0 60 2
-j2
-put 0 0 60 2
-j3

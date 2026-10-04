@@ -1,7 +1,9 @@
 
-@
-   
-	
-
-
-list-tube-used
+@put 0 0 60 1
+x
+reserve
+reserve
+put 0 0 60 3
+new
+release 1 0 0
+stats-tube default

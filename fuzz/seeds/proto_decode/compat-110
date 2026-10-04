@@ -1,6 +1,9 @@
 
-@put 0 0 60 1
-x
-pause-tube default 0
-reserve-with-timeout 0
+@pause-tube default 1
+watch other
+pause-tube other 7
+pause-tube other 8
 stats-tube default
+stats-tube other
+stats-tube default
+stats

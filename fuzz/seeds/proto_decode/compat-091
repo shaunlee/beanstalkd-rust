@@ -1,11 +1,23 @@
 
-@use jobs
-put 0 0 60 1
-x
-use other
+@watch t01
+watch t02
+watch t03
+watch t04
+watch t05
+watch t06
+watch t07
+watch t08
+watch t09
+watch t10
+watch t11
+watch t12
+use u1
+use u2
+ignore t03
+ignore t07
+ignore t01
+ignore t12
+ignore t05
 list-tubes
-use default
-list-tubes
-delete 1
-list-tubes
-stats-tube jobs
+list-tubes-watched
+stats

@@ -1,8 +1,2 @@
 
-@put 0 0 60 5
-hello
-reserve
-release 1 0 1
-peek-ready
-peek-delayed
-peek-ready
+@release 999 0 0

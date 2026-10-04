@@ -1,13 +1,7 @@
 
-@watch t1
-watch keep1
-watch t2
-watch t3
-watch keep2
-watch t4
-use t5
-watch keep3
-watch t6
+@watch a
+watch b
+watch x
+watch y
 list-tubes
 list-tubes
-list-tubes-watched

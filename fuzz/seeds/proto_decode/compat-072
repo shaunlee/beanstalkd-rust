@@ -1,20 +1,11 @@
 
-@put 0 100 60 2
-d1
-put 0 50 60 2
-d2
+@put 0 0 60 2
+j1
 put 0 0 60 2
-b3
-put 0 0 60 2
-b4
+j2
 reserve
-bury 3 0
+bury 1 0
 reserve
-bury 4 0
-kick 10
+bury 2 0
+kick 0
 stats-tube default
-kick 1
-peek-ready
-kick 10
-stats-job 1
-stats-job 2

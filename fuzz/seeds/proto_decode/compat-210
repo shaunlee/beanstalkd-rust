@@ -8,15 +8,11 @@ reserve
 reserve
 reserve
 reserve
-put 0 0 60 1
-a
-delete 1
-reserve
-put 0 0 60 1
-b
-put 0 0 60 1
-c
-put 0 0 60 1
-d
-put 0 0 60 1
-e
+put 0 0 60 4
+job1
+put 0 0 60 4
+job2
+put 0 0 60 4
+job3
+put 0 0 60 4
+job4

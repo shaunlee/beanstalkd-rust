@@ -1,12 +1,6 @@
 
-@put 0 0 1 1
-a
-put 0 0 1 1
-b
+@put 0 0 1 5
+hello
 reserve
-reserve
-list-tube-used
-list-tube-used
-reserve
-reserve
-stats
+peek-ready
+stats-job 1

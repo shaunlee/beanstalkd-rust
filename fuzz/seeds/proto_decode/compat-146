@@ -1,2 +1,6 @@
 
-@quit
+@put 0 0 60 0
+
+peek 1
+reserve
+stats-job 1

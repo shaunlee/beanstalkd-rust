@@ -1,11 +1,15 @@
 
-@use a
-put 0 0 60 1
-x
-reserve-job 1
-bury 1 0
-use default
-watch a
+@put 0 0 60 2
+r1
+put 0 0 60 2
+r2
+kick-job 1
 reserve
 kick-job 1
-stats-job 1
+use other
+put 0 100 60 2
+d3
+use default
+kick-job 3
+stats-job 3
+kick-job 3

@@ -1,4 +1,10 @@
 
-@put 0 0 60 5
-hello
+@put 10 0 60 1
+x
 reserve
+release 1 3 1
+stats-job 1
+peek-delayed
+stats-tube default
+stats-job 1
+peek-ready

@@ -1,21 +1,5 @@
 
-@use t
-put 0 0 60 1
-r
-put 0 100 60 1
-d
-put 0 0 60 1
-b
-put 0 0 60 1
-v
-watch t
-reserve-job 3
-bury 3 0
-reserve-job 4
+@put 0 0 60 5
+hello
+reserve
 delete 1
-delete 2
-delete 3
-delete 4
-delete 4
-stats-tube t
-stats

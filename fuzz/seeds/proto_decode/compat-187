@@ -1,8 +1,6 @@
 
-@put 0 0 3 1
-x
+@put 0 0 2 5
+hello
 reserve
-reserve-with-timeout 0
 touch 1
-reserve-with-timeout 0
 stats-job 1

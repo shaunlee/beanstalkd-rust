@@ -1,2 +1,2 @@
 
-@use ab*c
+@use foo bar

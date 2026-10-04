@@ -1,5 +1,2 @@
 
-@put 0 0 60 5
-hello
-reserve
-delete 1
+@delete 18446744073709551616

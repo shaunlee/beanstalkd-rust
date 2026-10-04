@@ -1,22 +1,11 @@
 
-@stats
+@use p
 put 0 0 60 1
 a
-put 0 0 60 1
-b
-put 0 0 60 1
-c
-stats
-reserve
-release 1 0 30
-stats
-reserve
-bury 2 0
-stats
-kick 1
-stats
-kick-job 1
-stats
-delete 2
-delete 3
-stats
+pause-tube p 60
+watch p
+reserve-with-timeout 0
+stats-tube p
+stats-tube p
+watch p
+reserve-with-timeout 0

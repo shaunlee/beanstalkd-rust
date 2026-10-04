@@ -1,17 +1,14 @@
 
-@put 0 0 60 1
-x
-put 0 0 60 1
-y
-put 3 0 60 1
-z
-put 0 0 60 1
-abcput 0 0 60 6
-123456
-stats
+@watch a
+watch b
+watch b
+ignore default
 reserve
-stats-job 1
-delete 1
-put 0 0 60 1
-w
+reserve
+use a
+put 5 0 60 2
+a5
+use b
+put 9 0 60 2
+b9
 stats

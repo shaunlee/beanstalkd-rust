@@ -1,4 +1,5 @@
 
-@watch foo
-ignore default
-list-tubes-watched
+@put 0 0 60 1
+x
+reserve
+stats-job 1

@@ -1,14 +1,9 @@
 
-@watch a
-watch b
-watch c
-watch d
-ignore b
-list-tubes-watched
+@use foo
+put 0 0 60 5
+hello
+reserve-job 1
+delete 1
 list-tubes
-ignore default
-list-tubes-watched
-list-tubes
-watch b
-list-tubes-watched
+use default
 list-tubes

@@ -1,4 +1,7 @@
 
-@reserve-with-timeout 5
-put 0 0 60 5
-hello
+@reserve-with-timeout 1
+use other
+put 0 0 60 1
+x
+stats-tube other
+stats-tube default

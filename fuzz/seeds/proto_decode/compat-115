@@ -1,4 +1,6 @@
 
-@put 0 100 60 5
+@put 0 0 60 5
 hello
-peek-delayed
+reserve
+bury 1 0
+peek-buried
