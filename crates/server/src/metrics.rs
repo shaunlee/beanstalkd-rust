@@ -670,7 +670,44 @@ pub struct ClusterStats {
     pub rejoining: bool,
     pub votes_refused: u64,
     pub next_local_conn: Option<u64>,
+    /// What the node is doing: `joining` (not a member yet, waiting to be
+    /// added), `rejoining` (catching up without voting, after data loss or
+    /// as a new member), `starting` (other startup work: probing peers for
+    /// `--cluster-init`, waiting for a leader), or `normal`.
+    pub phase: &'static str,
+    /// Waiting until the operator adds this node (it is not a member yet).
+    pub joining: bool,
+    pub membership: MembershipStats,
+    /// This node is in the effective membership (voter or learner).
+    pub is_member: bool,
+    /// Leader only: entries each learner is missing (the learners of
+    /// `replication_lag`).
+    pub learner_lag: Option<std::collections::BTreeMap<u64, u64>>,
 }
+
+/// The effective membership as this node sees it (the latest membership
+/// entry in its log, committed or not).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MembershipStats {
+    /// Voters of every configuration (both halves of a joint one).
+    pub voters: std::collections::BTreeSet<u64>,
+    pub learners: std::collections::BTreeSet<u64>,
+    /// Every member's cluster address.
+    pub addrs: std::collections::BTreeMap<u64, String>,
+    pub joint: bool,
+    pub log_index: Option<u64>,
+    /// Whether the entry is committed, as far as this node knows.
+    pub committed: bool,
+    /// The highest node id ever a member (ids at or below are never reused).
+    pub highest_member: u64,
+}
+
+/// [`ClusterStats::role`] before Raft runs (a node still probing its
+/// peers); no `beanstalkd_cluster_role` sample is 1 then.
+pub const ROLE_STARTING: &str = "starting";
+
+/// [`ClusterStats::rewinds`] before any rewind.
+pub const NO_REWINDS: [(&str, u64); 4] = [("view", 0), ("error", 0), ("stall", 0), ("dropped", 0)];
 
 const ROLES: [&str; 5] = ["leader", "follower", "candidate", "learner", "shutdown"];
 
@@ -866,25 +903,144 @@ pub fn render_cluster_prometheus(out: &mut String, c: &ClusterStats) {
         Kind::Gauge,
         opt_gauge(c.next_local_conn),
     );
+    render_membership_prometheus(out, c);
 }
 
-/// Adds `"cluster": {...}` to a `render_admin_json` document.
+/// The membership part of [`render_cluster_prometheus`]. Member labels are
+/// bounded: a membership holds at most a few nodes (the wire bounds it).
+fn render_membership_prometheus(out: &mut String, c: &ClusterStats) {
+    let m = &c.membership;
+    let flag = |b: bool| u8::from(b).to_string();
+    let gauges: [(&str, &str, String); 8] = [
+        (
+            "beanstalkd_cluster_voters",
+            "Voters in the effective membership (both halves of a joint configuration).",
+            m.voters.len().to_string(),
+        ),
+        (
+            "beanstalkd_cluster_learners",
+            "Learners (non-voting members) in the effective membership.",
+            m.learners.len().to_string(),
+        ),
+        (
+            "beanstalkd_cluster_membership_joint",
+            "1 while a joint configuration (a voter change in progress) is in effect.",
+            flag(m.joint),
+        ),
+        (
+            "beanstalkd_cluster_membership_log_index",
+            "Log index of the effective membership entry (-1: none).",
+            opt_gauge(m.log_index),
+        ),
+        (
+            "beanstalkd_cluster_membership_committed",
+            "1 when the effective membership entry is known to be committed.",
+            flag(m.committed),
+        ),
+        (
+            "beanstalkd_cluster_highest_member_id",
+            "Highest node id ever a member (ids at or below it are never reused).",
+            m.highest_member.to_string(),
+        ),
+        (
+            "beanstalkd_cluster_is_member",
+            "1 when this node is in the effective membership (voter or learner).",
+            flag(c.is_member),
+        ),
+        (
+            "beanstalkd_cluster_joining",
+            "1 while this node waits to be added to the cluster (not a member yet).",
+            flag(c.joining),
+        ),
+    ];
+    for (name, help, value) in gauges {
+        family(out, name, help, Kind::Gauge);
+        sample(out, name, &[], &value);
+    }
+    family(
+        out,
+        "beanstalkd_cluster_member",
+        "1 for each member of the effective membership, with its role and address.",
+        Kind::Gauge,
+    );
+    for (id, addr) in &m.addrs {
+        let role = if m.voters.contains(id) {
+            "voter"
+        } else {
+            "learner"
+        };
+        sample(
+            out,
+            "beanstalkd_cluster_member",
+            &[("node", &id.to_string()), ("role", role), ("addr", addr)],
+            "1",
+        );
+    }
+    family(
+        out,
+        "beanstalkd_cluster_learner_lag",
+        "Leader only: log entries each learner is missing.",
+        Kind::Gauge,
+    );
+    if let Some(lag) = &c.learner_lag {
+        for (node, n) in lag {
+            sample(
+                out,
+                "beanstalkd_cluster_learner_lag",
+                &[("node", &node.to_string())],
+                &n.to_string(),
+            );
+        }
+    }
+}
+
+/// `{"<node>": entries, ...}`, or `null`.
+fn json_lag(lag: Option<&std::collections::BTreeMap<u64, u64>>) -> String {
+    let Some(m) = lag else {
+        return "null".to_owned();
+    };
+    let parts: Vec<String> = m.iter().map(|(id, n)| format!("\"{id}\":{n}")).collect();
+    format!("{{{}}}", parts.join(","))
+}
+
+fn json_membership(m: &MembershipStats) -> String {
+    let ids = |set: &std::collections::BTreeSet<u64>| {
+        let parts: Vec<String> = set.iter().map(u64::to_string).collect();
+        format!("[{}]", parts.join(","))
+    };
+    let mut nodes = String::from("{");
+    for (i, (id, addr)) in m.addrs.iter().enumerate() {
+        if i > 0 {
+            nodes.push(',');
+        }
+        nodes.push_str(&format!("\"{id}\":"));
+        push_json_str(&mut nodes, addr);
+    }
+    nodes.push('}');
+    let fields = [
+        ("voters", Json::Raw(ids(&m.voters))),
+        ("learners", Json::Raw(ids(&m.learners))),
+        ("nodes", Json::Raw(nodes)),
+        ("joint", Json::Bool(m.joint)),
+        (
+            "log_index",
+            Json::Raw(
+                m.log_index
+                    .map_or_else(|| "null".to_owned(), |v| v.to_string()),
+            ),
+        ),
+        ("committed", Json::Bool(m.committed)),
+        ("highest_member", Json::Num(m.highest_member)),
+    ];
+    let mut out = String::new();
+    push_object(&mut out, &fields);
+    out
+}
+
+/// Adds `"cluster": {...}` to a `render_admin_json` document (or to `{}`).
 pub fn append_cluster_json(json: &mut String, c: &ClusterStats) {
     let opt = |v: Option<u64>| v.map_or_else(|| "null".to_owned(), |v| v.to_string());
-    let lag = match &c.replication_lag {
-        None => "null".to_owned(),
-        Some(m) => {
-            let mut s = String::from("{");
-            for (i, (peer, n)) in m.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                s.push_str(&format!("\"{peer}\":{n}"));
-            }
-            s.push('}');
-            s
-        }
-    };
+    let lag = json_lag(c.replication_lag.as_ref());
     let rewinds = {
         let parts: Vec<String> = c
             .rewinds
@@ -920,11 +1076,19 @@ pub fn append_cluster_json(json: &mut String, c: &ClusterStats) {
         ("rejoining", Json::Bool(c.rejoining)),
         ("votes_refused", Json::Num(c.votes_refused)),
         ("next_local_conn", Json::Raw(opt(c.next_local_conn))),
+        ("phase", Json::Str(c.phase)),
+        ("joining", Json::Bool(c.joining)),
+        ("is_member", Json::Bool(c.is_member)),
+        ("membership", Json::Raw(json_membership(&c.membership))),
+        ("learner_lag", Json::Raw(json_lag(c.learner_lag.as_ref()))),
     ];
     // The document is one object: reopen it before its closing brace.
     if json.ends_with('}') {
         json.pop();
-        json.push_str(",\"cluster\":");
+        if !json.ends_with('{') {
+            json.push(',');
+        }
+        json.push_str("\"cluster\":");
         push_object(json, &fields);
         json.push('}');
     }
@@ -938,7 +1102,10 @@ mod tests {
     use bstk_engine::{Engine, EngineConfig, Snapshot, StaticSysInfo, SysSnapshot};
     use bstk_proto::{Command, StatsServer, StatsTube, TubeName};
 
-    use super::{ServerRsStats, render_admin_json, render_prometheus};
+    use super::{
+        ClusterStats, MembershipStats, ServerRsStats, append_cluster_json, render_admin_json,
+        render_cluster_prometheus, render_prometheus,
+    };
 
     fn rs() -> ServerRsStats {
         ServerRsStats {
@@ -1676,5 +1843,155 @@ mod tests {
             // The server object is unaffected by the cap.
             assert_eq!(v["server"]["current-tubes"], 3);
         }
+    }
+
+    /// A leader of voters 1-3 with learner 4 (index fields set: the parser
+    /// rejects the -1 of absent ones).
+    fn cluster_stats() -> ClusterStats {
+        ClusterStats {
+            node_id: 1,
+            role: "leader",
+            term: 3,
+            leader_id: Some(1),
+            commit_index: Some(40),
+            applied_index: Some(40),
+            last_log_index: Some(41),
+            replication_lag: Some(BTreeMap::from([(2, 0), (3, 1), (4, 9)])),
+            log_first_index: Some(1),
+            snapshot_index: Some(0),
+            next_local_conn: Some(7),
+            ready: true,
+            phase: "normal",
+            is_member: true,
+            membership: MembershipStats {
+                voters: BTreeSet::from([1, 2, 3]),
+                learners: BTreeSet::from([4]),
+                addrs: (1..=4).map(|i| (i, format!("127.0.0.1:1140{i}"))).collect(),
+                joint: false,
+                log_index: Some(12),
+                committed: true,
+                highest_member: 5,
+            },
+            learner_lag: Some(BTreeMap::from([(4, 9)])),
+            rewinds: super::NO_REWINDS,
+            ..ClusterStats::default()
+        }
+    }
+
+    fn value(fams: &BTreeMap<String, Family>, name: &str, labels: &[(&str, &str)]) -> String {
+        let want: Vec<(String, String)> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        fams[name]
+            .samples
+            .iter()
+            .find(|(l, _)| *l == want)
+            .unwrap_or_else(|| panic!("{name}{labels:?} missing"))
+            .1
+            .clone()
+    }
+
+    #[test]
+    fn cluster_membership_metrics() {
+        let mut text = String::new();
+        render_cluster_prometheus(&mut text, &cluster_stats());
+        let fams = parse(&text);
+        for (name, want) in [
+            ("beanstalkd_cluster_voters", "3"),
+            ("beanstalkd_cluster_learners", "1"),
+            ("beanstalkd_cluster_membership_joint", "0"),
+            ("beanstalkd_cluster_membership_log_index", "12"),
+            ("beanstalkd_cluster_membership_committed", "1"),
+            ("beanstalkd_cluster_highest_member_id", "5"),
+            ("beanstalkd_cluster_is_member", "1"),
+            ("beanstalkd_cluster_joining", "0"),
+            ("beanstalkd_cluster_rejoining", "0"),
+        ] {
+            assert_eq!(fams[name].kind, "gauge", "{name}");
+            assert_eq!(value(&fams, name, &[]), want, "{name}");
+        }
+        assert_eq!(
+            value(&fams, "beanstalkd_cluster_learner_lag", &[("node", "4")]),
+            "9"
+        );
+        assert_eq!(fams["beanstalkd_cluster_learner_lag"].samples.len(), 1);
+        assert_eq!(fams["beanstalkd_cluster_member"].samples.len(), 4);
+        let member = |id: &str, role: &str, addr: &str| {
+            value(
+                &fams,
+                "beanstalkd_cluster_member",
+                &[("node", id), ("role", role), ("addr", addr)],
+            )
+        };
+        assert_eq!(member("3", "voter", "127.0.0.1:11403"), "1");
+        assert_eq!(member("4", "learner", "127.0.0.1:11404"), "1");
+
+        // Not the leader, not a member: no lag samples, flags at 0/1.
+        let mut s = cluster_stats();
+        s.learner_lag = None;
+        s.replication_lag = None;
+        s.is_member = false;
+        s.joining = true;
+        s.membership.joint = true;
+        let mut text = String::new();
+        render_cluster_prometheus(&mut text, &s);
+        let fams = parse(&text);
+        assert!(fams["beanstalkd_cluster_learner_lag"].samples.is_empty());
+        assert_eq!(value(&fams, "beanstalkd_cluster_is_member", &[]), "0");
+        assert_eq!(value(&fams, "beanstalkd_cluster_joining", &[]), "1");
+        assert_eq!(
+            value(&fams, "beanstalkd_cluster_membership_joint", &[]),
+            "1"
+        );
+        // Absent membership index: -1, as the other absent indexes.
+        s.membership.log_index = None;
+        let mut text = String::new();
+        render_cluster_prometheus(&mut text, &s);
+        assert!(
+            text.contains("\nbeanstalkd_cluster_membership_log_index -1\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn cluster_membership_json() {
+        let mut json = String::from("{}");
+        append_cluster_json(&mut json, &cluster_stats());
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let c = &v["cluster"];
+        assert_eq!(c["phase"], "normal");
+        assert_eq!(c["joining"], false);
+        assert_eq!(c["is_member"], true);
+        assert_eq!(c["learner_lag"], serde_json::json!({"4": 9}));
+        assert_eq!(
+            c["membership"],
+            serde_json::json!({
+                "voters": [1, 2, 3],
+                "learners": [4],
+                "nodes": {
+                    "1": "127.0.0.1:11401",
+                    "2": "127.0.0.1:11402",
+                    "3": "127.0.0.1:11403",
+                    "4": "127.0.0.1:11404"
+                },
+                "joint": false,
+                "log_index": 12,
+                "committed": true,
+                "highest_member": 5
+            })
+        );
+        let mut s = cluster_stats();
+        s.learner_lag = None;
+        s.membership = MembershipStats::default();
+        let mut json = String::from("{}");
+        append_cluster_json(&mut json, &s);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["cluster"]["learner_lag"], serde_json::Value::Null);
+        assert_eq!(
+            v["cluster"]["membership"]["log_index"],
+            serde_json::Value::Null
+        );
+        assert_eq!(v["cluster"]["membership"]["voters"], serde_json::json!([]));
     }
 }

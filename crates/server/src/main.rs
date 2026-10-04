@@ -216,6 +216,14 @@ fn main() -> ExitCode {
                 listener,
                 engine: engine_config(&config),
                 sys: Arc::new(ProcessSysInfo::collect()),
+                publish: {
+                    let state = http.as_ref().map(|(s, _)| Arc::clone(s));
+                    Box::new(move |info| {
+                        if let Some(s) = state {
+                            s.set_cluster(info);
+                        }
+                    })
+                },
             };
             match runtime.block_on(start_cluster(args)) {
                 Ok(node) => (node.engine.clone(), Some(node)),
@@ -547,9 +555,6 @@ async fn serve(
         });
     }
     if let Some((state, task)) = http {
-        if let Some(c) = &cluster {
-            state.set_cluster(c.info());
-        }
         state.set_ready(engine_tx.clone());
         tasks.push(task);
     }

@@ -15,7 +15,9 @@ Release tags are `v<version>` and match the workspace version in
 
 - **Operations guide** ([docs/OPERATIONS.md](https://github.com/shaunlee/beanstalkd-rust/blob/main/docs/OPERATIONS.md)):
   install, configuration, persistence, security, cluster bootstrap, node
-  loss and rejoin, backup and restore, upgrades, monitoring and alerts,
+  loss and rejoin, membership runbooks (grow 1 → 3 and 3 → 5, shrink,
+  replace a failed node or disk, remove the leader, change an address, CA
+  rotation), backup and restore, upgrades, monitoring and alerts,
   troubleshooting. Shipped in the release archives with
   `scripts/mkcluster-certs.sh`, which creates a cluster CA and node
   certificates.
@@ -50,10 +52,34 @@ Release tags are `v<version>` and match the workspace version in
   seeds, `--timeout` and `--json`. It follows the leader, waits for a started
   change to complete, prints the cluster's notes, and exits 0 (done), 1
   (refused or conflicting), 2 (usage), 3 (unreachable) or 4 (accepted but not
-  confirmed in time). The server's flags are unchanged.
+  confirmed in time). A removed node that still runs (and still names itself
+  or its old leader) is skipped for a member's view. The server's flags are
+  unchanged.
+
+- **Membership metrics** on `/metrics` and in the `cluster` object of
+  `/admin`: `beanstalkd_cluster_voters`, `_learners`,
+  `_member{node,role,addr}`, `_membership_joint`, `_membership_log_index`,
+  `_membership_committed`, `_highest_member_id`, `_is_member`, `_joining`
+  and, on the leader, `_learner_lag{node}`; `/admin` adds `membership`
+  (voters, learners, addresses, joint, log index, committed, highest
+  member), `is_member`, `joining`, `learner_lag` and `phase` (`joining`,
+  `rejoining`, `starting`, `normal`).
 
 ### Changed
 
+- Cluster `/readyz` (and `beanstalkd_cluster_ready`) is 503 on a node that
+  is not in the membership: one waiting to be added, or a removed node that
+  still runs. A removed node's clients are disconnected, and their
+  reservations released, at once (COMPAT C11).
+- A cluster node that is still starting (discovering its cluster, waiting
+  to be added, rejoining, waiting for a leader) answers `/metrics` and
+  `/admin` with its cluster figures only, instead of 503, so
+  `beanstalkd_cluster_joining` and `beanstalkd_cluster_rejoining` can be
+  watched (before, a rejoining node exported nothing until it had caught
+  up). Standalone servers still answer 503 until the binlog is replayed.
+- A node restarted with its data after it was removed from the membership
+  logs that it was removed (it still waits for a leader that never comes:
+  stop it).
 - A node started with an empty data directory whose id was removed from the
   cluster (or lies below the highest id ever used) refuses to start: node
   ids are never reused.

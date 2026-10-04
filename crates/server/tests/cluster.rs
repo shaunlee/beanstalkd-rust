@@ -1003,12 +1003,25 @@ fn wiped_node_does_not_vote_until_it_has_caught_up() {
     c.nodes[behind].signal(Signal::SIGCONT);
 
     // `behind` lacks the job and `acker` refuses to vote: no leader.
-    // (`/admin` is served only once a node accepts clients.)
+    // (`/admin` shows only the cluster figures until a node accepts
+    // clients.)
     std::thread::sleep(Duration::from_secs(3));
     let a = c.nodes[behind].admin().unwrap();
     assert_ne!(a["cluster"]["role"], "leader", "{a}");
     assert_eq!(c.nodes[acker].readyz(), 503);
-    assert!(c.nodes[acker].admin().is_none());
+    let a = c.nodes[acker].admin().unwrap();
+    assert!(a.get("server").is_none(), "{a}");
+    let cl = &a["cluster"];
+    assert_eq!(
+        (&cl["role"], &cl["phase"], &cl["rejoining"], &cl["ready"]),
+        (
+            &Value::from("starting"),
+            &Value::from("rejoining"),
+            &Value::from(true),
+            &Value::from(false)
+        ),
+        "{a}"
+    );
     assert_eq!(count(&c.nodes[acker], "rejoin mode:"), rejoins + 1);
     assert!(!marker.exists());
     assert!(!c.nodes[acker].has_raft_state());
@@ -2533,6 +2546,147 @@ fn admin_replaces_a_node_and_moves_it() {
     let mut on_l = c.nodes[l].connect();
     assert_eq!(reserve(&mut on_l, "reserve-with-timeout 5"), job);
     release(was);
+}
+
+/// The value of the unlabelled sample `name` in a `/metrics` text.
+fn gauge(metrics: &str, name: &str) -> Option<String> {
+    metrics
+        .lines()
+        .find_map(|l| l.strip_prefix(name)?.strip_prefix(' '))
+        .map(str::to_owned)
+}
+
+/// P6-T6: observability of membership. A node started before it is added
+/// shows `joining` on `/metrics` and `/admin` (cluster figures only) and is
+/// not ready; once added it catches up, becomes ready, and the leader
+/// reports it as a learner with its lag. A node removed while it runs is
+/// not ready any more (whether or not it learned of its removal).
+#[test]
+fn membership_metrics_and_readiness_of_joining_and_removed_nodes() {
+    let opts = Opts {
+        node_timeout: "2s",
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(3, &opts);
+    let l = c.leader();
+    let lp = c.nodes[l].cluster;
+    let lid = c.nodes[l].id;
+    let n4 = c.configure_extra_node(&[1, 2, 3, 4], &[], &opts);
+    c.nodes[n4].start(&[]);
+    let a = wait_for(Duration::from_secs(15), || {
+        c.nodes[n4]
+            .admin()
+            .filter(|a| a["cluster"]["joining"] == true)
+    })
+    .unwrap_or_else(|| panic!("node 4 never reported joining: {:?}", c.nodes[n4].admin()));
+    let cl = &a["cluster"];
+    assert_eq!(cl["phase"], "joining", "{a}");
+    assert_eq!(cl["is_member"], false, "{a}");
+    assert_eq!(cl["ready"], false, "{a}");
+    assert_eq!(c.nodes[n4].readyz(), 503);
+    let m = c.nodes[n4].metrics();
+    assert_eq!(
+        gauge(&m, "beanstalkd_cluster_joining").as_deref(),
+        Some("1"),
+        "{m}"
+    );
+    assert_eq!(
+        gauge(&m, "beanstalkd_cluster_is_member").as_deref(),
+        Some("0"),
+        "{m}"
+    );
+    assert_eq!(
+        gauge(&m, "beanstalkd_cluster_ready").as_deref(),
+        Some("0"),
+        "{m}"
+    );
+    assert!(!m.contains("beanstalkd_current_jobs"), "{m}");
+
+    let addr = format!("127.0.0.1:{}", c.nodes[n4].cluster);
+    assert_eq!(change(lp, |e| add(4, &addr, e)), None);
+    assert!(
+        c.nodes[n4].wait_ready(Duration::from_secs(30)),
+        "node 4 never became ready"
+    );
+    let a = c.nodes[n4].admin().unwrap();
+    let cl = &a["cluster"];
+    assert_eq!(
+        (&cl["phase"], &cl["joining"], &cl["is_member"]),
+        (
+            &Value::from("normal"),
+            &Value::from(false),
+            &Value::from(true)
+        ),
+        "{a}"
+    );
+    assert_eq!(cl["membership"]["learners"], serde_json::json!([4]), "{a}");
+    let mut on_l = c.nodes[l].connect();
+    inserted(&on_l.put(b"x"));
+    let m = wait_for(Duration::from_secs(10), || {
+        let m = c.nodes[l].metrics();
+        m.contains("beanstalkd_cluster_learner_lag{node=\"4\"} 0")
+            .then_some(m)
+    })
+    .unwrap_or_else(|| panic!("no learner lag 0 for node 4: {}", c.nodes[l].metrics()));
+    for (name, want) in [
+        ("beanstalkd_cluster_voters", "3"),
+        ("beanstalkd_cluster_learners", "1"),
+        ("beanstalkd_cluster_membership_joint", "0"),
+        ("beanstalkd_cluster_membership_committed", "1"),
+        ("beanstalkd_cluster_is_member", "1"),
+        ("beanstalkd_cluster_highest_member_id", "4"),
+        ("beanstalkd_cluster_joining", "0"),
+    ] {
+        assert_eq!(gauge(&m, name).as_deref(), Some(want), "{name}: {m}");
+    }
+    assert!(
+        m.contains(&format!(
+            "beanstalkd_cluster_member{{node=\"4\",role=\"learner\",addr=\"{addr}\"}} 1"
+        )),
+        "{m}"
+    );
+    assert!(
+        m.contains(&format!(
+            "beanstalkd_cluster_member{{node=\"{lid}\",role=\"voter\","
+        )),
+        "{m}"
+    );
+    let idx: u64 = gauge(&m, "beanstalkd_cluster_membership_log_index")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(Some(idx), current(lp).map(|l| l.index), "{m}");
+    let a = c.nodes[l].admin().unwrap();
+    assert_eq!(
+        a["cluster"]["learner_lag"],
+        serde_json::json!({"4": 0}),
+        "{a}"
+    );
+    assert_eq!(
+        a["cluster"]["membership"]["nodes"]["4"],
+        Value::from(addr.as_str()),
+        "{a}"
+    );
+
+    // Removed while running: not ready from then on.
+    assert!(change(lp, |e| remove(4, e, false)).is_some());
+    wait_membership(&mut c, &[0, 1, 2], &[1, 2, 3], &[]);
+    let not_ready = wait_for(Duration::from_secs(10), || {
+        (c.nodes[n4].readyz() == 503).then_some(())
+    });
+    assert!(not_ready.is_some(), "the removed node stayed ready");
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(c.nodes[n4].readyz(), 503);
+    let a = c.nodes[n4].admin().unwrap();
+    assert_eq!(a["cluster"]["ready"], false, "{a}");
+    c.nodes[n4].stop(Signal::SIGTERM);
+    let m = c.nodes[l].metrics();
+    assert_eq!(
+        gauge(&m, "beanstalkd_cluster_learners").as_deref(),
+        Some("0"),
+        "{m}"
+    );
+    assert!(!m.contains("beanstalkd_cluster_learner_lag{"), "{m}");
 }
 
 // P6-T5: the operator CLI, `beanstalkd-rs cluster`, against real nodes.

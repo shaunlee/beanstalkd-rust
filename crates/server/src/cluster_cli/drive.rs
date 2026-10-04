@@ -273,13 +273,19 @@ impl<'a> Operator<'a> {
     }
 
     /// The membership view of the node connected, or of the first one that
-    /// answers.
+    /// answers. A node outside its own membership (removed but still
+    /// running: it is not told, and keeps naming itself or its old leader)
+    /// is used only if no member answers.
     async fn fetch(&mut self) -> Result<NodeStatusEx, Fail> {
         let mut bad: Vec<String> = Vec::new();
         let mut last = String::from("no node answered");
+        let mut outsider: Option<NodeStatusEx> = None;
         for _ in 0..=self.candidates.len() {
             if self.link.is_none() {
-                self.connect_any(None, &bad).await?;
+                match self.connect_any(None, &bad).await {
+                    Ok(()) => {}
+                    Err(e) => return outsider.ok_or(e),
+                }
             }
             let budget = self.budget(CALL_CAP);
             let Some(link) = self.link.as_mut() else {
@@ -288,7 +294,21 @@ impl<'a> Operator<'a> {
             match link.call(AdminRequest::Membership, budget).await {
                 Ok(AdminResponse::Membership(v)) => {
                     self.learn(&v);
-                    return Ok(*v);
+                    let Some(link) = self.link.as_ref() else {
+                        return Ok(*v);
+                    };
+                    let removed =
+                        !v.membership.nodes.is_empty() && !v.membership.is_member(link.node);
+                    if !removed || bad.contains(&link.addr) {
+                        return Ok(*v);
+                    }
+                    self.progress(&format!(
+                        "{} (node {}) is not a member any more; asking another node",
+                        link.addr, link.node
+                    ));
+                    bad.push(link.addr.clone());
+                    self.link = None;
+                    outsider = Some(*v);
                 }
                 Ok(other) => {
                     return Err(Fail::Refused(format!(
@@ -303,7 +323,7 @@ impl<'a> Operator<'a> {
                 }
             }
         }
-        Err(Fail::Unreachable(last))
+        outsider.ok_or(Fail::Unreachable(last))
     }
 
     /// Like [`Self::fetch`], from the leader when the node asked names one

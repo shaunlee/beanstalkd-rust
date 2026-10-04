@@ -29,6 +29,11 @@ and the plan in [docs/PLAN.md](docs/PLAN.md).
 - Cluster mode: 3 or 5 nodes replicate every job and connection through
   Raft over mutual TLS and keep serving through the loss of a minority of
   nodes; clients connect to any node.
+- Dynamic cluster membership: add, remove, replace and move nodes, and
+  grow from 1 to 3 or 3 to 5 nodes, while the cluster serves
+  (`beanstalkd-rs cluster`, an authenticated operator command), with
+  membership metrics and runbooks in
+  [docs/OPERATIONS.md](docs/OPERATIONS.md).
 - More operations per CPU second than the reference in standalone
   plaintext mode ([docs/BENCH.md](docs/BENCH.md)).
 

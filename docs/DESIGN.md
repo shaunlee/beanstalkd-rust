@@ -351,9 +351,34 @@ Cluster figures, added to `/metrics` and `/admin` in cluster mode only (`metrics
 | `beanstalkd_cluster_rejoining` | gauge | 1 while the node is in rejoin mode (no votes, no clients) |
 | `beanstalkd_cluster_votes_refused_total` | counter | vote requests refused in rejoin mode |
 | `beanstalkd_cluster_next_local_conn` | gauge | local number of the next client connection (-1 before clients are accepted) |
+| `beanstalkd_cluster_voters` | gauge | voters in the effective membership (both halves of a joint configuration) |
+| `beanstalkd_cluster_learners` | gauge | learners in the effective membership |
+| `beanstalkd_cluster_member{node,role,addr}` | gauge | 1 per member, `role` `voter` or `learner` (bounded: the wire caps a membership's size) |
+| `beanstalkd_cluster_membership_joint` | gauge | 1 while a joint configuration is in effect |
+| `beanstalkd_cluster_membership_log_index` | gauge | log index of the effective membership entry |
+| `beanstalkd_cluster_membership_committed` | gauge | 1 when this node knows that entry is committed (commit or applied index at or above it) |
+| `beanstalkd_cluster_highest_member_id` | gauge | highest id ever a member (`SmMeta::highest_member`, raised to the ids of the effective membership) |
+| `beanstalkd_cluster_is_member` | gauge | 1 when this node is in the effective membership |
+| `beanstalkd_cluster_joining` | gauge | 1 while the node waits to be added (startup discovery decided Join) |
+| `beanstalkd_cluster_learner_lag{node}` | gauge | leader only: entries a learner is missing (the learners of `replication_lag`) |
 
 Absent indexes are exported as -1. `/admin` has the same values under
-`"cluster"` (absent ones as `null`).
+`"cluster"` (absent ones as `null`), the membership as `"membership":
+{"voters": [...], "learners": [...], "nodes": {"<id>": "<addr>"},
+"joint", "log_index", "committed", "highest_member"}`, plus
+`"is_member"`, `"joining"`, `"learner_lag"` and `"phase"`: `joining`
+(waiting to be added; also in rejoin mode), `rejoining` (catching up
+without voting, after data loss or as a new member), `starting` (other
+startup work: `--cluster-init` probes, waiting for a leader) or `normal`.
+
+The effective membership is the latest membership entry in the node's
+log, committed or not. From the moment its cluster listener runs (before
+discovery), a cluster node registers its figures with the HTTP listener:
+until the engine is up, `/metrics` and `/admin` return the cluster
+figures alone (`role` `starting` while Raft does not run), so joining and
+rejoining nodes can be watched; `/readyz` stays 503. Readiness also
+requires the node to be in its effective membership (a removed node that
+still runs is not told).
 
 ## 7. Write-Ahead Log (P1, `bstk-store`)
 
@@ -699,3 +724,10 @@ Findings (P5-T6), each fixed with a regression test in the owning crate:
 - `bstk_raft::forward::ForwardHandler::admin(req, from)` (default `Unsupported`); the listener sends admin changes to it, and answers `NotLeader { leader: None, addr: None }` before Raft runs; `listener::admin_dispatch` is gone.
 - `membership::allowed(effective, committed, seeds)`: the allowlist (and the forward handler's admission, `Core::is_member`) includes the committed membership's nodes until a removal is committed on this node.
 - Server: `cluster::admin` (`handle`, `plan`, `Change`, `Context`, `finish_joint`, `joint_goal`, `DONE_BOUND`, `PROBE_BOUND`, `PROMOTE_MAX_LAG`, `PROMOTE_MAX_SILENCE`, `MIN_VOTERS`); `Core::admin_lock`; `config::is_loopback` is public in the crate. Test hook file `test-hold-change` (feature `test-hooks`).
+
+**P6-T6 (membership observability)**
+- `metrics::ClusterStats` gained `phase`, `joining`, `is_member`, `membership: MembershipStats` and `learner_lag`; new series in §6.2 "Cluster metrics". `append_cluster_json` also appends to `{}`.
+- `cluster::StartArgs::publish` hands the HTTP listener a `ClusterView` as soon as the cluster listener runs (the status view before `Core` exists, `Core` after); `/metrics` and `/admin` answer with the cluster figures alone until the engine is up. `ClusterNode::info` is gone.
+- Readiness (`duties::readiness`) requires membership in the effective configuration.
+- A restarted node outside the membership of its own log warns that it was removed (it still waits: the entry may be uncommitted).
+- `beanstalkd-rs cluster` sets aside the view of a node outside its own membership (a removed node still running) and asks another node.

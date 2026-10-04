@@ -106,7 +106,7 @@ use bstk_raft::{CONN_SEQ_BITS, NodeId, Op, Request, TypeConfig, owner_of};
 
 use crate::config::{ClusterSettings, SNAPSHOT_CHUNK};
 use crate::engine_actor::{Clock, EngineHandle};
-use crate::metrics::{ClusterInfo, ClusterStats};
+use crate::metrics::{self, ClusterInfo, ClusterStats, MembershipStats};
 use crate::sysinfo::{ProcessSysInfo, SharedSysInfo};
 
 /// How long a leader waits for a control proposal to be applied before
@@ -787,6 +787,7 @@ const PROBE_LOG_EVERY: Duration = Duration::from_secs(5);
 /// with the rejoin marker). Also returns the nodes to ask while rejoining
 /// (the seeds and the nodes of the membership decided on, see
 /// [`Core::rejoin`]). Safety: docs/DESIGN.md §8 "Why rejoin is safe".
+#[allow(clippy::too_many_arguments)]
 async fn discover(
     net: &Network,
     allowlist: &bstk_raft::listener::PeerAllowlist,
@@ -795,6 +796,7 @@ async fn discover(
     mut local: Option<Vote<NodeId>>,
     log: &LogStore,
     data_dir: &Path,
+    joining: &AtomicBool,
 ) -> Result<(Option<Vote<NodeId>>, BTreeSet<NodeId>), StartError> {
     let mut marked = durable::rejoin_marked(data_dir);
     let save = async |v: &Vote<NodeId>| {
@@ -840,7 +842,12 @@ async fn discover(
                 tracing::warn!(membership = ?m.log_id, "cluster config differs from the membership: {d}");
             }
         }
-        let why = match status::startup_decision(id, &answers, local) {
+        let decision = status::startup_decision(id, &answers, local);
+        joining.store(
+            matches!(decision, status::Startup::Join { .. }),
+            Ordering::Relaxed,
+        );
+        let why = match decision {
             status::Startup::Rejoin { vote, membership } => {
                 // Durable before a vote is saved or Raft starts: a vote file
                 // without the marker would make a restart look like an
@@ -995,13 +1002,29 @@ impl ClusterInfo for Core {
                 .collect::<BTreeMap<_, _>>()
         });
         let committed = self.status.committed.load(Ordering::Acquire);
+        let commit_index = (committed != u64::MAX).then_some(committed);
+        let applied_index = m.last_applied.map(|l| l.index);
+        let (membership, is_member) = membership_stats(
+            self.id,
+            &m.membership_config,
+            commit_index.max(applied_index),
+            self.state.highest_member(),
+        );
+        let learner_lag = replication_lag.as_ref().map(|lag| {
+            lag.iter()
+                .filter(|(id, _)| membership.learners.contains(id))
+                .map(|(&id, &n)| (id, n))
+                .collect()
+        });
+        let rejoining = self.status.rejoining.load(Ordering::Relaxed);
+        let started = self.status.started.load(Ordering::Acquire);
         ClusterStats {
             node_id: self.id,
             role,
             term: m.current_term,
             leader_id: m.current_leader,
-            commit_index: (committed != u64::MAX).then_some(committed),
-            applied_index: m.last_applied.map(|l| l.index),
+            commit_index,
+            applied_index,
             last_log_index: last_log,
             replication_lag,
             log_bytes: log.bytes,
@@ -1027,9 +1050,121 @@ impl ClusterInfo for Core {
             drop_node_proposals: self.status.drop_node_proposals.load(Ordering::Relaxed),
             ready: self.ready(),
             isolated: self.status.isolated.load(Ordering::Relaxed),
-            rejoining: self.status.rejoining.load(Ordering::Relaxed),
+            rejoining,
             votes_refused: self.gate.refused(),
             next_local_conn: self.conn_ids.get().map(|c| c.peek_local()),
+            phase: phase(false, rejoining, started),
+            joining: false,
+            membership,
+            is_member,
+            learner_lag,
+        }
+    }
+}
+
+/// [`ClusterStats::phase`]. A node that joins is also in rejoin mode (it
+/// catches up without voting once added), so `joining` comes first.
+fn phase(joining: bool, rejoining: bool, started: bool) -> &'static str {
+    if joining {
+        "joining"
+    } else if rejoining {
+        "rejoining"
+    } else if started {
+        "normal"
+    } else {
+        "starting"
+    }
+}
+
+/// The membership figures of `m` for node `id`, and whether `id` is a
+/// member. `known_committed` is the highest index this node knows to be
+/// committed (its commit index or applied index); `highest_applied` is the
+/// applied `SmMeta::highest_member`, raised to the ids `m` names (an entry
+/// not applied yet may name higher ones).
+fn membership_stats(
+    id: NodeId,
+    m: &StoredMembership<NodeId, BasicNode>,
+    known_committed: Option<u64>,
+    highest_applied: NodeId,
+) -> (MembershipStats, bool) {
+    let committed = m
+        .log_id()
+        .is_some_and(|l| known_committed.is_some_and(|k| k >= l.index));
+    view_stats(
+        id,
+        &MembershipView::from_stored(m, committed),
+        highest_applied,
+    )
+}
+
+fn view_stats(
+    id: NodeId,
+    view: &MembershipView,
+    highest_applied: NodeId,
+) -> (MembershipStats, bool) {
+    let highest_member = view
+        .nodes
+        .keys()
+        .copied()
+        .fold(highest_applied, NodeId::max);
+    let stats = MembershipStats {
+        voters: view.voters(),
+        learners: view.learners(),
+        joint: view.is_joint(),
+        log_index: view.log_id.map(|l| l.index),
+        committed: view.committed,
+        highest_member,
+        addrs: view.nodes.clone(),
+    };
+    (stats, view.is_member(id))
+}
+
+/// What `/metrics`, `/admin` and `/readyz` see of a cluster node from the
+/// moment its cluster listener runs, so that a node still discovering its
+/// cluster (joining, rejoining) can be watched: its storage and the status
+/// view until [`Core`] exists, then `Core`.
+struct ClusterView {
+    id: NodeId,
+    status: Arc<StatusView>,
+    joining: Arc<AtomicBool>,
+    core: OnceLock<Arc<Core>>,
+}
+
+impl ClusterInfo for ClusterView {
+    fn ready(&self) -> bool {
+        self.core.get().is_some_and(|c| c.ready())
+    }
+
+    fn stats(&self) -> ClusterStats {
+        if let Some(core) = self.core.get() {
+            return core.stats();
+        }
+        let ex = self.status.status_ex();
+        let log = self.status.log.metrics();
+        let joining = self.joining.load(Ordering::Relaxed);
+        let (membership, is_member) = view_stats(self.id, &ex.membership, ex.highest_member);
+        ClusterStats {
+            node_id: self.id,
+            role: if ex.raft_running {
+                "learner"
+            } else {
+                metrics::ROLE_STARTING
+            },
+            term: ex.term,
+            leader_id: ex.leader,
+            commit_index: ex.status.committed.map(|l| l.index),
+            applied_index: ex.last_applied.map(|l| l.index),
+            last_log_index: ex.status.last_log_id.map(|l| l.index),
+            log_bytes: log.bytes,
+            log_segments: log.segments,
+            log_first_index: log.first_index,
+            rejoining: ex.rejoining,
+            phase: phase(joining, ex.rejoining, false),
+            joining,
+            membership,
+            is_member,
+            rewinds: metrics::NO_REWINDS,
+            ..ClusterStats::default()
         }
     }
 }
@@ -1051,10 +1186,6 @@ pub struct ClusterNode {
 impl ClusterNode {
     pub fn clients(&self) -> Arc<Clients> {
         self.core.clients.clone()
-    }
-
-    pub fn info(&self) -> Arc<dyn ClusterInfo> {
-        self.core.clone()
     }
 
     /// After the actor has finished (`EngineMsg::Shutdown`): stops the
@@ -1101,6 +1232,9 @@ pub struct StartArgs<'a> {
     pub listener: tokio::net::TcpListener,
     pub engine: EngineConfig,
     pub sys: Arc<ProcessSysInfo>,
+    /// Called once, as soon as the cluster listener runs, with what the
+    /// HTTP endpoints show of this node from then on.
+    pub publish: Box<dyn FnOnce(Arc<dyn ClusterInfo>) + Send + 'a>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1225,6 +1359,14 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         ClusterListener::spawn_deferred::<handler::Handler>(args.listener, lcfg)
             .map_err(|e| StartError::Other(format!("cluster listener: {e}")))?;
     tracing::info!(node = id, addr = %listener.local_addr(), ?mode, "cluster listener started");
+    let joining = Arc::new(AtomicBool::new(false));
+    let view = Arc::new(ClusterView {
+        id,
+        status: status_view.clone(),
+        joining: joining.clone(),
+        core: OnceLock::new(),
+    });
+    (args.publish)(view.clone());
 
     if mode == Mode::Rejoin {
         announce_rejoin();
@@ -1252,6 +1394,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
             local,
             &log,
             &c.data_dir,
+            &joining,
         )
         .await?;
     }
@@ -1295,6 +1438,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         plaintext_allow_remote: c.plaintext_allow_remote,
         heartbeat: c.heartbeat,
     });
+    let _ = view.core.set(core.clone());
 
     if mode == Mode::Bootstrap {
         let members: BTreeMap<NodeId, BasicNode> = c
@@ -1352,7 +1496,21 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
                 return Err(e);
             }
         }
-        Mode::Bootstrap | Mode::Restart => tracing::info!("waiting for a leader"),
+        Mode::Bootstrap => tracing::info!("waiting for a leader"),
+        Mode::Restart => {
+            // A warning, not an exit: the entry may be an uncommitted one
+            // that a new leader truncates.
+            let m = &status_view.startup_membership;
+            if membership::has_members(m) && !membership::is_member(m, id) {
+                tracing::warn!(
+                    membership = ?m.log_id(),
+                    "this node is not in the membership of its own log: it was removed (or its \
+                     removal was not committed yet); a removed node never serves clients again \
+                     and its id is never reused: stop it"
+                );
+            }
+            tracing::info!("waiting for a leader");
+        }
     }
     core.drop_previous_connections().await;
 

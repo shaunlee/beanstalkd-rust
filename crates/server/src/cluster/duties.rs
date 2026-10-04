@@ -31,8 +31,9 @@
 //! # Readiness ([`readiness`])
 //!
 //! Every node: ready (`/readyz` 200) once the startup cleanup is done, a
-//! leader is known, and the applied index has reached the last commit index
-//! this node learned.
+//! leader is known, the applied index has reached the last commit index
+//! this node learned, and the node is in its effective membership (a node
+//! removed while running is not told, and must not be sent clients).
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -241,7 +242,10 @@ pub async fn readiness(core: Arc<Core>) {
         let ready = core.status.started.load(Ordering::Acquire)
             && core.leader().is_some()
             && caught_up
-            && !core.status.isolated.load(Ordering::Relaxed);
+            && !core.status.isolated.load(Ordering::Relaxed)
+            // The effective membership, not `Core::is_member`: that one still
+            // admits a node whose removal is not committed yet.
+            && super::membership::is_member(&core.membership(), core.id);
         core.status.ready.store(ready, Ordering::Release);
     }
 }

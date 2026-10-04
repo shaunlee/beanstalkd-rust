@@ -4,9 +4,9 @@
 //! | request | response |
 //! |---|---|
 //! | `GET /healthz` | 200 `ok` while the process runs |
-//! | `GET /readyz` | 503 until the engine is recovered (binlog replayed) and the listeners accept connections, then 200 `ready`; in cluster mode also 503 whenever no leader is known or this node lags behind the commit index it learned |
-//! | `GET /metrics` | Prometheus text format (`metrics::render_prometheus`), 503 before ready |
-//! | `GET /admin` | JSON (`metrics::render_admin_json`), 503 before ready |
+//! | `GET /readyz` | 503 until the engine is recovered (binlog replayed) and the listeners accept connections, then 200 `ready`; in cluster mode also 503 whenever no leader is known, this node lags behind the commit index it learned, is isolated, or is not a member |
+//! | `GET /metrics` | Prometheus text format (`metrics::render_prometheus`), 503 before ready; a cluster node that is still starting answers 200 with its cluster metrics only |
+//! | `GET /admin` | JSON (`metrics::render_admin_json`), 503 before ready; a cluster node that is still starting answers 200 with `{"cluster": {...}}` only |
 //! | another path | 404 |
 //! | another method | 405 (with `Allow: GET`) |
 //! | a request with a body | 400 |
@@ -185,7 +185,13 @@ async fn route(state: &HttpState, req: &Request<Incoming>) -> Response<Full<Byte
 /// slowly does not hold it.
 async fn monitoring(state: &HttpState, prometheus: bool) -> Response<Full<Bytes>> {
     if state.engine.get().is_none() {
-        return not_ready();
+        // A cluster node still starting (discovering its cluster, joining,
+        // rejoining) shows its cluster figures, so that phase can be
+        // watched; the engine's are not available yet.
+        return match state.cluster.get() {
+            Some(c) => cluster_only(&c.stats(), prometheus),
+            None => not_ready(),
+        };
     }
     let _permit =
         match tokio::time::timeout(SNAPSHOT_PERMIT_TIMEOUT, state.snapshot_permits.acquire()).await
@@ -210,6 +216,20 @@ async fn monitoring(state: &HttpState, prometheus: bool) -> Response<Full<Bytes>
         if let Some(c) = &cluster {
             metrics::append_cluster_json(&mut text, c);
         }
+        body(StatusCode::OK, JSON_CONTENT_TYPE, text)
+    }
+}
+
+/// The `/metrics` or `/admin` document of a cluster node that is still
+/// starting: the cluster figures only (`{"cluster": {...}}` for `/admin`).
+fn cluster_only(c: &metrics::ClusterStats, prometheus: bool) -> Response<Full<Bytes>> {
+    if prometheus {
+        let mut text = String::new();
+        metrics::render_cluster_prometheus(&mut text, c);
+        body(StatusCode::OK, PROMETHEUS_CONTENT_TYPE, text)
+    } else {
+        let mut text = String::from("{}");
+        metrics::append_cluster_json(&mut text, c);
         body(StatusCode::OK, JSON_CONTENT_TYPE, text)
     }
 }
@@ -413,5 +433,61 @@ mod tests {
             monitoring(&state, true).await.status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    struct Joining;
+
+    impl metrics::ClusterInfo for Joining {
+        fn ready(&self) -> bool {
+            false
+        }
+        fn stats(&self) -> metrics::ClusterStats {
+            metrics::ClusterStats {
+                node_id: 4,
+                role: metrics::ROLE_STARTING,
+                phase: "joining",
+                joining: true,
+                rejoining: true,
+                rewinds: metrics::NO_REWINDS,
+                ..metrics::ClusterStats::default()
+            }
+        }
+    }
+
+    async fn body_text(resp: Response<Full<Bytes>>) -> String {
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// A cluster node that is still starting (no engine yet) shows its
+    /// cluster figures on `/metrics` and `/admin`, and is not ready.
+    #[tokio::test]
+    async fn a_starting_cluster_node_shows_its_cluster_figures() {
+        let settings = HttpSettings {
+            addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            max_tube_series: 5,
+            snapshot_min_interval: Duration::from_secs(1),
+        };
+        let state = HttpState::new(&settings, ServerCounters::new(1));
+        state.set_cluster(Arc::new(Joining));
+        let resp = monitoring(&state, true).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = body_text(resp).await;
+        assert!(text.contains("\nbeanstalkd_cluster_joining 1\n"), "{text}");
+        assert!(
+            text.contains("\nbeanstalkd_cluster_is_member 0\n"),
+            "{text}"
+        );
+        assert!(!text.contains("beanstalkd_current_jobs"), "{text}");
+        let resp = monitoring(&state, false).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_str(&body_text(resp).await).unwrap();
+        assert_eq!(v["cluster"]["phase"], "joining", "{v}");
+        assert_eq!(v["cluster"]["role"], "starting", "{v}");
+        assert!(v.get("server").is_none(), "{v}");
+        assert!(!state.cluster.get().unwrap().ready());
     }
 }

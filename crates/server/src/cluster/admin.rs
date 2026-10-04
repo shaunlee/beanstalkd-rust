@@ -604,10 +604,11 @@ fn note(core: &Core, m: &Membership<NodeId, BasicNode>, change: &Change) -> Opti
         });
     }
     if change.is_voter_change() && after % 2 == 0 {
+        let fewer = after - 1;
         notes.push(format!(
-            "{after} voters: an even count tolerates no more failures than {} voters; change to \
-             an odd count",
-            after - 1
+            "{after} voters: an even count tolerates no more failures than {fewer} voter{}; \
+             change to an odd count",
+            if fewer == 1 { "" } else { "s" }
         ));
     }
     if change.is_voter_change() && after < MIN_VOTERS {

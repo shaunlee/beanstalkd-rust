@@ -462,11 +462,14 @@ unknown ca`.
 
 ### 5.1 Requirements and behavior
 
-- **3 or 5 nodes**, each with its own configuration file holding the same
-  `[[cluster.peer]]` list (ids 1 to 65535 and cluster addresses) and its
-  own `node_id`, `listen`, `data_dir` and certificate. A 3-node cluster
-  survives the loss of 1 node, a 5-node cluster of 2. (1 node is accepted
-  for tests.)
+- **3 or 5 voters**, each node with its own configuration file holding
+  its own `node_id` (1 to 65535), `listen`, `data_dir` and certificate,
+  and a `[[cluster.peer]]` list: the nodes to bootstrap with, or seeds to
+  find a running cluster. A 3-voter cluster survives the loss of 1 node, a
+  5-voter cluster of 2. Nodes are added, removed, replaced and moved while
+  the cluster runs (sections 5.8 and 5.9); the membership in the Raft log,
+  not the configuration files, is then the authority. (1 voter is accepted
+  for tests and as a start to grow from.)
 - **The same `-z`** on every node (at most 33488896). A node with another
   value is refused by its peers.
 - **No binlog**: `-b` / `[binlog]` is an error with `[cluster]`; the Raft
@@ -480,7 +483,7 @@ unknown ca`.
   so nothing acknowledged is lost when a minority of nodes fails, and a
   command costs a network round trip more than standalone. Differences
   from a single server that clients can observe: [COMPAT.md](COMPAT.md)
-  "Cluster mode" (C1 to C10).
+  "Cluster mode" (C1 to C11).
 - **Data directory** (`cluster.data_dir`): `log/` (Raft log segments,
   vote), `snapshot/` (a state snapshot every `snapshot_every` = 100,000
   entries; log segments older than the snapshot, except the last 1,000
@@ -542,12 +545,29 @@ member. The answers carry the membership (node ids and addresses), each
 node's Raft vote and log positions. So a removed node's certificate (or
 its key, if it leaked) can still read that, and a malicious holder could
 answer probes with a made-up membership or vote and stall or mislead a
-node that is starting without its data. When you remove a node you no
-longer trust, issue a new CA and new certificates for the remaining nodes
-and roll them out (section 7.3). Probe connections are limited (one per
-node id, at most 30 s each, 8 at once), and in plaintext test mode they
-are accepted from loopback only unless
+node that is starting without its data. Probe connections are limited
+(one per node id, at most 30 s each, 8 at once), and in plaintext test
+mode they are accepted from loopback only unless
 `insecure_plaintext_allow_remote = true`.
+
+**Rotate the CA** when you remove a node you no longer trust (its
+certificate, or a leaked key, could still probe), or when the CA key may
+have leaked: issue a new CA and new certificates for the remaining nodes
+and the operator, and switch every node at once (a node trusts one CA, so
+nodes on different CAs cannot talk). On the walkthrough of section 5.3,
+with nodes 2, 4 and 5 left (helpers: section 5.9), the full restart took
+0.5 s:
+
+```sh
+scripts/mkcluster-certs.sh "$W/tls-new" 2 4 5 admin
+for i in 2 4 5; do stop_node $i; done
+mv "$W/tls" "$W/tls-old"; mv "$W/tls-new" "$W/tls"
+for i in 2 4 5; do start_node $i; done
+for i in 2 4 5; do wait_ready $i; done
+```
+
+The old certificates are refused from then on (`TLS handshake failed:
+invalid peer certificate: BadSignature`).
 
 On each node `N`, install its files so that the service group can read
 the key (Linux, as root):
@@ -616,7 +636,7 @@ this section uses it; with systemd, replace the start and stop commands by
 ```sh
 W=/tmp/bstk-cluster
 BIN=$PWD/target/release/beanstalkd-rs
-scripts/mkcluster-certs.sh "$W/tls" 1 2 3
+scripts/mkcluster-certs.sh "$W/tls" 1 2 3 admin
 for i in 1 2 3; do
   cat > "$W/node$i.toml" <<EOF
 [[listener]]
@@ -726,12 +746,14 @@ elections under write load.
 ### 5.6 Replacing a node or wiping its data (rejoin)
 
 A node whose `data_dir` was lost (a new disk, a replaced machine with the
-same id and address, a corrupted log) is brought back by starting it
+same id, a corrupted log) is brought back by starting it
 **without** `--cluster-init` on an **empty** `data_dir`. It then
 *rejoins*: it may have acknowledged entries and granted votes it no
 longer remembers, so it adopts the highest vote of the other nodes, does
 not vote or stand for election, and serves no clients (`/readyz` 503,
 `beanstalkd_cluster_rejoining` = 1) until it has caught up with a leader.
+While a node starts, `/metrics` and `/admin` show its cluster figures
+only (section 8.1).
 A `rejoin` marker in `data_dir` keeps it in this mode across crashes.
 
 ```sh
@@ -790,8 +812,9 @@ Rules:
 - **Never restore an old copy of one node's `data_dir`** into a running
   cluster: a node that forgot only part of its history can break Raft's
   guarantees. Wipe it instead and let it rejoin.
-- A replacement machine must keep the node's id and cluster address (the
-  peer list is static) and get that node's certificate.
+- A replacement machine keeps the node's id and gets that node's
+  certificate; it may get a new address (section 5.9, "Replace a node's
+  disk"). The node may also be replaced by one with a new id (section 5.9).
 - Do not start a wiped node with `--cluster-init` by mistake: if a peer
   is already established it rejoins anyway (with a warning), but on a
   cluster whose other nodes are also empty it would bootstrap.
@@ -876,6 +899,319 @@ ID  ROLE    ADDRESS          APPLIED  LAG  STATE
 2   voter   10.0.0.2:11302   4        0    ok
 3   leader  10.0.0.3:11302   4        0    ok
 ```
+
+### 5.9 Membership runbooks
+
+Every block below was run as written against the local walkthrough of
+section 5.3 (TLS on loopback, macOS, release build); the timings are
+from those runs. On real hosts use `systemctl start` / `stop` instead of
+`start_node` / `stop_node`, and your addresses. The helpers, for the
+shell that holds `W` and `BIN` from section 5.3 (create the operator
+certificate first if needed: `scripts/mkcluster-certs.sh "$W/tls" admin`):
+
+```sh
+node_config() {   # node_config ID SEED_ID...: a config like section 5.3's
+  i=$1; shift
+  cat > "$W/node$i.toml" <<EOT
+[[listener]]
+addr = "127.0.0.1:1130$i"
+
+[cluster]
+node_id = $i
+listen = "127.0.0.1:1140$i"
+data_dir = "node$i"
+
+[cluster.tls]
+cert = "tls/node$i.pem"
+key = "tls/node$i.key"
+ca = "tls/cluster-ca.pem"
+
+[http]
+addr = "127.0.0.1:918$i"
+
+[log]
+level = "info"
+EOT
+  for p in "$@"; do
+    printf '\n[[cluster.peer]]\nid = %s\naddr = "127.0.0.1:1140%s"\n' "$p" "$p" >> "$W/node$i.toml"
+  done
+}
+start_node() {    # start_node ID [ARGS...]
+  i=$1; shift
+  "$BIN" --config "$W/node$i.toml" "$@" >> "$W/node$i.log" 2>&1 &
+  echo $! > "$W/node$i.pid"
+}
+stop_node() {     # stop_node ID: SIGTERM and wait for the exit
+  pid=$(cat "$W/node$1.pid"); kill -TERM "$pid"
+  while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
+}
+wait_ready() {    # wait_ready ID
+  until curl -fs "http://127.0.0.1:918$1/readyz" > /dev/null; do sleep 0.2; done
+}
+bcl() {           # beanstalkd-rs cluster with the operator certificate
+  "$BIN" cluster --node 127.0.0.1:11401 --node 127.0.0.1:11402 --node 127.0.0.1:11403 \
+    --ca "$W/tls/cluster-ca.pem" --cert "$W/tls/admin.pem" --key "$W/tls/admin.key" "$@"
+}
+settled() {       # every member answers its status and none is rejoining
+  local out; out=$(bcl status --json 2>/dev/null) &&
+    ! printf "%s" "$out" | grep -qE '"reachable":false|"rejoining":true'
+}
+```
+
+Rules that hold for every runbook:
+
+- **Ids are never reused.** A new node gets an id above `highest member id
+  ever` (`bcl status`), and its own certificate (`scripts/mkcluster-certs.sh
+  "$W/tls" ID`, where the CA key is).
+- **A new node's `[[cluster.peer]]` list** needs a few running members
+  (seeds); it need not list itself, and the other nodes' configurations
+  need not list it (they learn its address from the membership). An entry
+  in a configuration is also an *address override* for that node (see
+  "Change a node's address").
+- **Add, then start**: `add` makes the node a learner; started, it catches
+  up from the leader and becomes ready (1.1 to 1.5 s here); then `promote`
+  makes it a voter. Starting it first also works: it waits, not ready
+  (`/readyz` 503, `beanstalkd_cluster_joining` 1), and logs `startup:
+  waiting for the cluster's status (join: node 5 is not a member of the
+  cluster yet (voters {1, 2, 3, 4}, highest member id 4); waiting until it
+  is added as a learner)` until it is added.
+- **One voter per change, and an odd count**: each `promote` or `remove`
+  of a voter is one change; the cluster notes an even count (`NOTE: 4
+  voters: an even count tolerates no more failures than 3 voters; change to
+  an odd count`). No voter change runs while a voter does not answer or is
+  rejoining, except removing that voter.
+- **A removed node is not told**: stop it right after `remove`. Until then
+  it serves nothing (`/readyz` 503), its clients' connections are dropped
+  (their reservations return to ready), it logs failed vote requests
+  (`... rejected: not a member of this cluster`) and closes new client
+  connections after `node_timeout`. Restarted with its data it logs `this
+  node is not in the membership of its own log: it was removed ...` and
+  waits forever; with an empty data directory it refuses to start (`cannot
+  start node 1: node id 1 is not a member, and ids up to 6 have been used:
+  node ids are never reused ...`).
+
+#### Grow from 3 to 5 nodes
+
+Node 4 is added and then started; node 5 is started first and waits until
+it is added:
+
+```sh
+scripts/mkcluster-certs.sh "$W/tls" 4 5
+node_config 4 1 2 3
+node_config 5 1 2 3
+bcl add 4 127.0.0.1:11404
+start_node 4; wait_ready 4
+bcl promote 4
+start_node 5
+sleep 2; curl -s http://127.0.0.1:9185/metrics | grep -E '^beanstalkd_cluster_(joining|is_member|ready) '
+bcl add 5 127.0.0.1:11405
+wait_ready 5
+bcl promote 5
+bcl status
+```
+
+```
+beanstalkd_cluster_ready 0
+beanstalkd_cluster_is_member 0
+beanstalkd_cluster_joining 1
+...
+membership (term 1 index 14, committed)
+  voters:   1 2 3 4 5
+  learners: -
+leader: node 3 (127.0.0.1:11403), term 1
+highest member id ever: 5
+
+ID  ROLE    ADDRESS          APPLIED  LAG  STATE
+1   voter   127.0.0.1:11401  14       0    ok
+2   voter   127.0.0.1:11402  14       0    ok
+3   leader  127.0.0.1:11403  14       0    ok
+4   voter   127.0.0.1:11404  14       0    ok
+5   voter   127.0.0.1:11405  14       0    ok
+```
+
+Each `add` and `promote` took 30 to 70 ms. Followers answer with the
+leader, and the tool follows it (`127.0.0.1:11401 is not the leader;
+following to node 3 at 127.0.0.1:11403` on stderr).
+
+#### Grow from 1 to 3 nodes
+
+A single-node cluster (for example a test cluster that becomes
+production) is created with only its own entry, then grown one voter at a
+time. At 2 voters the cluster tolerates no failure and a wiped voter may
+not be able to rejoin: go on to 3 at once.
+
+```sh
+scripts/mkcluster-certs.sh "$W/tls" 1 2 3 admin
+node_config 1 1
+node_config 2 1
+node_config 3 1
+start_node 1 --cluster-init; wait_ready 1
+bcl add 2 127.0.0.1:11402
+start_node 2; wait_ready 2
+bcl promote 2
+bcl add 3 127.0.0.1:11403
+start_node 3; wait_ready 3
+bcl promote 3
+bcl status
+```
+
+The whole block took 4 s; `bcl promote 2` notes `2 voters: an even count
+tolerates no more failures than 1 voter; change to an odd count; 2
+voter(s): below 3, a wiped voter may be unable to rejoin`.
+
+#### Shrink from 5 to 3 nodes
+
+Remove one voter at a time, and stop each removed node:
+
+```sh
+bcl remove 5
+stop_node 5
+bcl remove 4
+stop_node 4
+bcl status
+```
+
+```
+remove: done
+membership (term 1 index 16, committed)
+  voters:   1 2 3 4
+  learners: -
+
+NOTE: node 5 is not told it was removed (it isolates itself): stop its process; its id can never be used again; 4 voters: an even count tolerates no more failures than 3 voters; change to an odd count
+```
+
+Removing a voter below 3 needs `--force`: `refused: removing node 1 leaves
+2 voter(s), fewer than 3: a wiped voter of a two-voter membership rejoins
+only while the other leads, and the voter of a one-voter membership never
+(use force to do it anyway)`.
+
+#### Replace a failed node with a new id
+
+Node 1 of three voters is dead. Remove it first, then add, start and
+promote the replacement (node 6): the cluster refuses every voter change
+while a voter does not answer, so a promotion before the removal fails
+with `refused: voter N did not answer its status (unreachable: node N:
+backing off after 5 failed dial(s)): voter changes need every voter's
+answer (one rejoining unseen must not be overlooked)`; removing the dead voter is the one change allowed then, and
+it needs `--force` because it leaves 2 voters. Until the promotion the
+cluster has 2 voters and tolerates no further failure. (Adding the
+replacement as a learner is allowed while a voter is down, so it can also
+be added and started before the removal, leaving only the promotion after
+it.)
+
+```sh
+kill -KILL "$(cat "$W/node1.pid")"   # the failure
+bcl remove 1 --force
+scripts/mkcluster-certs.sh "$W/tls" 6
+node_config 6 2 3
+bcl add 6 127.0.0.1:11406
+start_node 6; wait_ready 6
+bcl promote 6
+bcl status
+```
+
+```
+membership (term 1 index 25, committed)
+  voters:   2 3 6
+  learners: -
+leader: node 3 (127.0.0.1:11403), term 1
+highest member id ever: 6
+...
+```
+
+The replacement was ready 1.1 s after its start. If the failed machine
+comes back, do not start node 1 on it (it is removed; with its old data
+it would wait forever).
+
+#### Replace a node's disk (same id), optionally at a new address
+
+A node whose data is lost keeps its id and rejoins (section 5.6): stop
+it if it still runs, empty its data directory, start it:
+
+```sh
+rm -rf "$W/node2"
+start_node 2; wait_ready 2
+bcl status
+```
+
+It was ready 1.3 s after its start. To bring it back at another address
+(a new machine), change the address in the membership before starting
+it, and its `listen`. No other node's configuration may list it (see
+"Change a node's address"):
+
+```sh
+kill -KILL "$(cat "$W/node6.pid")"   # the failure
+rm -rf "$W/node6"
+bcl set-addr 6 127.0.0.1:11416
+perl -pi -e 's/^listen = .*/listen = "127.0.0.1:11416"/' "$W/node6.toml"
+start_node 6; wait_ready 6
+bcl status
+```
+
+```
+ID  ROLE    ADDRESS          APPLIED  LAG  STATE
+2   voter   127.0.0.1:11402  34       0    ok
+3   leader  127.0.0.1:11403  34       0    ok
+6   voter   127.0.0.1:11416  34       0    ok
+```
+
+#### Remove a node that is still running, or the leader
+
+`remove` works on a running node (shrink above): stop it afterwards.
+Removing the leader (4 voters, node 3 leading, a client putting jobs in a
+loop on each node):
+
+```sh
+bcl remove 3
+stop_node 3
+```
+
+```
+127.0.0.1:11402 is not the leader; following to node 3 at 127.0.0.1:11403
+127.0.0.1:11403 (node 3) is not a member any more; asking another node
+remove: done
+membership (term 2 index 1394, committed)
+  voters:   2 4 5
+  learners: -
+
+NOTE: node 3 (the leader that ran this change) steps down once it is committed; another node leads, and node 3 is not told it was removed: stop its process
+```
+
+openraft 0.9 has no leader transfer: the old leader steps down and the
+others elect a new one. Replies on the other nodes paused for 1.28 to
+1.36 s (two runs) and their connections stayed open; the removed leader's
+own clients were disconnected at once. A node whose `node_timeout` is
+shorter than an election closes its clients' connections meanwhile (keep
+the default 5 s).
+
+#### Change a node's address
+
+`set-addr` changes the address in the membership; every node then dials
+the node there, **except** nodes whose configuration lists that node in
+`[[cluster.peer]]`: a configured address overrides the membership, read at
+startup, and such a node logs `cluster config differs from the
+membership: node 2: config address 127.0.0.1:11402 overrides membership
+address 127.0.0.1:11412`. A leader with a stale override cannot replicate
+to the moved node. So first remove the node's entry from the other nodes'
+configurations and restart them one at a time (nothing changes yet: the
+membership has the same address), then change the address and restart
+the node there. Node 2 below is listed in node 3's and node 6's
+configurations:
+
+```sh
+perl -0pi -e 's/\[\[cluster\.peer\]\]\nid = 2\naddr = "[^"]*"\n//' "$W/node3.toml" "$W/node6.toml"
+stop_node 6; start_node 6; wait_ready 6
+stop_node 3; start_node 3; wait_ready 3
+bcl set-addr 2 127.0.0.1:11412
+stop_node 2
+perl -pi -e 's/127\.0\.0\.1:11402/127.0.0.1:11412/' "$W/node2.toml"
+start_node 2; wait_ready 2
+bcl status
+```
+
+The restarts took 0.4 s each and node 2 was ready 0.23 s after its start
+at the new address. A non-loopback address over plaintext cluster traffic
+needs `--force`.
 
 ## 6. Backup and restore
 
@@ -968,7 +1304,7 @@ the whole cluster or a mistake that deleted jobs everywhere.
   a server that does not know the version refuses to start rather than
   misread it.
 - **Cluster wire protocol**: every cluster connection starts with a
-  hello carrying the protocol version (now 3) and `-z`. A node refuses a
+  hello carrying the protocol version (now 4) and `-z`. A node refuses a
   hello with another version, logging at warn `cluster connection
   rejected: hello from node 1 rejected: unsupported protocol version 4`;
   the dialing side retries with backoff forever (on the leader openraft
@@ -992,9 +1328,17 @@ the whole cluster or a mistake that deleted jobs everywhere.
   upgrading; a change of the binlog, cluster data or protocol format is a
   user-facing change and is called out there.
 
+**From 0.5.x**: 0.5.x speaks cluster protocol version 3, later versions
+version 4 (membership changes), so 0.5.x and later nodes cannot be mixed
+in one cluster: stop every node, replace every binary, start every node
+(section 5.7; the data directories are kept). Standalone servers upgrade
+as in 7.2. **Later versions** (same protocol version): a rolling restart
+(7.3).
+
 0.5.0 is the first release, so no upgrade between two releases has been
 tested yet. What was tested is replacing the binary with a build of the
-same version, which exercises the procedures below.
+same version, both by a full stop and start and by a rolling restart,
+which exercises the procedures below.
 
 ### 7.2 Standalone
 
@@ -1040,9 +1384,26 @@ for i in 1 2 3; do
 done
 ```
 
-If a future release changes the protocol version, the upgrade is a full
-cluster restart: stop every node, replace the binaries, start every node;
-the release notes will say so.
+Before the next node, also wait until `beanstalkd-rs cluster status`
+shows every member reachable and none rejoining (helpers `settled` and the
+others: section 5.9). Under load (one client per node putting jobs in a
+loop, reconnecting when closed), on the 3-voter walkthrough with nodes 2,
+4 and 5 and node 5 leading:
+
+```sh
+for i in 2 4 5; do stop_node $i; start_node $i; wait_ready $i; until settled; do sleep 0.5; done; echo "node$i done"; done
+```
+
+The three restarts took 2.2 s in all. Each client lost its connection
+once (its node restarting) and reconnected; replies paused at most 2.0 s;
+59,218 acknowledged puts were all present afterwards (two more jobs than
+acknowledged: puts in flight when a connection closed were committed
+without their reply reaching the client, as with any disconnect). A
+second run: 88,572 acknowledged puts, all present, longest pause 195 ms.
+
+If a release changes the protocol version (as 0.5.x to later versions
+does, section 7.1), the upgrade is a full cluster restart: stop every
+node, replace the binaries, start every node; the release notes say so.
 
 ## 8. Monitoring
 
@@ -1053,9 +1414,9 @@ Enable with `[http] addr` (off by default; no authentication, section 4).
 | Endpoint | Answers |
 |---|---|
 | `/healthz` | `200 ok` while the process serves HTTP (liveness) |
-| `/readyz` | `200 ready` once startup and binlog replay are done; in cluster mode while the node has a leader and has applied everything it knows to be committed (see section 11 for a caveat); otherwise 503 |
-| `/metrics` | Prometheus text format |
-| `/admin` | read-only JSON: every `stats` key, every tube's `stats-tube`, server-side counters, and in cluster mode a `cluster` object |
+| `/readyz` | `200 ready` once startup and binlog replay are done; in cluster mode while the node is a member, has a leader, is not isolated, and has applied everything it knows to be committed (see section 11 for a caveat); otherwise 503. A node waiting to be added and a removed node that still runs are never ready. |
+| `/metrics` | Prometheus text format; 503 until ready, except that a cluster node that is still starting (joining, rejoining, waiting for a leader) exports its cluster metrics only |
+| `/admin` | read-only JSON: every `stats` key, every tube's `stats-tube`, server-side counters, and in cluster mode a `cluster` object (while a cluster node starts, `{"cluster": {...}}` only) |
 
 The `stats` command over the protocol shows the same server values as the
 reference (`printf 'stats\r\n' | nc -w 1 127.0.0.1 11300`).
@@ -1076,7 +1437,10 @@ The full list, with the `stats` key behind each metric:
 | `beanstalkd_binlog_current_index`, `beanstalkd_binlog_oldest_index`, `beanstalkd_binlog_max_size_bytes` | binlog file count and size |
 | `beanstalkd_pending_connections`, `beanstalkd_pending_rejected_total`, `beanstalkd_auth_failures_total`, `beanstalkd_auth_timeouts_total` | TLS handshake and token floods |
 | `beanstalkd_cluster_role{role}`, `beanstalkd_cluster_leader_id`, `beanstalkd_cluster_term` | leadership and elections |
-| `beanstalkd_cluster_ready`, `beanstalkd_cluster_isolated`, `beanstalkd_cluster_rejoining` | whether the node can serve clients |
+| `beanstalkd_cluster_ready`, `beanstalkd_cluster_isolated`, `beanstalkd_cluster_rejoining`, `beanstalkd_cluster_joining`, `beanstalkd_cluster_is_member` | whether the node can serve clients; a node waiting to be added (`joining`); a removed node still running (`is_member` 0) |
+| `beanstalkd_cluster_voters`, `beanstalkd_cluster_learners`, `beanstalkd_cluster_member{node,role,addr}` | the membership as each node sees it (an even voter count, a learner left behind) |
+| `beanstalkd_cluster_membership_joint`, `beanstalkd_cluster_membership_committed`, `beanstalkd_cluster_membership_log_index` | a membership change in progress, or stuck |
+| `beanstalkd_cluster_learner_lag{node}` | entries a learner is missing before it can be promoted (leader only) |
 | `beanstalkd_cluster_replication_lag{peer}` | entries each follower is missing (exported by the leader only) |
 | `beanstalkd_cluster_commit_index`, `beanstalkd_cluster_applied_index` | a node falling behind |
 | `beanstalkd_cluster_forward_queue`, `beanstalkd_cluster_forward_queue_full`, `beanstalkd_cluster_rejected_puts_total`, `beanstalkd_cluster_refused_connections_total` | back-pressure from the leader |
@@ -1119,6 +1483,18 @@ groups:
       - alert: BeanstalkdRejoining
         expr: beanstalkd_cluster_rejoining == 1
         for: 10m
+      - alert: BeanstalkdJoining
+        expr: beanstalkd_cluster_joining == 1
+        for: 10m
+      - alert: BeanstalkdRemovedNodeRunning
+        expr: beanstalkd_cluster_is_member == 0 and beanstalkd_cluster_joining == 0
+        for: 5m
+      - alert: BeanstalkdMembershipChangeStuck
+        expr: beanstalkd_cluster_membership_joint == 1 or beanstalkd_cluster_membership_committed == 0
+        for: 2m
+      - alert: BeanstalkdEvenVoterCount
+        expr: beanstalkd_cluster_voters % 2 == 0
+        for: 30m
       - alert: BeanstalkdConnectionsHigh
         expr: beanstalkd_current_connections > 50000
         for: 5m
@@ -1167,11 +1543,23 @@ while serving, 2 for a command-line syntax error, 5 for `-u`.
 | `invalid configuration: cluster.tls.cert: certificate is not valid for bstk-node-3` | The node's certificate lacks the SAN `bstk-node-<node_id>` (wrong file for this node). |
 | `cluster connection rejected: TLS handshake: ...` on the peers; `invalid peer certificate: BadSignature` / `UnknownIssuer` in their replication errors | The node's certificate is from another CA than `[cluster.tls] ca` on its peers. |
 | `cluster peer refused this node: max_job_size mismatch (every node must use the same -z)`; on the peers `cluster hello rejected: max_job_size mismatch: node 1 uses 65535, node 3 uses 1000` | Different `-z` / `server.max_job_size` on this node. |
-| `cluster peer refused this node: this node is not a member of the cluster according to node 2`; on the peers `cluster connection rejected: hello from node 4 rejected: node 4 is not a member of the cluster` | The node's id is not in the cluster's Raft membership (it was removed, or not added yet), or, on a node that has no membership yet, not in that node's `[[cluster.peer]]` list. |
+| `cluster peer refused this node: this node is not a member of the cluster according to node 2 (removed, or not added yet)`, `... rejected: not a member of this cluster`; on the peers `cluster connection rejected: hello from node 4 rejected: node 4 is not a member of the cluster` | The node's id is not in the cluster's Raft membership (it was removed, or not added yet), or, on a node that has no membership yet, not in that node's `[[cluster.peer]]` list. A node waiting to join logs the join message below instead. |
 | `cluster connection rejected: hello from node 1 rejected: unsupported protocol version 4` | Mixed releases with different cluster protocols (section 7.1). |
 | `--cluster-init: DIR already holds Raft state; a cluster is bootstrapped only once ...` | Remove `--cluster-init` (or the systemd drop-in, section 5.3). |
 | Stays at `waiting for a leader`, `/readyz` 503 | No majority is reachable: check that enough nodes run, that the cluster ports are open between all nodes (both directions), and the TLS / `-z` errors above. A new cluster started with `--cluster-init` waits until a majority of the other nodes answer (section 5.3). |
-| `startup: waiting for the cluster's status (...)` | A joining or rejoining node (section 5.6) is waiting for answers: a rejoin needs `n - quorum(n) + 1` of the other current voters that are not rejoining themselves (1 with 2 voters, 2 with 3 or 4, 3 with 5); start them, or wait until another rejoin finishes. |
+| `startup: waiting for the cluster's status (join: node 5 is not a member of the cluster yet (voters {1, 2, 3, 4}, highest member id 4); waiting until it is added as a learner)` | The node was started before it was added (`beanstalkd_cluster_joining` 1, `/readyz` 503): add it (`beanstalkd-rs cluster add`, section 5.9) and it continues by itself. |
+| `startup: waiting for the cluster's status (1 of the 2 answers needed from the current voters {3, 6} holding the membership at index 29 and not rejoining themselves)` | A rejoining node (section 5.6) is waiting for answers: a rejoin needs `n - quorum(n) + 1` of the other current voters that are not rejoining themselves (1 with 2 voters, 2 with 3 or 4, 3 with 5); start them, or wait until another rejoin finishes. With `... a membership change is in progress` or `... a joint configuration ...: waiting until it is uniform` it waits until the change is committed. |
+| `cannot start node 1: node id 1 is not a member, and ids up to 6 have been used: node ids are never reused (a removed node joins again only under a new id above 6)` (exit 1) | A removed id was started with an empty data directory. Use a new id (section 5.9). |
+| `this node is not in the membership of its own log: it was removed (or its removal was not committed yet) ...`, then `waiting for a leader` forever | A removed node was restarted with its data. Stop it; it never serves again under this id. |
+| A removed node that still runs: ERROR `while requesting vote ... rejected: not a member of this cluster` every election timeout, `/readyz` 503, `beanstalkd_cluster_is_member` 0, and after `node_timeout` `no leader reachable: closing every client connection` | It was not told of its removal and isolates itself. Stop it. |
+| `cluster config differs from the membership: node 2: config address 127.0.0.1:11402 overrides membership address 127.0.0.1:11412` | This node's `[[cluster.peer]]` entry overrides the membership address of node 2 (after a `set-addr`): it dials the old address. Remove or correct the entry and restart this node (section 5.9, "Change a node's address"). `members not in the config` and `config peers not in the membership` in the same message are informational. |
+| `refused: a membership change is in progress` (CLI exit 1) | Another change is running (a voter change takes two commits; a new leader first finishes a change its predecessor left). Run `status` and the command again. |
+| `conflict: the membership changed while this request was being made (it was based on ..., it is now ...); nothing was changed ...` (CLI exit 1) | Another change got in between the tool's read and its request. Check `status` and decide again. |
+| `refused: voter N did not answer its status (...): voter changes need every voter's answer ...` / `refused: voter 2 is rejoining: voter changes wait until it has caught up ...` (CLI exit 1) | Bring the voter back or wait for its rejoin; a dead voter can only be removed (section 5.9, "Replace a failed node"). |
+| `refused: removing node 1 leaves 2 voter(s), fewer than 3: ...` / `refused: node id 3 is not above 6, the highest id ever used: node ids are never reused (use a new id)` (CLI exit 1) | A guardrail: add a voter first (or `--force`), or use a new id. |
+| `beanstalkd-rs cluster: cert is not an admin certificate (SAN bstk-admin): ...`, `--cert and --key (the bstk-admin certificate) are required ...` (CLI exit 2) | Use `admin.pem` / `admin.key` from `scripts/mkcluster-certs.sh DIR admin` (section 5.2). |
+| `cannot reach the cluster: 127.0.0.1:11499: Connection refused (os error 61)`, or `... TLS handshake failed: invalid peer certificate: BadSignature (is --ca the cluster CA, ...)` (CLI exit 3) | No `--node` answered: wrong address, nodes down, or a CA or certificate from another (or an old, rotated) CA. |
+| `timed out: the change was accepted by ... but not seen to complete within ...; it may still complete` (CLI exit 4) | Run `status` before repeating the command. |
 | `rejoin: waiting ... (the highest vote (...) is this node's own leadership)` | The wiped node was the leader; it waits until the others elect a new one (a few seconds). |
 | Peers log `vote refused: the vote gate is closed` (debug) | Normal while a node rejoins: it does not vote until it has caught up. |
 | `INSECURE: cluster.insecure_plaintext = true: ...` | Test configuration; use `[cluster.tls]` in production. |
@@ -1184,15 +1572,20 @@ byte, checked by differential tests against the reference. The
 intentional differences (binlog format and fail-stop behavior, graceful
 SIGTERM, `-u`, hostnames in `-l`, and cluster-mode differences such as
 per-node `stats` identity fields) are listed in [COMPAT.md](COMPAT.md):
-"Known differences" (D1 to D14), "Cluster mode" (C1 to C10) and the
+"Known differences" (D1 to D14), "Cluster mode" (C1 to C11) and the
 extensions (token authentication).
 
 ## 11. Known limitations
 
-- **Static cluster membership**: nodes cannot be added or removed, and
-  the cluster cannot grow from 3 to 5, without rebuilding it (dynamic
-  membership is planned, PLAN P6). A failed machine is replaced by a new
-  one with the same id, address and certificate (section 5.6).
+- **Membership changes** (section 5.9): no leader transfer (openraft
+  0.9), so removing the leader costs one election (about 1.3 s); a removed
+  node is not told and must be stopped; node ids are never reused; one
+  voter per change, and none while a voter is down (except removing it) or
+  rejoining; no automatic removal of dead nodes. With 1 or 2 voters a
+  wiped voter cannot (1) or can only while the other leads (2) rejoin, so
+  grow past 2 at once. Rejoins are serialized: a second wiped node waits
+  until the first has caught up. Config `[[cluster.peer]]` addresses
+  override the membership's (section 5.9).
 - **Cluster CPU cost**: a command costs about 17 to 18 µs of CPU per node
   at 100 connections (see [BENCH.md](BENCH.md) "P4-T6"), several times
   standalone, because every node applies every command and every entry is

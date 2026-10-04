@@ -214,6 +214,46 @@ async fn status_reports_roles_lag_and_unreachable_nodes() {
     assert_eq!(json["membership"]["learners"][0], 3);
 }
 
+/// A removed node that still runs (it is not told) names itself as the
+/// leader of an old term: asked first, its view is set aside for a member's.
+#[tokio::test]
+async fn a_removed_node_is_not_taken_for_the_leader() {
+    let addrs: Arc<Mutex<Vec<(NodeId, String)>>> = Arc::default();
+    let view = |leader| {
+        let addrs = addrs.clone();
+        move |_: &AdminRequest| {
+            V {
+                leader: Some(leader),
+                index: 9,
+                committed: true,
+                configs: vec![vec![2, 3, 4]],
+                nodes: addrs.lock().unwrap().clone(),
+                applied: 20,
+            }
+            .answer()
+        }
+    };
+    let removed = Stub::start(1, view(1)).await;
+    let leader = Stub::start(2, view(2)).await;
+    *addrs.lock().unwrap() = nodes(&[(2, &leader.addr)]);
+
+    let st = settings(vec![removed.addr.clone(), leader.addr.clone()], 5 * SECS);
+    let report = Operator::new(&st).status().await.unwrap();
+    assert_eq!(report.view.leader, Some(2));
+    assert_eq!(report.nodes.len(), 1);
+    assert_eq!(report.nodes[0].role, Role::Leader);
+
+    // Only the removed node answers: its view, rather than nothing.
+    let closed = {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    *addrs.lock().unwrap() = nodes(&[(2, &closed)]);
+    let st = settings(vec![removed.addr.clone()], 5 * SECS);
+    let report = Operator::new(&st).status().await.unwrap();
+    assert_eq!(report.view.leader, Some(1));
+}
+
 /// A request to a follower is redirected; the leader's own membership (not
 /// the follower's, possibly stale) is the one the change is based on; the
 /// change is `Started` and the tool waits through the joint step.
