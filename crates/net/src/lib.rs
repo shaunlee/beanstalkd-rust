@@ -61,8 +61,20 @@ impl AsyncRead for QuietTcp {
         loop {
             let mut guard = ready!(this.io.poll_read_ready(cx))?;
             let unfilled = buf.initialize_unfilled();
+            let room = unfilled.len();
             match guard.try_io(|s| s.get_ref().read(unfilled)) {
                 Ok(Ok(n)) => {
+                    // A read that left room in the buffer drained the socket
+                    // (epoll and kqueue are edge-triggered), so clear the
+                    // readiness now instead of paying a read that fails with
+                    // EAGAIN; tokio's own `TcpStream` does the same. The
+                    // guard's tick keeps this safe: a newer event, e.g. data
+                    // that arrived after the read, is not cleared. A full
+                    // buffer may leave more behind, and n == 0 is EOF, which
+                    // must stay readable.
+                    if 0 < n && n < room {
+                        guard.clear_ready();
+                    }
                     buf.advance(n);
                     return Poll::Ready(Ok(()));
                 }
@@ -182,5 +194,98 @@ mod tests {
         qr.read_to_end(&mut got).await.unwrap();
         w.await.unwrap();
         assert!(got == expect);
+    }
+
+    /// Bursts arrive while the reader is parked, between polls and mid-read;
+    /// after every short read the next burst must still be delivered, in
+    /// order. A lost wake-up shows up as the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn short_reads_do_not_lose_later_data() {
+        use std::time::Duration;
+        const MSGS: u32 = 3000;
+        let (mut q, t) = pair().await;
+        let (_tr, mut tw) = t.into_split();
+        let w = tokio::spawn(async move {
+            for i in 0..MSGS {
+                // Varying sizes, so reads end both short and full.
+                let len = 1 + (i as usize * 37) % 700;
+                let msg: Vec<u8> = (0..len).map(|j| (i as usize + j) as u8).collect();
+                tw.write_all(&(len as u32).to_be_bytes()).await.unwrap();
+                tw.write_all(&msg).await.unwrap();
+                match i % 5 {
+                    0 => tokio::time::sleep(Duration::from_micros(200)).await,
+                    1 => tokio::task::yield_now().await,
+                    2 => std::thread::sleep(Duration::from_micros(50)),
+                    _ => {}
+                }
+            }
+            tw.shutdown().await.unwrap();
+        });
+        let r = tokio::time::timeout(Duration::from_secs(60), async move {
+            let mut buf = vec![0u8; 64 << 10];
+            let mut pending: Vec<u8> = Vec::new();
+            let mut done = 0u32;
+            loop {
+                let n = q.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return (done, pending.len());
+                }
+                pending.extend_from_slice(&buf[..n]);
+                while pending.len() >= 4 {
+                    let len = u32::from_be_bytes(pending[..4].try_into().unwrap()) as usize;
+                    if pending.len() < 4 + len {
+                        break;
+                    }
+                    let i = done as usize;
+                    assert_eq!(len, 1 + (i * 37) % 700);
+                    assert!(
+                        pending[4..4 + len]
+                            .iter()
+                            .enumerate()
+                            .all(|(j, b)| *b == (i + j) as u8)
+                    );
+                    pending.drain(..4 + len);
+                    done += 1;
+                }
+                // Let the next burst land between this poll and the next.
+                match done % 3 {
+                    0 => tokio::task::yield_now().await,
+                    1 => tokio::time::sleep(Duration::from_micros(100)).await,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("a wake-up was lost");
+        assert_eq!(r, (MSGS, 0));
+        w.await.unwrap();
+    }
+
+    /// Request and response in lock step: every request is a short read
+    /// that clears readiness, and the next one must wake the reader again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lockstep_requests_each_wake_the_reader() {
+        use std::time::Duration;
+        let (mut q, mut t) = pair().await;
+        let peer = tokio::spawn(async move {
+            for i in 0..5000u32 {
+                t.write_all(&i.to_be_bytes()).await.unwrap();
+                let mut b = [0u8; 4];
+                t.read_exact(&mut b).await.unwrap();
+                assert_eq!(u32::from_be_bytes(b), i + 1);
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let mut buf = [0u8; 4096];
+            for i in 0..5000u32 {
+                let n = q.read(&mut buf).await.unwrap();
+                assert_eq!(n, 4);
+                assert_eq!(u32::from_be_bytes(buf[..4].try_into().unwrap()), i);
+                q.write_all(&(i + 1).to_be_bytes()).await.unwrap();
+            }
+        })
+        .await
+        .expect("a wake-up was lost");
+        peer.await.unwrap();
     }
 }
