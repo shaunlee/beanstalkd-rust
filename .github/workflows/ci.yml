@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Tests that need stunnel must fail rather than skip when it is missing.
+  BSTK_REQUIRE_STUNNEL: "1"
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-10-04)
+        with:
+          toolchain: "1.98"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install stunnel (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q stunnel4
+      # stunnel before 5.82 closes the connection early on macOS when the
+      # peer half-closes while data is still to be forwarded, which fails the
+      # half-close cases of ref_vs_stunnel_ref. The runner image's Homebrew
+      # metadata can lag, hence the update and the version check.
+      - name: Install stunnel (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update --quiet
+          brew install stunnel
+          v="$(stunnel -version 2>&1 | sed -n 's/^stunnel \([0-9][0-9.]*\) .*/\1/p' | head -n1)"
+          echo "stunnel $v"
+          printf '5.82\n%s\n' "$v" | sort -V -C || { echo "stunnel $v is older than 5.82" >&2; exit 1; }
+      - name: Locate stunnel
+        run: echo "BSTK_STUNNEL_BIN=$(command -v stunnel || command -v stunnel4)" >> "$GITHUB_ENV"
+      - name: Restore reference build
+        id: ref
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ref
+          key: ref-25085c5-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ref.sh') }}
+      - name: Build reference
+        if: steps.ref.outputs.cache-hit != 'true'
+        run: scripts/build-ref.sh
+      - name: Save reference build
+        if: steps.ref.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ref
+          key: ${{ steps.ref.outputs.cache-primary-key }}
+      - name: Quality gate
+        run: scripts/check.sh --no-fail-fast
+
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      SMOKE_TIMEOUT: "120"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-10-04)
+        with:
+          toolchain: "1.98"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: clients/go/go.mod
+          cache-dependency-path: clients/go/go.sum
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Restore reference build
+        id: ref
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ref
+          key: ref-25085c5-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/build-ref.sh') }}
+      - name: Build reference
+        if: steps.ref.outputs.cache-hit != 'true'
+        run: scripts/build-ref.sh
+      - name: Save reference build
+        if: steps.ref.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ref
+          key: ${{ steps.ref.outputs.cache-primary-key }}
+      - name: Build beanstalkd-rs (release)
+        run: |
+          cargo build --release -p bstk-server
+          echo "BSTK_RS_BIN=$PWD/target/release/beanstalkd-rs" >> "$GITHUB_ENV"
+          echo "SMOKE_VENV=$RUNNER_TEMP/smoke-venv" >> "$GITHUB_ENV"
+      - name: Smoke (plain)
+        run: SMOKE_OUT="$RUNNER_TEMP/smoke/plain" clients/run-smoke.sh
+      - name: Smoke (binlog)
+        run: SMOKE_OUT="$RUNNER_TEMP/smoke/binlog" SMOKE_BINLOG=1 clients/run-smoke.sh
+      - name: Smoke (restart)
+        run: SMOKE_OUT="$RUNNER_TEMP/smoke/restart" SMOKE_RESTART=1 clients/run-smoke.sh
+      - name: Smoke (TLS)
+        run: SMOKE_OUT="$RUNNER_TEMP/smoke/tls" SMOKE_TLS=1 clients/run-smoke.sh
+      - name: Smoke (mTLS, restart, token, HTTP)
+        run: SMOKE_OUT="$RUNNER_TEMP/smoke/mtls" SMOKE_MTLS=1 SMOKE_RESTART=1 SMOKE_TOKEN=1 SMOKE_HTTP=1 clients/run-smoke.sh
+      - name: Smoke (cluster)
+        run: SMOKE_OUT="$RUNNER_TEMP/smoke/cluster" SMOKE_CLUSTER=1 clients/run-smoke.sh
+      - name: Smoke (cluster, leader kill)
+        run: SMOKE_OUT="$RUNNER_TEMP/smoke/cluster-kill" SMOKE_CLUSTER_KILL=1 clients/run-smoke.sh
+      - name: Upload transcripts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: smoke-transcripts
+          path: ${{ runner.temp }}/smoke
+          if-no-files-found: ignore
+
+  chaos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BSTK_CHAOS_VERBOSE: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-10-04)
+        with:
+          toolchain: "1.98"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build beanstalkd-rs (debug, for the multi-process runs)
+        run: |
+          echo "cores: $(nproc)"
+          cargo build -p bstk-server
+          echo "BSTK_RS_BIN=$PWD/target/debug/beanstalkd-rs" >> "$GITHUB_ENV"
+          echo "BSTK_CHAOS_DIR=$RUNNER_TEMP/chaos" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/chaos"
+      - name: In-process chaos (200 seeds)
+        run: BSTK_CHAOS_SEEDS=200 cargo test --release -p bstk-chaos --test inprocess full -- --ignored --nocapture
+      - name: Multi-process chaos (5 runs)
+        run: BSTK_CHAOS_MP_RUNS=5 cargo test --release -p bstk-chaos --test multiprocess full -- --ignored --nocapture
+      - name: Upload chaos logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chaos-logs
+          path: ${{ runner.temp }}/chaos
+          if-no-files-found: ignore
+
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CARGO_DENY_VERSION: "0.20.2"
+      CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-10-04)
+        with:
+          toolchain: "1.98"
+      # A checksum-pinned release binary: cargo install would compile it on
+      # every run, and the cargo-deny action's container ships Rust 1.85,
+      # older than this workspace's rust-version.
+      - name: Install cargo-deny
+        run: |
+          name="cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl"
+          curl -sSfL -o "$RUNNER_TEMP/$name.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$CARGO_DENY_VERSION/$name.tar.gz"
+          echo "$CARGO_DENY_SHA256  $RUNNER_TEMP/$name.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$name.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$name" >> "$GITHUB_PATH"
+      - name: cargo deny check
+        run: cargo deny check advisories bans licenses sources

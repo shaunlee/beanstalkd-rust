@@ -1,0 +1,28 @@
+# cargo-deny configuration (`cargo deny check`, run by the `deny` CI job).
+# Every exception below states why it is acceptable.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses only; all are compatible with this project's MIT license.
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "ISC", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicates come from transitive version splits (thiserror 1/2, getrandom,
+# syn) that this workspace cannot unify; they are reported, not fatal.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace crates depend on each other by path; none is published.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

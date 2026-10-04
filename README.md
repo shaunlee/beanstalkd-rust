@@ -1,5 +1,7 @@
 # beanstalkd-rust
 
+[![CI](https://github.com/shaunlee/beanstalkd-rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shaunlee/beanstalkd-rust/actions/workflows/ci.yml)
+
 A Rust reimplementation of [beanstalkd](https://github.com/beanstalkd/beanstalkd), the simple work queue, that is byte-for-byte compatible with the original protocol so existing clients work unmodified.
 
 Status: **P3 complete**: a server compatible with the reference, with an optional write-ahead log (`-b`), TLS / mTLS, optional token authentication, Prometheus metrics, and an optional Raft cluster mode (3 or 5 nodes) that keeps serving through the loss of a minority of nodes. Performance work (P4) is next; see `docs/PLAN.md`.
@@ -51,6 +53,33 @@ clients/run-smoke.sh      # real-client smoke tests (needs python3 and go)
 ```
 
 Benchmarks: see `docs/BENCH.md` (`scripts/build-ref.sh --optimized`, then `bench/run-matrix.sh`).
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request:
+
+| Job | Runner | What |
+|---|---|---|
+| `check` | `ubuntu-latest` (x86_64), `ubuntu-24.04-arm` (aarch64), `macos-latest` | builds the reference, then `scripts/check.sh --no-fail-fast` (fmt, clippy, build, all tests including the differential and stunnel suites) |
+| `smoke` | `ubuntu-latest` | `clients/run-smoke.sh` in plain, binlog, restart, TLS, mTLS (with restart, token and HTTP), cluster and cluster leader-kill modes |
+| `chaos` | `ubuntu-latest` | 200 in-process seeds and 5 multi-process runs |
+| `deny` | `ubuntu-latest` | `cargo deny check` (advisories, bans, licenses, sources; `deny.toml`) |
+
+`.github/workflows/weekly.yml` (weekly and on demand) runs 1,000 in-process seeds and 50 multi-process runs.
+
+The same locally:
+
+```sh
+scripts/build-ref.sh
+BSTK_REQUIRE_STUNNEL=1 scripts/check.sh --no-fail-fast   # needs stunnel (stunnel4 on Debian/Ubuntu)
+SMOKE_CLUSTER_KILL=1 clients/run-smoke.sh                 # one smoke mode; see clients/README.md
+cargo build -p bstk-server
+BSTK_CHAOS_SEEDS=200 cargo test --release -p bstk-chaos --test inprocess full -- --ignored --nocapture
+BSTK_CHAOS_MP_RUNS=5 cargo test --release -p bstk-chaos --test multiprocess full -- --ignored --nocapture
+cargo deny check
+```
+
+Platform notes: `BSTK_REQUIRE_STUNNEL=1` makes the stunnel suites fail instead of skipping when stunnel is missing. On macOS, stunnel must be 5.82 or newer: older versions close a half-closed connection before forwarding the reply, which fails the half-close cases of `ref_vs_stunnel_ref` (the CI job runs `brew update` first and checks the version). Ubuntu's `stunnel4` (5.72) is not affected.
 
 ## Documentation
 
