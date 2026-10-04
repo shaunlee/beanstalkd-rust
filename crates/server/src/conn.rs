@@ -121,16 +121,17 @@ pub async fn handle_plain(
     mut reply_rx: mpsc::UnboundedReceiver<Response>,
     max_job_size: u32,
 ) {
-    let _guard = ConnGuard::connected(conn, engine_tx.clone());
-    // Declared after the guard, so the socket is closed before the engine
-    // hears about the disconnect.
     let mut stream = match QuietTcp::new(stream) {
         Ok(s) => s,
         Err(e) => {
             tracing::debug!("cannot register a client socket: {e}");
+            drop(ConnGuard::connected(conn, engine_tx));
             return;
         }
     };
+    // Declared after the socket, so on every exit path `Disconnect` is
+    // queued before the client can see the close (docs/DESIGN.md §6).
+    let _guard = ConnGuard::connected(conn, engine_tx.clone());
     let mut codec = ServerCodec::new(max_job_size).emit_put_started();
     let mut rbuf = BytesMut::with_capacity(INITIAL_BUF_CAPACITY);
     let mut wbuf = BytesMut::with_capacity(256);

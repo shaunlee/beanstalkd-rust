@@ -250,9 +250,13 @@ impl Drop for Cluster {
     }
 }
 
-fn free_addr() -> Result<SocketAddr, String> {
+/// A free address, kept bound in `held` so that later probes and the
+/// proxies' listeners cannot be given the same port.
+fn free_addr(held: &mut Vec<std::net::TcpListener>) -> Result<SocketAddr, String> {
     let l = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|e| format!("bind: {e}"))?;
-    l.local_addr().map_err(|e| format!("local_addr: {e}"))
+    let addr = l.local_addr().map_err(|e| format!("local_addr: {e}"))?;
+    held.push(l);
+    Ok(addr)
 }
 
 impl Cluster {
@@ -282,13 +286,14 @@ impl Cluster {
                 (Some(t), d)
             }
         };
+        let mut held = Vec::new();
         let mut nodes = Vec::new();
         for id in 1..=cfg.nodes {
             nodes.push(Node {
                 id,
-                client: free_addr()?,
-                http: free_addr()?,
-                cluster: free_addr()?,
+                client: free_addr(&mut held)?,
+                http: free_addr(&mut held)?,
+                cluster: free_addr(&mut held)?,
                 data_dir: dir.join(format!("data{id}")),
                 config: dir.join(format!("node{id}.toml")),
                 log: dir.join(format!("node{id}.log")),
@@ -309,6 +314,7 @@ impl Cluster {
                 }
             }
         }
+        drop(held);
         for n in &nodes {
             let mut peers = String::new();
             for m in &nodes {

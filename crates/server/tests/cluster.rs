@@ -80,7 +80,13 @@ struct Proxy {
 
 impl Proxy {
     fn start(target: SocketAddr) -> Proxy {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // On a claimed port: any free port could be a node's, claimed but
+        // not yet bound. Never released, as the listener is never closed.
+        let listener = loop {
+            if let Ok(l) = TcpListener::bind(("127.0.0.1", claim_port())) {
+                break l;
+            }
+        };
         let addr = listener.local_addr().unwrap();
         let cut = Arc::new(AtomicBool::new(false));
         let conns: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
@@ -605,6 +611,11 @@ fn follower_kill_releases_its_reservations_after_drop_node() {
     let mut on_leader = c.nodes[l].connect();
     let job = inserted(&on_leader.put(b"x"));
     let mut worker = c.nodes[f].connect();
+    // The leader last hears from the follower after this (the reserve, or a
+    // later ping), so it may drop it only 2 x node_timeout after this, less
+    // up to one heartbeat: the replication side counts too, and its last
+    // answer may be the heartbeat before the reserve.
+    let heard = Instant::now();
     assert_eq!(reserve(&mut worker, "reserve-with-timeout 5"), job);
     let mut waiter = c.nodes[l].connect();
     waiter.send(b"reserve-with-timeout 30\r\n");
@@ -615,8 +626,9 @@ fn follower_kill_releases_its_reservations_after_drop_node() {
     // ready and goes to the waiting reserve.
     let (id, _) = read_reserved(&mut waiter);
     assert_eq!(id, job);
+    let silent = heard.elapsed();
+    assert!(silent >= Duration::from_millis(1900), "{silent:?}");
     let took = killed.elapsed();
-    assert!(took >= Duration::from_millis(1900), "{took:?}");
     assert!(took < Duration::from_secs(10), "{took:?}");
     let a = c.nodes[l].admin().unwrap();
     assert!(
@@ -851,6 +863,11 @@ fn wiped_node_does_not_vote_until_it_has_caught_up() {
     let mut on_leader = c.nodes[l].connect();
     inserted(&on_leader.put(b"before"));
 
+    // The bootstrap may already have sent `acker` through rejoin mode once
+    // (docs/DESIGN.md §8 "Bootstrap"), so its log is counted from here.
+    let count = |n: &Node, what: &str| n.log_text().matches(what).count();
+    let rejoins = count(&c.nodes[acker], "rejoin mode:");
+    let completes = count(&c.nodes[acker], "rejoin complete");
     c.nodes[behind].signal(Signal::SIGSTOP);
     let job = inserted(&on_leader.put(b"acknowledged by two"));
     drop(on_leader);
@@ -869,7 +886,7 @@ fn wiped_node_does_not_vote_until_it_has_caught_up() {
     assert_ne!(a["cluster"]["role"], "leader", "{a}");
     assert_eq!(c.nodes[acker].readyz(), 503);
     assert!(c.nodes[acker].admin().is_none());
-    assert!(c.nodes[acker].log_text().contains("rejoin mode"));
+    assert_eq!(count(&c.nodes[acker], "rejoin mode:"), rejoins + 1);
 
     // A crash during rejoin keeps the marker: still rejoining, and
     // --cluster-init is refused.
@@ -885,7 +902,7 @@ fn wiped_node_does_not_vote_until_it_has_caught_up() {
     c.nodes[acker].start(&[]);
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(c.nodes[acker].readyz(), 503);
-    assert_eq!(c.nodes[acker].log_text().matches("rejoin mode:").count(), 2);
+    assert_eq!(count(&c.nodes[acker], "rejoin mode:"), rejoins + 2);
     assert_ne!(
         c.nodes[behind].admin().unwrap()["cluster"]["role"],
         "leader"
@@ -899,7 +916,7 @@ fn wiped_node_does_not_vote_until_it_has_caught_up() {
     let a = c.nodes[acker].admin().unwrap();
     assert_eq!(a["cluster"]["rejoining"], false, "{a}");
     assert!(a["cluster"]["votes_refused"].as_u64().unwrap() > 0, "{a}");
-    assert!(c.nodes[acker].log_text().contains("rejoin complete"));
+    assert_eq!(count(&c.nodes[acker], "rejoin complete"), completes + 1);
     for n in &c.nodes {
         let mut cl = n.connect();
         let (hdr, body) = cl.body_reply(&format!("peek {job}"));
@@ -911,18 +928,47 @@ fn wiped_node_does_not_vote_until_it_has_caught_up() {
     // a running cluster and rejoins instead of bootstrapping.
     let nl = c.leader();
     let f = c.followers(nl)[0];
+    let skip = c.nodes[f].log_text().lines().count();
     c.nodes[f].kill9();
     c.nodes[f].wipe();
     c.nodes[f].start(&["--cluster-init"]);
     assert!(c.nodes[f].wait_ready(Duration::from_secs(20)));
     let log = c.nodes[f].log_text();
+    let since: Vec<&str> = log.lines().skip(skip).collect();
     assert!(
-        log.contains("already belongs to a running cluster"),
+        since
+            .iter()
+            .any(|l| l.contains("already belongs to a running cluster")),
         "{log}"
     );
-    assert!(log.contains("rejoin complete"), "{log}");
+    assert!(since.iter().any(|l| l.contains("rejoin complete")), "{log}");
     let mut cl = c.nodes[f].connect();
     assert_eq!(cl.stat("stats", "current-jobs-ready"), "2");
+}
+
+/// A client that has seen its connection close and then sends a command on
+/// another connection to the same node finds the first one gone
+/// (docs/COMPAT.md C10). Each round races the close against the next
+/// command, so a wrong order shows up within a few hundred rounds.
+#[test]
+fn a_close_is_ordered_before_later_commands_on_the_same_node() {
+    let mut c = Cluster::start(3, &Opts::default());
+    let l = c.leader();
+    let f = c.followers(l)[0];
+    for node in [l, f] {
+        let mut p = c.nodes[node].connect();
+        for round in 0..300 {
+            let mut q = c.nodes[node].connect();
+            q.send(b"quit\r\n");
+            let (_, end) = q.read_to_end(Duration::from_secs(10));
+            assert_eq!(end, End::Closed);
+            assert_eq!(
+                p.stat("stats", "current-connections"),
+                "1",
+                "node {node}, round {round}"
+            );
+        }
+    }
 }
 
 /// Chaos finding 5: connection ids of a process whose `Connect`s never
@@ -950,8 +996,13 @@ fn connection_ids_are_fresh_after_a_restart_without_committed_connects() {
         cl.send(b"use t\r\n");
         held.push(cl);
     }
-    let used = next(&c.nodes[f]);
-    assert_eq!(used, first + 3);
+    // A connect returns once the kernel has queued the connection; the
+    // node numbers it when its accept loop gets to it.
+    let used = wait_for(Duration::from_secs(3), || {
+        let n = next(&c.nodes[f]);
+        (n == first + 3).then_some(n)
+    })
+    .unwrap_or_else(|| panic!("not all 3 connections numbered: {}", next(&c.nodes[f])));
     c.nodes[f].kill9();
     drop(held);
     for &i in &others {
@@ -989,6 +1040,8 @@ fn one_way_partition_isolates_the_follower_and_the_leader_drops_it() {
     let mut on_leader = c.nodes[l].connect();
     let job = inserted(&on_leader.put(b"x"));
     let mut worker = c.nodes[f].connect();
+    // See `follower_kill_releases_its_reservations_after_drop_node`.
+    let heard = Instant::now();
     assert_eq!(reserve(&mut worker, "reserve-with-timeout 5"), job);
     let mut waiter = c.nodes[l].connect();
     waiter.send(b"reserve-with-timeout 30\r\n");
@@ -1011,8 +1064,8 @@ fn one_way_partition_isolates_the_follower_and_the_leader_drops_it() {
     // waiting reserve.
     let (id, _) = read_reserved(&mut waiter);
     assert_eq!(id, job);
-    let took = cut.elapsed();
-    assert!(took >= Duration::from_millis(1900), "{took:?}");
+    let silent = heard.elapsed();
+    assert!(silent >= Duration::from_secs(2), "{silent:?}");
     let a = c.nodes[l].admin().unwrap();
     assert!(
         a["cluster"]["drop_node_proposals"].as_u64().unwrap() >= 1,
@@ -1442,7 +1495,10 @@ fn stale_leader_is_rejected_by_a_rejoined_node() {
 
     // The acker loses its data and rejoins; it reaches both others (the
     // old leader still cannot reach the new one). Then the new leader is
-    // cut off: the stale leader and the rejoined node are alone.
+    // cut off: the stale leader and the rejoined node are alone. The
+    // bootstrap may already have sent the acker through rejoin mode
+    // (docs/DESIGN.md §8 "Bootstrap"), so its log is read from here.
+    let skip = c.nodes[acker].log_text().lines().count();
     c.nodes[acker].kill9();
     c.nodes[acker].wipe();
     c.heal_pair(old_id, acker_id);
@@ -1451,6 +1507,7 @@ fn stale_leader_is_rejected_by_a_rejoined_node() {
         c.nodes[acker]
             .log_text()
             .lines()
+            .skip(skip)
             .find(|l| l.contains("rejoin: adopted the highest vote"))
             .map(str::to_owned)
     })
@@ -1523,7 +1580,12 @@ fn stale_leader_is_rejected_by_a_rejoined_node() {
         }
     }
     let log = c.nodes[acker].log_text();
-    assert!(log.contains("rejoin complete"), "{log}");
+    assert!(
+        log.lines()
+            .skip(skip)
+            .any(|l| l.contains("rejoin complete")),
+        "{log}"
+    );
 }
 
 /// `--cluster-init` on a wiped node while the other nodes are down: it
@@ -1537,6 +1599,8 @@ fn cluster_init_on_a_wiped_node_waits_for_the_survivors_and_rejoins() {
     let job = inserted(&on_leader.put(b"survives"));
     drop(on_leader);
     let f = c.followers(l)[0];
+    // See `wiped_node_does_not_vote_until_it_has_caught_up`.
+    let skip = c.nodes[f].log_text().lines().count();
     for i in 0..3 {
         c.nodes[i].kill9();
     }
@@ -1557,11 +1621,14 @@ fn cluster_init_on_a_wiped_node_waits_for_the_survivors_and_rejoins() {
     }
     c.wait_all_ready();
     let log = c.nodes[f].log_text();
+    let since: Vec<&str> = log.lines().skip(skip).collect();
     assert!(
-        log.contains("already belongs to a running cluster"),
+        since
+            .iter()
+            .any(|l| l.contains("already belongs to a running cluster")),
         "{log}"
     );
-    assert!(log.contains("rejoin complete"), "{log}");
+    assert!(since.iter().any(|l| l.contains("rejoin complete")), "{log}");
     for n in &c.nodes {
         let mut cl = n.connect();
         let (hdr, body) = cl.body_reply(&format!("peek {job}"));
