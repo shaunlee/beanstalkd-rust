@@ -49,6 +49,22 @@
 //! [`AdminResponse::Unsupported`] until the leader-side executor exists
 //! (P6-T4); [`AdminRequest::Membership`] answers the status source's
 //! [`crate::status::NodeStatusEx`].
+//!
+//! Probe connections ([`ClientMsg::ProbeHello`], P6-T3) let a node that is
+//! not a member yet (a node joining, or one checking whether its id was
+//! removed) ask for status at startup: the identity is checked as for a peer
+//! hello, the allowlist is not (in plaintext mode, which proves no identity,
+//! only from loopback unless [`ListenerConfig::plaintext_remote_probes`]).
+//! The connection holds one of [`ListenerConfig::max_probe_conns`] probe
+//! slots (no peer slot), at most one per node id (a newer probe connection
+//! of the same id replaces the older), carries only status probes, and
+//! closes after [`ListenerConfig::probe_idle_timeout`] without one, after
+//! [`ListenerConfig::probe_max_requests`] of them, or after
+//! [`ListenerConfig::probe_max_lifetime`] in any case: a certificate holder
+//! (a removed node's included) holds at most one slot, and only briefly.
+//! What it reveals (votes, log ids, the membership with addresses) is
+//! disclosed to any holder of a cluster certificate, removed nodes included,
+//! until that certificate is retired (docs/DESIGN.md §8 "Startup probes").
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
@@ -153,13 +169,28 @@ pub struct ListenerConfig {
     pub max_admin_conns: usize,
     /// An admin connection without a request for this long is closed.
     pub admin_idle_timeout: Duration,
+    /// Probe connections ([`ClientMsg::ProbeHello`]) open at once; more are
+    /// refused at their hello.
+    pub max_probe_conns: usize,
+    /// A probe connection without a request for this long is closed.
+    pub probe_idle_timeout: Duration,
+    /// A probe connection is closed after this long, busy or not.
+    pub probe_max_lifetime: Duration,
+    /// A probe connection is closed after answering this many probes (a
+    /// node's own probes use one per connection).
+    pub probe_max_requests: usize,
+    /// Accept plaintext probe hellos from any address, not only loopback
+    /// (`cluster.insecure_plaintext_allow_remote`; ignored with TLS).
+    pub plaintext_remote_probes: bool,
 }
 
 impl ListenerConfig {
     /// Defaults: 16 handshakes at once, `max(4, 2 × peers)` of them per
     /// source address (every peer may share one address, as on a test
     /// machine or behind NAT), 2 s handshake, 32 MiB frames, the default
-    /// `-z`, no vote gate, 4 admin connections idle for at most 60 s.
+    /// `-z`, no vote gate, 4 admin connections idle for at most 60 s, 8
+    /// probe connections (one per node id) idle for at most 5 s, open for at
+    /// most 30 s and 16 probes, plaintext probes from loopback only.
     pub fn new(node_id: NodeId, peers: BTreeSet<NodeId>, tls: Option<Arc<ServerConfig>>) -> Self {
         let per_ip = peers.len().saturating_mul(2).max(4);
         ListenerConfig {
@@ -175,6 +206,11 @@ impl ListenerConfig {
             status: None,
             max_admin_conns: 4,
             admin_idle_timeout: Duration::from_secs(60),
+            max_probe_conns: 8,
+            probe_idle_timeout: Duration::from_secs(5),
+            probe_max_lifetime: Duration::from_secs(30),
+            probe_max_requests: 16,
+            plaintext_remote_probes: false,
         }
     }
 }
@@ -284,6 +320,8 @@ impl ClusterListener {
         let shared = Arc::new(Shared {
             handshakes: Arc::new(Semaphore::new(cfg.max_handshakes)),
             admins: Arc::new(Semaphore::new(cfg.max_admin_conns)),
+            probes: Arc::new(Semaphore::new(cfg.max_probe_conns)),
+            probers: Arc::new(StdMutex::new(HashMap::new())),
             per_ip_limit: AtomicUsize::new(cfg.max_handshakes_per_ip),
             allowed: StdMutex::new(cfg.peers.clone()),
             cfg,
@@ -344,6 +382,8 @@ pub const REJECT_VERSION: &str = "unsupported protocol version";
 pub const REJECT_MAX_JOB_SIZE: &str = "max_job_size mismatch (every node must use the same -z)";
 /// Reason sent for an admin hello beyond [`ListenerConfig::max_admin_conns`].
 pub const REJECT_ADMIN_BUSY: &str = "too many admin connections";
+/// Reason sent for a probe hello beyond [`ListenerConfig::max_probe_conns`].
+pub const REJECT_PROBE_BUSY: &str = "too many probe connections";
 
 /// Whether a plaintext admin connection from `ip` may proceed: loopback
 /// only, as plaintext proves no identity (an IPv4 client of a dual-stack
@@ -385,6 +425,12 @@ struct Shared {
     handshakes: Arc<Semaphore>,
     /// Open admin connections (see [`ListenerConfig::max_admin_conns`]).
     admins: Arc<Semaphore>,
+    /// Probe slots (see [`ListenerConfig::max_probe_conns`]); each permit
+    /// is held by an entry of `probers`.
+    probes: Arc<Semaphore>,
+    /// The open probe connection of each node id: generation, closer and
+    /// its probe slot.
+    probers: Arc<StdMutex<HashMap<NodeId, Prober>>>,
     /// Handshakes allowed per source address (see [`PeerAllowlist::set`]).
     per_ip_limit: AtomicUsize,
     /// Nodes allowed to connect. Lock order: `allowed`, then `peers`.
@@ -435,6 +481,66 @@ impl Shared {
         if peers.get(&peer).is_some_and(|(g, _)| *g == generation) {
             peers.remove(&peer);
         }
+    }
+}
+
+struct Prober {
+    generation: u64,
+    close: Arc<Notify>,
+    permit: OwnedSemaphorePermit,
+}
+
+/// A probe connection's registration in [`Shared::probers`]: dropping it
+/// (the connection ended, or its hello answer could not be written)
+/// releases the probe slot unless a newer connection of the same id has
+/// taken it over.
+struct ProbeSlot {
+    probers: Arc<StdMutex<HashMap<NodeId, Prober>>>,
+    node: NodeId,
+    generation: u64,
+    close: Arc<Notify>,
+}
+
+impl Drop for ProbeSlot {
+    fn drop(&mut self) {
+        let mut probers = lock(&self.probers);
+        if probers
+            .get(&self.node)
+            .is_some_and(|p| p.generation == self.generation)
+        {
+            probers.remove(&self.node);
+        }
+    }
+}
+
+impl Shared {
+    /// Registers a probe connection of `node`: takes over the slot of the
+    /// node's older probe connection (closing it) or a free one.
+    fn register_probe(&self, node: NodeId) -> Option<ProbeSlot> {
+        let mut probers = lock(&self.probers);
+        let permit = match probers.remove(&node) {
+            Some(old) => {
+                old.close.notify_one();
+                old.permit
+            }
+            None => self.probes.clone().try_acquire_owned().ok()?,
+        };
+        let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
+        let close = Arc::new(Notify::new());
+        probers.insert(
+            node,
+            Prober {
+                generation,
+                close: close.clone(),
+                permit,
+            },
+        );
+        Some(ProbeSlot {
+            probers: self.probers.clone(),
+            node,
+            generation,
+            close,
+        })
     }
 }
 
@@ -583,6 +689,10 @@ where
             drop(slot);
             serve_admin(io, addr, permit, shared).await
         }
+        Ok(Ok((io, Caller::Prober(probe)))) => {
+            drop(slot);
+            serve_probe(io, probe, shared).await
+        }
         Ok(Err(e)) => Err(Phase::Handshake(e)),
         Err(_) => Err(Phase::Handshake("handshake timed out".into())),
     }
@@ -593,6 +703,9 @@ enum Caller {
     Peer(NodeId),
     /// Holds one of the admin slots for the connection's life.
     Admin(OwnedSemaphorePermit),
+    /// A node (member or not) asking for status only; holds its node's
+    /// probe slot for the connection's life.
+    Prober(ProbeSlot),
 }
 
 enum Phase {
@@ -653,7 +766,9 @@ where
                 return Ok(());
             }
             Ok(Ok(Some(ClientMsg::Admin { id, body }))) => (id, body),
-            Ok(Ok(Some(ClientMsg::Hello(_) | ClientMsg::AdminHello(_)))) => {
+            Ok(Ok(Some(
+                ClientMsg::Hello(_) | ClientMsg::AdminHello(_) | ClientMsg::ProbeHello(_),
+            ))) => {
                 return Err(Phase::Violation(
                     "second hello on an admin connection".into(),
                 ));
@@ -683,6 +798,53 @@ where
             .await
             .map_err(|e| Phase::Serve(e.to_string()))?;
     }
+}
+
+/// Serves a probe connection until it ends, goes idle, reaches its request
+/// or lifetime cap, is replaced by a newer probe connection of the same node,
+/// or sends anything but a status probe.
+async fn serve_probe<S>(io: S, probe: ProbeSlot, shared: &Shared) -> Result<(), Phase>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let cfg = &shared.cfg;
+    let node = probe.node;
+    tokio::select! {
+        r = probe_requests(io, node, cfg) => r,
+        () = probe.close.notified() => Err(Phase::Serve(format!(
+            "probe connection of node {node} replaced by a newer one"
+        ))),
+        () = tokio::time::sleep(cfg.probe_max_lifetime) => Ok(()),
+    }
+}
+
+async fn probe_requests<S>(mut io: S, node: NodeId, cfg: &ListenerConfig) -> Result<(), Phase>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    for _ in 0..cfg.probe_max_requests {
+        let read = wire::read_frame::<_, ClientMsg>(&mut io, wire::ADMIN_MAX_REQUEST_FRAME);
+        let (id, body) = match tokio::time::timeout(cfg.probe_idle_timeout, read).await {
+            Err(_) | Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some(ClientMsg::Request {
+                id,
+                body: body @ (RpcRequest::Status | RpcRequest::StatusEx),
+            }))) => (id, body),
+            Ok(Ok(Some(_))) => {
+                return Err(Phase::Violation(format!(
+                    "node {node} sent something other than a status probe on a probe connection"
+                )));
+            }
+            Ok(Err(e)) => return Err(Phase::Violation(format!("probe connection: {e}"))),
+        };
+        let resp = status_response(&body, cfg.status.as_deref());
+        let frame = wire::encode(&ServerMsg::Response { id, body: resp }, cfg.max_frame)
+            .map_err(|e| Phase::Serve(e.to_string()))?;
+        wire::write_frame(&mut io, &frame)
+            .await
+            .map_err(|e| Phase::Serve(e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// Answers one admin request. Membership changes are not implemented yet
@@ -731,6 +893,10 @@ where
             format!("node {}", h.from),
         ),
         ClientMsg::AdminHello(h) => (admin_verdict(&h, shared, addr, certs), "admin".into()),
+        ClientMsg::ProbeHello(h) => (
+            probe_verdict(&h, shared, addr, certs),
+            format!("node {} (probe)", h.from),
+        ),
         ClientMsg::Request { .. } | ClientMsg::Admin { .. } => {
             return Err("request before hello".into());
         }
@@ -801,6 +967,57 @@ fn peer_verdict(
     }
 }
 
+/// Whether a plaintext probe hello from `ip` may proceed: loopback only, as
+/// for an admin connection ([`plaintext_admin_allowed`]), unless the
+/// operator allowed plaintext cluster traffic from other hosts
+/// (`remote`), where peer hellos from any address are accepted as well.
+pub fn plaintext_probe_allowed(ip: IpAddr, remote: bool) -> bool {
+    remote || plaintext_admin_allowed(ip)
+}
+
+/// A probe hello: the identity as for a peer, but no membership check (the
+/// caller may be a node that is not a member yet), then its node's probe
+/// slot.
+fn probe_verdict(
+    h: &wire::Hello,
+    shared: &Shared,
+    addr: SocketAddr,
+    certs: Option<Option<&[CertificateDer<'_>]>>,
+) -> Result<Caller, (String, &'static str)> {
+    let cfg = &shared.cfg;
+    let identity = match certs {
+        Some(certs) => crate::tls::verify_peer_identity(certs, h.from),
+        None if plaintext_probe_allowed(addr.ip(), cfg.plaintext_remote_probes) => Ok(()),
+        None => Err("plaintext probe connections are accepted from loopback only".into()),
+    };
+    if h.version != PROTOCOL_VERSION {
+        Err((
+            format!("unsupported protocol version {}", h.version),
+            REJECT_VERSION,
+        ))
+    } else if h.to != cfg.node_id {
+        Err((
+            format!("probe for node {}, this is node {}", h.to, cfg.node_id),
+            REJECT_HELLO,
+        ))
+    } else if h.from == cfg.node_id {
+        Err((
+            format!("probe from this node's own id {}", h.from),
+            REJECT_HELLO,
+        ))
+    } else if let Err(e) = identity {
+        Err((e, REJECT_HELLO))
+    } else {
+        match shared.register_probe(h.from) {
+            Some(probe) => Ok(Caller::Prober(probe)),
+            None => Err((
+                format!("{} probe connections open", cfg.max_probe_conns),
+                REJECT_PROBE_BUSY,
+            )),
+        }
+    }
+}
+
 /// An operator tool's hello: the admin identity (see the module docs), then
 /// a free admin slot.
 fn admin_verdict(
@@ -853,7 +1070,7 @@ where
     loop {
         let (id, body) = match wire::read_frame::<_, ClientMsg>(&mut io, cfg.max_frame).await {
             Ok(Some(ClientMsg::Request { id, body })) => (id, body),
-            Ok(Some(ClientMsg::Hello(_) | ClientMsg::AdminHello(_))) => {
+            Ok(Some(ClientMsg::Hello(_) | ClientMsg::AdminHello(_) | ClientMsg::ProbeHello(_))) => {
                 return Err(Phase::Serve("second hello".into()));
             }
             Ok(Some(ClientMsg::Admin { .. })) => {
@@ -888,6 +1105,24 @@ where
     }
 }
 
+/// The answer to a status probe ([`RpcRequest::Status`] or
+/// [`RpcRequest::StatusEx`]; anything else is refused).
+fn status_response(body: &RpcRequest, status: Option<&dyn StatusSource>) -> RpcResponse {
+    match (body, status) {
+        (RpcRequest::Status, Some(s)) => RpcResponse::status(s.status()),
+        // (A status answer cannot carry an error; any other kind is a
+        // failed probe for the dialer.)
+        (RpcRequest::Status, None) => {
+            RpcResponse::Control(Err(WireError::Rejected(NO_STATUS.into())))
+        }
+        (RpcRequest::StatusEx, Some(s)) => RpcResponse::StatusEx(Ok(Box::new(s.status_ex()))),
+        (RpcRequest::StatusEx, None) => {
+            RpcResponse::StatusEx(Err(WireError::Rejected(NO_STATUS.into())))
+        }
+        _ => RpcResponse::Control(Err(WireError::Rejected("not a status probe".into()))),
+    }
+}
+
 /// Serves one request (shared with the simulated network). `service` is
 /// `None` until Raft runs.
 pub(crate) async fn dispatch<H: ForwardHandler>(
@@ -899,16 +1134,7 @@ pub(crate) async fn dispatch<H: ForwardHandler>(
 ) -> RpcResponse {
     let not_started = || WireError::Rejected(NOT_STARTED.into());
     match body {
-        RpcRequest::Status => match status {
-            Some(s) => RpcResponse::status(s.status()),
-            // (A status answer cannot carry an error; any other kind is a
-            // failed probe for the dialer.)
-            None => RpcResponse::Control(Err(WireError::Rejected(NO_STATUS.into()))),
-        },
-        RpcRequest::StatusEx => RpcResponse::StatusEx(match status {
-            Some(s) => Ok(Box::new(s.status_ex())),
-            None => Err(WireError::Rejected(NO_STATUS.into())),
-        }),
+        RpcRequest::Status | RpcRequest::StatusEx => status_response(&body, status),
         RpcRequest::AppendEntries(r) => RpcResponse::AppendEntries(match service {
             Some((raft, _)) => raft
                 .append_entries(r)

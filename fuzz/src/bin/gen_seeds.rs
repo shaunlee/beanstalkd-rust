@@ -321,6 +321,12 @@ fn raft() {
             version: wire::PROTOCOL_VERSION,
             to: Some(2),
         }),
+        ClientMsg::ProbeHello(Hello {
+            version: wire::PROTOCOL_VERSION,
+            from: 4,
+            to: 2,
+            max_job_size: 65535,
+        }),
         ClientMsg::Admin {
             id: 1,
             body: AdminRequest::Membership,

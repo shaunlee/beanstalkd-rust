@@ -534,6 +534,21 @@ directory to issue a certificate for one node with the existing CA
 one expires. Certificates are read at startup only: replace the files,
 then restart the nodes one at a time (section 7.3).
 
+There is no revocation list: every certificate the CA signed for a node
+id stays valid until it expires. Before a node has joined, and while it
+starts, it asks the others for their status over *probe connections*,
+which any node certificate of the CA may open, whether or not its id is a
+member. The answers carry the membership (node ids and addresses), each
+node's Raft vote and log positions. So a removed node's certificate (or
+its key, if it leaked) can still read that, and a malicious holder could
+answer probes with a made-up membership or vote and stall or mislead a
+node that is starting without its data. When you remove a node you no
+longer trust, issue a new CA and new certificates for the remaining nodes
+and roll them out (section 7.3). Probe connections are limited (one per
+node id, at most 30 s each, 8 at once), and in plaintext test mode they
+are accepted from loopback only unless
+`insecure_plaintext_allow_remote = true`.
+
 On each node `N`, install its files so that the service group can read
 the key (Linux, as root):
 
@@ -739,7 +754,8 @@ The log shows the steps (the data directory is created if missing):
 
 ```
 WARN beanstalkd_rs::cluster: rejoin mode: this node started without Raft state (or did not finish rejoining); ...
-WARN beanstalkd_rs::cluster: rejoin: adopted the highest vote of the other nodes answered=2 of=2 vote=T2-N2:committed
+INFO beanstalkd_rs::cluster: startup: learned the cluster membership membership=Some(LogId { leader_id: LeaderId { term: 1, node_id: 1 }, index: 0 }) voters=[{1, 2, 3}] nodes=[1, 2, 3]
+WARN beanstalkd_rs::cluster: rejoin: adopted the highest vote of the current voters that answered membership=Some(...) voters={1, 2, 3} vote=T2-N2:committed
 INFO beanstalkd_rs::cluster: rejoin: caught up with the leader index=25
 WARN beanstalkd_rs::cluster: rejoin complete: this node votes and stands for election again
 INFO beanstalkd_rs::cluster: cluster node ready node=1 first_local=117381027659776
@@ -747,14 +763,30 @@ INFO beanstalkd_rs::cluster: cluster node ready node=1 first_local=1173810276597
 
 Rules:
 
-- A rejoining node needs answers from a majority of the *other* nodes
-  (both others in a 3-node cluster) and a running leader. Until then it
-  waits and logs `rejoin: waiting for the other nodes' status (1 of the 2
-  answers needed)`; it completes by itself once enough nodes are up. If
+- A rejoining node learns the current membership from its peers (any
+  reachable member will do) and needs answers from enough of the *other*
+  current voters, not rejoining themselves (1 with 2 voters, 2 with 3 or
+  4, 3 with 5: enough to meet every majority of the voters), and a
+  running leader. Until then it waits and logs `startup: waiting for the
+  cluster's status (1 of the 2 answers needed from the current voters
+  ...)`; it completes by itself once enough nodes are up. It also waits
+  while a membership change is in progress, and a node whose id was
+  removed refuses to start. The `rejoin` marker appears only once the node
+  has decided to rejoin; before that its data directory holds neither Raft
+  state nor marker, and `beanstalkd_cluster_rejoining` is the signal. If
   the wiped node had been the leader, it also waits until the others have
   elected a new one (`the highest vote (T2-N2:committed) is this node's
-  own leadership`).
-- Rejoin at most a minority of nodes at a time (one in a 3-node cluster).
+  own leadership`). If its id is removed from the membership before it
+  has caught up, it exits with `cannot finish rejoining node N: ...`.
+- Rejoin one node at a time: a node that is still rejoining does not count
+  for another, so with 3 voters a second wiped node waits until the first
+  has finished.
+- With a single voter, a wiped voter can never rejoin (no other node holds
+  the data): restore its data directory. With two voters, a wiped voter
+  rejoins only while the other one stays leader; if that one restarts or
+  loses leadership meanwhile, the cluster stalls (the rejoining node does
+  not vote until it has caught up) until the data is restored. Do not stay
+  at two voters longer than needed.
 - **Never restore an old copy of one node's `data_dir`** into a running
   cluster: a node that forgot only part of its history can break Raft's
   guarantees. Wipe it instead and let it rejoin.
@@ -1065,7 +1097,7 @@ while serving, 2 for a command-line syntax error, 5 for `-u`.
 | `cluster connection rejected: hello from node 1 rejected: unsupported protocol version 4` | Mixed releases with different cluster protocols (section 7.1). |
 | `--cluster-init: DIR already holds Raft state; a cluster is bootstrapped only once ...` | Remove `--cluster-init` (or the systemd drop-in, section 5.3). |
 | Stays at `waiting for a leader`, `/readyz` 503 | No majority is reachable: check that enough nodes run, that the cluster ports are open between all nodes (both directions), and the TLS / `-z` errors above. A new cluster started with `--cluster-init` waits until a majority of the other nodes answer (section 5.3). |
-| `rejoin: waiting for the other nodes' status (1 of the 2 answers needed)` | A rejoining node (section 5.6) needs a majority of the other nodes up; start them. |
+| `startup: waiting for the cluster's status (...)` | A joining or rejoining node (section 5.6) is waiting for answers: a rejoin needs `n - quorum(n) + 1` of the other current voters that are not rejoining themselves (1 with 2 voters, 2 with 3 or 4, 3 with 5); start them, or wait until another rejoin finishes. |
 | `rejoin: waiting ... (the highest vote (...) is this node's own leadership)` | The wiped node was the leader; it waits until the others elect a new one (a few seconds). |
 | Peers log `vote refused: the vote gate is closed` (debug) | Normal while a node rejoins: it does not vote until it has caught up. |
 | `INSECURE: cluster.insecure_plaintext = true: ...` | Test configuration; use `[cluster.tls]` in production. |
@@ -1092,8 +1124,9 @@ extensions (token authentication).
   standalone, because every node applies every command and every entry is
   fsynced on a majority. Plan cluster capacity accordingly.
 - **Bootstrapping** needs all nodes of a 3-node cluster (a majority of
-  the others) up; a rejoin needs a majority of the other nodes and a
-  leader.
+  the others) up; a rejoin needs `n - quorum(n) + 1` of the other current
+  voters, none of them rejoining, and a leader; with two voters the
+  survivor must be (and stay) the leader, otherwise the cluster stalls.
 - **Snapshot building** briefly stops a node from applying entries (about
   0.2 to 0.4 s for 1 to 2 million jobs), and a snapshot received from the
   leader that fails validation stops the follower until an operator wipes

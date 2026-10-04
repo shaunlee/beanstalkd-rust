@@ -2394,3 +2394,202 @@ async fn closes_within(s: &mut tokio::net::TcpStream, d: Duration) -> bool {
         Ok(Ok(0) | Err(_))
     )
 }
+
+fn probe_hello(from: NodeId) -> ClientMsg {
+    ClientMsg::ProbeHello(Hello {
+        version: PROTOCOL_VERSION,
+        from,
+        to: 1,
+        max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
+    })
+}
+
+/// P6-T3: a node that is not a member (here 9: the listener allows 1..=3)
+/// is refused as a peer but answered on a probe connection, which carries
+/// status probes only and is bounded by `max_probe_conns`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_connections_answer_non_members_status_only() {
+    let (l, raft, handler, addr) = admin_target(None, true, |c| c.max_probe_conns = 2).await;
+    let stranger = Network::new(net_config(9, [(1, addr.to_string())].into(), None));
+    let e = stranger.status_ex(1).await.expect_err("not a member");
+    assert!(
+        matches!(&e, ForwardError::Unreachable(m) if m.contains("not a member")),
+        "{e:?}"
+    );
+    assert_eq!(
+        stranger.probe_status_ex(1).await.expect("probe"),
+        sample_status_ex()
+    );
+    assert_eq!(
+        crate::status::StatusTransport::status_ex(&stranger, 1)
+            .await
+            .expect("trait"),
+        sample_status_ex()
+    );
+    // Status probes only: anything else closes the connection.
+    let (mut io, h) = hello_with(addr, None, &probe_hello(9))
+        .await
+        .expect("hello");
+    assert!(
+        matches!(h, ServerHello::Accepted { node_id: 1, .. }),
+        "{h:?}"
+    );
+    let ok = exchange(
+        &mut io,
+        &ClientMsg::Request {
+            id: 1,
+            body: wire::RpcRequest::Status,
+        },
+    )
+    .await;
+    match ok {
+        Some(ServerMsg::Response { id: 1, body }) => assert!(body.into_status().is_some()),
+        other => panic!("status expected: {other:?}"),
+    }
+    let forward = ClientMsg::Request {
+        id: 2,
+        body: wire::RpcRequest::Forward(ForwardRequest {
+            from: 9,
+            items: Vec::new(),
+        }),
+    };
+    assert!(exchange(&mut io, &forward).await.is_none());
+    let (mut io, _) = hello_with(addr, None, &probe_hello(9))
+        .await
+        .expect("hello");
+    assert!(exchange(&mut io, &admin_hello(Some(1))).await.is_none());
+    // Misaddressed, or claiming the listener's own id.
+    let wrong = ClientMsg::ProbeHello(Hello {
+        version: PROTOCOL_VERSION,
+        from: 9,
+        to: 2,
+        max_job_size: 0,
+    });
+    assert!(rejected(
+        &hello_with(addr, None, &wrong).await,
+        REJECT_HELLO
+    ));
+    assert!(rejected(
+        &hello_with(addr, None, &probe_hello(1)).await,
+        REJECT_HELLO
+    ));
+    // At most `max_probe_conns` at once.
+    let (_a, _) = hello_with(addr, None, &probe_hello(9)).await.expect("1");
+    let (_b, _) = hello_with(addr, None, &probe_hello(8)).await.expect("2");
+    let h = hello_with(addr, None, &probe_hello(7)).await;
+    assert!(
+        rejected(&h, crate::listener::REJECT_PROBE_BUSY),
+        "{:?}",
+        h.as_ref().map(|r| &r.1)
+    );
+    assert_eq!(handler.calls(), 0);
+    drop((_a, _b));
+    l.shutdown().await;
+    if let Some(r) = raft {
+        let _ = r.shutdown().await;
+    }
+}
+
+/// P6-T3: under mTLS a probe needs the certificate of the id it claims (any
+/// id, member or not); the admin certificate is no prober.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_connections_check_identity_under_mtls() {
+    let pki = Pki::new("cluster CA");
+    let (l, _, _, addr) = admin_target(Some(&pki.node(1)), false, |_| {}).await;
+    // Node 9's certificate, not a member: answered over a probe connection.
+    let tls9 = pki.node(9);
+    let net9 = Network::new(net_config(9, [(1, addr.to_string())].into(), Some(&tls9)));
+    assert_eq!(
+        net9.probe_status_ex(1).await.expect("probe"),
+        sample_status_ex()
+    );
+    // Node 2's certificate claiming id 9.
+    let h = hello_with(addr, Some(pki.node(2).client), &probe_hello(9)).await;
+    assert!(rejected(&h, REJECT_HELLO), "{:?}", h.as_ref().map(|r| &r.1));
+    // The admin certificate.
+    let h = hello_with(addr, Some(pki.admin()), &probe_hello(9)).await;
+    assert!(rejected(&h, REJECT_HELLO), "{:?}", h.as_ref().map(|r| &r.1));
+    // Plaintext on a TLS listener.
+    assert!(hello_with(addr, None, &probe_hello(9)).await.is_err());
+    l.shutdown().await;
+}
+
+fn status_probe(id: u64) -> ClientMsg {
+    ClientMsg::Request {
+        id,
+        body: wire::RpcRequest::Status,
+    }
+}
+
+/// Whether `io` answers a status probe (`false`: the listener closed it).
+async fn probe_answered(io: &mut Box<dyn TestIo>, id: u64) -> bool {
+    matches!(
+        exchange(io, &status_probe(id)).await,
+        Some(ServerMsg::Response { id: got, .. }) if got == id
+    )
+}
+
+/// P6-T3 review (M2): one probe connection per node id (a newer one takes
+/// over the older's slot, even when every slot is taken), so a certificate
+/// holder cannot hold more than one; each closes after its request cap or
+/// its lifetime, however busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_connections_are_one_per_node_and_capped() {
+    let (l, _, _, addr) = admin_target(None, false, |c| {
+        c.max_probe_conns = 2;
+        c.probe_max_requests = 3;
+        c.probe_max_lifetime = Duration::from_millis(600);
+    })
+    .await;
+    let (mut a, _) = hello_with(addr, None, &probe_hello(9)).await.expect("9");
+    let (mut b, _) = hello_with(addr, None, &probe_hello(8)).await.expect("8");
+    assert!(probe_answered(&mut a, 1).await);
+    // Every slot is taken: node 9's newer connection replaces its older
+    // one, node 7 is still refused.
+    let (mut a2, h) = hello_with(addr, None, &probe_hello(9))
+        .await
+        .expect("9 again");
+    assert!(matches!(h, ServerHello::Accepted { .. }), "{h:?}");
+    assert!(
+        !probe_answered(&mut a, 2).await,
+        "the older probe stays open"
+    );
+    assert!(probe_answered(&mut a2, 1).await);
+    let h = hello_with(addr, None, &probe_hello(7)).await;
+    assert!(
+        rejected(&h, crate::listener::REJECT_PROBE_BUSY),
+        "{:?}",
+        h.as_ref().map(|r| &r.1)
+    );
+    // The request cap: three probes, then the connection closes.
+    assert!(probe_answered(&mut b, 1).await);
+    assert!(probe_answered(&mut b, 2).await);
+    assert!(probe_answered(&mut b, 3).await);
+    assert!(!probe_answered(&mut b, 4).await, "past the request cap");
+    // Its slot is free again.
+    let (mut c, _) = hello_with(addr, None, &probe_hello(7)).await.expect("7");
+    // The lifetime cap: a request every 400 ms (well below the idle
+    // timeout and the request cap), closed after 600 ms anyway.
+    assert!(probe_answered(&mut c, 1).await);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(probe_answered(&mut c, 2).await);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!probe_answered(&mut c, 3).await, "past the lifetime cap");
+    l.shutdown().await;
+}
+
+/// P6-T3 review (M2): plaintext proves no identity, so a plaintext probe
+/// hello is accepted from loopback only, unless remote plaintext was
+/// allowed explicitly.
+#[test]
+fn plaintext_probes_are_loopback_only_by_default() {
+    use crate::listener::plaintext_probe_allowed;
+    let lan: std::net::IpAddr = "10.1.2.3".parse().expect("ip");
+    let mapped: std::net::IpAddr = "::ffff:127.0.0.1".parse().expect("ip");
+    assert!(!plaintext_probe_allowed(lan, false));
+    assert!(plaintext_probe_allowed(lan, true));
+    for ip in ["127.0.0.1", "::1"] {
+        assert!(plaintext_probe_allowed(ip.parse().expect("ip"), false));
+    }
+    assert!(plaintext_probe_allowed(mapped, false));
+}

@@ -41,24 +41,27 @@
 //! Open the storage (a locked data directory exits with status 10) and start
 //! the cluster listener *before* Raft: until Raft runs it answers only status
 //! probes (from the log store, `bstk_raft::status`). Then pick the startup
-//! mode (docs/DESIGN.md §8 "Startup probes", "Bootstrap", "Rejoin"):
+//! mode (docs/DESIGN.md §8 "Startup modes", "Bootstrap", "Rejoin"):
 //!
 //! - **Restart** (the data directory holds state, no rejoin marker): start
 //!   Raft as it is.
-//! - **Bootstrap** (`--cluster-init`, empty data directory): probe the other
-//!   nodes until `bstk_raft::status::bootstrap_decision` decides to initialize
-//!   the membership from `[[cluster.peer]]`, or, as soon as one belongs to a
-//!   running cluster, to rejoin it (with a warning: a wiped node started with
-//!   `--cluster-init` by mistake); otherwise keep asking.
-//! - **Rejoin** (an empty data directory without `--cluster-init`, or the
-//!   marker [`durable::REJOIN_FILE`] left by an unfinished rejoin): the node
-//!   may have acknowledged entries and granted votes it no longer remembers,
-//!   so it writes the marker, persists the highest vote of a majority of the
-//!   other nodes (`status::adopt_vote`) and only then starts Raft, with
-//!   elections disabled and the vote gate closed, serving no clients. It
-//!   leaves rejoin mode once it has applied a `DropNode(self)` entry proposed
-//!   after this process started (so everything committed before is in its
-//!   log); a crash before that keeps the marker.
+//! - **Bootstrap** (`--cluster-init`, empty data directory, this node in
+//!   `cluster.initial_voters`): probe the other initial voters until
+//!   `bstk_raft::status::bootstrap_decision` decides to initialize the
+//!   membership with the initial voters, or, as soon as one belongs to a
+//!   running cluster, to go to discovery (with a warning: a wiped node started
+//!   with `--cluster-init` by mistake); otherwise keep asking.
+//! - **Discovery** (an empty data directory otherwise, or the marker
+//!   [`durable::REJOIN_FILE`] left by an unfinished rejoin; [`discover`]):
+//!   learn the current membership from the seeds and its nodes, then join
+//!   (wait until added), refuse (a removed or skipped id), or rejoin: the
+//!   node may have acknowledged entries and granted votes it no longer
+//!   remembers, so it writes the marker, persists the highest vote of
+//!   enough current voters (`status::startup_decision`) and only then
+//!   starts Raft, with elections disabled and the vote gate closed, serving
+//!   no clients. It leaves rejoin mode once it has applied a `DropNode(self)`
+//!   entry proposed after this process started (so everything committed
+//!   before is in its log); a crash before that keeps the marker.
 //!
 //! Then wait until a leader is known and this node has applied everything it
 //! knows to be committed, close out the connections of this node's previous
@@ -92,7 +95,7 @@ use bstk_proto::Response;
 use bstk_raft::client::{Network, NetworkConfig};
 use bstk_raft::forward::{ControlRequest, ControlResponse, ForwardError};
 use bstk_raft::listener::{ClusterListener, ListenerConfig, VoteGate};
-use bstk_raft::status::{self, Adopt, Bootstrap, MembershipView, NodeStatusEx, StatusSource};
+use bstk_raft::status::{self, Bootstrap, MembershipView, NodeStatusEx, StatusSource};
 use bstk_raft::storage::{self, LogOptions, LogStore, ReplySink, SmOptions, StateHandle};
 use bstk_raft::tls::ClusterTls;
 use bstk_raft::{CONN_SEQ_BITS, NodeId, Op, Request, TypeConfig, owner_of};
@@ -643,11 +646,21 @@ impl Core {
 
     /// Rejoin mode (see the module docs): returns once this node has
     /// applied an entry the leader proposed for it after this process
-    /// started, then leaves rejoin mode.
-    async fn rejoin(&self) -> Result<(), StartError> {
+    /// started, then leaves rejoin mode. Every [`REJOIN_RECHECK`] until then
+    /// it asks `targets` (the seeds and the nodes of the membership
+    /// discovery decided on) and this node's membership's nodes for their
+    /// status, and gives up if [`status::startup_decision`] refuses this id:
+    /// it was removed meanwhile, and no leader would ever propose its
+    /// `DropNode`.
+    async fn rejoin(&self, targets: &BTreeSet<NodeId>) -> Result<(), StartError> {
+        let mut checked = Instant::now();
         loop {
+            #[cfg(feature = "test-hooks")]
+            let held = test_hooks::rejoin_held(&self.data_dir);
+            #[cfg(not(feature = "test-hooks"))]
+            let held = false;
             match self.leader() {
-                Some(l) if l != self.id => {
+                Some(l) if l != self.id && !held => {
                     let op = Op::DropNode {
                         node: self.id,
                         up_to_local: self.state.highest_local(self.id),
@@ -668,6 +681,15 @@ impl Core {
                 }
                 _ => {}
             }
+            if checked.elapsed() >= REJOIN_RECHECK {
+                checked = Instant::now();
+                if let Some(reason) = self.removed_while_rejoining(targets).await {
+                    return Err(StartError::Other(format!(
+                        "cannot finish rejoining node {}: {reason}",
+                        self.id
+                    )));
+                }
+            }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         durable::clear_rejoin(&self.data_dir).map_err(|e| {
@@ -683,6 +705,23 @@ impl Core {
         Ok(())
     }
 }
+
+impl Core {
+    /// `Some(reason)` if the other nodes' status says this id is no longer
+    /// a member and never will be again (see [`Core::rejoin`]).
+    async fn removed_while_rejoining(&self, targets: &BTreeSet<NodeId>) -> Option<String> {
+        let mut ask = targets.clone();
+        ask.extend(self.membership().membership().nodes().map(|(&n, _)| n));
+        let (answers, _) = status::probe_ex(&self.net, self.id, &ask).await;
+        match status::startup_decision(self.id, &answers, None) {
+            status::Startup::Refuse(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// How often a node in rejoin mode checks that it is still a member.
+const REJOIN_RECHECK: Duration = Duration::from_secs(3);
 
 /// See [`Core::leader_reachable`]. A single voter needs no acknowledgement
 /// (openraft refreshes `millis_since_quorum_ack` only when its core loop
@@ -710,56 +749,153 @@ fn leader_reachable(
 const PROBE_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const PROBE_LOG_EVERY: Duration = Duration::from_secs(5);
 
-/// Rejoin: asks the other nodes for their status until the answers of a
-/// majority of the cluster among them give the vote to persist before
-/// Raft starts (see the module docs and [`status::adopt_vote`]). `local` is
-/// this node's own persisted vote (a restart with the rejoin marker).
-async fn probe_rejoin_vote(
+/// Discovery, for a node without usable Raft state (an empty data
+/// directory, or the rejoin marker): asks the config seeds, and then the
+/// nodes of the membership they report, for their [`NodeStatusEx`] (over
+/// probe connections, so a node that is not a member yet is answered) until
+/// [`status::startup_decision`] decides. Returns the vote to start Raft with
+/// once this node is a member (rejoin; a node that joins waits here until
+/// the operator has added it); a removed or skipped id, or a voter that no
+/// quorum of other voters can vouch for, is an error. While waiting, the
+/// learned membership's nodes are allowed to connect and are dialed at its
+/// addresses (config overrides first), so the leader that adds this node
+/// need not be a seed. `local` is this node's own persisted vote (a restart
+/// with the rejoin marker). Also returns the nodes to ask while rejoining
+/// (the seeds and the nodes of the membership decided on, see
+/// [`Core::rejoin`]). Safety: docs/DESIGN.md §8 "Why rejoin is safe".
+async fn discover(
     net: &Network,
+    allowlist: &bstk_raft::listener::PeerAllowlist,
     id: NodeId,
-    peers: &BTreeSet<NodeId>,
-    local: Option<Vote<NodeId>>,
-) -> Result<Option<Vote<NodeId>>, StartError> {
-    let n = peers.len();
-    if n <= 1 {
+    overrides: &BTreeMap<NodeId, String>,
+    mut local: Option<Vote<NodeId>>,
+    log: &LogStore,
+    data_dir: &Path,
+) -> Result<(Option<Vote<NodeId>>, BTreeSet<NodeId>), StartError> {
+    let mut marked = durable::rejoin_marked(data_dir);
+    let save = async |v: &Vote<NodeId>| {
+        let mut store = log.clone();
+        RaftLogStorage::save_vote(&mut store, v)
+            .await
+            .map_err(|e| StartError::Other(format!("rejoin: cannot save the vote: {e}")))
+    };
+    let seeds: BTreeSet<NodeId> = overrides.keys().copied().filter(|&n| n != id).collect();
+    if seeds.is_empty() {
         return Err(StartError::Other(
-            "rejoin: a single-node cluster cannot rejoin (it has no other node to learn its \
-             state from); restore the data directory, or start it with --cluster-init to \
-             create a new cluster"
+            "rejoin: a single-node cluster cannot rejoin, and a joining node needs another \
+             node to learn the cluster from: [[cluster.peer]] lists no other node; restore \
+             the data directory, list a node of the running cluster, or start it with \
+             --cluster-init to create a new cluster"
                 .into(),
         ));
     }
-    let need = status::quorum(n);
-    let mut answers = BTreeMap::new();
+    let mut targets = seeds.clone();
+    let mut answers: BTreeMap<NodeId, NodeStatusEx> = BTreeMap::new();
+    let mut learned: Option<openraft::LogId<NodeId>> = None;
     let mut delay = Duration::from_millis(50);
     let mut logged: Option<Instant> = None;
     loop {
-        answers.extend(status::probe(net, id, peers).await);
-        let why = match status::adopt_vote(n, &answers, local) {
-            Adopt::Vote(Some(v)) if v.is_committed() && v.leader_id().voted_for() == Some(id) => {
-                // The others still follow this node's previous life as
-                // their leader: wait until they elect another one (never
-                // start with a committed vote naming this node).
-                answers.clear();
-                format!("the highest vote ({v}) is this node's own leadership")
+        let (got, failed) = status::probe_ex(net, id, &targets).await;
+        answers.extend(got);
+        if let Some(m) = status::learned_membership(&answers)
+            && m.log_id != learned
+        {
+            learned = m.log_id;
+            let mut allow: BTreeSet<NodeId> = seeds.clone();
+            allow.extend(m.nodes.keys().copied());
+            allowlist.set(allow);
+            net.set_members(m.nodes.clone());
+            targets = seeds.iter().chain(m.nodes.keys()).copied().collect();
+            tracing::info!(
+                membership = ?m.log_id,
+                voters = ?m.configs,
+                nodes = ?m.nodes.keys().collect::<Vec<_>>(),
+                "startup: learned the cluster membership"
+            );
+            for d in membership::config_differences(overrides, &m.nodes) {
+                tracing::warn!(membership = ?m.log_id, "cluster config differs from the membership: {d}");
             }
-            Adopt::Vote(v) => {
-                tracing::warn!(
-                    answered = answers.len(),
-                    of = n - 1,
-                    vote = %v.map_or_else(|| "none".to_string(), |v| v.to_string()),
-                    "rejoin: adopted the highest vote of the other nodes"
-                );
-                return Ok(v);
+        }
+        let why = match status::startup_decision(id, &answers, local) {
+            status::Startup::Rejoin { vote, membership } => {
+                // Durable before a vote is saved or Raft starts: a vote file
+                // without the marker would make a restart look like an
+                // ordinary one, and a crash before the node has caught up
+                // must bring it back here with its vote gate closed. (Not
+                // earlier: a node waiting to join may be restarted with
+                // --cluster-init, which refuses a marker.)
+                if !marked {
+                    durable::mark_rejoin(data_dir).map_err(|e| {
+                        StartError::Other(format!(
+                            "cannot write the rejoin marker in {}: {e}",
+                            data_dir.display()
+                        ))
+                    })?;
+                    marked = true;
+                }
+                if let Some(v) = &vote {
+                    save(v).await?;
+                }
+                // Re-check after the vote is durable: a membership committed
+                // since the answers above (which P6-T4's guardrails refuse
+                // while this node reports `rejoining`) means deciding again,
+                // with the saved vote as the floor (votes only increase).
+                let voters = membership.voters();
+                let (again, _) = status::probe_ex(net, id, &voters).await;
+                match status::startup_decision(id, &again, vote) {
+                    status::Startup::Rejoin {
+                        vote: v2,
+                        membership: m2,
+                    } if m2.log_id == membership.log_id => {
+                        if let Some(v) = v2.filter(|v2| Some(*v2) != vote) {
+                            save(&v).await?;
+                        }
+                        let vote = v2.or(vote);
+                        tracing::warn!(
+                            membership = ?membership.log_id,
+                            voters = ?voters,
+                            vote = %vote.map_or_else(|| "none".to_string(), |v| v.to_string()),
+                            "rejoin: adopted the highest vote of the current voters that answered"
+                        );
+                        let mut ask = seeds;
+                        ask.extend(membership.nodes.keys().copied());
+                        return Ok((vote, ask));
+                    }
+                    other => {
+                        local = vote.or(local);
+                        answers = again;
+                        format!(
+                            "the membership changed or the voters stopped answering while the \
+                             vote was adopted ({other:?}); deciding again"
+                        )
+                    }
+                }
             }
-            Adopt::TooFew => format!("{} of the {need} answers needed", answers.len()),
-            Adopt::Incomparable => {
-                answers.clear();
-                "the highest votes are incomparable".to_string()
+            status::Startup::Refuse(reason) => {
+                return Err(StartError::Other(format!(
+                    "cannot start node {id}: {reason}"
+                )));
+            }
+            status::Startup::Join {
+                voters,
+                highest_member,
+            } => format!(
+                "join: node {id} is not a member of the cluster yet (voters {voters:?}, highest \
+                 member id {highest_member}); waiting until it is added as a learner"
+            ),
+            status::Startup::Wait { reason, fresh } => {
+                if fresh {
+                    answers.clear();
+                }
+                reason
             }
         };
         if logged.is_none_or(|t| t.elapsed() >= PROBE_LOG_EVERY) {
-            tracing::warn!("rejoin: waiting for the other nodes' status ({why})");
+            tracing::warn!(
+                answered = ?answers.keys().collect::<Vec<_>>(),
+                unreachable = ?failed,
+                "startup: waiting for the cluster's status ({why})"
+            );
             logged = Some(Instant::now());
         }
         tokio::time::sleep(delay).await;
@@ -767,16 +903,17 @@ async fn probe_rejoin_vote(
     }
 }
 
-/// `--cluster-init` on an empty data directory: asks the other nodes for
-/// their status until [`status::bootstrap_decision`] decides (each round
-/// on that round's answers only). `None`: initialize; `Some(peer)`: `peer`
-/// belongs to a running cluster, rejoin it.
-async fn probe_bootstrap(net: &Network, id: NodeId, peers: &BTreeSet<NodeId>) -> Option<NodeId> {
-    let n = peers.len();
+/// `--cluster-init` on an empty data directory, for a node of the initial
+/// voter set `voters`: asks the other initial voters for their status until
+/// [`status::bootstrap_decision`] decides (each round on that round's answers
+/// only). `None`: initialize; `Some(peer)`: `peer` belongs to a running
+/// cluster, rejoin it.
+async fn probe_bootstrap(net: &Network, id: NodeId, voters: &BTreeSet<NodeId>) -> Option<NodeId> {
+    let n = voters.len();
     let mut delay = Duration::from_millis(50);
     let mut logged: Option<Instant> = None;
     loop {
-        let answers = status::probe(net, id, peers).await;
+        let answers = status::probe(net, id, voters).await;
         match status::bootstrap_decision(n, &answers) {
             Bootstrap::Wait => {
                 if logged.is_none_or(|t| t.elapsed() >= PROBE_LOG_EVERY) {
@@ -800,8 +937,10 @@ async fn probe_bootstrap(net: &Network, id: NodeId, peers: &BTreeSet<NodeId>) ->
 fn announce_rejoin() {
     tracing::warn!(
         "rejoin mode: this node started without Raft state (or did not finish rejoining); \
-         it adopts the highest vote of the other nodes before it starts Raft, does not vote \
-         or stand for election, and serves no clients, until it has caught up with a leader"
+         it learns the current membership from the other nodes, joins (waiting until it is \
+         added) or adopts the highest vote of enough of the current voters before it starts \
+         Raft, and does not vote, stand for election or serve clients until it has caught up \
+         with a leader"
     );
 }
 
@@ -995,9 +1134,8 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
     net_cfg.backoff_max = Duration::from_millis(500);
     let net = Network::new(net_cfg);
 
-    // The config seeds: whom startup probes ask (bootstrap and rejoin
-    // still use them, P6-T3 moves rejoin to the current voters), and whom
-    // the listener accepts until this node has a membership.
+    // The config seeds: whom discovery asks first, and whom the listener
+    // accepts until this node has a membership.
     let peers: BTreeSet<NodeId> = c.peers.keys().copied().collect();
     let mut mode = match (marked, c.init, had_state) {
         (true, true, _) => {
@@ -1008,6 +1146,17 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
             )));
         }
         (true, false, _) | (false, false, false) => Mode::Rejoin,
+        // A node outside the initial voters must never initialize (openraft
+        // refuses a membership without this node, and the voters would
+        // differ from the other initial nodes'): it joins.
+        (false, true, _) if !c.initial_voters.contains(&id) => {
+            tracing::info!(
+                initial_voters = ?c.initial_voters,
+                "--cluster-init: this node is not an initial voter; it joins the cluster once \
+                 the initial voters have created it and the operator has added it"
+            );
+            Mode::Rejoin
+        }
         (false, true, _) => Mode::Bootstrap,
         (false, false, true) => Mode::Restart,
     };
@@ -1047,26 +1196,17 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
     lcfg.max_job_size = args.engine.max_job_size;
     lcfg.vote_gate = Some(gate.clone());
     lcfg.status = Some(status_view.clone());
+    lcfg.plaintext_remote_probes = c.plaintext_allow_remote;
     let (listener, service) =
         ClusterListener::spawn_deferred::<handler::Handler>(args.listener, lcfg)
             .map_err(|e| StartError::Other(format!("cluster listener: {e}")))?;
     tracing::info!(node = id, addr = %listener.local_addr(), ?mode, "cluster listener started");
 
-    let enter_rejoin = |marked: bool| -> Result<(), StartError> {
-        announce_rejoin();
-        // Durable before a vote is saved: a vote file without the marker
-        // would make a restart look like an ordinary one.
-        if !marked {
-            durable::mark_rejoin(&c.data_dir)
-                .map_err(|e| other("cannot write the rejoin marker in", &e))?;
-        }
-        Ok(())
-    };
     if mode == Mode::Rejoin {
-        enter_rejoin(marked)?;
+        announce_rejoin();
     }
     if mode == Mode::Bootstrap
-        && let Some(peer) = probe_bootstrap(&net, id, &peers).await
+        && let Some(peer) = probe_bootstrap(&net, id, &c.initial_voters).await
     {
         tracing::warn!(
             peer,
@@ -1075,16 +1215,21 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         );
         mode = Mode::Rejoin;
         rejoining.store(true, Ordering::Release);
-        enter_rejoin(false)?;
+        announce_rejoin();
     }
+    let mut rejoin_targets = BTreeSet::new();
     if mode == Mode::Rejoin {
         let local = log.status().vote;
-        if let Some(v) = probe_rejoin_vote(&net, id, &peers, local).await? {
-            let mut store = log.clone();
-            RaftLogStorage::save_vote(&mut store, &v)
-                .await
-                .map_err(|e| StartError::Other(format!("rejoin: cannot save the vote: {e}")))?;
-        }
+        (_, rejoin_targets) = discover(
+            &net,
+            &listener.allowlist(),
+            id,
+            &c.peers,
+            local,
+            &log,
+            &c.data_dir,
+        )
+        .await?;
     }
 
     let config = raft_config(c, mode != Mode::Rejoin).map_err(StartError::Other)?;
@@ -1126,12 +1271,13 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         let members: BTreeMap<NodeId, BasicNode> = c
             .peers
             .iter()
+            .filter(|(n, _)| c.initial_voters.contains(n))
             .map(|(&n, addr)| (n, BasicNode::new(addr)))
             .collect();
         raft.initialize(members)
             .await
             .map_err(|e| StartError::Other(format!("--cluster-init: {e}")))?;
-        tracing::info!(peers = c.peers.len(), "cluster membership initialized");
+        tracing::info!(voters = ?c.initial_voters, "cluster membership initialized");
     }
 
     if mode != Mode::Rejoin {
@@ -1171,7 +1317,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
 
     match mode {
         Mode::Rejoin => {
-            if let Err(e) = core.rejoin().await {
+            if let Err(e) = core.rejoin(&rejoin_targets).await {
                 abort_all(&mut tasks);
                 return Err(e);
             }

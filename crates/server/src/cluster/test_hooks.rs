@@ -15,6 +15,10 @@
 //! - `change-membership <id>,<id>,...`: `Raft::change_membership` to these
 //!   voters (removed nodes are not kept as learners);
 //! - `set-nodes <id>=<addr>,...`: `ChangeMembers::SetNodes` (address change).
+//!
+//! On a rejoining node, the file `<data_dir>/test-hold-rejoin` (see
+//! [`rejoin_held`]) keeps it from asking for its `DropNode`, so a test can
+//! change the membership while it is still in rejoin mode.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -28,6 +32,12 @@ use super::Core;
 
 pub const CMD_FILE: &str = "test-membership.cmd";
 pub const OUT_FILE: &str = "test-membership.out";
+pub const HOLD_REJOIN_FILE: &str = "test-hold-rejoin";
+
+/// Whether the test holds this node in rejoin mode (see the module docs).
+pub fn rejoin_held(data_dir: &Path) -> bool {
+    data_dir.join(HOLD_REJOIN_FILE).exists()
+}
 
 fn parse_id(s: &str) -> Result<NodeId, String> {
     s.trim()
@@ -44,6 +54,12 @@ async fn execute(core: &Core, line: &str) -> Result<u64, String> {
         "add-learner" => {
             let id = parse_id(words.next().ok_or("add-learner: missing id")?)?;
             let addr = words.next().ok_or("add-learner: missing address")?;
+            // Ids only ever grow (PLAN §9.3); a lower id would make a node's
+            // removal check misread it as removed.
+            let highest = core.state.highest_member();
+            if id <= highest {
+                return Err(format!("add-learner: id {id} is not above {highest}"));
+            }
             core.raft
                 .add_learner(id, BasicNode::new(addr), false)
                 .await

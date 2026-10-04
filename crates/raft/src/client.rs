@@ -511,25 +511,31 @@ impl Network {
         )))
     }
 
-    async fn dial(&self, peer: &Peer) -> Result<Box<dyn Io>, String> {
+    /// TCP connection and, with TLS, the handshake with `target` at `addr`.
+    async fn open_io(&self, target: NodeId, addr: &str) -> Result<Box<dyn Io>, String> {
         let cfg = &self.inner.cfg;
-        let tcp = TcpStream::connect(&peer.addr)
+        let tcp = TcpStream::connect(addr)
             .await
             .map_err(|e| format!("connect: {e}"))?;
         tcp.set_nodelay(true)
             .map_err(|e| format!("set_nodelay: {e}"))?;
         let tcp = QuietTcp::new(tcp).map_err(|e| format!("register: {e}"))?;
-        let mut io: Box<dyn Io> = match &cfg.tls {
+        Ok(match &cfg.tls {
             None => Box::new(tcp),
             Some(tls) => {
-                let name = crate::tls::server_name_for(peer.target)?;
+                let name = crate::tls::server_name_for(target)?;
                 let s = TlsConnector::from(tls.clone())
                     .connect(name, tcp)
                     .await
                     .map_err(|e| format!("TLS handshake: {e}"))?;
                 Box::new(s)
             }
-        };
+        })
+    }
+
+    async fn dial(&self, peer: &Peer) -> Result<Box<dyn Io>, String> {
+        let cfg = &self.inner.cfg;
+        let mut io = self.open_io(peer.target, &peer.addr).await?;
         let hello = ClientMsg::Hello(Hello {
             version: PROTOCOL_VERSION,
             from: cfg.node_id,
@@ -746,13 +752,87 @@ impl Network {
     }
 }
 
+impl Network {
+    /// Asks `target` for its status and membership view over a one-shot
+    /// probe connection ([`ClientMsg::ProbeHello`]): unlike
+    /// [`Network::status_ex`] it uses no peer slot and is answered even if
+    /// this node is not a member of `target`'s membership (a node joining,
+    /// or checking whether its id was removed; docs/DESIGN.md §8 "Startup
+    /// modes"). Bounded by the connect timeout plus the forward timeout.
+    pub async fn probe_status_ex(&self, target: NodeId) -> Result<NodeStatusEx, ForwardError> {
+        let Some(addr) = self.address(target) else {
+            return Err(ForwardError::Unreachable(format!(
+                "node {target} has no known address"
+            )));
+        };
+        let cfg = &self.inner.cfg;
+        let bound = cfg.connect_timeout + cfg.forward_timeout;
+        match tokio::time::timeout(bound, self.probe_once(target, &addr)).await {
+            Ok(r) => r,
+            Err(_) => Err(ForwardError::Timeout),
+        }
+    }
+
+    async fn probe_once(&self, target: NodeId, addr: &str) -> Result<NodeStatusEx, ForwardError> {
+        let cfg = &self.inner.cfg;
+        let net = |e: String| ForwardError::Network(format!("node {target} at {addr}: {e}"));
+        let mut io = self
+            .open_io(target, addr)
+            .await
+            .map_err(|e| ForwardError::Unreachable(format!("node {target} at {addr}: {e}")))?;
+        let hello = ClientMsg::ProbeHello(Hello {
+            version: PROTOCOL_VERSION,
+            from: cfg.node_id,
+            to: target,
+            max_job_size: cfg.max_job_size,
+        });
+        let frame = wire::encode(&hello, cfg.max_frame).map_err(|e| net(e.to_string()))?;
+        wire::write_frame(&mut io, &frame)
+            .await
+            .map_err(|e| net(format!("hello: {e}")))?;
+        match wire::read_frame::<_, ServerMsg>(&mut io, cfg.max_frame).await {
+            Ok(Some(ServerMsg::Hello(ServerHello::Accepted { node_id, .. })))
+                if node_id == target => {}
+            Ok(Some(ServerMsg::Hello(ServerHello::Rejected { reason }))) => {
+                return Err(ForwardError::Rejected(wire::sanitize(&reason)));
+            }
+            Ok(Some(_)) => return Err(net("unexpected answer to a probe hello".into())),
+            Ok(None) => return Err(net("connection closed during hello".into())),
+            Err(e) => return Err(net(format!("hello: {e}"))),
+        }
+        let req = ClientMsg::Request {
+            id: 1,
+            body: RpcRequest::StatusEx,
+        };
+        let frame = wire::encode(&req, cfg.max_frame).map_err(|e| net(e.to_string()))?;
+        wire::write_frame(&mut io, &frame)
+            .await
+            .map_err(|e| net(e.to_string()))?;
+        match wire::read_frame::<_, ServerMsg>(&mut io, cfg.max_frame).await {
+            Ok(Some(ServerMsg::Response {
+                id: 1,
+                body: RpcResponse::StatusEx(Ok(s)),
+            })) => Ok(*s),
+            Ok(Some(ServerMsg::Response {
+                body: RpcResponse::StatusEx(Err(e)),
+                ..
+            })) => Err(ForwardError::Rejected(wire::sanitize(&e.to_string()))),
+            Ok(Some(_)) => Err(net("unexpected answer to a status probe".into())),
+            Ok(None) => Err(net("connection closed".into())),
+            Err(e) => Err(net(e.to_string())),
+        }
+    }
+}
+
 impl StatusTransport for Network {
     async fn status(&self, target: NodeId) -> Result<NodeStatus, ForwardError> {
         Network::status(self, target).await
     }
 
+    /// Over a probe connection (see [`Network::probe_status_ex`]): startup
+    /// probes reach nodes whose membership does not list this node yet.
     async fn status_ex(&self, target: NodeId) -> Result<NodeStatusEx, ForwardError> {
-        Network::status_ex(self, target).await
+        Network::probe_status_ex(self, target).await
     }
 }
 

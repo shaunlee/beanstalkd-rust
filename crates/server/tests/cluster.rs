@@ -244,6 +244,10 @@ impl Node {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
+    fn wait_log(&self, text: &str, timeout: Duration) -> bool {
+        wait_for(timeout, || self.log_text().contains(text).then_some(())).is_some()
+    }
+
     /// Whether the data directory holds a Raft vote or log segment (the
     /// node initialized, or took part in a cluster).
     fn has_raft_state(&self) -> bool {
@@ -876,7 +880,16 @@ fn wiped_node_does_not_vote_until_it_has_caught_up() {
     c.nodes[l].kill9();
     c.nodes[acker].start(&[]);
     let marker = c.nodes[acker].data_dir.join("rejoin");
-    wait_for(Duration::from_secs(10), || marker.exists().then_some(())).expect("no rejoin marker");
+    // P6-T3: discovery writes the marker only once it decides to rejoin
+    // (here it cannot: one voter answers at most), and starts no Raft.
+    assert!(
+        c.nodes[acker].wait_log(
+            "startup: waiting for the cluster's status",
+            Duration::from_secs(10)
+        ),
+        "{}",
+        c.nodes[acker].log_text()
+    );
     c.nodes[behind].signal(Signal::SIGCONT);
 
     // `behind` lacks the job and `acker` refuses to vote: no leader.
@@ -887,11 +900,14 @@ fn wiped_node_does_not_vote_until_it_has_caught_up() {
     assert_eq!(c.nodes[acker].readyz(), 503);
     assert!(c.nodes[acker].admin().is_none());
     assert_eq!(count(&c.nodes[acker], "rejoin mode:"), rejoins + 1);
+    assert!(!marker.exists());
+    assert!(!c.nodes[acker].has_raft_state());
 
-    // A crash during rejoin keeps the marker: still rejoining, and
-    // --cluster-init is refused.
+    // A crash after discovery decided to rejoin keeps the marker (written
+    // here by hand: that moment cannot be reached without a second voter):
+    // still rejoining, and --cluster-init is refused.
     c.nodes[acker].kill9();
-    assert!(marker.exists());
+    std::fs::write(&marker, "rejoining\n").unwrap();
     let (st, _, err) = run(&[
         "--config",
         c.nodes[acker].config.to_str().unwrap(),
@@ -1360,7 +1376,8 @@ fn cluster_configuration_errors() {
             vec![],
             "cluster.tls.key is required",
         ),
-        // Two peers.
+        // Bootstrapping two voters (any number of seeds is fine without
+        // --cluster-init).
         (
             single_node_config(
                 dir.path(),
@@ -1370,8 +1387,8 @@ fn cluster_configuration_errors() {
                      [[cluster.peer]]\nid = 2\naddr = \"127.0.0.1:2\"\n",
                 ),
             ),
-            vec![],
-            "3 or 5 nodes",
+            vec!["--cluster-init"],
+            "3 or 5 voters",
         ),
         // Duplicate ids.
         (
@@ -1401,15 +1418,11 @@ fn cluster_configuration_errors() {
             vec![],
             "used by another peer",
         ),
-        // This node is not a peer.
+        // An initial voter that is not a peer.
         (
-            single_node_config(
-                dir.path(),
-                plain,
-                Some("[[cluster.peer]]\nid = 2\naddr = \"127.0.0.1:2\"\n"),
-            ),
+            single_node_config(dir.path(), &format!("{plain}\ninitial_voters = [4]"), None),
             vec![],
-            "not listed in [[cluster.peer]]",
+            "node 4 is not listed in [[cluster.peer]]",
         ),
         // Timing.
         (
@@ -1995,8 +2008,8 @@ mod membership {
     impl Cluster {
         /// Configures node `n + 1` (not started, not a member) with `peers`
         /// as its `[[cluster.peer]]` list (ids of this cluster, plus `extra`
-        /// unbound entries to make a valid count); the existing nodes'
-        /// configs are left alone, so they know it only from the membership.
+        /// unbound entries); the existing nodes' configs are left alone, so
+        /// they know it only from the membership.
         fn configure_extra_node(&mut self, peers: &[u64], extra: &[u64], opts: &Opts) -> usize {
             let id = self.nodes.len() as u64 + 1;
             let (client, http, cluster) = (claim_port(), claim_port(), claim_port());
@@ -2103,8 +2116,7 @@ mod membership {
         };
         let mut c = Cluster::start(3, &opts);
         let l = c.leader();
-        // Node 4's config: every current node, itself, and one unbound id
-        // (a config has 1, 3 or 5 entries).
+        // Node 4's config: every current node, itself, and one unbound id.
         let n4 = c.configure_extra_node(&[1, 2, 3, 4], &[5], &opts);
         let addr4 = format!("127.0.0.1:{}", c.nodes[n4].cluster);
         let idx = c.hook(l, &format!("add-learner 4 {addr4}")).unwrap();
@@ -2165,8 +2177,6 @@ mod membership {
         let fs = c.followers(l);
         let (f1, f2) = (fs[0], fs[1]);
         let (lid, f1id, f2id) = (c.nodes[l].id, c.nodes[f1].id, c.nodes[f2].id);
-        // The leader must be a seed: a node without a membership accepts
-        // only its seeds (until P6-T3's Join mode).
         let n4 = c.configure_extra_node(&[lid, f1id, 4], &[], &opts);
         let addr4 = format!("127.0.0.1:{}", c.nodes[n4].cluster);
         let idx = c.hook(l, &format!("add-learner 4 {addr4}")).unwrap();
@@ -2343,5 +2353,354 @@ mod membership {
         let mut client = c.nodes[l].connect();
         let job = inserted(&client.put(b"alone"));
         assert_eq!(reserve(&mut client, "reserve-with-timeout 5"), job);
+    }
+
+    impl Node {
+        /// Waits until the process has exited; its exit status.
+        fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+            let c = self.child.as_mut()?;
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(st) = c.try_wait().unwrap() {
+                    self.child = None;
+                    return Some(st);
+                }
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// P6-T3: grow 1 -> 2 -> 3 with Join and promote. Node 2 is started
+    /// before it is added (it waits as a joiner, then catches up as a
+    /// learner); node 3 after (the runbook order), with a single seed that
+    /// is not the leader. A one-voter cluster gains a second voter without
+    /// any vote adoption by a voter (a wiped voter of a one-voter cluster
+    /// could never rejoin).
+    #[test]
+    fn grow_one_to_three_through_join_and_promote() {
+        let opts = Opts {
+            node_timeout: "2s",
+            ..Opts::default()
+        };
+        let mut c = Cluster::start(1, &opts);
+        let l = c.leader();
+        let n2 = c.configure_extra_node(&[1], &[], &opts);
+        c.nodes[n2].start(&[]);
+        assert!(
+            c.nodes[n2].wait_log("join: node 2 is not a member", Duration::from_secs(15)),
+            "{}",
+            c.nodes[n2].log_text()
+        );
+        assert!(!c.nodes[n2].has_raft_state());
+        assert_ne!(c.nodes[n2].readyz(), 200);
+        let addr2 = format!("127.0.0.1:{}", c.nodes[n2].cluster);
+        let idx = c.hook(l, &format!("add-learner 2 {addr2}")).unwrap();
+        assert!(
+            c.nodes[n2].wait_ready(Duration::from_secs(30)),
+            "the joiner never became ready"
+        );
+        c.wait_applied(&[n2], idx);
+        let idx = c.hook(l, "change-membership 1,2").unwrap();
+        c.wait_applied(&[l, n2], idx);
+        let s = admin_status(c.nodes[n2].cluster).unwrap();
+        assert_eq!(s.membership.voters(), [1, 2].into(), "{s:?}");
+
+        // Node 3: added first, then started, knowing only node 2 (not the
+        // leader).
+        assert_eq!(c.leader(), l);
+        let n3 = c.configure_extra_node(&[2], &[], &opts);
+        let addr3 = format!("127.0.0.1:{}", c.nodes[n3].cluster);
+        let idx = c.hook(l, &format!("add-learner 3 {addr3}")).unwrap();
+        c.wait_applied(&[l, n2], idx);
+        c.nodes[n3].start(&[]);
+        assert!(
+            c.nodes[n3].wait_ready(Duration::from_secs(30)),
+            "node 3 never became ready"
+        );
+        let idx = c.hook(l, "change-membership 1,2,3").unwrap();
+        c.wait_applied(&[l, n2, n3], idx);
+        let log3 = c.nodes[n3].log_text();
+        assert!(log3.contains("rejoin complete"), "{log3}");
+
+        let mut on_3 = c.nodes[n3].connect();
+        let job = inserted(&on_3.put(b"grown"));
+        let mut on_1 = c.nodes[l].connect();
+        assert_eq!(reserve(&mut on_1, "reserve-with-timeout 5"), job);
+        drop(on_1);
+        // Three voters: the two joiners elect a leader without node 1.
+        c.nodes[l].kill9();
+        let nl = c.leader();
+        assert!(nl == n2 || nl == n3, "{nl}");
+        let mut on_new = c.nodes[nl].connect();
+        let job = inserted(&on_new.put(b"after-failover"));
+        let other = if nl == n2 { n3 } else { n2 };
+        assert!(c.nodes[other].wait_ready(Duration::from_secs(15)));
+        let mut on_other = c.nodes[other].connect();
+        assert_eq!(reserve(&mut on_other, "reserve-with-timeout 10"), job);
+    }
+
+    /// Grows 3 -> 4 voters (learner, then promote) and returns node 4's
+    /// index; node 4 is configured with `seeds` (and itself).
+    fn grow_to_four(c: &mut Cluster, l: usize, seeds: &[u64], opts: &Opts) -> usize {
+        let mut peers = seeds.to_vec();
+        peers.push(4);
+        let n4 = c.configure_extra_node(&peers, &[], opts);
+        let addr4 = format!("127.0.0.1:{}", c.nodes[n4].cluster);
+        c.hook(l, &format!("add-learner 4 {addr4}")).unwrap();
+        c.nodes[n4].start(&[]);
+        assert!(c.nodes[n4].wait_ready(Duration::from_secs(30)));
+        let idx = c.hook(l, "change-membership 1,2,3,4").unwrap();
+        c.wait_applied(&[0, 1, 2, n4], idx);
+        n4
+    }
+
+    /// P6-T3: after 3 -> 4 voters, a wiped original follower (whose config
+    /// lists only the original three) rejoins against the current voters:
+    /// it learns node 4 from the membership and needs answers from two of
+    /// the three other voters (`rejoin_answers(4) = 2`). With the other
+    /// original follower down for good, those are the leader and node 4,
+    /// which only the membership names.
+    #[test]
+    fn wiped_voter_rejoins_against_the_current_voters() {
+        let opts = Opts {
+            node_timeout: "2s",
+            ..Opts::default()
+        };
+        let mut c = Cluster::start(3, &opts);
+        let l = c.leader();
+        let n4 = grow_to_four(&mut c, l, &[1, 2, 3], &opts);
+        let f = c.followers(l).into_iter().find(|&i| i != n4).unwrap();
+        let mut on_leader = c.nodes[l].connect();
+        let job = inserted(&on_leader.put(b"before-wipe"));
+        drop(on_leader);
+        let o = c
+            .followers(l)
+            .into_iter()
+            .find(|&i| i != n4 && i != f)
+            .unwrap();
+        let skip = c.nodes[f].log_text().lines().count();
+        c.nodes[f].kill9();
+        c.nodes[f].wipe();
+        // With node 4 and the other original follower down, only the leader
+        // answers: not enough.
+        c.nodes[n4].kill9();
+        c.nodes[o].kill9();
+        c.nodes[f].start(&[]);
+        assert!(
+            c.nodes[f].wait_log(
+                "1 of the 2 answers needed from the current voters",
+                Duration::from_secs(20)
+            ),
+            "{}",
+            c.nodes[f].log_text()
+        );
+        assert!(!c.nodes[f].has_raft_state());
+        assert_ne!(c.nodes[f].readyz(), 200);
+        c.nodes[n4].start(&[]);
+        assert!(
+            c.nodes[f].wait_ready(Duration::from_secs(30)),
+            "the wiped voter never rejoined"
+        );
+        let log = c.nodes[f].log_text();
+        let since: Vec<&str> = log.lines().skip(skip).collect();
+        let adopted = since
+            .iter()
+            .find(|l| {
+                l.contains("rejoin: adopted the highest vote of the current voters that answered")
+            })
+            .unwrap_or_else(|| panic!("{log}"));
+        assert!(adopted.contains("{1, 2, 3, 4}"), "{adopted}");
+        assert!(since.iter().any(|l| l.contains("rejoin complete")), "{log}");
+        let mut on_f = c.nodes[f].connect();
+        let (hdr, _) = on_f.body_reply(&format!("peek {job}"));
+        assert_eq!(hdr, format!("FOUND {job} 11"));
+    }
+
+    /// P6-T3: a wiped voter whose only seed was removed (and is gone) waits,
+    /// saying so, without guessing; once its config names a current member
+    /// it rejoins.
+    #[test]
+    fn stale_seed_list_waits_until_a_current_member_is_configured() {
+        let opts = Opts {
+            node_timeout: "2s",
+            ..Opts::default()
+        };
+        let mut c = Cluster::start(3, &opts);
+        let l = c.leader();
+        let fs = c.followers(l);
+        let (gone, keep) = (fs[0], fs[1]);
+        let gone_id = c.nodes[gone].id;
+        // Node 4 knows only `gone` and itself.
+        let n4 = grow_to_four(&mut c, l, &[gone_id], &opts);
+        let voters: Vec<String> = [l, keep, n4]
+            .iter()
+            .map(|&i| c.nodes[i].id.to_string())
+            .collect();
+        let idx = c
+            .hook(l, &format!("change-membership {}", voters.join(",")))
+            .unwrap();
+        c.wait_applied(&[l, keep, n4], idx);
+        c.nodes[gone].kill9();
+
+        c.nodes[n4].kill9();
+        c.nodes[n4].wipe();
+        let skip = c.nodes[n4].log_text().lines().count();
+        c.nodes[n4].start(&[]);
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(c.nodes[n4].running());
+        assert!(!c.nodes[n4].has_raft_state());
+        assert_ne!(c.nodes[n4].readyz(), 200);
+        let log = c.nodes[n4].log_text();
+        let since: Vec<&str> = log.lines().skip(skip).collect();
+        assert!(
+            since
+                .iter()
+                .any(|l| l.contains("startup: waiting for the cluster's status")
+                    && l.contains("no node that answered knows a committed membership")),
+            "{log}"
+        );
+
+        // Name a current member (the leader) as a seed and restart.
+        c.nodes[n4].kill9();
+        let leader_line = format!(
+            "[[cluster.peer]]\nid = {}\naddr = \"127.0.0.1:{}\"\n",
+            c.nodes[l].id, c.nodes[l].cluster
+        );
+        let text = std::fs::read_to_string(&c.nodes[n4].config).unwrap();
+        std::fs::write(&c.nodes[n4].config, format!("{text}{leader_line}")).unwrap();
+        c.nodes[n4].start(&[]);
+        assert!(
+            c.nodes[n4].wait_ready(Duration::from_secs(30)),
+            "never rejoined after a current member was configured"
+        );
+        let log = c.nodes[n4].log_text();
+        assert!(log.contains("rejoin complete"), "{log}");
+    }
+
+    /// P6-T3: a removed node restarted with an empty data directory refuses
+    /// to start (ids are never reused) and creates no Raft state.
+    #[test]
+    fn removed_id_with_an_empty_data_dir_refuses_to_start() {
+        let opts = Opts::default();
+        let mut c = Cluster::start(3, &opts);
+        let l = c.leader();
+        let fs = c.followers(l);
+        let (f, keep) = (fs[0], fs[1]);
+        let voters = format!("{},{}", c.nodes[l].id, c.nodes[keep].id);
+        let idx = c.hook(l, &format!("change-membership {voters}")).unwrap();
+        c.wait_applied(&[l, keep], idx);
+        c.nodes[f].kill9();
+        c.nodes[f].wipe();
+        c.nodes[f].start(&[]);
+        let st = c.nodes[f]
+            .wait_exit(Duration::from_secs(20))
+            .expect("the removed node kept running");
+        assert_eq!(st.code(), Some(1), "{}", c.nodes[f].log_text());
+        let log = c.nodes[f].log_text();
+        assert!(log.contains("never reused"), "{log}");
+        assert!(!c.nodes[f].has_raft_state());
+        // The cluster is unaffected.
+        let mut on_keep = c.nodes[keep].connect();
+        inserted(&on_keep.put(b"still-here"));
+    }
+
+    /// P6-T3: `--cluster-init` with `initial_voters = [1, 2, 3]` on four
+    /// configured nodes: node 4 never initializes; it joins once added.
+    #[test]
+    fn cluster_init_with_initial_voters_and_a_joiner() {
+        let opts = Opts {
+            extra: "initial_voters = [1, 2, 3]".into(),
+            ..Opts::default()
+        };
+        let mut c = Cluster::configure(4, &opts);
+        for n in &mut c.nodes {
+            n.start(&["--cluster-init"]);
+        }
+        for i in 0..3 {
+            assert!(c.nodes[i].wait_ready(Duration::from_secs(20)));
+        }
+        let l = c.leader();
+        assert!(
+            c.nodes[3].wait_log("join: node 4 is not a member", Duration::from_secs(15)),
+            "{}",
+            c.nodes[3].log_text()
+        );
+        assert!(!c.nodes[3].has_raft_state());
+        assert_ne!(c.nodes[3].readyz(), 200);
+        let s = admin_status(c.nodes[l].cluster).unwrap();
+        assert_eq!(s.membership.voters(), [1, 2, 3].into(), "{s:?}");
+        assert!(s.membership.learners().is_empty());
+
+        let addr4 = format!("127.0.0.1:{}", c.nodes[3].cluster);
+        c.hook(l, &format!("add-learner 4 {addr4}")).unwrap();
+        assert!(
+            c.nodes[3].wait_ready(Duration::from_secs(30)),
+            "the joiner never became ready"
+        );
+        let mut on_4 = c.nodes[3].connect();
+        let job = inserted(&on_4.put(b"joined"));
+        let mut on_l = c.nodes[l].connect();
+        assert_eq!(reserve(&mut on_l, "reserve-with-timeout 5"), job);
+    }
+
+    /// P6-T3 review: a voter removed while it is still in rejoin mode (the
+    /// test hook holds back its `DropNode`) gives up with a refusal instead
+    /// of asking for a `DropNode` no leader would propose.
+    #[test]
+    fn voter_removed_while_rejoining_gives_up() {
+        let opts = Opts {
+            node_timeout: "2s",
+            ..Opts::default()
+        };
+        let mut c = Cluster::start(3, &opts);
+        let l = c.leader();
+        let fs = c.followers(l);
+        let (f, other) = (fs[0], fs[1]);
+        let f_id = c.nodes[f].id;
+        let skip = c.nodes[f].log_text().lines().count();
+        c.nodes[f].kill9();
+        c.nodes[f].wipe();
+        std::fs::create_dir_all(&c.nodes[f].data_dir).unwrap();
+        std::fs::write(c.nodes[f].data_dir.join("test-hold-rejoin"), "").unwrap();
+        c.nodes[f].start(&[]);
+        let since = |n: &Node| -> Vec<String> {
+            n.log_text()
+                .lines()
+                .skip(skip)
+                .map(str::to_string)
+                .collect()
+        };
+        wait_for(Duration::from_secs(20), || {
+            since(&c.nodes[f])
+                .iter()
+                .any(|l| l.contains("rejoin: adopted the highest vote"))
+                .then_some(())
+        })
+        .unwrap_or_else(|| panic!("{}", c.nodes[f].log_text()));
+        assert!(c.nodes[f].running());
+        assert_ne!(c.nodes[f].readyz(), 200);
+
+        let keep = format!("{},{}", c.nodes[l].id, c.nodes[other].id);
+        let idx = c.hook(l, &format!("change-membership {keep}")).unwrap();
+        c.wait_applied(&[l, other], idx);
+        let st = c.nodes[f]
+            .wait_exit(Duration::from_secs(30))
+            .unwrap_or_else(|| panic!("still running: {}", c.nodes[f].log_text()));
+        assert!(!st.success(), "{st:?}");
+        let log = since(&c.nodes[f]);
+        assert!(
+            log.iter().any(
+                |l| l.contains(&format!("cannot finish rejoining node {f_id}"))
+                    && l.contains("never reused")
+            ),
+            "{}",
+            log.join("\n")
+        );
+        // The two remaining voters serve on.
+        let mut on_leader = c.nodes[l].connect();
+        inserted(&on_leader.put(b"after-removal"));
     }
 }

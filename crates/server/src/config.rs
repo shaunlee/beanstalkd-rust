@@ -438,6 +438,7 @@ struct RawCluster {
     insecure_plaintext: Option<bool>,
     insecure_plaintext_allow_remote: Option<bool>,
     tls: Option<RawClusterTls>,
+    initial_voters: Option<Vec<i64>>,
     #[serde(default, rename = "peer")]
     peers: Vec<RawPeer>,
 }

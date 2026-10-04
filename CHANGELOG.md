@@ -20,8 +20,34 @@ Release tags are `v<version>` and match the workspace version in
   `scripts/mkcluster-certs.sh`, which creates a cluster CA and node
   certificates.
 
+- **Cluster startup modes for changing membership** (no operator command
+  changes membership yet): `[[cluster.peer]]` now lists seeds and address
+  overrides (any number; a node need not list itself), and the new
+  `cluster.initial_voters` chooses the voters `--cluster-init` creates (all
+  peers by default; 1, 3 or 5). A node whose id is not a member yet waits
+  until it is added (join), whether it is started before or after the add; a
+  node that lost its data rejoins against the cluster's current voters,
+  learned from any reachable member, and waits while a membership change is
+  in progress.
+
 ### Changed
 
+- A node started with an empty data directory whose id was removed from the
+  cluster (or lies below the highest id ever used) refuses to start: node
+  ids are never reused.
+- A node that lost its data counts only answers from current voters that
+  hold the current membership and are not rejoining themselves: if a
+  majority of the voters lost their data at once, they no longer rejoin
+  from the survivor (which could silently lose entries committed only on
+  them); they wait until data is restored. Rejoins are therefore done one
+  node at a time. The number of answers needed is the fewest that meet
+  every majority of the voters (1 with 2 voters, 2 with 3 or 4, 3 with
+  5), so a wiped voter of a two-voter cluster can rejoin while the other
+  voter leads. A node removed from the membership while still rejoining
+  exits with an error instead of waiting forever.
+- Startup status probes from nodes that are not members are limited to
+  one connection per node id, 30 s and 16 probes each; in plaintext test
+  mode only from loopback unless `insecure_plaintext_allow_remote = true`.
 - **Cluster protocol version 4** (incompatible): nodes of 0.5.x cannot join
   a cluster of later versions, or the reverse. Upgrade a 0.5.x cluster by
   stopping every node, upgrading all of them, then starting them again; a

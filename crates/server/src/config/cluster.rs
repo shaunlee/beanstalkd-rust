@@ -6,9 +6,13 @@
 //! here changes the configuration.
 //!
 //! Rules:
-//! - `node_id` in 1..=65535 and listed in `[[cluster.peer]]`;
-//! - 1, 3 or 5 peers (1 only makes sense for tests), with unique ids and
-//!   unique addresses;
+//! - `node_id` in 1..=65535;
+//! - at least one `[[cluster.peer]]` (seeds and local address overrides,
+//!   any number), with unique ids and unique addresses; the node itself
+//!   need not be listed (a node joining a running cluster);
+//! - `initial_voters` (the voters `--cluster-init` creates; all peers by
+//!   default): 1, 3 or 5 distinct peers (1 only makes sense for tests),
+//!   checked when set or with `--cluster-init`;
 //! - `[cluster.tls]` (`cert`, `key`, `ca`) is required unless
 //!   `insecure_plaintext = true`, and the two exclude each other;
 //! - `insecure_plaintext = true` requires `listen` and every peer address to
@@ -22,7 +26,7 @@
 //! - `listen` must not conflict with a client or HTTP listener;
 //! - `--cluster-init` needs `[cluster]`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -65,7 +69,13 @@ pub struct ClusterSettings {
     pub election_timeout: (Duration, Duration),
     /// `None` only with `insecure_plaintext = true`.
     pub tls: Option<ClusterTlsFiles>,
+    /// `insecure_plaintext_allow_remote = true`: plaintext cluster traffic,
+    /// startup probes included, from other hosts too.
+    pub plaintext_allow_remote: bool,
     pub peers: BTreeMap<u64, String>,
+    /// The voters `--cluster-init` creates (`cluster.initial_voters`, all
+    /// peers by default); a node outside them never initializes.
+    pub initial_voters: BTreeSet<u64>,
     pub init: bool,
 }
 
@@ -193,15 +203,57 @@ fn resolve_cluster(
         addrs.push(addr.clone());
         peers.insert(id, addr);
     }
-    if !matches!(peers.len(), 1 | 3 | 5) {
+    if peers.is_empty() {
+        return Err(invalid(
+            "[[cluster.peer]] lists no node: list the initial nodes (to bootstrap) or at least \
+             one node of the running cluster (to join it)",
+        ));
+    }
+    let initial_voters = match &raw.initial_voters {
+        None => peers.keys().copied().collect::<BTreeSet<u64>>(),
+        Some(ids) => {
+            let mut set = BTreeSet::new();
+            for &v in ids {
+                let id = u64::try_from(v)
+                    .ok()
+                    .filter(|v| peers.contains_key(v))
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "cluster.initial_voters: node {v} is not listed in [[cluster.peer]]"
+                        ))
+                    })?;
+                if !set.insert(id) {
+                    return Err(invalid(format!(
+                        "cluster.initial_voters: node {id} is listed more than once"
+                    )));
+                }
+            }
+            set
+        }
+    };
+    if (raw.initial_voters.is_some() || cli.cluster_init)
+        && !matches!(initial_voters.len(), 1 | 3 | 5)
+    {
+        let what = if raw.initial_voters.is_some() {
+            "cluster.initial_voters lists"
+        } else {
+            "--cluster-init: [[cluster.peer]] lists (no cluster.initial_voters)"
+        };
         return Err(invalid(format!(
-            "[[cluster.peer]] lists {} node(s): a cluster has 3 or 5 nodes (1 for tests)",
-            peers.len()
+            "{what} {} node(s): a cluster starts with 3 or 5 voters (1 for tests); set \
+             cluster.initial_voters to choose them among the peers",
+            initial_voters.len()
         )));
     }
-    if !peers.contains_key(&node_id) {
+    if cli.cluster_init
+        && !initial_voters.contains(&node_id)
+        && initial_voters.last().is_some_and(|&top| node_id < top)
+    {
         return Err(invalid(format!(
-            "cluster.node_id = {node_id} is not listed in [[cluster.peer]]"
+            "--cluster-init: node {node_id} is not an initial voter, and its id is below the \
+             highest initial voter's ({}): node ids are never reused or filled in, so this node \
+             could never be added; give it an id above every initial voter",
+            initial_voters.last().copied().unwrap_or(0)
         )));
     }
 
@@ -353,7 +405,9 @@ fn resolve_cluster(
         heartbeat,
         election_timeout,
         tls,
+        plaintext_allow_remote: allow_remote,
         peers,
+        initial_voters,
         init: cli.cluster_init,
     })
 }
@@ -370,7 +424,7 @@ pub fn cluster_summary(c: &ClusterSettings) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "cluster: node {} of {} (listen {}, data_dir {})",
+        "cluster: node {} with {} configured peer(s) (listen {}, data_dir {})",
         c.node_id,
         c.peers.len(),
         c.listen,
@@ -378,6 +432,9 @@ pub fn cluster_summary(c: &ClusterSettings) -> String {
     );
     for (id, addr) in &c.peers {
         let _ = writeln!(s, "cluster peer {id}: {addr}");
+    }
+    if c.init {
+        let _ = writeln!(s, "cluster initial voters: {:?}", c.initial_voters);
     }
     let _ = match &c.tls {
         Some(t) => writeln!(
@@ -457,12 +514,14 @@ mod tests {
                     key: PathBuf::from("/etc/bstk/n2.key"),
                     ca: PathBuf::from("/pki/ca.pem"),
                 }),
+                plaintext_allow_remote: false,
                 peers: [
                     (1, "10.0.0.1:11400".to_string()),
                     (2, "10.0.0.2:11400".to_string()),
                     (3, "node3.example:11400".to_string()),
                 ]
                 .into(),
+                initial_voters: [1, 2, 3].into(),
                 init: false,
             }
         );
@@ -472,7 +531,11 @@ mod tests {
         assert!(c.init);
         assert_eq!(resolve(&[], "").unwrap(), None);
         let s = cluster_summary(&c);
-        assert!(s.contains("cluster: node 2 of 3"), "{s}");
+        assert!(
+            s.contains("cluster: node 2 with 3 configured peer(s)"),
+            "{s}"
+        );
+        assert!(s.contains("cluster initial voters: {1, 2, 3}"), "{s}");
         assert!(s.contains("cluster peer 3: node3.example:11400"), "{s}");
     }
 
@@ -504,18 +567,52 @@ mod tests {
         let one = "[[cluster.peer]]\nid = 2\naddr = \"10.0.0.2:1\"\n";
         assert!(resolve(&[], &config(TLS, one)).is_ok());
         let e = error(&[], &config(TLS, ""));
-        assert!(e.contains("lists 0 node(s)"), "{e}");
+        assert!(e.contains("lists no node"), "{e}");
+        // Seeds: any number, the node itself need not be listed (P6-T3).
         let two =
             "[[cluster.peer]]\nid = 1\naddr = \"a:1\"\n[[cluster.peer]]\nid = 2\naddr = \"b:1\"\n";
-        assert!(error(&[], &config(TLS, two)).contains("3 or 5"));
+        assert!(resolve(&[], &config(TLS, two)).is_ok());
+        assert!(error(&["--cluster-init"], &config(TLS, two)).contains("3 or 5"));
         let five: String = (1..=5)
             .map(|i| format!("[[cluster.peer]]\nid = {i}\naddr = \"10.0.0.{i}:1\"\n"))
             .collect();
-        assert!(resolve(&[], &config(TLS, &five)).is_ok());
+        assert!(resolve(&["--cluster-init"], &config(TLS, &five)).is_ok());
         let four: String = (1..=4)
             .map(|i| format!("[[cluster.peer]]\nid = {i}\naddr = \"10.0.0.{i}:1\"\n"))
             .collect();
-        assert!(error(&[], &config(TLS, &four)).contains("3 or 5"));
+        assert!(resolve(&[], &config(TLS, &four)).is_ok());
+        let e = error(&["--cluster-init"], &config(TLS, &four));
+        assert!(e.contains("3 or 5") && e.contains("initial_voters"), "{e}");
+        // An explicit initial voter set: a subset of the peers, 1, 3 or 5.
+        let with_iv = |ids: &str, peers: &str| {
+            config(TLS, peers).replace(
+                "data_dir = \"raft\"\n",
+                &format!("data_dir = \"raft\"\ninitial_voters = {ids}\n"),
+            )
+        };
+        let c = resolve(&["--cluster-init"], &with_iv("[1, 2, 3]", &four))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.initial_voters, [1, 2, 3].into());
+        let c = resolve(&[], &with_iv("[2]", &four)).unwrap().unwrap();
+        assert_eq!(c.initial_voters, [2].into());
+        let e = error(&[], &with_iv("[1, 2]", &four));
+        assert!(e.contains("cluster.initial_voters lists 2"), "{e}");
+        let e = error(&[], &with_iv("[1, 2, 7]", &four));
+        assert!(e.contains("node 7 is not listed"), "{e}");
+        let e = error(&[], &with_iv("[1, 2, 2]", &four));
+        assert!(e.contains("more than once"), "{e}");
+        // Node 2 outside the initial voters {1, 3, 4} could never be added
+        // (ids below the highest member are never readmitted).
+        let e = error(&["--cluster-init"], &with_iv("[1, 3, 4]", &four));
+        assert!(e.contains("never reused"), "{e}");
+        assert!(
+            resolve(
+                &["--cluster-init"],
+                &with_iv("[1, 3, 4]", &four).replace("node_id = 2", "node_id = 5")
+            )
+            .is_ok()
+        );
         let e = error(&[], &config(TLS, &PEERS3.replace("id = 2", "id = 1")));
         assert!(e.contains("listed more than once"), "{e}");
         let e = error(
@@ -523,8 +620,7 @@ mod tests {
             &config(TLS, &PEERS3.replace("10.0.0.2:11400", "10.0.0.1:11400")),
         );
         assert!(e.contains("used by another peer"), "{e}");
-        let e = error(&[], &config(TLS, &PEERS3.replace("id = 2", "id = 4")));
-        assert!(e.contains("not listed"), "{e}");
+        assert!(resolve(&[], &config(TLS, &PEERS3.replace("id = 2", "id = 4"))).is_ok());
         for bad in ["\"10.0.0.1\"", "\"x:y\"", "\":1\"", "\"a b:1\""] {
             let e = error(
                 &[],
@@ -585,6 +681,7 @@ mod tests {
         };
         let c = resolve(&[], &local("", loopback)).unwrap().unwrap();
         assert_eq!(c.tls, None);
+        assert!(!c.plaintext_allow_remote);
         assert!(cluster_summary(&c).contains("DISABLED"));
         let e = error(&[], &local("", PEERS3));
         assert!(
@@ -605,6 +702,8 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(c.tls, None);
+        // Startup probes from other hosts are accepted in plaintext too.
+        assert!(c.plaintext_allow_remote);
         let e = error(
             &[],
             &config(

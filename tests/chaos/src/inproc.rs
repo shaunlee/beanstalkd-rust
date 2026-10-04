@@ -39,9 +39,12 @@
 //! A wiped node (and one restarted while its emulated rejoin marker is still
 //! set) runs in **rejoin mode**, as the server does (docs/DESIGN.md §8
 //! "Rejoin"): it probes the other nodes over the simulated network
-//! (`bstk_raft::status::probe`) until a majority of the cluster among them
-//! answered (it waits in the background otherwise: the fault schedule goes
-//! on), persists the highest vote with `save_vote`, then starts Raft with
+//! (`bstk_raft::status::probe`) until the server's startup decision
+//! (`status::startup_decision`, fed the static membership and each node's
+//! emulated rejoin marker) says rejoin, i.e. `status::rejoin_answers(n)` of
+//! the other nodes that are not rejoining themselves answered (it waits in
+//! the background otherwise: the fault schedule goes on), persists the highest
+//! vote with `save_vote`, then starts Raft with
 //! elections off (`runtime_config().elect(false)`) and its vote gate closed
 //! (`SimNetwork::set_vote_gate`) until it has applied the `DropNode(self)` a
 //! leader proposed for it after it started; then it clears the marker,
@@ -84,7 +87,7 @@ use bstk_proto::{Command, Response};
 use bstk_raft::forward::{ForwardError, ForwardHandler, ForwardTransport};
 use bstk_raft::listener::VoteGate;
 use bstk_raft::sim::{FaultAction, SimConfig, SimNetwork, SimRng};
-use bstk_raft::status::{self, Adopt, StatusSource};
+use bstk_raft::status::{self, StatusSource};
 use bstk_raft::storage::{
     self, ClusterStateMachine, LogOptions, OpenError, ReplySink, SmOptions, StateHandle,
 };
@@ -775,13 +778,38 @@ impl RunShared {
         let peers: BTreeSet<NodeId> = self.ids.iter().copied().collect();
         let node = self.net.node(id);
         let local = parts.log.status().vote;
+        // The membership never changes here: every answer reports the
+        // bootstrap membership (all ids, committed), so the server's decision
+        // (`startup_decision`) applies as is and reduces to adopting the
+        // highest vote of `rejoin_answers(n)` other voters that are not
+        // rejoining themselves (each answer carries its node's emulated
+        // marker, as the server reports `rejoining`).
+        let membership = status::MembershipView {
+            log_id: Some(openraft::LogId::default()),
+            committed: true,
+            configs: vec![peers.clone()],
+            nodes: peers.iter().map(|&p| (p, format!("node-{p}"))).collect(),
+        };
         let vote = loop {
-            let answers = status::probe(&node, id, &peers).await;
-            match status::adopt_vote(self.ids.len(), &answers, local) {
-                Adopt::Vote(Some(v))
-                    if v.is_committed() && v.leader_id().voted_for() == Some(id) => {}
-                Adopt::Vote(v) => break v,
-                Adopt::TooFew | Adopt::Incomparable => {}
+            // Marked before or after the probe: a race can only make an
+            // answer count as rejoining, which makes the decision wait.
+            let before = lock(&self.rejoin_marker).clone();
+            let answered = status::probe(&node, id, &peers).await;
+            let after = lock(&self.rejoin_marker).clone();
+            let answers: BTreeMap<NodeId, status::NodeStatusEx> = answered
+                .into_iter()
+                .map(|(p, s)| {
+                    let mut ex = status::NodeStatusEx::from_status(s);
+                    ex.membership = membership.clone();
+                    ex.highest_member = peers.iter().copied().max().unwrap_or(0);
+                    ex.rejoining = before.contains(&p) || after.contains(&p);
+                    (p, ex)
+                })
+                .collect();
+            match status::startup_decision(id, &answers, local) {
+                status::Startup::Rejoin { vote, .. } => break vote,
+                status::Startup::Wait { .. } => {}
+                other => return Err(format!("node {id}: unexpected rejoin decision {other:?}")),
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };

@@ -55,7 +55,9 @@ use crate::{ForwardRequest, ForwardResponse, NodeId, TypeConfig};
 /// - 4: P6-T2: [`RpcRequest::StatusEx`] (status plus membership) and the
 ///   admin channel ([`ClientMsg::AdminHello`], [`AdminRequest`]). Appended
 ///   variants only; nodes still require an exact version (0.5.0 was never
-///   released, so no deployed cluster needs negotiation).
+///   released, so no deployed cluster needs negotiation). P6-T3 appended
+///   [`ClientMsg::ProbeHello`] (status probes from nodes that are not
+///   members yet) within the same unreleased version.
 pub const PROTOCOL_VERSION: u32 = 4;
 
 pub const HEADER_LEN: usize = 4;
@@ -158,6 +160,11 @@ pub enum ClientMsg {
         id: u64,
         body: AdminRequest,
     },
+    /// Version 4 (P6-T3): a startup probe from a node that may not be a
+    /// member yet. Identity is checked as for [`ClientMsg::Hello`], the
+    /// membership is not; the connection then carries only status probes
+    /// ([`RpcRequest::Status`], [`RpcRequest::StatusEx`]).
+    ProbeHello(Hello),
 }
 
 /// Variants are only ever appended: their indexes are the encoding.
@@ -1543,6 +1550,12 @@ mod tests {
                 id: 14,
                 body: RpcRequest::StatusEx,
             },
+            ClientMsg::ProbeHello(Hello {
+                version: PROTOCOL_VERSION,
+                from: 4,
+                to: 1,
+                max_job_size: 65535,
+            }),
         ];
         v.extend(
             admin_requests()
@@ -1645,7 +1658,9 @@ mod tests {
             [1, 1, 6]
         );
         assert_eq!(tag(&v4_client_msgs()[0]), 2);
-        assert_eq!(tag(&v4_client_msgs()[3]), 3);
+        assert_eq!(tag(&v4_client_msgs()[4]), 3);
+        // P6-T3: appended after `Admin`.
+        assert_eq!(tag(&v4_client_msgs()[3]), 4);
         let stag = |m: &ServerMsg| postcard::to_allocvec(m).expect("encode")[0];
         assert_eq!(
             stag(&ServerMsg::Hello(ServerHello::Rejected {

@@ -535,6 +535,14 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 5. **Operator interface: a `beanstalkd-rs cluster` subcommand** speaking the cluster port with a separate admin identity: an `AdminHello` (no peer slot), mTLS with SAN `bstk-admin` from the cluster CA (`scripts/mkcluster-certs.sh` issues it), loopback-only in plaintext mode. Requests `status`, `add` (learner), `promote`, `remove`, `set-addr`, each with a compare-and-set on the membership log id; non-leaders answer with the leader's id and address; the leader runs a change in the background and the CLI polls. Guardrails (overridable with `--force` where safe): one voter change per request, no fewer than 3 voters, promote only a caught-up learner, refuse while any voter is rejoining or the membership is joint. HTTP stays read-only; config-file reconciliation was rejected (stale configs on a new leader would revert membership).
 6. **Cluster protocol v4, no negotiation**: new messages are appended variants (`AdminHello`, admin RPCs, `StatusEx`) and the version becomes 4; nodes keep requiring an exact version. 0.5.0 was never released, so no deployed v3 cluster needs a rolling upgrade; CHANGELOG states that 0.5.x and later versions cannot be mixed in one cluster.
 7. **Observability**: voters, learners, joint flag, membership log id and commit state, per-learner lag, `is_member` in `/admin` and `/metrics`; readiness is false on a non-member.
+8. **Conditions P6-T4's executor must keep** (the rejoin argument, DESIGN §8 "Why rejoin is safe", assumes them; from the P6-T3 review):
+   - a node becomes a voter only through `change_membership(BTreeSet)` from a membership that already lists it (as a learner); never `ChangeMembers::AddVoters` (A1);
+   - a leftover joint configuration `(C, C')` is finished towards `C'`, never back to `C` (A1);
+   - never add an id at or below `highest_member` (ids are never reused);
+   - refuse voter changes while any voter reports `rejoining` or does not answer `StatusEx` (A2);
+   - one voter change per step (each step a uniform membership differing by one voter from the previous one);
+   - never shrink below 3 voters without `--force` (two-voter memberships stall a rejoin unless the survivor leads; one-voter ones cannot rejoin their voter);
+   - done in P6-T3 already: `Core::rejoin` gives up with a refusal (exit status 1) when the membership no longer lists the node, instead of retrying its `DropNode` forever.
 
 ### 9.4 Tasks (sequential: one subagent at a time; the lead picks each subagent's model)
 

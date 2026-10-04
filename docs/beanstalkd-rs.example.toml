@@ -136,22 +136,28 @@ format = "text"
 
 # Cluster mode: replicate every job and connection through Raft across 3 or
 # 5 nodes (docs/DESIGN.md §8). Without a [cluster] table beanstalkd-rs is a
-# single server, exactly as above. Every node has its own file with the same
-# [[cluster.peer]] list and its own node_id, listen and [cluster.tls] files.
+# single server, exactly as above. Every node has its own file with its own
+# node_id, listen and [cluster.tls] files; [[cluster.peer]] lists seeds (the
+# initial nodes, or nodes of the running cluster to learn its membership
+# from) and local address overrides.
 #
-# Rules: node_id must be listed in [[cluster.peer]]; 3 or 5 peers (1 for
-# tests), with unique ids and addresses; [cluster.tls] is required unless
+# Rules: at least one peer, with unique ids and addresses; initial_voters
+# (default: every peer) lists 1, 3 or 5 peers (1 for tests); with
+# --cluster-init, a node outside initial_voters needs an id above every
+# initial voter (node ids are never reused); [cluster.tls] is required unless
 # insecure_plaintext = true (not both); -b / binlog.dir cannot be combined
 # with [cluster] (the Raft log replaces the binlog); every node must use the
 # same max job size (-z / server.max_job_size), at most 33488896 in cluster
 # mode.
 #
-# Bootstrap a new cluster once: start every initial node with --cluster-init
-# (all with the same [[cluster.peer]] list; refused if data_dir already holds
-# state). Restart nodes without --cluster-init. A node whose data_dir is
-# empty (new, or wiped after a disk loss) and that is started without
-# --cluster-init rejoins: it does not vote or serve clients until it has
-# caught up with a leader (docs/DESIGN.md §8).
+# Bootstrap a new cluster once: start every initial voter with --cluster-init
+# (all with the same [[cluster.peer]] list and initial_voters; refused if
+# data_dir already holds state). Restart nodes without --cluster-init. A node
+# whose data_dir is empty (new, or wiped after a disk loss) learns the
+# current membership from its peers: if its id is not a member yet it waits
+# until it is added; if it is a member it rejoins and does not vote or serve
+# clients until it has caught up with a leader; if its id was removed it
+# refuses to start (docs/DESIGN.md §8, "Startup modes").
 #
 # [cluster]
 # # This node's id, 1..=65535.
@@ -181,6 +187,8 @@ format = "text"
 # # who can reach the cluster port can then join the cluster).
 # insecure_plaintext = false
 # insecure_plaintext_allow_remote = false
+# # The voters --cluster-init creates (default: every peer).
+# initial_voters = [1, 2, 3]
 #
 # [cluster.tls]
 # # One certificate per node, used as the cluster listener's server
@@ -191,7 +199,7 @@ format = "text"
 # key = "node1.key"
 # ca = "cluster-ca.pem"
 #
-# # Every member of the cluster, this node included.
+# # Seeds: here every initial node, this node included.
 # [[cluster.peer]]
 # id = 1
 # addr = "10.0.0.1:11400"

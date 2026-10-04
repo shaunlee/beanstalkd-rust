@@ -239,9 +239,10 @@ async fn wiped_voter_in_rejoin_mode_keeps_committed_entries() {
 }
 
 /// The server's safe rejoin, on the simulated network: ask the other nodes
-/// for their status until a majority of the cluster among them answered,
-/// persist the highest vote with the log store's `save_vote`, then start
-/// Raft in rejoin mode (elections off, vote gate closed).
+/// for their status until `rejoin_answers(n)` of them answered (both others
+/// of the three nodes used here), persist the highest vote with the log
+/// store's `save_vote`, then start Raft in rejoin mode (elections off, vote
+/// gate closed).
 async fn rejoin(
     f: &mut Fixture,
     id: NodeId,

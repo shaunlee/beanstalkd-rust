@@ -752,11 +752,18 @@ fn isolate(c: &mut Cluster, id: u64, sh: &Shared) {
     sh.event(format!("isolate node {id}"));
 }
 
-/// Whether a node has not finished rejoining: its data directory was
-/// wiped (the restarted server has not recreated its log yet) or holds the
-/// server's rejoin marker.
+/// Whether a node has not finished rejoining: its data directory holds no
+/// Raft state (wiped; since P6-T3 the server writes its rejoin marker only
+/// once discovery decides to rejoin, so a node still probing has neither)
+/// or holds the server's rejoin marker.
 fn rejoin_pending(data_dir: &Path) -> bool {
-    !data_dir.join("log").exists() || data_dir.join("rejoin").exists()
+    let has_state = std::fs::read_dir(data_dir.join("log")).is_ok_and(|rd| {
+        rd.filter_map(Result::ok).any(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n == "vote" || n.ends_with(".seg")
+        })
+    });
+    !has_state || data_dir.join("rejoin").exists()
 }
 
 fn restart(c: &mut Cluster, bin: &Path, id: u64, wipe: bool, sh: &Shared) {
