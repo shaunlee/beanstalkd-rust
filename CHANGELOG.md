@@ -30,8 +30,8 @@ Release tags are `v<version>` and match the workspace version in
   in progress.
 
 - **Membership changes at runtime**, run by the leader on requests over the
-  cluster port's authenticated admin channel (the operator command follows
-  in a later release): add a node as a learner, promote a learner to voter,
+  cluster port's authenticated admin channel (`beanstalkd-rs cluster`, below):
+  add a node as a learner, promote a learner to voter,
   remove a node (the leader too), and change a node's address. Each request
   names the membership it was based on and is refused if that changed; one
   change runs at a time. Guardrails: one voter added or removed per change;
@@ -41,6 +41,16 @@ Release tags are `v<version>` and match the workspace version in
   only when forced; a plaintext address off loopback only when forced. A
   change interrupted by a leader change is finished by the next leader. A
   removed node is not told: stop it. Removing the leader costs one election.
+
+- **`beanstalkd-rs cluster` operator command**: `status` (voters, learners,
+  the leader, each node's state and lag), `add`, `promote`, `remove` and
+  `set-addr` (`--force` where the cluster allows it), over mTLS with the
+  `bstk-admin` certificate from `scripts/mkcluster-certs.sh DIR admin` (or
+  `--insecure-plaintext` for test clusters), with `--node` / `--config`
+  seeds, `--timeout` and `--json`. It follows the leader, waits for a started
+  change to complete, prints the cluster's notes, and exits 0 (done), 1
+  (refused or conflicting), 2 (usage), 3 (unreachable) or 4 (accepted but not
+  confirmed in time). The server's flags are unchanged.
 
 ### Changed
 

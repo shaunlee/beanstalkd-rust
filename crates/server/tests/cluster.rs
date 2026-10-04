@@ -503,12 +503,16 @@ impl Cluster {
 }
 
 fn write_node_config(n: &Node, opts: &Opts, peers: &str) {
+    let security = if opts.extra.contains("[cluster.tls]") {
+        ""
+    } else {
+        "insecure_plaintext = true\n"
+    };
     let text = format!(
         "[[listener]]\naddr = \"127.0.0.1:{}\"\n\
          [http]\naddr = \"127.0.0.1:{}\"\nsnapshot_min_interval = \"0s\"\n\
          [cluster]\nnode_id = {}\nlisten = \"127.0.0.1:{}\"\n\
-         data_dir = \"{}\"\nnode_timeout = \"{}\"\nsnapshot_every = {}\n\
-         insecure_plaintext = true\n{peers}",
+         data_dir = \"{}\"\nnode_timeout = \"{}\"\nsnapshot_every = {}\n{security}{}\n{peers}",
         n.client,
         n.http,
         n.id,
@@ -516,6 +520,7 @@ fn write_node_config(n: &Node, opts: &Opts, peers: &str) {
         n.data_dir.display(),
         opts.node_timeout,
         opts.snapshot_every,
+        opts.extra.replace("{id}", &n.id.to_string()),
     );
     std::fs::write(&n.config, text).unwrap();
 }
@@ -2528,6 +2533,417 @@ fn admin_replaces_a_node_and_moves_it() {
     let mut on_l = c.nodes[l].connect();
     assert_eq!(reserve(&mut on_l, "reserve-with-timeout 5"), job);
     release(was);
+}
+
+// P6-T5: the operator CLI, `beanstalkd-rs cluster`, against real nodes.
+
+/// The output of one `beanstalkd-rs cluster` run.
+struct CliOut {
+    code: Option<i32>,
+    out: String,
+    err: String,
+}
+
+impl CliOut {
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.out).unwrap_or_else(|e| panic!("{e}: {}", self.out))
+    }
+}
+
+/// Runs `scripts/mkcluster-certs.sh` into a fresh directory: a CA plus the
+/// named node ids and `admin`.
+fn script_pki(what: &[&str]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new("bash")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/mkcluster-certs.sh"
+        ))
+        .arg(dir.path())
+        .args(what)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mkcluster-certs.sh: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    dir
+}
+
+/// The options of an mTLS cluster whose node certificates are `pki`'s.
+fn tls_opts(pki: &Path) -> Opts {
+    let p = pki.display();
+    Opts {
+        node_timeout: "2s",
+        extra: format!(
+            "[cluster.tls]\ncert = \"{p}/node{{id}}.pem\"\nkey = \"{p}/node{{id}}.key\"\n\
+             ca = \"{p}/cluster-ca.pem\"\n"
+        ),
+        ..Opts::default()
+    }
+}
+
+/// How the CLI is told which cluster to talk to.
+#[derive(Clone)]
+struct Operator(Vec<String>);
+
+impl Operator {
+    /// With the `bstk-admin` certificate of `pki`, seeded with `node`.
+    fn tls(pki: &Path, node: &Node) -> Operator {
+        let p = pki.display();
+        Operator(
+            [
+                "--node".to_string(),
+                format!("127.0.0.1:{}", node.cluster),
+                "--ca".into(),
+                format!("{p}/cluster-ca.pem"),
+                "--cert".into(),
+                format!("{p}/admin.pem"),
+                "--key".into(),
+                format!("{p}/admin.key"),
+            ]
+            .into(),
+        )
+    }
+
+    fn plain(node: &Node) -> Operator {
+        Operator(
+            [
+                "--node".to_string(),
+                format!("127.0.0.1:{}", node.cluster),
+                "--insecure-plaintext".into(),
+            ]
+            .into(),
+        )
+    }
+
+    fn command(&self, cmd: &[&str]) -> Command {
+        let mut c = Command::new(BIN);
+        c.arg("cluster")
+            .args(cmd)
+            .args(&self.0)
+            .stdin(Stdio::null());
+        c
+    }
+
+    fn run(&self, cmd: &[&str]) -> CliOut {
+        let out = self.command(cmd).output().unwrap();
+        CliOut {
+            code: out.status.code(),
+            out: String::from_utf8_lossy(&out.stdout).into_owned(),
+            err: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    }
+
+    /// Runs `cmd` until it succeeds, retrying the refusals that clear by
+    /// themselves (a learner still catching up, a change in progress).
+    fn run_until_done(&self, cmd: &[&str]) -> CliOut {
+        let deadline = Instant::now() + Duration::from_secs(40);
+        loop {
+            let o = self.run(cmd);
+            let transient = [
+                "not caught up",
+                "has not replicated",
+                "rejoining",
+                "in progress",
+                "did not answer",
+                "conflict",
+            ];
+            if o.code == Some(1) && transient.iter().any(|t| o.err.contains(t)) {
+                assert!(Instant::now() < deadline, "{cmd:?}: {}", o.err);
+                std::thread::sleep(Duration::from_millis(300));
+                continue;
+            }
+            assert_eq!(o.code, Some(0), "{cmd:?}: {}", o.err);
+            return o;
+        }
+    }
+
+    /// `status --json` until every node in the membership shows `voters`
+    /// and `learners` (committed, not joint).
+    fn wait_membership(&self, voters: &[u64], learners: &[u64]) -> Value {
+        let want = |ids: &[u64]| Value::from(ids.to_vec());
+        let mut last = String::new();
+        let found = wait_for(Duration::from_secs(40), || {
+            let o = self.run(&["status", "--json"]);
+            last = format!("{} {}", o.out, o.err);
+            let v: Value = serde_json::from_str(&o.out).ok()?;
+            let m = &v["membership"];
+            (v["ok"] == true
+                && m["committed"] == true
+                && m["joint"] == false
+                && m["voters"] == want(voters)
+                && m["learners"] == want(learners))
+            .then_some(v)
+        });
+        found.unwrap_or_else(|| panic!("membership never became {voters:?} + {learners:?}: {last}"))
+    }
+}
+
+/// P6-T5: the whole life of a membership through the CLI over mTLS with
+/// certificates from `scripts/mkcluster-certs.sh`: `status` (text, JSON, and
+/// seeded from a node's configuration file), `add` sent to a follower (which
+/// names the leader), starting the new node, `promote` (with the even-count
+/// note), `remove` (with the note to stop the node), and the identity
+/// checks: a node certificate, a certificate from another CA, an untrusted
+/// server and plaintext are all refused.
+#[test]
+fn cli_manages_membership_over_mtls() {
+    let pki = script_pki(&["1", "2", "3", "4", "admin"]);
+    let opts = tls_opts(pki.path());
+    let mut c = Cluster::start(3, &opts);
+    let l = c.leader();
+    let f = c.followers(l)[0];
+    let leader_id = c.nodes[l].id;
+    let n4 = c.configure_extra_node(&[1, 2, 3, 4], &[], &opts);
+    let via_follower = Operator::tls(pki.path(), &c.nodes[f]);
+
+    let o = via_follower.run(&["status"]);
+    assert_eq!(o.code, Some(0), "{}", o.err);
+    assert!(o.out.contains("voters:   1 2 3"), "{}", o.out);
+    assert!(o.out.contains("learners: -"), "{}", o.out);
+    assert!(
+        o.out.contains(&format!("leader: node {leader_id}")),
+        "{}",
+        o.out
+    );
+    assert_eq!(o.out.matches(" ok").count(), 3, "{}", o.out);
+    let v = via_follower.run(&["status", "--json"]).json();
+    assert_eq!(
+        (&v["ok"], &v["leader"]),
+        (&Value::Bool(true), &Value::from(leader_id))
+    );
+    assert_eq!(v["highest_member"], 3);
+    let nodes = v["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 3);
+    assert!(
+        nodes
+            .iter()
+            .all(|n| n["reachable"] == true && n["lag"].is_u64()),
+        "{v}"
+    );
+    assert_eq!(nodes.iter().filter(|n| n["role"] == "leader").count(), 1);
+
+    // Seeds and the CA from a node's configuration file.
+    let p = pki.path().display().to_string();
+    let o = Command::new(BIN)
+        .args(["cluster", "status", "--config"])
+        .arg(&c.nodes[0].config)
+        .args([
+            "--cert",
+            &format!("{p}/admin.pem"),
+            "--key",
+            &format!("{p}/admin.key"),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // Identity checks.
+    let other_ca = script_pki(&["admin"]);
+    let node_cert = |name: &str| {
+        let mut op = via_follower.0.clone();
+        let at = |flag: &str| op.iter().position(|a| a == flag).unwrap() + 1;
+        let (cert, key) = (at("--cert"), at("--key"));
+        op[cert] = format!("{p}/{name}.pem");
+        op[key] = format!("{p}/{name}.key");
+        Operator(op)
+    };
+    let o = node_cert("node1").run(&["status"]);
+    assert_eq!(o.code, Some(2), "{}", o.err);
+    assert!(o.err.contains("not an admin certificate"), "{}", o.err);
+    let q = other_ca.path().display().to_string();
+    let with = |ca: &str, dir: &str| {
+        let mut op = via_follower.0.clone();
+        for (flag, file) in [
+            ("--ca", "cluster-ca.pem"),
+            ("--cert", "admin.pem"),
+            ("--key", "admin.key"),
+        ] {
+            let at = op.iter().position(|a| a == flag).unwrap() + 1;
+            op[at] = format!("{}/{file}", if flag == "--ca" { ca } else { dir });
+        }
+        Operator(op)
+    };
+    // An admin certificate from another CA: the nodes refuse it.
+    let o = with(&p, &q).run(&["status"]);
+    assert_eq!(o.code, Some(3), "{}", o.err);
+    assert!(
+        o.err.contains("refused the client certificate") || o.err.contains("TLS handshake"),
+        "{}",
+        o.err
+    );
+    // The right certificate but another CA's trust: the nodes are not trusted.
+    let o = with(&q, &p).run(&["status"]);
+    assert_eq!(o.code, Some(3), "{}", o.err);
+    assert!(o.err.contains("TLS handshake failed"), "{}", o.err);
+    // Plaintext against an mTLS cluster, and no certificate at all.
+    let plain = Operator::plain(&c.nodes[f]);
+    assert_eq!(plain.run(&["status", "--timeout", "3s"]).code, Some(3));
+    let o = Command::new(BIN)
+        .args([
+            "cluster",
+            "status",
+            "--node",
+            &format!("127.0.0.1:{}", c.nodes[f].cluster),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("--cert"));
+
+    // Grow 3 -> 4 through a follower: it names the leader and the CLI
+    // follows.
+    let addr4 = format!("127.0.0.1:{}", c.nodes[n4].cluster);
+    let o = via_follower.run_until_done(&["add", "4", &addr4]);
+    assert!(o.err.contains("following to node"), "{}", o.err);
+    assert!(o.out.contains("learners: 4"), "{}", o.out);
+    c.nodes[n4].start(&[]);
+    assert!(c.nodes[n4].wait_ready(Duration::from_secs(30)));
+    let o = via_follower.run_until_done(&["promote", "4"]);
+    assert!(o.out.contains("voters:   1 2 3 4"), "{}", o.out);
+    assert!(
+        o.out.contains("NOTE:") && o.out.contains("4 voters"),
+        "{}",
+        o.out
+    );
+    via_follower.wait_membership(&[1, 2, 3, 4], &[]);
+    let mut on_4 = c.nodes[n4].connect();
+    let job = inserted(&on_4.put(b"four"));
+    let mut on_l = c.nodes[l].connect();
+    assert_eq!(reserve(&mut on_l, "reserve-with-timeout 5"), job);
+    drop((on_4, on_l));
+
+    // Shrink back: the node is told to be stopped.
+    let o = via_follower.run_until_done(&["remove", "4"]);
+    assert!(o.out.contains("voters:   1 2 3"), "{}", o.out);
+    assert!(
+        o.out.contains("NOTE:") && o.out.contains("stop its process"),
+        "{}",
+        o.out
+    );
+    c.nodes[n4].stop(Signal::SIGTERM);
+    let v = via_follower.wait_membership(&[1, 2, 3], &[]);
+    assert_eq!(v["highest_member"], 4);
+}
+
+/// P6-T5 over plaintext (`--insecure-plaintext`, from loopback): the
+/// refusals and exit statuses: a guardrail refusal and a usage error and an
+/// unreachable cluster each have their own status, errors are JSON with
+/// `--json`, and concurrent changes from several processes are all either
+/// applied or refused as a conflict or a change in progress, never both
+/// applied to one membership.
+#[test]
+fn cli_exit_statuses_and_concurrent_changes() {
+    let opts = Opts {
+        node_timeout: "2s",
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(3, &opts);
+    let l = c.leader();
+    let f = c.followers(l)[0];
+    let op = Operator::plain(&c.nodes[l]);
+
+    let o = op.run(&["status"]);
+    assert_eq!(o.code, Some(0), "{}", o.err);
+    assert!(o.out.contains("voters:   1 2 3"), "{}", o.out);
+
+    // Refused by a guardrail: exit 1, the reason on stderr.
+    let o = op.run(&["promote", "9"]);
+    assert_eq!(o.code, Some(1), "{}", o.out);
+    assert!(
+        o.err.contains("refused") && o.err.contains("not a learner"),
+        "{}",
+        o.err
+    );
+    let fid = c.nodes[f].id.to_string();
+    let o = op.run(&["remove", &fid]);
+    assert_eq!(o.code, Some(1));
+    assert!(o.err.contains("fewer than 3"), "{}", o.err);
+    let o = op.run(&["add", "2", "127.0.0.1:1"]);
+    assert_eq!(o.code, Some(1), "{}", o.err);
+    // The same, as JSON on stdout.
+    let o = op.run(&["remove", &fid, "--json"]);
+    assert_eq!(o.code, Some(1));
+    let v = o.json();
+    assert_eq!(
+        (&v["ok"], &v["kind"], &v["exit"]),
+        (&false.into(), &"refused".into(), &1.into())
+    );
+    assert!(v["error"].as_str().unwrap().contains("fewer than 3"), "{v}");
+    // Nothing was changed.
+    op.wait_membership(&[1, 2, 3], &[]);
+
+    // Usage: no node to ask.
+    let o = Command::new(BIN)
+        .args(["cluster", "status", "--insecure-plaintext"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no node to ask"));
+
+    // Unreachable: exit 3 within the timeout.
+    let dead = claim_port();
+    let started = Instant::now();
+    let o = Command::new(BIN)
+        .args([
+            "cluster",
+            "status",
+            "--insecure-plaintext",
+            "--timeout",
+            "3s",
+            "--node",
+        ])
+        .arg(format!("127.0.0.1:{dead}"))
+        .output()
+        .unwrap();
+    release(dead);
+    assert_eq!(
+        o.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+
+    // Several processes at once, each from the same view: those that win
+    // change the membership, the others are told why.
+    let children: Vec<_> = [5u64, 6, 7]
+        .into_iter()
+        .map(|id| {
+            op.command(&["add", &id.to_string(), &format!("127.0.0.1:{id}")])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let mut applied = 0;
+    for ch in children {
+        let o = ch.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        match o.status.code() {
+            Some(0) => applied += 1,
+            Some(1) => assert!(
+                err.contains("conflict") || err.contains("in progress"),
+                "{err}"
+            ),
+            other => panic!("{other:?}: {err}"),
+        }
+    }
+    assert!(applied >= 1);
+    let v = op.run(&["status", "--json"]).json();
+    assert_eq!(
+        v["membership"]["learners"].as_array().unwrap().len(),
+        applied,
+        "{v}"
+    );
 }
 
 /// P6-T1: membership changes through the test-only hook (feature

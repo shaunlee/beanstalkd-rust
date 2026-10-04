@@ -514,8 +514,8 @@ certificate for the cluster port's admin channel, `admin.pem` /
 `admin.key`: signed by the same CA, SAN DNS name `bstk-admin` and nothing
 else, `clientAuth` only. Nodes refuse it as a peer and refuse node
 certificates on the admin channel; it belongs on the operator's machine,
-not on the nodes (the membership commands that use it arrive in a later
-release; with `insecure_plaintext` the admin channel is open to loopback
+not on the nodes (the `beanstalkd-rs cluster` commands, section 5.8, use
+it; with `insecure_plaintext` the admin channel is open to loopback
 only):
 
 ```sh
@@ -802,6 +802,80 @@ SIGTERM each node (`systemctl stop`); each exits within a fraction of a
 second. Start them again without `--cluster-init`, in any order; the
 cluster serves once a majority is up, with every committed job, job id,
 counter and drain mode preserved (COMPAT C5).
+
+### 5.8 Membership commands (`beanstalkd-rs cluster`)
+
+`beanstalkd-rs cluster <command>` shows and changes the membership of a
+running cluster through the cluster port's admin channel (the runbooks
+for growing, shrinking, replacing and moving nodes build on it). It is a
+separate command line: the server flags (`-l`, `-p`, ...) do not apply to
+it and are refused before it. `beanstalkd-rs cluster --help` lists every
+option.
+
+| Command | What it does |
+|---|---|
+| `status` | voters, learners, the leader, the highest member id ever, the membership's log id and whether it is committed, whether a joint configuration is in effect, and for each member its address, applied index, lag behind the leader, and state (`ok`, `rejoining`, `starting`, or unreachable). Exit 0 whenever a node answered. |
+| `add ID HOST:PORT` | adds node `ID` as a learner (it replicates, it does not vote). |
+| `promote ID [--force]` | makes a caught-up learner a voter. `--force` promotes a learner that is not caught up. |
+| `remove ID [--force]` | removes a learner or a voter, the leader too. The node is not told: stop its process. `--force` goes below 3 voters. |
+| `set-addr ID HOST:PORT [--force]` | changes a node's cluster address. `--force` allows a non-loopback address over plaintext cluster traffic. |
+
+Options common to all commands (before or after the command):
+
+- `--node HOST:PORT` (repeatable): the cluster address of any member.
+  Nodes are asked in order until one answers; the members' addresses
+  learned from the answers are tried after them. `--config FILE` takes the
+  `[[cluster.peer]]` addresses and the `[cluster.tls]` `ca` from a node's
+  configuration file instead (or in addition).
+- `--ca FILE`, `--cert FILE`, `--key FILE`: the cluster CA and the
+  operator certificate from `scripts/mkcluster-certs.sh DIR admin`
+  (section 5.2). A node certificate is refused (exit 2). With
+  `insecure_plaintext` clusters (tests only) pass `--insecure-plaintext`
+  instead, from the machine that runs the node.
+- `--timeout DURATION` (default `30s`): the most a command may take in all.
+- `--json`: one JSON object on stdout instead of text, errors included
+  (`{"ok": false, "exit": 1, "kind": "refused", "error": "..."}`).
+
+Every change is based on the membership the tool has just read (a
+compare-and-set on its log id): if another change got in first, the
+command prints the membership it found and exits 1 without changing
+anything (`conflict`), and you decide again; nothing is retried. A node
+that is not the leader names the leader, and the tool follows it (the
+message `... is not the leader; following to node N` on stderr). A change
+the leader runs in the background is waited for until the new membership
+is committed and final. Notes from the cluster (an even number of voters,
+"stop the removed node") are printed as `NOTE:` lines. The guardrails
+(one voter per change, no fewer than 3 voters, only a caught-up learner,
+ids never reused, no voter change while a voter rejoins) are the cluster's;
+the command only reports their refusals.
+
+Exit status:
+
+| Status | Meaning |
+|---|---|
+| 0 | done (for `status`: a node answered) |
+| 1 | refused by the cluster (a guardrail, a conflict, a rejected identity) |
+| 2 | usage error, or a certificate or configuration file that cannot be used |
+| 3 | no node could be reached, or no leader was found, within the timeout |
+| 4 | the change was accepted (or sent) but not seen to complete within the timeout; **it may still complete**: run `status` and look before repeating it |
+
+```sh
+beanstalkd-rs cluster status --node 10.0.0.1:11302 \
+    --ca cluster-tls/cluster-ca.pem --cert cluster-tls/admin.pem --key cluster-tls/admin.key
+```
+
+```
+membership (term 1 index 5, committed)
+  voters:   1 2 3
+  learners: -
+leader: node 3 (10.0.0.3:11302), term 1
+highest member id ever: 3
+
+ID  ROLE    ADDRESS          APPLIED  LAG  STATE
+1   voter   10.0.0.1:11302   4        0    ok
+2   voter   10.0.0.2:11302   4        0    ok
+3   leader  10.0.0.3:11302   4        0    ok
+```
 
 ## 6. Backup and restore
 

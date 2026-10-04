@@ -11,17 +11,26 @@
 //! `--check-config`, `--cluster-init`, `--threads`, and `--version` as an
 //! alias of `-v`) so they never shadow a reference short flag (including the
 //! removed `-c` and `-n`).
+//!
+//! `beanstalkd-rs cluster <command>` is the one subcommand (the operator's
+//! membership tool, `cluster_cli`). It is a real clap subcommand, so the flat
+//! flags stay exactly as above: the parent has no positional arguments, and
+//! `cluster` can only appear where a positional would be an error anyway.
+//! Flat flags given before it would be silently ignored, so they are refused.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use clap::error::ErrorKind;
 use clap::parser::ValueSource;
-use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser};
+use clap::{ArgAction, ArgMatches, CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use bstk_engine::DEFAULT_BINLOG_MAX_SIZE;
 use bstk_proto::{DEFAULT_MAX_JOB_SIZE, MAX_JOB_SIZE_LIMIT};
 use bstk_store::SyncPolicy;
+
+use crate::cluster_cli::ClusterArgs;
 
 /// `DEFAULT_FSYNC_MS` in dat.h: the fsync rate when `-b` is given without
 /// `-f` or `-F` (`serv.c` starts with `wantsync = 1`).
@@ -32,6 +41,7 @@ pub const DEFAULT_FSYNC_MS: u64 = 50;
 #[command(
     name = "beanstalkd-rs",
     disable_version_flag = true,
+    disable_help_subcommand = true,
     args_override_self = true
 )]
 pub struct Cli {
@@ -117,6 +127,11 @@ pub struct Cli {
     )]
     pub threads: Option<u16>,
 
+    /// An operator command instead of a server (see `beanstalkd-rs cluster
+    /// --help`)
+    #[command(subcommand)]
+    pub sub: Option<Sub>,
+
     /// Resolved fsync policy (from `-f` / `-F` in argument order); only
     /// meaningful with `-b`.
     #[arg(skip = SyncPolicy::Interval(Duration::from_millis(DEFAULT_FSYNC_MS)))]
@@ -126,6 +141,12 @@ pub struct Cli {
     /// configuration file value applies only when they were not).
     #[arg(skip)]
     pub given: Given,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Sub {
+    /// Inspect and change the membership of a running cluster
+    Cluster(ClusterArgs),
 }
 
 /// Whether an option with a default value (or a derived value, like
@@ -155,6 +176,19 @@ impl Cli {
 
     pub(crate) fn from_matches(matches: &ArgMatches) -> Result<Cli, clap::Error> {
         let mut cli = Cli::from_arg_matches(matches)?;
+        // Only the server's own flags: the command's global options are
+        // propagated into these matches as well.
+        if matches.subcommand().is_some()
+            && Cli::command().get_arguments().any(|a| {
+                matches.value_source(a.get_id().as_str()) == Some(ValueSource::CommandLine)
+            })
+        {
+            return Err(Cli::command().error(
+                ErrorKind::ArgumentConflict,
+                "server flags cannot be combined with the `cluster` command; give the command's \
+                 own options after it (see `beanstalkd-rs cluster --help`)",
+            ));
+        }
         // Defaults (e.g. `-F`'s implicit `false`) have indices too; only
         // occurrences on the command line count.
         let last = |id: &str| {
@@ -393,5 +427,141 @@ mod tests {
     fn max_job_size_accepts_a_negative_value_argument() {
         let cli = Cli::try_parse_from(["beanstalkd-rs", "-z", "-1"]).expect("-z -1 parses");
         assert_eq!(cli.max_job_size, MAX_JOB_SIZE_LIMIT);
+    }
+
+    fn cluster(args: &[&str]) -> Result<ClusterArgs, clap::Error> {
+        let mut argv = vec!["cluster"];
+        argv.extend_from_slice(args);
+        match parse(&argv)?.sub {
+            Some(Sub::Cluster(a)) => Ok(a),
+            None => panic!("no subcommand"),
+        }
+    }
+
+    #[test]
+    fn cluster_subcommand_leaves_the_flat_flags_alone() {
+        let cli = parse(&["-l", "127.0.0.1", "-p", "1", "-F", "-f", "10", "-V"]).expect("flat");
+        assert!(cli.sub.is_none());
+        assert_eq!(cli.port, 1);
+        assert_eq!(cli.sync, SyncPolicy::Interval(Duration::from_millis(10)));
+        // The parent has no positional arguments and no `help` subcommand:
+        // a stray word is still a usage error.
+        assert!(parse(&["status"]).is_err());
+        assert!(parse(&["help"]).is_err());
+        assert!(parse(&["clusters"]).is_err());
+        // Flags that are not the command's are refused after it...
+        assert!(cluster(&["status", "-p", "1"]).is_err());
+        assert!(cluster(&["status", "-F"]).is_err());
+        // ...and before it, where they would be silently dropped.
+        for flat in [
+            &["-p", "1"][..],
+            &["-V"],
+            &["--config", "x"],
+            &["--check-config"],
+            &["-f", "0"],
+        ] {
+            let mut argv = flat.to_vec();
+            argv.extend(["cluster", "status", "--node", "h:1"]);
+            let e = parse(&argv).expect_err("flat flags before the command");
+            assert_eq!(
+                e.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{flat:?}"
+            );
+        }
+        // The command's own --config is not the server's.
+        let a = cluster(&["status", "--config", "n.toml"]).expect("config");
+        assert_eq!(a.common.config, Some(PathBuf::from("n.toml")));
+    }
+
+    #[test]
+    fn cluster_commands_parse() {
+        use crate::cluster_cli::ClusterCmd;
+        let a = cluster(&[
+            "status",
+            "--node",
+            "h:1",
+            "--node",
+            "[::1]:2",
+            "--insecure-plaintext",
+        ])
+        .expect("status");
+        assert_eq!(a.command, ClusterCmd::Status);
+        assert_eq!(a.common.node, ["h:1", "[::1]:2"]);
+        assert!(a.common.insecure_plaintext && !a.common.json);
+        assert_eq!(a.common.timeout, Duration::from_secs(30));
+
+        // Options may precede the command as well as follow it.
+        let a = cluster(&[
+            "--node",
+            "h:1",
+            "--json",
+            "--timeout",
+            "5s",
+            "add",
+            "4",
+            "h:4",
+        ])
+        .expect("add");
+        assert_eq!(
+            a.command,
+            ClusterCmd::Add {
+                id: 4,
+                addr: "h:4".into()
+            }
+        );
+        assert!(a.common.json);
+        assert_eq!(a.common.node, ["h:1"]);
+        assert_eq!(a.common.timeout, Duration::from_secs(5));
+
+        let a = cluster(&[
+            "promote", "4", "--force", "--cert", "c", "--key", "k", "--ca", "a",
+        ])
+        .expect("promote");
+        assert_eq!(a.command, ClusterCmd::Promote { id: 4, force: true });
+        assert_eq!(a.common.cert, Some(PathBuf::from("c")));
+        let a = cluster(&["remove", "2"]).expect("remove");
+        assert_eq!(
+            a.command,
+            ClusterCmd::Remove {
+                id: 2,
+                force: false
+            }
+        );
+        let a = cluster(&["set-addr", "2", "h:9", "--force"]).expect("set-addr");
+        assert_eq!(
+            a.command,
+            ClusterCmd::SetAddr {
+                id: 2,
+                addr: "h:9".into(),
+                force: true
+            }
+        );
+    }
+
+    #[test]
+    fn cluster_usage_errors() {
+        // No command: usage text and clap's usage status (2).
+        let e = parse(&["cluster"]).expect_err("no command");
+        assert_eq!(e.exit_code(), 2);
+        for bad in [
+            &["frobnicate"][..],
+            &["add", "4"],
+            &["add", "0", "h:4"],
+            &["add", "65536", "h:4"],
+            &["add", "x", "h:4"],
+            &["add", "4", "nohost"],
+            &["add", "4", "h:0"],
+            &["promote"],
+            &["remove", "1", "2"],
+            &["status", "--node", "nohost"],
+            &["status", "--timeout", "0"],
+            &["status", "--timeout", "soon"],
+            &["status", "--force"],
+            &["add", "4", "h:4", "--nope"],
+        ] {
+            let e = cluster(bad).expect_err("usage error");
+            assert_eq!(e.exit_code(), 2, "{bad:?}");
+        }
     }
 }

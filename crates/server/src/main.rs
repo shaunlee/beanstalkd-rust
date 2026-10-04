@@ -34,6 +34,7 @@
 mod auth;
 mod cli;
 mod cluster;
+mod cluster_cli;
 mod config;
 mod conn;
 mod engine_actor;
@@ -77,6 +78,10 @@ const EXIT_LOCKED: u8 = 10;
 
 fn main() -> ExitCode {
     let cli = Cli::from_env();
+
+    if let Some(cli::Sub::Cluster(args)) = &cli.sub {
+        return cluster_cli::run(args);
+    }
 
     if cli.version {
         println!("beanstalkd-rs {}", env!("CARGO_PKG_VERSION"));

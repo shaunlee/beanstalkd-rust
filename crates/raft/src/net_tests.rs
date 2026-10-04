@@ -2216,6 +2216,92 @@ async fn admin_channel_identity_under_mtls() {
     let _ = raft.shutdown().await;
 }
 
+/// P6-T5: the operator tool's TLS configuration (`admin_client_tls_from_pem`)
+/// reaches a node without knowing its id, trusting only the cluster CA and
+/// only node names; a certificate that is not an admin one is refused
+/// before any dial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_tool_tls_accepts_any_node_name_from_the_cluster_ca() {
+    use crate::tls::{admin_client_tls_from_pem, verify_node_certificate};
+    let pki = Pki::new("cluster CA");
+    let rogue = Pki::new("rogue CA");
+    let (l, raft, _handler, addr) = admin_target(Some(&pki.node(1)), true, |_| {}).await;
+    let raft = raft.expect("raft");
+    let tool = |trust: &Pki, signer: &Pki| {
+        let (cert, key) = signer.client_leaf(&[crate::tls::ADMIN_DNS_NAME.to_string()]);
+        admin_client_tls_from_pem(cert.as_bytes(), key.as_bytes(), trust.ca_pem().as_bytes())
+    };
+    // The name is a placeholder: the verifier takes the real one from the
+    // node's certificate.
+    let connect = |cfg: Arc<rustls::ClientConfig>, addr: SocketAddr| async move {
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("tcp");
+        let io = tokio_rustls::TlsConnector::from(cfg)
+            .connect(
+                rustls_pki_types::ServerName::try_from("bstk-cluster").expect("name"),
+                tcp,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let certs = io.get_ref().1.peer_certificates().map(<[_]>::to_vec);
+        Ok::<_, String>((io, certs))
+    };
+
+    let cfg = tool(&pki, &pki).expect("config");
+    let (mut io, certs) = connect(cfg.clone(), addr).await.expect("handshake");
+    verify_node_certificate(certs.as_deref(), 1).expect("node 1's certificate");
+    assert!(verify_node_certificate(certs.as_deref(), 2).is_err());
+    assert!(verify_node_certificate(None, 1).is_err());
+    let f = wire::encode(&admin_hello(None), wire::DEFAULT_MAX_FRAME).expect("encode");
+    wire::write_frame(&mut io, &f).await.expect("write");
+    match wire::read_frame::<_, ServerMsg>(&mut io, wire::DEFAULT_MAX_FRAME).await {
+        Ok(Some(ServerMsg::Hello(ServerHello::Accepted { node_id: 1, .. }))) => {}
+        other => panic!("{other:?}"),
+    }
+    drop(io);
+
+    // A server certificate from another CA is not trusted.
+    let tcp = bind().await;
+    let rogue_addr = tcp.local_addr().expect("addr");
+    let rogue_cfg = listener_config(1, &[1], Some(&tls_with_cert_for(&rogue, &rogue, 1)));
+    let (rl, _slot) =
+        ClusterListener::spawn_deferred::<CountingHandler>(tcp, rogue_cfg).expect("listener");
+    let e = connect(cfg, rogue_addr).await;
+    assert!(e.is_err(), "a server from another CA was trusted");
+    rl.shutdown().await;
+
+    // A node certificate presented as the tool's is refused locally.
+    let (cert, key) = pki.leaf(&[node_dns_name(2)]);
+    let e = admin_client_tls_from_pem(cert.as_bytes(), key.as_bytes(), pki.ca_pem().as_bytes())
+        .expect_err("a node certificate is not an admin certificate");
+    assert!(e.0.contains("not an admin certificate"), "{e}");
+    let both = pki.leaf(&[crate::tls::ADMIN_DNS_NAME.into(), node_dns_name(2)]);
+    assert!(
+        admin_client_tls_from_pem(
+            both.0.as_bytes(),
+            both.1.as_bytes(),
+            pki.ca_pem().as_bytes()
+        )
+        .is_err()
+    );
+    // An admin certificate from another CA is refused by the node (TLS 1.3
+    // may report it on the first read).
+    let wrong_ca = tool(&pki, &rogue).expect("config");
+    let refused = match connect(wrong_ca, addr).await {
+        Err(_) => true,
+        Ok((mut io, _)) => {
+            let f = wire::encode(&admin_hello(None), wire::DEFAULT_MAX_FRAME).expect("encode");
+            let _ = wire::write_frame(&mut io, &f).await;
+            !matches!(
+                wire::read_frame::<_, ServerMsg>(&mut io, wire::DEFAULT_MAX_FRAME).await,
+                Ok(Some(_))
+            )
+        }
+    };
+    assert!(refused, "an admin certificate from another CA was served");
+    l.shutdown().await;
+    let _ = raft.shutdown().await;
+}
+
 #[test]
 fn identity_checks_exclude_each_other() {
     use crate::tls::{ADMIN_DNS_NAME, verify_admin_identity, verify_peer_identity};
