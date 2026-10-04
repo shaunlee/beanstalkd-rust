@@ -1,0 +1,54 @@
+# beanstalkd-rs: standalone with TLS, mutual TLS, token authentication, a
+# write-ahead log and the HTTP monitoring endpoints.
+# Every key is documented in docs/beanstalkd-rs.example.toml.
+#
+# Files this configuration expects (readable by the server's user; keep the
+# keys and tokens.txt mode 0600 or 0640):
+#   /etc/beanstalkd-rs/tls/server.pem   certificate chain for the listeners
+#   /etc/beanstalkd-rs/tls/server.key   its private key
+#   /etc/beanstalkd-rs/tls/client-ca.pem  CA that signs client certificates
+#   /etc/beanstalkd-rs/tokens.txt       one token per line
+#
+# Install as /etc/beanstalkd-rs/config.toml for the systemd unit, then check
+# it with
+#   beanstalkd-rs --config /etc/beanstalkd-rs/config.toml --check-config
+
+[[listener]]
+# Plaintext for local clients only.
+addr = "127.0.0.1:11300"
+
+[[listener]]
+# TLS; clients send `auth <token>` first (a beanstalkd-rs extension, so the
+# client library must support it).
+addr = "0.0.0.0:11301"
+tls = true
+auth = "token"
+
+[[listener]]
+# TLS with client certificates: works with any client that can use TLS.
+addr = "0.0.0.0:11302"
+tls = true
+auth = "mtls"
+
+[tls]
+cert = "/etc/beanstalkd-rs/tls/server.pem"
+key = "/etc/beanstalkd-rs/tls/server.key"
+client_ca = "/etc/beanstalkd-rs/tls/client-ca.pem"
+
+[auth]
+tokens_file = "/etc/beanstalkd-rs/tokens.txt"
+timeout = "10s"
+
+[binlog]
+dir = "/var/lib/beanstalkd-rs"
+fsync = "50ms"
+
+[http]
+# /healthz, /readyz, /metrics (Prometheus) and /admin (read-only JSON).
+# There is no authentication on this port: keep it on loopback or a
+# monitoring network.
+addr = "127.0.0.1:9180"
+
+[log]
+level = "info"
+format = "json"

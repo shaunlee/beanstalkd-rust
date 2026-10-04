@@ -1,0 +1,15 @@
+# beanstalkd-rs: standalone, plaintext, jobs in memory only.
+# Equivalent to `beanstalkd-rs -l 0.0.0.0 -p 11300`, the reference's
+# defaults. Every key is documented in docs/beanstalkd-rs.example.toml.
+#
+# Install as /etc/beanstalkd-rs/config.toml for the systemd unit
+# (packaging/systemd/beanstalkd-rs.service), then check it with
+#   beanstalkd-rs --config /etc/beanstalkd-rs/config.toml --check-config
+
+[[listener]]
+# Plaintext: every beanstalkd client works. Restrict access with a firewall,
+# or listen on "127.0.0.1:11300" if clients are local.
+addr = "0.0.0.0:11300"
+
+[log]
+level = "warn"

@@ -6,6 +6,26 @@ A Rust reimplementation of [beanstalkd](https://github.com/beanstalkd/beanstalkd
 
 Status: **P3 complete**: a server compatible with the reference, with an optional write-ahead log (`-b`), TLS / mTLS, optional token authentication, Prometheus metrics, and an optional Raft cluster mode (3 or 5 nodes) that keeps serving through the loss of a minority of nodes. Performance work (P4) is next; see `docs/PLAN.md`.
 
+## Install
+
+- **Release archives** (Linux x86_64 and aarch64 as `-gnu`, needing glibc 2.34 or newer, and as static `-musl` builds; macOS aarch64), once a version is tagged, on the [releases page](https://github.com/shaunlee/beanstalkd-rust/releases), with `SHA256SUMS`: each holds the `beanstalkd-rs` binary, the example configuration and `packaging/`.
+
+  ```sh
+  sha256sum -c --ignore-missing SHA256SUMS
+  tar -xzf beanstalkd-rs-<version>-<target>.tar.gz
+  ```
+
+- **Container image**: build it from the `Dockerfile` (no image is published). It runs as a non-root user, listens on port 11300 and keeps data in the `/data` volume:
+
+  ```sh
+  docker build -t beanstalkd-rs .
+  docker run -d -p 11300:11300 -v bstk:/data beanstalkd-rs -l 0.0.0.0 -p 11300 -b /data
+  ```
+
+- **systemd**: `packaging/systemd/beanstalkd-rs.service` (hardened; install steps in its header) runs `beanstalkd-rs --config /etc/beanstalkd-rs/config.toml`. Ready-made configurations for standalone, binlog, TLS / mTLS / token / HTTP and a 3-node cluster are in `packaging/examples/`.
+
+Changes per version: `CHANGELOG.md`.
+
 ## Build and run
 
 ```sh
@@ -63,7 +83,10 @@ Benchmarks: see `docs/BENCH.md` (`scripts/build-ref.sh --optimized`, then `bench
 | `check` | `ubuntu-latest` (x86_64), `ubuntu-24.04-arm` (aarch64), `macos-latest` | builds the reference, then `scripts/check.sh --no-fail-fast` (fmt, clippy, build, all tests including the differential and stunnel suites) |
 | `smoke` | `ubuntu-latest` | `clients/run-smoke.sh` in plain, binlog, restart, TLS, mTLS (with restart, token and HTTP), cluster and cluster leader-kill modes |
 | `chaos` | `ubuntu-latest` | 200 in-process seeds and 5 multi-process runs |
+| `docker` | `ubuntu-latest` | builds the image (not pushed) and runs `scripts/docker-smoke.sh`: the default command and the healthcheck, then a binlog on a volume across a graceful restart |
 | `deny` | `ubuntu-latest` | `cargo deny check` (advisories, bans, licenses, sources; `deny.toml`) |
+
+`.github/workflows/release.yml` runs on a `v*` tag (which must equal `v` + the workspace version in `Cargo.toml`): it builds and smoke-tests the release archives, writes `SHA256SUMS` and publishes a GitHub Release. Started by hand (`workflow_dispatch`) it is a dry run that keeps the archives as a workflow artifact, unless `publish` is set for an existing tag.
 
 `.github/workflows/weekly.yml` (weekly and on demand) runs 1,000 in-process seeds and 50 multi-process runs.
 

@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "bstk-bench"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "clap",
  "nix",
@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "bstk-chaos"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "bstk-engine",
  "bstk-proto",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "bstk-compat"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "rcgen",
  "rustls",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "bstk-engine"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "bstk-engine-oracle",
  "bstk-proto",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "bstk-engine-oracle"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "bstk-proto",
  "bytes",
@@ -232,14 +232,14 @@ dependencies = [
 
 [[package]]
 name = "bstk-net"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "bstk-proto"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "proptest",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "bstk-raft"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "bstk-engine",
  "bstk-net",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "bstk-server"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "bstk-engine",
  "bstk-net",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "bstk-store"
-version = "0.1.0"
+version = "0.5.0"
 dependencies = [
  "bstk-engine",
  "bstk-proto",

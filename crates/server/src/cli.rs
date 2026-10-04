@@ -8,8 +8,9 @@
 //! two wins (`-f 10 -F` never fsyncs, `-F -f 10` fsyncs every 10 ms).
 //!
 //! Options that the reference does not have are long-only (`--config`,
-//! `--check-config`, `--cluster-init`) so they never shadow a reference short flag
-//! (including the removed `-c` and `-n`).
+//! `--check-config`, `--cluster-init`, `--threads`, and `--version` as an
+//! alias of `-v`) so they never shadow a reference short flag (including the
+//! removed `-c` and `-n`).
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -90,7 +91,7 @@ pub struct Cli {
     pub verbose: u8,
 
     /// Show version information and exit
-    #[arg(short = 'v', action = ArgAction::SetTrue)]
+    #[arg(short = 'v', long = "version", action = ArgAction::SetTrue)]
     pub version: bool,
 
     /// Read settings from a TOML configuration file (command-line flags
@@ -366,6 +367,13 @@ mod tests {
         let mut shorts: Vec<char> = cmd.get_arguments().filter_map(|a| a.get_short()).collect();
         shorts.sort_unstable();
         assert_eq!(shorts, ['F', 'V', 'b', 'f', 'l', 'p', 's', 'u', 'v', 'z']);
+    }
+
+    #[test]
+    fn version_has_reference_short_flag_and_long_alias() {
+        assert!(parse(&["-v"]).expect("-v").version);
+        assert!(parse(&["--version"]).expect("--version").version);
+        assert!(!parse(&[]).expect("no args").version);
     }
 
     #[test]

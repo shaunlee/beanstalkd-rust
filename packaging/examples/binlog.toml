@@ -1,0 +1,22 @@
+# beanstalkd-rs: standalone, plaintext, with a write-ahead log so jobs
+# survive restarts and crashes (like `beanstalkd -b DIR`).
+# Every key is documented in docs/beanstalkd-rs.example.toml.
+#
+# Install as /etc/beanstalkd-rs/config.toml for the systemd unit
+# (packaging/systemd/beanstalkd-rs.service), whose StateDirectory= creates
+# /var/lib/beanstalkd-rs for the beanstalkd user; then check it with
+#   beanstalkd-rs --config /etc/beanstalkd-rs/config.toml --check-config
+
+[[listener]]
+addr = "0.0.0.0:11300"
+
+[binlog]
+# Must be writable by the server's user. One server per directory: a second
+# instance on the same directory exits with status 10.
+dir = "/var/lib/beanstalkd-rs"
+# fsync at most every 50 ms (the reference's default): a power loss can lose
+# the last 50 ms of acknowledged writes. "always" fsyncs before every reply.
+fsync = "50ms"
+
+[log]
+level = "warn"

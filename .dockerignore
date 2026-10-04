@@ -1,0 +1,16 @@
+# The image builds only bstk-server; keep the build context small and free
+# of host build output (target/, the reference build in .ref/).
+.git
+.github
+.ref
+.codegraph
+.claude
+target
+**/target
+**/__pycache__
+**/.venv
+bench/results
+clients
+docs
+Dockerfile
+.dockerignore

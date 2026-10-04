@@ -1,0 +1,201 @@
+name: Release
+
+# A v* tag builds, smoke-tests and publishes a GitHub Release. Run it by
+# hand (workflow_dispatch) for a dry run: the archives and SHA256SUMS are
+# kept as a workflow artifact and nothing is published unless `publish` is
+# set, which also requires the tag v<version> to exist already.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub Release (the tag v<version> must already exist)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-10-04)
+        with:
+          toolchain: "1.98"
+      # Every crate inherits workspace.package.version, so one version names
+      # the release; a crate that does not is a mistake caught here.
+      - name: Check the version
+        id: version
+        run: |
+          versions="$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[].version] | unique | join(" ")')"
+          echo "workspace versions: $versions"
+          case "$versions" in
+            *" "*) echo "::error::crates disagree on the version: $versions"; exit 1 ;;
+          esac
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$versions" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the Cargo version $versions (expected tag v$versions)"
+            exit 1
+          fi
+          echo "version=$versions" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        # A gnu binary needs at least the glibc symbol versions it was
+        # linked against: built on Ubuntu 22.04 it needs glibc 2.34 (RHEL 9,
+        # Debian 12, Ubuntu 22.04 and later); built on 24.04 it needed 2.38.
+        # The static musl builds run on any Linux of their architecture.
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            musl: true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+      # The release profile keeps line tables for profiling (debug = 1),
+      # which makes a Linux binary about 6x larger; the shipped binary drops
+      # them but keeps symbols, so backtraces still name functions.
+      CARGO_PROFILE_RELEASE_STRIP: debuginfo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-10-04)
+        with:
+          toolchain: "1.98"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        # C objects (aws-lc) built against one runner image's glibc headers
+        # must not be reused on another.
+        with:
+          key: release-${{ matrix.os }}-${{ matrix.target }}
+      - name: Install musl-tools
+        if: matrix.musl
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q musl-tools
+      - name: Build
+        run: cargo build --release --locked -p bstk-server --target "$TARGET"
+      - name: Inspect the binary
+        run: |
+          bin="target/$TARGET/release/beanstalkd-rs"
+          ls -l "$bin"
+          file "$bin"
+          if [ "$RUNNER_OS" = Linux ]; then
+            # The newest glibc symbol version sets the oldest distribution
+            # the gnu build runs on; a static musl build has none.
+            objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1 || echo "no glibc symbols"
+          fi
+      - name: Smoke test
+        run: |
+          bin="target/$TARGET/release/beanstalkd-rs"
+          test "$("$bin" --version)" = "beanstalkd-rs $VERSION"
+          test "$("$bin" -v)" = "beanstalkd-rs $VERSION"
+          smoke() { python3 scripts/pkg-smoke.py --port 11300 "$@"; }
+          dir="$RUNNER_TEMP/binlog"
+          "$bin" -l 127.0.0.1 -p 11300 -b "$dir" &
+          pid=$!
+          smoke --version "$VERSION" --persist-put 3
+          kill -TERM "$pid"
+          wait "$pid"
+          "$bin" -l 127.0.0.1 -p 11300 -b "$dir" &
+          pid=$!
+          smoke --persist-expect 3
+          kill -TERM "$pid"
+          wait "$pid"
+      - name: Package
+        run: |
+          name="beanstalkd-rs-$VERSION-$TARGET"
+          stage="$RUNNER_TEMP/stage/$name"
+          mkdir -p "$stage/docs"
+          cp "target/$TARGET/release/beanstalkd-rs" LICENSE README.md CHANGELOG.md "$stage/"
+          cp docs/beanstalkd-rs.example.toml "$stage/docs/"
+          cp -R packaging "$stage/"
+          tar -czf "$name.tar.gz" -C "$RUNNER_TEMP/stage" "$name"
+          tar -tzvf "$name.tar.gz"
+          echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: archive-${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  checksums:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          sha256sum -- *.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          ls -l
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: beanstalkd-rs-${{ needs.version.outputs.version }}
+          path: dist
+          if-no-files-found: error
+
+  publish:
+    needs: [version, checksums]
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: beanstalkd-rs-${{ needs.version.outputs.version }}
+          path: dist
+      # The notes are this version's CHANGELOG.md section. --verify-tag
+      # refuses to create the tag, so a manual run cannot invent a release.
+      - name: Create the GitHub Release
+        run: |
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on && /^\[[^]]*\]: / { exit }
+            on { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          test -s "$RUNNER_TEMP/notes.md" || { echo "::error::CHANGELOG.md has no section for $VERSION"; exit 1; }
+          gh release create "v$VERSION" --verify-tag --title "beanstalkd-rs $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" dist/*
