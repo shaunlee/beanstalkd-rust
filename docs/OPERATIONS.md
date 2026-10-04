@@ -509,6 +509,24 @@ created cluster-tls/node2.pem (SAN DNS:bstk-node-2, valid 825 days)
 created cluster-tls/node3.pem (SAN DNS:bstk-node-3, valid 825 days)
 ```
 
+The argument `admin` (alone or with node ids) issues the operator
+certificate for the cluster port's admin channel, `admin.pem` /
+`admin.key`: signed by the same CA, SAN DNS name `bstk-admin` and nothing
+else, `clientAuth` only. Nodes refuse it as a peer and refuse node
+certificates on the admin channel; it belongs on the operator's machine,
+not on the nodes (the membership commands that use it arrive in a later
+release; with `insecure_plaintext` the admin channel is open to loopback
+only):
+
+```sh
+scripts/mkcluster-certs.sh cluster-tls admin
+```
+
+```
+reusing cluster-tls/cluster-ca.pem
+created cluster-tls/admin.pem (SAN DNS:bstk-admin, client only, valid 825 days)
+```
+
 Keys are created with mode 0600. Keep `cluster-ca.key` off the nodes:
 whoever has it can join the cluster. Run the script again with the same
 directory to issue a certificate for one node with the existing CA

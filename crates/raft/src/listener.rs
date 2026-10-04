@@ -33,7 +33,22 @@
 //!
 //! Rejections are logged at most about once a second; a rejected hello gets a
 //! generic reason ([`REJECT_HELLO`], [`REJECT_NOT_MEMBER`], [`REJECT_VERSION`],
-//! [`REJECT_MAX_JOB_SIZE`]) and the details are only logged locally.
+//! [`REJECT_MAX_JOB_SIZE`], [`REJECT_ADMIN_BUSY`]) and the details are only
+//! logged locally.
+//!
+//! Admin connections (protocol version 4, [`ClientMsg::AdminHello`]) go
+//! through the same handshake budget, then hold one of
+//! [`ListenerConfig::max_admin_conns`] admin slots instead of a peer slot.
+//! The caller must prove the admin identity: with TLS a certificate whose
+//! only SAN is `bstk-admin` ([`crate::tls::verify_admin_identity`]),
+//! without TLS a loopback source address ([`plaintext_admin_allowed`]). An
+//! admin connection carries only admin requests (frames of at most
+//! [`wire::ADMIN_MAX_REQUEST_FRAME`]) and closes after
+//! [`ListenerConfig::admin_idle_timeout`] without one; a peer connection
+//! that sends an admin request is closed. Membership changes answer
+//! [`AdminResponse::Unsupported`] until the leader-side executor exists
+//! (P6-T4); [`AdminRequest::Membership`] answers the status source's
+//! [`crate::status::NodeStatusEx`].
 
 use std::collections::{BTreeSet, HashMap};
 use std::io;
@@ -44,6 +59,7 @@ use std::time::Duration;
 
 use openraft::Raft;
 use rustls::ServerConfig;
+use rustls_pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -53,8 +69,8 @@ use tokio_rustls::TlsAcceptor;
 use crate::forward::{ForwardHandler, check_control, check_forward};
 use crate::status::StatusSource;
 use crate::wire::{
-    self, ClientMsg, FrameError, PROTOCOL_VERSION, RpcRequest, RpcResponse, ServerHello, ServerMsg,
-    WireError,
+    self, AdminRequest, AdminResponse, ClientMsg, FrameError, PROTOCOL_VERSION, RpcRequest,
+    RpcResponse, ServerHello, ServerMsg, WireError,
 };
 use crate::{NodeId, TypeConfig};
 use bstk_net::QuietTcp;
@@ -133,13 +149,17 @@ pub struct ListenerConfig {
     /// Answers status probes (the node's log store). `None` (the default):
     /// probes are refused.
     pub status: Option<Arc<dyn StatusSource>>,
+    /// Admin connections open at once; more are refused at their hello.
+    pub max_admin_conns: usize,
+    /// An admin connection without a request for this long is closed.
+    pub admin_idle_timeout: Duration,
 }
 
 impl ListenerConfig {
     /// Defaults: 16 handshakes at once, `max(4, 2 × peers)` of them per
     /// source address (every peer may share one address, as on a test
     /// machine or behind NAT), 2 s handshake, 32 MiB frames, the default
-    /// `-z`, no vote gate.
+    /// `-z`, no vote gate, 4 admin connections idle for at most 60 s.
     pub fn new(node_id: NodeId, peers: BTreeSet<NodeId>, tls: Option<Arc<ServerConfig>>) -> Self {
         let per_ip = peers.len().saturating_mul(2).max(4);
         ListenerConfig {
@@ -153,6 +173,8 @@ impl ListenerConfig {
             max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
             vote_gate: None,
             status: None,
+            max_admin_conns: 4,
+            admin_idle_timeout: Duration::from_secs(60),
         }
     }
 }
@@ -261,6 +283,7 @@ impl ClusterListener {
         let slot = Arc::new(OnceLock::new());
         let shared = Arc::new(Shared {
             handshakes: Arc::new(Semaphore::new(cfg.max_handshakes)),
+            admins: Arc::new(Semaphore::new(cfg.max_admin_conns)),
             per_ip_limit: AtomicUsize::new(cfg.max_handshakes_per_ip),
             allowed: StdMutex::new(cfg.peers.clone()),
             cfg,
@@ -319,6 +342,15 @@ pub const REJECT_VERSION: &str = "unsupported protocol version";
 /// Reason sent for a hello with another `-z` (the dialer logs it as a
 /// configuration error).
 pub const REJECT_MAX_JOB_SIZE: &str = "max_job_size mismatch (every node must use the same -z)";
+/// Reason sent for an admin hello beyond [`ListenerConfig::max_admin_conns`].
+pub const REJECT_ADMIN_BUSY: &str = "too many admin connections";
+
+/// Whether a plaintext admin connection from `ip` may proceed: loopback
+/// only, as plaintext proves no identity (an IPv4 client of a dual-stack
+/// listener appears as `::ffff:127.0.0.1`).
+pub fn plaintext_admin_allowed(ip: IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
 
 struct RateLimit {
     state: StdMutex<(Option<std::time::Instant>, u64)>,
@@ -351,6 +383,8 @@ impl RateLimit {
 struct Shared {
     cfg: ListenerConfig,
     handshakes: Arc<Semaphore>,
+    /// Open admin connections (see [`ListenerConfig::max_admin_conns`]).
+    admins: Arc<Semaphore>,
     /// Handshakes allowed per source address (see [`PeerAllowlist::set`]).
     per_ip_limit: AtomicUsize,
     /// Nodes allowed to connect. Lock order: `allowed`, then `peers`.
@@ -501,17 +535,10 @@ async fn serve_tcp<H: ForwardHandler>(
         None => {
             let handshake = async {
                 let mut io = tcp;
-                let peer = hello(&mut io, shared, addr, |_| Ok(())).await?;
-                Ok::<_, String>((io, peer))
+                let caller = hello(&mut io, shared, addr, None).await?;
+                Ok::<_, String>((io, caller))
             };
-            match tokio::time::timeout(cfg.handshake_timeout, handshake).await {
-                Ok(Ok((io, peer))) => {
-                    drop(slot);
-                    serve_peer(io, peer, shared, service).await
-                }
-                Ok(Err(e)) => Err(Phase::Handshake(e)),
-                Err(_) => Err(Phase::Handshake("handshake timed out".into())),
-            }
+            after_handshake(handshake, slot, addr, shared, service).await
         }
         Some(tls) => {
             let acceptor = TlsAcceptor::from(tls.clone());
@@ -521,31 +548,58 @@ async fn serve_tcp<H: ForwardHandler>(
                     .await
                     .map_err(|e| format!("TLS handshake: {e}"))?;
                 let certs = io.get_ref().1.peer_certificates().map(<[_]>::to_vec);
-                let peer = hello(&mut io, shared, addr, |id| {
-                    crate::tls::verify_peer_identity(certs.as_deref(), id)
-                })
-                .await?;
-                Ok::<_, String>((io, peer))
+                let caller = hello(&mut io, shared, addr, Some(certs.as_deref())).await?;
+                Ok::<_, String>((io, caller))
             };
-            match tokio::time::timeout(cfg.handshake_timeout, handshake).await {
-                Ok(Ok((io, peer))) => {
-                    drop(slot);
-                    serve_peer(io, peer, shared, service).await
-                }
-                Ok(Err(e)) => Err(Phase::Handshake(e)),
-                Err(_) => Err(Phase::Handshake("handshake timed out".into())),
-            }
+            after_handshake(handshake, slot, addr, shared, service).await
         }
     };
     match result {
         Ok(()) => {}
-        Err(Phase::Handshake(e)) => shared.log_reject(addr, &e),
+        Err(Phase::Handshake(e) | Phase::Violation(e)) => shared.log_reject(addr, &e),
         Err(Phase::Serve(e)) => tracing::debug!(%addr, error = %e, "cluster connection closed"),
     }
 }
 
+/// Waits for the handshake (within the timeout, holding `slot`), then
+/// serves the connection as what its hello proved.
+async fn after_handshake<S, H>(
+    handshake: impl std::future::Future<Output = Result<(S, Caller), String>>,
+    slot: HandshakeSlot,
+    addr: SocketAddr,
+    shared: &Shared,
+    service: &OnceLock<Service<H>>,
+) -> Result<(), Phase>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    H: ForwardHandler,
+{
+    match tokio::time::timeout(shared.cfg.handshake_timeout, handshake).await {
+        Ok(Ok((io, Caller::Peer(peer)))) => {
+            drop(slot);
+            serve_peer(io, peer, shared, service).await
+        }
+        Ok(Ok((io, Caller::Admin(permit)))) => {
+            drop(slot);
+            serve_admin(io, addr, permit, shared).await
+        }
+        Ok(Err(e)) => Err(Phase::Handshake(e)),
+        Err(_) => Err(Phase::Handshake("handshake timed out".into())),
+    }
+}
+
+/// What a connection's hello proved it to be.
+enum Caller {
+    Peer(NodeId),
+    /// Holds one of the admin slots for the connection's life.
+    Admin(OwnedSemaphorePermit),
+}
+
 enum Phase {
     Handshake(String),
+    /// A message the connection's kind may not send (logged like a
+    /// rejected handshake).
+    Violation(String),
     Serve(String),
 }
 
@@ -568,40 +622,151 @@ where
     };
     let r = tokio::select! {
         r = serve(io, peer, &shared.cfg, service) => r,
-        () = close.notified() => Err(if shared.is_allowed(peer) {
+        () = close.notified() => Err(Phase::Serve(if shared.is_allowed(peer) {
             "replaced by a newer connection of the same peer".into()
         } else {
             format!("node {peer} is no longer allowed (not a member)")
-        }),
+        })),
     };
     shared.unregister(peer, generation);
-    r.map_err(Phase::Serve)
+    r
 }
 
-/// Reads and checks the hello; answers it. Returns the peer's id. The
-/// answer to a rejected hello carries a generic reason; the details are
-/// returned (and logged by the caller).
-async fn hello<S, F>(
+/// Serves an admin connection until it ends, goes idle or sends anything
+/// but an admin request. Every request is logged at info.
+async fn serve_admin<S>(
+    mut io: S,
+    addr: SocketAddr,
+    _permit: OwnedSemaphorePermit,
+    shared: &Shared,
+) -> Result<(), Phase>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let cfg = &shared.cfg;
+    tracing::info!(%addr, "cluster admin connection accepted");
+    loop {
+        let read = wire::read_frame::<_, ClientMsg>(&mut io, wire::ADMIN_MAX_REQUEST_FRAME);
+        let (id, body) = match tokio::time::timeout(cfg.admin_idle_timeout, read).await {
+            Err(_) => {
+                tracing::info!(%addr, "cluster admin connection closed: idle");
+                return Ok(());
+            }
+            Ok(Ok(Some(ClientMsg::Admin { id, body }))) => (id, body),
+            Ok(Ok(Some(ClientMsg::Hello(_) | ClientMsg::AdminHello(_)))) => {
+                return Err(Phase::Violation(
+                    "second hello on an admin connection".into(),
+                ));
+            }
+            Ok(Ok(Some(ClientMsg::Request { .. }))) => {
+                return Err(Phase::Violation(
+                    "peer request on an admin connection".into(),
+                ));
+            }
+            Ok(Ok(None)) => {
+                tracing::info!(%addr, "cluster admin connection closed");
+                return Ok(());
+            }
+            Ok(Err(e)) => return Err(Phase::Violation(format!("admin connection: {e}"))),
+        };
+        // `Debug` escapes the request's strings (bounded while decoding).
+        // Reads are what a CLI polls, so only changes are logged at info.
+        if matches!(body, AdminRequest::Membership) {
+            tracing::debug!(%addr, request = ?body, "cluster admin request");
+        } else {
+            tracing::info!(%addr, request = ?body, "cluster admin request");
+        }
+        let resp = admin_dispatch(body, cfg.status.as_deref());
+        let frame = wire::encode(&ServerMsg::Admin { id, body: resp }, cfg.max_frame)
+            .map_err(|e| Phase::Serve(e.to_string()))?;
+        wire::write_frame(&mut io, &frame)
+            .await
+            .map_err(|e| Phase::Serve(e.to_string()))?;
+    }
+}
+
+/// Answers one admin request. Membership changes are not implemented yet
+/// (P6-T4), so nothing here reaches openraft's membership API.
+pub(crate) fn admin_dispatch(
+    req: AdminRequest,
+    status: Option<&dyn StatusSource>,
+) -> AdminResponse {
+    match req {
+        AdminRequest::Membership => match status {
+            Some(s) => AdminResponse::Membership(Box::new(s.status_ex())),
+            None => AdminResponse::Refused {
+                reason: NO_STATUS.into(),
+            },
+        },
+        AdminRequest::AddLearner { .. }
+        | AdminRequest::Promote { .. }
+        | AdminRequest::Remove { .. }
+        | AdminRequest::SetAddr { .. } => AdminResponse::Unsupported,
+    }
+}
+
+/// Reads and checks the hello; answers it. Returns what the connection
+/// proved to be. `certs` is `None` without TLS, else the client's
+/// (CA-verified) certificate chain. The answer to a rejected hello carries a
+/// generic reason; the details are returned (and logged by the caller).
+async fn hello<S>(
     io: &mut S,
     shared: &Shared,
     addr: SocketAddr,
-    identity: F,
-) -> Result<NodeId, String>
+    certs: Option<Option<&[CertificateDer<'_>]>>,
+) -> Result<Caller, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    F: FnOnce(NodeId) -> Result<(), String>,
 {
     let cfg = &shared.cfg;
-    let h = match wire::read_frame::<_, ClientMsg>(io, cfg.max_frame).await {
-        Ok(Some(ClientMsg::Hello(h))) => h,
-        Ok(Some(ClientMsg::Request { .. })) => return Err("request before hello".into()),
+    let msg = match wire::read_frame::<_, ClientMsg>(io, cfg.max_frame).await {
+        Ok(Some(m)) => m,
         Ok(None) => return Err("closed before hello".into()),
         Err(e) => return Err(format!("hello: {e}")),
     };
-    // (details for the local log, generic reason for the peer). Identity
-    // before membership: only a node that proved its id learns that it is
-    // not a member.
-    let verdict: Result<(), (String, &str)> = if h.version != PROTOCOL_VERSION {
+    // (details for the local log, generic reason for the caller).
+    let (verdict, who): (Result<Caller, (String, &str)>, String) = match msg {
+        ClientMsg::Hello(h) => (
+            peer_verdict(&h, shared, addr, certs),
+            format!("node {}", h.from),
+        ),
+        ClientMsg::AdminHello(h) => (admin_verdict(&h, shared, addr, certs), "admin".into()),
+        ClientMsg::Request { .. } | ClientMsg::Admin { .. } => {
+            return Err("request before hello".into());
+        }
+    };
+    let answer = match &verdict {
+        Ok(_) => ServerHello::Accepted {
+            version: PROTOCOL_VERSION,
+            node_id: cfg.node_id,
+            max_job_size: cfg.max_job_size,
+        },
+        Err((_, generic)) => ServerHello::Rejected {
+            reason: (*generic).to_string(),
+        },
+    };
+    let frame =
+        wire::encode(&ServerMsg::Hello(answer), cfg.max_frame).map_err(|e| e.to_string())?;
+    wire::write_frame(io, &frame)
+        .await
+        .map_err(|e| e.to_string())?;
+    verdict.map_err(|(detail, _)| format!("hello from {who} rejected: {detail}"))
+}
+
+/// A peer's hello. Identity before membership: only a node that proved its
+/// id learns that it is not a member.
+fn peer_verdict(
+    h: &wire::Hello,
+    shared: &Shared,
+    addr: SocketAddr,
+    certs: Option<Option<&[CertificateDer<'_>]>>,
+) -> Result<Caller, (String, &'static str)> {
+    let cfg = &shared.cfg;
+    let identity = |id| match certs {
+        None => Ok(()),
+        Some(certs) => crate::tls::verify_peer_identity(certs, id),
+    };
+    if h.version != PROTOCOL_VERSION {
         Err((
             format!("unsupported protocol version {}", h.version),
             REJECT_VERSION,
@@ -632,26 +797,45 @@ where
         tracing::error!(from = h.from, %addr, "cluster hello rejected: {reason}");
         Err((reason, REJECT_MAX_JOB_SIZE))
     } else {
-        Ok(())
+        Ok(Caller::Peer(h.from))
+    }
+}
+
+/// An operator tool's hello: the admin identity (see the module docs), then
+/// a free admin slot.
+fn admin_verdict(
+    h: &wire::AdminHello,
+    shared: &Shared,
+    addr: SocketAddr,
+    certs: Option<Option<&[CertificateDer<'_>]>>,
+) -> Result<Caller, (String, &'static str)> {
+    let cfg = &shared.cfg;
+    let identity = match certs {
+        Some(certs) => crate::tls::verify_admin_identity(certs),
+        None if plaintext_admin_allowed(addr.ip()) => Ok(()),
+        None => Err("plaintext admin connections are accepted from loopback only".into()),
     };
-    let answer = match &verdict {
-        Ok(()) => ServerHello::Accepted {
-            version: PROTOCOL_VERSION,
-            node_id: cfg.node_id,
-            max_job_size: cfg.max_job_size,
-        },
-        Err((_, generic)) => ServerHello::Rejected {
-            reason: (*generic).to_string(),
-        },
-    };
-    let frame =
-        wire::encode(&ServerMsg::Hello(answer), cfg.max_frame).map_err(|e| e.to_string())?;
-    wire::write_frame(io, &frame)
-        .await
-        .map_err(|e| e.to_string())?;
-    verdict
-        .map(|()| h.from)
-        .map_err(|(detail, _)| format!("hello from node {} rejected: {detail}", h.from))
+    if h.version != PROTOCOL_VERSION {
+        Err((
+            format!("unsupported protocol version {}", h.version),
+            REJECT_VERSION,
+        ))
+    } else if let Some(to) = h.to.filter(|&to| to != cfg.node_id) {
+        Err((
+            format!("admin hello for node {to}, this is node {}", cfg.node_id),
+            REJECT_HELLO,
+        ))
+    } else if let Err(e) = identity {
+        Err((e, REJECT_HELLO))
+    } else {
+        match shared.admins.clone().try_acquire_owned() {
+            Ok(permit) => Ok(Caller::Admin(permit)),
+            Err(_) => Err((
+                format!("{} admin connections open", cfg.max_admin_conns),
+                REJECT_ADMIN_BUSY,
+            )),
+        }
+    }
 }
 
 async fn serve<S, H>(
@@ -659,7 +843,7 @@ async fn serve<S, H>(
     peer: NodeId,
     cfg: &ListenerConfig,
     service: &OnceLock<Service<H>>,
-) -> Result<(), String>
+) -> Result<(), Phase>
 where
     S: AsyncRead + AsyncWrite + Unpin,
     H: ForwardHandler,
@@ -669,9 +853,16 @@ where
     loop {
         let (id, body) = match wire::read_frame::<_, ClientMsg>(&mut io, cfg.max_frame).await {
             Ok(Some(ClientMsg::Request { id, body })) => (id, body),
-            Ok(Some(ClientMsg::Hello(_))) => return Err("second hello".into()),
+            Ok(Some(ClientMsg::Hello(_) | ClientMsg::AdminHello(_))) => {
+                return Err(Phase::Serve("second hello".into()));
+            }
+            Ok(Some(ClientMsg::Admin { .. })) => {
+                return Err(Phase::Violation(format!(
+                    "admin request on the connection of node {peer}"
+                )));
+            }
             Ok(None) => return Ok(()),
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(Phase::Serve(e.to_string())),
         };
         let svc = service.get().map(|s| (&s.raft, &*s.handler));
         let resp = dispatch(
@@ -685,13 +876,15 @@ where
         let frame = match wire::encode(&ServerMsg::Response { id, body: resp }, cfg.max_frame) {
             Ok(f) => f,
             Err(FrameError::TooLarge { len, max }) => {
-                return Err(format!("response of {len} bytes exceeds {max}"));
+                return Err(Phase::Serve(format!(
+                    "response of {len} bytes exceeds {max}"
+                )));
             }
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(Phase::Serve(e.to_string())),
         };
         wire::write_frame(&mut io, &frame)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| Phase::Serve(e.to_string()))?;
     }
 }
 
@@ -712,6 +905,10 @@ pub(crate) async fn dispatch<H: ForwardHandler>(
             // failed probe for the dialer.)
             None => RpcResponse::Control(Err(WireError::Rejected(NO_STATUS.into()))),
         },
+        RpcRequest::StatusEx => RpcResponse::StatusEx(match status {
+            Some(s) => Ok(Box::new(s.status_ex())),
+            None => Err(WireError::Rejected(NO_STATUS.into())),
+        }),
         RpcRequest::AppendEntries(r) => RpcResponse::AppendEntries(match service {
             Some((raft, _)) => raft
                 .append_entries(r)

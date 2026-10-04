@@ -1165,6 +1165,8 @@ fn sustained_load_through_a_follower_resends_nothing() {
     );
 }
 
+/// The cluster CA and node certificates, plus `admin.pem` / `admin.key`
+/// (SAN `bstk-admin`, client only) and `rogue-admin.*` from another CA.
 fn write_cluster_pki(dir: &Path, n: u64) {
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -1177,7 +1179,7 @@ fn write_cluster_pki(dir: &Path, n: u64) {
         .push(DnType::CommonName, "bstk cluster test CA");
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let ca_key = KeyPair::generate().unwrap();
-    let ca = params.self_signed(&ca_key).unwrap();
+    let ca = params.clone().self_signed(&ca_key).unwrap();
     std::fs::write(dir.join("cluster-ca.pem"), ca.pem()).unwrap();
     for id in 1..=n {
         let mut p = CertificateParams::new(vec![format!("bstk-node-{id}")]).unwrap();
@@ -1194,6 +1196,45 @@ fn write_cluster_pki(dir: &Path, n: u64) {
         std::fs::write(dir.join(format!("node{id}.pem")), cert.pem()).unwrap();
         std::fs::write(dir.join(format!("node{id}.key")), key.serialize_pem()).unwrap();
     }
+    let rogue_key = KeyPair::generate().unwrap();
+    let rogue = params.self_signed(&rogue_key).unwrap();
+    for (name, signer, signer_key) in [("admin", &ca, &ca_key), ("rogue-admin", &rogue, &rogue_key)]
+    {
+        let mut p =
+            CertificateParams::new(vec![bstk_raft::tls::ADMIN_DNS_NAME.to_string()]).unwrap();
+        p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let key = KeyPair::generate().unwrap();
+        let cert = p.signed_by(&key, signer, signer_key).unwrap();
+        std::fs::write(dir.join(format!("{name}.pem")), cert.pem()).unwrap();
+        std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem()).unwrap();
+    }
+}
+
+/// A TLS client config trusting `dir`'s cluster CA and presenting
+/// `dir/<name>.pem`.
+fn client_tls(dir: &Path, name: &str) -> Arc<rustls::ClientConfig> {
+    use rustls_pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    for c in rustls_pki_types::CertificateDer::pem_file_iter(dir.join("cluster-ca.pem")).unwrap() {
+        roots.add(c.unwrap()).unwrap();
+    }
+    let certs = rustls_pki_types::CertificateDer::pem_file_iter(dir.join(format!("{name}.pem")))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key =
+        rustls_pki_types::PrivateKeyDer::from_pem_file(dir.join(format!("{name}.key"))).unwrap();
+    Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certs, key)
+        .unwrap(),
+    )
 }
 
 #[test]
@@ -1226,6 +1267,42 @@ fn mtls_cluster_replicates() {
     let job = inserted(&on_f.put(b"secure"));
     let mut on_l = c.nodes[l].connect();
     assert_eq!(reserve(&mut on_l, "reserve-with-timeout 5"), job);
+
+    // P6-T2: the admin certificate reads the membership; a node's
+    // certificate, an admin certificate from another CA and plaintext are
+    // refused on the admin channel.
+    use bstk_raft::wire::{AdminRequest, AdminResponse};
+    let port = c.nodes[f].cluster;
+    let id = c.nodes[f].id;
+    let admin = admin_request_with(
+        port,
+        Some((id, client_tls(pki.path(), "admin"))),
+        AdminRequest::Membership,
+    );
+    match admin {
+        Ok(Some(AdminResponse::Membership(s))) => {
+            assert_eq!(s.membership.voters(), [1, 2, 3].into(), "{s:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+    let node = format!("node{}", c.nodes[l].id);
+    let refused = admin_request_with(
+        port,
+        Some((id, client_tls(pki.path(), &node))),
+        AdminRequest::Membership,
+    );
+    assert!(
+        matches!(&refused, Err(e) if e.contains("hello rejected")),
+        "{refused:?}"
+    );
+    let rogue = admin_request_with(
+        port,
+        Some((id, client_tls(pki.path(), "rogue-admin"))),
+        AdminRequest::Membership,
+    );
+    assert!(matches!(rogue, Ok(None) | Err(_)), "{rogue:?}");
+    let plain = admin_request_with(port, None, AdminRequest::Membership);
+    assert!(matches!(plain, Ok(None) | Err(_)), "{plain:?}");
 }
 
 /// A one-node cluster configuration in `dir` (plus `extra` in
@@ -1764,6 +1841,149 @@ fn single_node_cannot_rejoin() {
     assert!(err.contains("cannot rejoin"), "{err}");
 }
 
+/// One request on a plaintext admin connection (protocol version 4) to
+/// the cluster port `port`; `None` if the node does not answer.
+fn admin_request(
+    port: u16,
+    body: bstk_raft::wire::AdminRequest,
+) -> Option<bstk_raft::wire::AdminResponse> {
+    admin_request_with(port, None, body).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Like [`admin_request`], over TLS as node `tls.0` expects (`tls.1`
+/// presents the client certificate). `Err`: the hello was refused.
+fn admin_request_with(
+    port: u16,
+    tls: Option<(u64, Arc<rustls::ClientConfig>)>,
+    body: bstk_raft::wire::AdminRequest,
+) -> Result<Option<bstk_raft::wire::AdminResponse>, String> {
+    use bstk_raft::wire::{self, AdminHello, ClientMsg, ServerHello, ServerMsg};
+    trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {}
+    impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Io for T {}
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let Ok(tcp) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else {
+            return Ok(None);
+        };
+        let mut s: Box<dyn Io> = match tls {
+            None => Box::new(tcp),
+            Some((id, c)) => Box::new(
+                tokio_rustls::TlsConnector::from(c)
+                    .connect(bstk_raft::tls::server_name_for(id).unwrap(), tcp)
+                    .await
+                    .map_err(|e| format!("TLS handshake: {e}"))?,
+            ),
+        };
+        let hello = ClientMsg::AdminHello(AdminHello {
+            version: wire::PROTOCOL_VERSION,
+            to: None,
+        });
+        let f = wire::encode(&hello, wire::DEFAULT_MAX_FRAME).unwrap();
+        if wire::write_frame(&mut s, &f).await.is_err() {
+            return Ok(None);
+        }
+        match wire::read_frame::<_, ServerMsg>(&mut s, wire::DEFAULT_MAX_FRAME).await {
+            Ok(Some(ServerMsg::Hello(ServerHello::Accepted { .. }))) => {}
+            Ok(None) => return Ok(None),
+            other => return Err(format!("admin hello refused: {other:?}")),
+        }
+        let f = wire::encode(&ClientMsg::Admin { id: 1, body }, wire::DEFAULT_MAX_FRAME).unwrap();
+        if wire::write_frame(&mut s, &f).await.is_err() {
+            return Ok(None);
+        }
+        match wire::read_frame::<_, ServerMsg>(&mut s, wire::DEFAULT_MAX_FRAME).await {
+            Ok(Some(ServerMsg::Admin { id: 1, body })) => Ok(Some(body)),
+            _ => Ok(None),
+        }
+    })
+}
+
+fn admin_status(port: u16) -> Option<bstk_raft::status::NodeStatusEx> {
+    match admin_request(port, bstk_raft::wire::AdminRequest::Membership)? {
+        bstk_raft::wire::AdminResponse::Membership(s) => Some(*s),
+        other => panic!("membership expected: {other:?}"),
+    }
+}
+
+/// P6-T2: the admin channel's membership read reports each node's view,
+/// while Raft runs and before it does (a node waiting for its rejoin
+/// probes); membership changes answer `Unsupported` until P6-T4.
+#[test]
+fn admin_status_reports_the_membership_before_and_after_raft_runs() {
+    use bstk_raft::wire::{AdminRequest, AdminResponse};
+    let mut c = Cluster::start(3, &Opts::default());
+    let l = c.leader();
+    c.wait_all_ready();
+    let leader_id = c.nodes[l].id;
+    let mut log_id = None;
+    for n in &c.nodes {
+        let s = wait_for(Duration::from_secs(10), || {
+            admin_status(n.cluster).filter(|s| s.leader == Some(leader_id))
+        })
+        .unwrap_or_else(|| panic!("node {} never reported the leader", n.id));
+        assert!(s.raft_running && !s.rejoining, "{s:?}");
+        assert!(s.term >= 1 && s.status.has_state, "{s:?}");
+        assert!(s.last_applied.is_some(), "{s:?}");
+        let m = &s.membership;
+        assert_eq!(m.voters(), [1, 2, 3].into(), "{s:?}");
+        assert!(
+            m.learners().is_empty() && !m.is_joint() && m.committed,
+            "{s:?}"
+        );
+        assert_eq!(m.nodes[&n.id], format!("127.0.0.1:{}", n.cluster));
+        assert_eq!(s.highest_member, 3);
+        assert!(log_id.is_none() || log_id == m.log_id, "{s:?}");
+        log_id = m.log_id;
+    }
+    for req in [
+        AdminRequest::AddLearner {
+            id: 4,
+            addr: "127.0.0.1:1".into(),
+            expect: log_id,
+        },
+        AdminRequest::Promote {
+            ids: [3].into(),
+            expect: log_id,
+        },
+        AdminRequest::Remove {
+            id: 3,
+            expect: log_id,
+        },
+        AdminRequest::SetAddr {
+            id: 3,
+            addr: "127.0.0.1:1".into(),
+            expect: log_id,
+        },
+    ] {
+        assert_eq!(
+            admin_request(c.nodes[l].cluster, req),
+            Some(AdminResponse::Unsupported)
+        );
+    }
+
+    // Node 1 alone, in rejoin mode with its state kept (as after a crash
+    // during a rejoin): its probes find nobody, so Raft never starts, and
+    // the answer comes from storage.
+    for n in &mut c.nodes {
+        n.stop(Signal::SIGTERM);
+    }
+    std::fs::write(c.nodes[0].data_dir.join("rejoin"), b"rejoining\n").unwrap();
+    c.nodes[0].start(&[]);
+    let s = wait_for(Duration::from_secs(10), || admin_status(c.nodes[0].cluster))
+        .expect("no answer before Raft runs");
+    assert!(
+        !s.raft_running && s.rejoining && s.leader.is_none(),
+        "{s:?}"
+    );
+    assert_eq!(s.membership.voters(), [1, 2, 3].into(), "{s:?}");
+    assert_eq!(s.membership.log_id, log_id, "{s:?}");
+    assert_eq!(s.highest_member, 3, "{s:?}");
+    assert_eq!(s.term, s.status.vote.unwrap().leader_id().term, "{s:?}");
+}
+
 /// P6-T1: membership changes through the test-only hook (feature
 /// `test-hooks`, `cluster::test_hooks`; run by `scripts/check.sh` as
 /// `cargo test -p bstk-server --features test-hooks --test cluster membership::`).
@@ -1889,6 +2109,11 @@ mod membership {
         let addr4 = format!("127.0.0.1:{}", c.nodes[n4].cluster);
         let idx = c.hook(l, &format!("add-learner 4 {addr4}")).unwrap();
         c.wait_applied(&[0, 1, 2], idx);
+        // P6-T2: the admin channel reports the learner.
+        let s = admin_status(c.nodes[l].cluster).unwrap();
+        assert_eq!(s.membership.learners(), [4].into(), "{s:?}");
+        assert_eq!(s.membership.nodes[&4], addr4);
+        assert_eq!(s.highest_member, 4, "{s:?}");
         // Without --cluster-init and without state: started after it was
         // added (the runbook order), it catches up as a rejoining node.
         c.nodes[n4].start(&[]);
@@ -1904,6 +2129,9 @@ mod membership {
 
         let idx = c.hook(l, "change-membership 1,2,3,4").unwrap();
         c.wait_applied(&[0, 1, 2, n4], idx);
+        let s = admin_status(c.nodes[n4].cluster).unwrap();
+        assert_eq!(s.membership.voters(), [1, 2, 3, 4].into(), "{s:?}");
+        assert!(s.membership.learners().is_empty() && !s.membership.is_joint());
         let job = inserted(&on_learner.put(b"via-voter"));
         assert_eq!(reserve(&mut on_leader, "reserve-with-timeout 5"), job);
         for i in 0..3 {

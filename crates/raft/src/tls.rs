@@ -9,6 +9,13 @@
 //! that the id is a configured peer ([`verify_peer_identity`]), so nothing is
 //! processed for an unverified identity. rustls 0.23 with the aws-lc-rs
 //! provider is passed explicitly, not taken from the process default.
+//!
+//! Operator tools (the admin channel, protocol version 4) present a client
+//! certificate from the same CA whose only SAN DNS name is [`ADMIN_DNS_NAME`]
+//! ([`verify_admin_identity`]). The two identities exclude each other: a
+//! certificate carrying the admin name is refused as a node and one carrying
+//! any other name is refused as an admin, so a node's key cannot change
+//! membership and the admin key cannot replicate or forward.
 
 use std::fmt;
 use std::path::Path;
@@ -24,6 +31,9 @@ use crate::NodeId;
 pub fn node_dns_name(id: NodeId) -> String {
     format!("bstk-node-{id}")
 }
+
+/// The SAN DNS name of the operator (admin channel) certificate.
+pub const ADMIN_DNS_NAME: &str = "bstk-admin";
 
 /// The TLS configurations of one node: a client config for dialing peers
 /// and a server config for the cluster listener. Both present the node's
@@ -142,8 +152,17 @@ fn check_name(cert: &CertificateDer<'_>, id: NodeId) -> Result<(), String> {
         .map_err(|_| format!("certificate is not valid for {name}"))
 }
 
+/// The SAN DNS names of `cert` (webpki's parse; only for the exclusion
+/// checks, never instead of `verify_is_valid_for_subject_name`).
+fn dns_names(cert: &CertificateDer<'_>) -> Result<Vec<String>, String> {
+    let ee = webpki::EndEntityCert::try_from(cert)
+        .map_err(|e| format!("cannot parse certificate: {e}"))?;
+    Ok(ee.valid_dns_names().map(str::to_string).collect())
+}
+
 /// The listener's check after the hello: the (already CA-verified) client
-/// certificate chain `certs` must be valid for `bstk-node-<id>`.
+/// certificate chain `certs` must be valid for `bstk-node-<id>` and must
+/// not be an admin certificate.
 pub fn verify_peer_identity(
     certs: Option<&[CertificateDer<'_>]>,
     id: NodeId,
@@ -151,7 +170,34 @@ pub fn verify_peer_identity(
     let Some(leaf) = certs.and_then(|c| c.first()) else {
         return Err("no client certificate".into());
     };
-    check_name(leaf, id)
+    check_name(leaf, id)?;
+    if dns_names(leaf)?.iter().any(|n| n == ADMIN_DNS_NAME) {
+        return Err(format!(
+            "certificate carries the admin name {ADMIN_DNS_NAME}: refused as a node"
+        ));
+    }
+    Ok(())
+}
+
+/// The listener's check after an admin hello: the (already CA-verified)
+/// client certificate must be valid for [`ADMIN_DNS_NAME`] and carry no
+/// other DNS name (a node certificate is refused).
+pub fn verify_admin_identity(certs: Option<&[CertificateDer<'_>]>) -> Result<(), String> {
+    let Some(leaf) = certs.and_then(|c| c.first()) else {
+        return Err("no client certificate".into());
+    };
+    let name = ServerName::try_from(ADMIN_DNS_NAME).map_err(|e| e.to_string())?;
+    webpki::EndEntityCert::try_from(leaf)
+        .map_err(|e| format!("cannot parse certificate: {e}"))?
+        .verify_is_valid_for_subject_name(&name)
+        .map_err(|_| format!("certificate is not valid for {ADMIN_DNS_NAME}"))?;
+    let names = dns_names(leaf)?;
+    if names.iter().any(|n| n != ADMIN_DNS_NAME) {
+        return Err(format!(
+            "an admin certificate must carry only the name {ADMIN_DNS_NAME}, not {names:?}"
+        ));
+    }
+    Ok(())
 }
 
 pub fn server_name_for(target: NodeId) -> Result<ServerName<'static>, String> {

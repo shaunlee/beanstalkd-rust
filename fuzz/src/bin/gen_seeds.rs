@@ -11,7 +11,11 @@ use bstk_engine::{EngineInput, JobRecord, JournalEntry, RecordState};
 use bstk_proto::{Command, TubeName};
 use bstk_raft::forward::ControlRequest;
 use bstk_raft::storage::state_machine::fuzzing;
-use bstk_raft::wire::{self, ClientMsg, Hello, RpcRequest, RpcResponse, ServerHello, ServerMsg};
+use bstk_raft::status::{MembershipView, NodeStatus, NodeStatusEx};
+use bstk_raft::wire::{
+    self, AdminHello, AdminRequest, AdminResponse, ClientMsg, Hello, RpcRequest, RpcResponse,
+    ServerHello, ServerMsg, WireError,
+};
 use bstk_raft::{ForwardRequest, ForwardResponse, Op, Request};
 use bstk_store::{SyncPolicy, Wal, WalOptions};
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest, VoteResponse};
@@ -228,6 +232,27 @@ fn raft() {
             payload: EntryPayload::Blank,
         },
     ];
+    let joint = Membership::new(
+        vec![[1, 2].into(), [2, 3].into()],
+        (1..=4)
+            .map(|i| (i, BasicNode::new(format!("127.0.0.1:700{i}"))))
+            .collect::<BTreeMap<_, _>>(),
+    );
+    let status_ex = NodeStatusEx {
+        status: NodeStatus {
+            vote: Some(Vote::new_committed(3, 1)),
+            last_log_id: Some(LogId::new(leader, 14)),
+            committed: Some(LogId::new(leader, 14)),
+            has_state: true,
+        },
+        raft_running: true,
+        rejoining: false,
+        term: 3,
+        leader: Some(1),
+        last_applied: Some(LogId::new(leader, 14)),
+        highest_member: 4,
+        membership: MembershipView::new(Some(LogId::new(leader, 13)), &joint, false),
+    };
     let meta = SnapshotMeta {
         last_log_id: Some(LogId::new(leader, 14)),
         last_membership: StoredMembership::new(Some(LogId::new(leader, 13)), membership),
@@ -287,6 +312,49 @@ fn raft() {
             id: 12,
             body: RpcRequest::Status,
         },
+        // Protocol version 4 (P6-T2).
+        ClientMsg::Request {
+            id: 13,
+            body: RpcRequest::StatusEx,
+        },
+        ClientMsg::AdminHello(AdminHello {
+            version: wire::PROTOCOL_VERSION,
+            to: Some(2),
+        }),
+        ClientMsg::Admin {
+            id: 1,
+            body: AdminRequest::Membership,
+        },
+        ClientMsg::Admin {
+            id: 2,
+            body: AdminRequest::AddLearner {
+                id: 4,
+                addr: "127.0.0.1:7004".into(),
+                expect: Some(LogId::new(leader, 13)),
+            },
+        },
+        ClientMsg::Admin {
+            id: 3,
+            body: AdminRequest::Promote {
+                ids: [3, 4].into(),
+                expect: Some(LogId::new(leader, 13)),
+            },
+        },
+        ClientMsg::Admin {
+            id: 4,
+            body: AdminRequest::Remove {
+                id: 1,
+                expect: None,
+            },
+        },
+        ClientMsg::Admin {
+            id: 5,
+            body: AdminRequest::SetAddr {
+                id: 2,
+                addr: "[::1]:7002".into(),
+                expect: Some(LogId::new(leader, 13)),
+            },
+        },
     ];
     for (i, m) in requests.iter().enumerate() {
         write("raft_wire", &format!("client-{i}"), &frame(0, enc(m)));
@@ -307,6 +375,52 @@ fn raft() {
         ServerMsg::Response {
             id: 10,
             body: RpcResponse::Forward(Ok(ForwardResponse::Accepted)),
+        },
+        // Protocol version 4 (P6-T2).
+        ServerMsg::Response {
+            id: 13,
+            body: RpcResponse::StatusEx(Ok(Box::new(status_ex.clone()))),
+        },
+        ServerMsg::Response {
+            id: 13,
+            body: RpcResponse::StatusEx(Err(WireError::Rejected("seed".into()))),
+        },
+        ServerMsg::Admin {
+            id: 1,
+            body: AdminResponse::Membership(Box::new(status_ex)),
+        },
+        ServerMsg::Admin {
+            id: 2,
+            body: AdminResponse::Started,
+        },
+        ServerMsg::Admin {
+            id: 3,
+            body: AdminResponse::Done {
+                log_id: Some(LogId::new(leader, 15)),
+            },
+        },
+        ServerMsg::Admin {
+            id: 4,
+            body: AdminResponse::NotLeader {
+                leader: Some(1),
+                addr: Some("127.0.0.1:7001".into()),
+            },
+        },
+        ServerMsg::Admin {
+            id: 5,
+            body: AdminResponse::Conflict {
+                current: Some(LogId::new(leader, 13)),
+            },
+        },
+        ServerMsg::Admin {
+            id: 6,
+            body: AdminResponse::Refused {
+                reason: "seed".into(),
+            },
+        },
+        ServerMsg::Admin {
+            id: 7,
+            body: AdminResponse::Unsupported,
         },
     ];
     for (i, m) in replies.iter().enumerate() {

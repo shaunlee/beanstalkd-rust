@@ -119,6 +119,16 @@ impl Pki {
     }
 
     fn leaf(&self, names: &[String]) -> (String, String) {
+        self.leaf_with(
+            names,
+            vec![
+                ExtendedKeyUsagePurpose::ServerAuth,
+                ExtendedKeyUsagePurpose::ClientAuth,
+            ],
+        )
+    }
+
+    fn leaf_with(&self, names: &[String], ekus: Vec<ExtendedKeyUsagePurpose>) -> (String, String) {
         let mut params = CertificateParams::new(names.to_vec()).expect("params");
         params
             .distinguished_name
@@ -127,10 +137,7 @@ impl Pki {
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
         ];
-        params.extended_key_usages = vec![
-            ExtendedKeyUsagePurpose::ServerAuth,
-            ExtendedKeyUsagePurpose::ClientAuth,
-        ];
+        params.extended_key_usages = ekus;
         let key = KeyPair::generate().expect("key");
         let cert = params
             .signed_by(&key, &self.ca, &self.ca_key)
@@ -1076,6 +1083,8 @@ fn listener_defaults() {
     assert_eq!(c.max_handshakes_per_ip, 6);
     assert!(c.max_handshakes >= c.max_handshakes_per_ip);
     assert!(c.vote_gate.is_none());
+    assert_eq!(c.max_admin_conns, 4);
+    assert_eq!(c.admin_idle_timeout, Duration::from_secs(60));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1421,30 +1430,43 @@ async fn max_job_size_mismatch_is_rejected() {
     shutdown(vec![node]).await;
 }
 
+/// Older peers (version 3 is 0.5.x) and admin tools of another version
+/// are refused with the version reason: there is no negotiation (P6-T2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn old_protocol_version_is_rejected() {
+    assert_eq!(PROTOCOL_VERSION, 4);
     let (node, _) = single_target(None, None).await;
-    let mut s = tokio::net::TcpStream::connect(node.addr)
-        .await
-        .expect("connect");
-    let f = wire::encode(
-        &ClientMsg::Hello(Hello {
-            version: 1,
-            from: 2,
-            to: 1,
-            max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
-        }),
-        wire::DEFAULT_MAX_FRAME,
-    )
-    .expect("encode");
-    wire::write_frame(&mut s, &f).await.expect("hello");
-    let a: Option<ServerMsg> = wire::read_frame(&mut s, wire::DEFAULT_MAX_FRAME)
-        .await
-        .expect("answer");
-    assert!(
-        matches!(a, Some(ServerMsg::Hello(ServerHello::Rejected { ref reason })) if reason == crate::listener::REJECT_VERSION),
-        "{a:?}"
-    );
+    let mut hellos: Vec<ClientMsg> = [1, 3, PROTOCOL_VERSION + 1]
+        .into_iter()
+        .map(|version| {
+            ClientMsg::Hello(Hello {
+                version,
+                from: 2,
+                to: 1,
+                max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
+            })
+        })
+        .collect();
+    hellos.push(ClientMsg::AdminHello(wire::AdminHello {
+        version: 3,
+        to: None,
+    }));
+    for h in hellos {
+        let mut s = tokio::net::TcpStream::connect(node.addr)
+            .await
+            .expect("connect");
+        let f = wire::encode(&h, wire::DEFAULT_MAX_FRAME).expect("encode");
+        wire::write_frame(&mut s, &f).await.expect("hello");
+        let a: Option<ServerMsg> = wire::read_frame(&mut s, wire::DEFAULT_MAX_FRAME)
+            .await
+            .expect("answer");
+        assert!(
+            matches!(a, Some(ServerMsg::Hello(ServerHello::Rejected { ref reason })) if reason == crate::listener::REJECT_VERSION),
+            "{h:?}: {a:?}"
+        );
+        assert!(closes(&mut s).await);
+    }
+    assert_eq!(node.handler.calls(), 0);
     shutdown(vec![node]).await;
 }
 
@@ -1805,4 +1827,570 @@ async fn address_book_prefers_overrides_then_membership() {
     let e = c.vote(vote_req(2, 2), option()).await.expect_err("moved");
     assert!(matches!(e, RPCError::Unreachable(_)), "{e:?}");
     shutdown(vec![node]).await;
+}
+
+// ---- P6-T2: StatusEx and the admin channel ----
+
+struct FixedStatusEx(crate::status::NodeStatusEx);
+
+impl crate::status::StatusSource for FixedStatusEx {
+    fn status(&self) -> crate::status::NodeStatus {
+        self.0.status
+    }
+
+    fn status_ex(&self) -> crate::status::NodeStatusEx {
+        self.0.clone()
+    }
+}
+
+fn sample_status_ex() -> crate::status::NodeStatusEx {
+    let lid = |i| LogId::new(CommittedLeaderId::new(4, 3), i);
+    crate::status::NodeStatusEx {
+        status: crate::status::NodeStatus {
+            vote: Some(Vote::new_committed(4, 3)),
+            last_log_id: Some(lid(17)),
+            committed: Some(lid(15)),
+            has_state: true,
+        },
+        raft_running: false,
+        rejoining: true,
+        term: 4,
+        leader: None,
+        last_applied: Some(lid(12)),
+        highest_member: 4,
+        membership: crate::status::MembershipView {
+            log_id: Some(lid(10)),
+            committed: true,
+            configs: vec![[1, 2, 3].into()],
+            nodes: (1..=4).map(|i| (i, format!("127.0.0.1:{i}"))).collect(),
+        },
+    }
+}
+
+/// A listener for node 1 (peers 2 and 3) answering status from
+/// [`sample_status_ex`]; with `raft`, Raft (a single-node `MemLog`) and a
+/// counting handler are installed.
+async fn admin_target(
+    tls: Option<&ClusterTls>,
+    raft: bool,
+    edit: impl FnOnce(&mut ListenerConfig),
+) -> (
+    ClusterListener,
+    Option<Raft<TypeConfig>>,
+    Arc<CountingHandler>,
+    SocketAddr,
+) {
+    let tcp = bind().await;
+    let addr = tcp.local_addr().expect("addr");
+    let mut cfg = listener_config(1, &[1, 2, 3], tls);
+    cfg.status = Some(Arc::new(FixedStatusEx(sample_status_ex())));
+    edit(&mut cfg);
+    let (l, slot) = ClusterListener::spawn_deferred::<CountingHandler>(tcp, cfg).expect("listener");
+    let handler = Arc::new(CountingHandler::default());
+    let raft = if raft {
+        let net = Network::new(net_config(1, [(1, addr.to_string())].into(), None));
+        let r = Raft::new(1, raft_config(), net, MemLog::default(), MemSm::default())
+            .await
+            .expect("raft");
+        assert!(slot.set(r.clone(), handler.clone()));
+        Some(r)
+    } else {
+        None
+    };
+    (l, raft, handler, addr)
+}
+
+trait TestIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> TestIo for T {}
+
+impl Pki {
+    /// A client-only certificate (EKU clientAuth), as an operator's.
+    fn client_leaf(&self, names: &[String]) -> (String, String) {
+        self.leaf_with(names, vec![ExtendedKeyUsagePurpose::ClientAuth])
+    }
+
+    /// A client config presenting `cert` and trusting `trust`'s CA.
+    fn client_config(trust: &Pki, (cert, key): (String, String)) -> Arc<rustls::ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pki_types::CertificateDer::pem_slice_iter(trust.ca_pem().as_bytes()) {
+            roots.add(c.expect("ca")).expect("add");
+        }
+        let certs = rustls_pki_types::CertificateDer::pem_slice_iter(cert.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("certs");
+        let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(key.as_bytes()).expect("key");
+        let c = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_root_certificates(roots)
+        .with_client_auth_cert(certs, key)
+        .expect("client auth");
+        Arc::new(c)
+    }
+
+    /// The operator's TLS client config: SAN `bstk-admin`, clientAuth only.
+    fn admin(&self) -> Arc<rustls::ClientConfig> {
+        Pki::client_config(
+            self,
+            self.client_leaf(&[crate::tls::ADMIN_DNS_NAME.to_string()]),
+        )
+    }
+}
+
+/// Connects to node 1 at `addr` (TLS when `tls` is given), sends `hello`
+/// and returns the stream and the listener's answer, or why there was
+/// none (a TLS failure, a closed connection).
+async fn hello_with(
+    addr: SocketAddr,
+    tls: Option<Arc<rustls::ClientConfig>>,
+    hello: &ClientMsg,
+) -> Result<(Box<dyn TestIo>, ServerHello), String> {
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut io: Box<dyn TestIo> = match tls {
+        None => Box::new(tcp),
+        Some(c) => Box::new(
+            tokio_rustls::TlsConnector::from(c)
+                .connect(crate::tls::server_name_for(1).expect("name"), tcp)
+                .await
+                .map_err(|e| format!("TLS handshake: {e}"))?,
+        ),
+    };
+    let f = wire::encode(hello, wire::DEFAULT_MAX_FRAME).expect("encode");
+    wire::write_frame(&mut io, &f)
+        .await
+        .map_err(|e| e.to_string())?;
+    match wire::read_frame::<_, ServerMsg>(&mut io, wire::DEFAULT_MAX_FRAME).await {
+        Ok(Some(ServerMsg::Hello(h))) => Ok((io, h)),
+        other => Err(format!("{other:?}")),
+    }
+}
+
+fn admin_hello(to: Option<NodeId>) -> ClientMsg {
+    ClientMsg::AdminHello(wire::AdminHello {
+        version: PROTOCOL_VERSION,
+        to,
+    })
+}
+
+fn peer_hello(from: NodeId) -> ClientMsg {
+    ClientMsg::Hello(Hello {
+        version: PROTOCOL_VERSION,
+        from,
+        to: 1,
+        max_job_size: bstk_proto::DEFAULT_MAX_JOB_SIZE,
+    })
+}
+
+/// An accepted admin connection.
+async fn admin_conn(addr: SocketAddr, tls: Option<Arc<rustls::ClientConfig>>) -> Box<dyn TestIo> {
+    let (io, h) = hello_with(addr, tls, &admin_hello(Some(1)))
+        .await
+        .expect("answer");
+    assert!(
+        matches!(
+            h,
+            ServerHello::Accepted {
+                node_id: 1,
+                version: PROTOCOL_VERSION,
+                ..
+            }
+        ),
+        "{h:?}"
+    );
+    io
+}
+
+/// Sends `msg` and returns the next message, `None` if the connection
+/// closed (or failed) instead.
+async fn exchange(io: &mut Box<dyn TestIo>, msg: &ClientMsg) -> Option<ServerMsg> {
+    let f = wire::encode(msg, wire::DEFAULT_MAX_FRAME).expect("encode");
+    wire::write_frame(io, &f).await.ok()?;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        wire::read_frame::<_, ServerMsg>(io, wire::DEFAULT_MAX_FRAME),
+    )
+    .await
+    .expect("answer or close in time")
+    .ok()?
+}
+
+async fn admin_call(
+    io: &mut Box<dyn TestIo>,
+    id: u64,
+    body: wire::AdminRequest,
+) -> wire::AdminResponse {
+    match exchange(io, &ClientMsg::Admin { id, body }).await {
+        Some(ServerMsg::Admin { id: got, body }) if got == id => body,
+        other => panic!("admin answer expected: {other:?}"),
+    }
+}
+
+fn mutating_requests() -> Vec<wire::AdminRequest> {
+    let expect = Some(LogId::new(CommittedLeaderId::new(4, 3), 10));
+    vec![
+        wire::AdminRequest::AddLearner {
+            id: 5,
+            addr: "127.0.0.1:5".into(),
+            expect,
+        },
+        wire::AdminRequest::Promote {
+            ids: [4].into(),
+            expect,
+        },
+        wire::AdminRequest::Remove { id: 3, expect },
+        wire::AdminRequest::SetAddr {
+            id: 2,
+            addr: "127.0.0.1:22".into(),
+            expect,
+        },
+    ]
+}
+
+fn rejected(h: &Result<(Box<dyn TestIo>, ServerHello), String>, reason: &str) -> bool {
+    matches!(h, Ok((_, ServerHello::Rejected { reason: r })) if r == reason)
+}
+
+/// P6-T2: StatusEx is answered from the status source before Raft runs and
+/// after, needs an accepted hello, and falls back to the durable state for
+/// a source that knows no more; without a source it is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_ex_is_answered_before_and_after_raft_runs() {
+    let tcp = bind().await;
+    let addr = tcp.local_addr().expect("addr").to_string();
+    let mut cfg = listener_config(1, &[1, 2, 3], None);
+    cfg.status = Some(Arc::new(FixedStatusEx(sample_status_ex())));
+    let (listener, slot) =
+        ClusterListener::spawn_deferred::<CountingHandler>(tcp, cfg).expect("listener");
+    let net = Network::new(net_config(2, [(1, addr.clone())].into(), None));
+    assert_eq!(net.status_ex(1).await.expect("before"), sample_status_ex());
+    assert_eq!(
+        crate::status::StatusTransport::status_ex(&net, 1)
+            .await
+            .expect("trait"),
+        sample_status_ex()
+    );
+    let stranger = Network::new(net_config(9, [(1, addr.clone())].into(), None));
+    let e = stranger.status_ex(1).await.expect_err("unknown peer");
+    assert!(matches!(e, ForwardError::Unreachable(_)), "{e:?}");
+
+    let raft = Raft::new(
+        1,
+        raft_config(),
+        Network::new(net_config(1, [(1, addr.clone())].into(), None)),
+        MemLog::default(),
+        MemSm::default(),
+    )
+    .await
+    .expect("raft");
+    assert!(slot.set(raft.clone(), Arc::new(CountingHandler::default())));
+    assert_eq!(net.status_ex(1).await.expect("after"), sample_status_ex());
+    assert_eq!(
+        net.status(1).await.expect("status"),
+        sample_status_ex().status
+    );
+    listener.shutdown().await;
+    let _ = raft.shutdown().await;
+
+    // A source with only the durable state (the log store): the default.
+    let tcp = bind().await;
+    let addr = tcp.local_addr().expect("addr").to_string();
+    let durable = sample_status_ex().status;
+    let mut cfg = listener_config(1, &[1, 2, 3], None);
+    cfg.status = Some(Arc::new(FixedStatus(durable)));
+    let (listener, _slot) =
+        ClusterListener::spawn_deferred::<CountingHandler>(tcp, cfg).expect("listener");
+    let net = Network::new(net_config(2, [(1, addr.clone())].into(), None));
+    let got = net.status_ex(1).await.expect("default");
+    assert_eq!(got, crate::status::NodeStatusEx::from_status(durable));
+    assert_eq!(got.term, 4);
+    assert!(!got.raft_running && got.membership.nodes.is_empty());
+    listener.shutdown().await;
+
+    let (l, raft, addr) = lone_listener(|_| {}).await;
+    let net = Network::new(net_config(2, [(1, addr.to_string())].into(), None));
+    let e = net.status_ex(1).await.expect_err("no source");
+    assert!(
+        matches!(&e, ForwardError::Rejected(m) if m.contains("not served")),
+        "{e:?}"
+    );
+    l.shutdown().await;
+    let _ = raft.shutdown().await;
+}
+
+/// P6-T2: under mTLS the admin channel takes exactly the `bstk-admin`
+/// certificate from the cluster CA; node certificates, certificates from
+/// another CA and certificates naming both identities are refused, and the
+/// admin certificate is refused as a peer. Membership changes answer
+/// `Unsupported` and leave Raft untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_channel_identity_under_mtls() {
+    let pki = Pki::new("cluster CA");
+    let rogue = Pki::new("rogue CA");
+    let (l, raft, handler, addr) = admin_target(Some(&pki.node(1)), true, |_| {}).await;
+    let raft = raft.expect("raft");
+    let before = raft.metrics().borrow().membership_config.clone();
+
+    let mut io = admin_conn(addr, Some(pki.admin())).await;
+    assert_eq!(
+        admin_call(&mut io, 1, wire::AdminRequest::Membership).await,
+        wire::AdminResponse::Membership(Box::new(sample_status_ex()))
+    );
+    for (i, req) in (2..).zip(mutating_requests()) {
+        assert_eq!(
+            admin_call(&mut io, i, req).await,
+            wire::AdminResponse::Unsupported
+        );
+    }
+    assert_eq!(raft.metrics().borrow().membership_config, before);
+    // Any node may be asked without naming it; naming another is refused.
+    drop(io);
+    let (_io, h) = hello_with(addr, Some(pki.admin()), &admin_hello(None))
+        .await
+        .expect("answer");
+    assert!(matches!(h, ServerHello::Accepted { .. }), "{h:?}");
+    let h = hello_with(addr, Some(pki.admin()), &admin_hello(Some(2))).await;
+    assert!(rejected(&h, REJECT_HELLO), "{:?}", h.as_ref().map(|r| &r.1));
+
+    // A node's certificate on the admin channel.
+    let node2 = pki.node(2).client;
+    let h = hello_with(addr, Some(node2.clone()), &admin_hello(Some(1))).await;
+    assert!(rejected(&h, REJECT_HELLO), "{:?}", h.as_ref().map(|r| &r.1));
+    // The admin certificate as a peer (any id).
+    for from in [2, 3] {
+        let h = hello_with(addr, Some(pki.admin()), &peer_hello(from)).await;
+        assert!(rejected(&h, REJECT_HELLO), "{:?}", h.as_ref().map(|r| &r.1));
+    }
+    // A certificate carrying both names is neither.
+    let both = Pki::client_config(
+        &pki,
+        pki.leaf(&[crate::tls::ADMIN_DNS_NAME.into(), node_dns_name(2)]),
+    );
+    let h = hello_with(addr, Some(both.clone()), &admin_hello(Some(1))).await;
+    assert!(rejected(&h, REJECT_HELLO), "{:?}", h.as_ref().map(|r| &r.1));
+    let h = hello_with(addr, Some(both), &peer_hello(2)).await;
+    assert!(rejected(&h, REJECT_HELLO), "{:?}", h.as_ref().map(|r| &r.1));
+    // An admin certificate from another CA fails the TLS handshake.
+    let h = hello_with(addr, Some(rogue.admin()), &admin_hello(Some(1))).await;
+    assert!(h.is_err(), "{:?}", h.as_ref().map(|r| &r.1));
+    // A plaintext admin hello on a TLS listener.
+    let h = hello_with(addr, None, &admin_hello(Some(1))).await;
+    assert!(h.is_err(), "{:?}", h.as_ref().map(|r| &r.1));
+    // The node certificate still works as the node.
+    let (_io, h) = hello_with(addr, Some(node2), &peer_hello(2))
+        .await
+        .expect("answer");
+    assert!(matches!(h, ServerHello::Accepted { .. }), "{h:?}");
+
+    assert_eq!(handler.calls(), 0);
+    l.shutdown().await;
+    let _ = raft.shutdown().await;
+}
+
+#[test]
+fn identity_checks_exclude_each_other() {
+    use crate::tls::{ADMIN_DNS_NAME, verify_admin_identity, verify_peer_identity};
+    let pki = Pki::new("cluster CA");
+    let der = |(cert, _): (String, String)| {
+        rustls_pki_types::CertificateDer::pem_slice_iter(cert.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .expect("certs")
+    };
+    let admin = der(pki.client_leaf(&[ADMIN_DNS_NAME.into()]));
+    let node = der(pki.leaf(&[node_dns_name(2)]));
+    let both = der(pki.leaf(&[ADMIN_DNS_NAME.into(), node_dns_name(2)]));
+    let other = der(pki.client_leaf(&["bstk-admin.example".into()]));
+    assert_eq!(verify_admin_identity(Some(&admin)), Ok(()));
+    assert!(verify_admin_identity(Some(&node)).is_err());
+    assert!(verify_admin_identity(Some(&both)).is_err());
+    assert!(verify_admin_identity(Some(&other)).is_err());
+    assert!(verify_admin_identity(None).is_err());
+    assert_eq!(verify_peer_identity(Some(&node), 2), Ok(()));
+    assert!(verify_peer_identity(Some(&admin), 2).is_err());
+    assert!(verify_peer_identity(Some(&both), 2).is_err());
+}
+
+#[test]
+fn plaintext_admin_only_from_loopback() {
+    use crate::listener::plaintext_admin_allowed;
+    for ok in ["127.0.0.1", "127.9.9.9", "::1", "::ffff:127.0.0.1"] {
+        assert!(plaintext_admin_allowed(ok.parse().expect("ip")), "{ok}");
+    }
+    for no in [
+        "10.0.0.1",
+        "0.0.0.0",
+        "::",
+        "::ffff:10.0.0.1",
+        "fe80::1",
+        "192.168.1.1",
+    ] {
+        assert!(!plaintext_admin_allowed(no.parse().expect("ip")), "{no}");
+    }
+}
+
+/// P6-T2: in plaintext mode an admin tool on loopback is accepted (and its
+/// membership read is served before Raft runs too).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plaintext_admin_from_loopback_is_accepted() {
+    let (l, _, _, addr) = admin_target(None, false, |_| {}).await;
+    let mut io = admin_conn(addr, None).await;
+    assert_eq!(
+        admin_call(&mut io, 1, wire::AdminRequest::Membership).await,
+        wire::AdminResponse::Membership(Box::new(sample_status_ex()))
+    );
+    for (i, req) in (2..).zip(mutating_requests()) {
+        assert_eq!(
+            admin_call(&mut io, i, req).await,
+            wire::AdminResponse::Unsupported
+        );
+    }
+    l.shutdown().await;
+
+    // Without a status source the read is refused, not failed.
+    let (l, raft, addr) = lone_listener(|_| {}).await;
+    let mut io = admin_conn(addr, None).await;
+    assert!(matches!(
+        admin_call(&mut io, 1, wire::AdminRequest::Membership).await,
+        wire::AdminResponse::Refused { .. }
+    ));
+    l.shutdown().await;
+    let _ = raft.shutdown().await;
+}
+
+/// P6-T2: an admin connection carries nothing but admin requests (no
+/// forwards, Raft RPCs, controls, status probes or hellos), and a peer
+/// connection no admin request: either closes the connection before
+/// anything is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_and_peer_channels_do_not_mix() {
+    let (l, raft, handler, addr) = admin_target(None, true, |_| {}).await;
+    let raft = raft.expect("raft");
+    let vote_before = raft.metrics().borrow().vote;
+    let requests = [
+        wire::RpcRequest::Forward(forward_from(2)),
+        wire::RpcRequest::Vote(vote_req(9, 2)),
+        wire::RpcRequest::AppendEntries(heartbeat()),
+        wire::RpcRequest::Control(ControlRequest {
+            from: 2,
+            op: Op::SetDraining(true),
+        }),
+        wire::RpcRequest::Status,
+        wire::RpcRequest::StatusEx,
+    ];
+    for body in requests {
+        let mut io = admin_conn(addr, None).await;
+        let got = exchange(&mut io, &ClientMsg::Request { id: 1, body }).await;
+        assert!(got.is_none(), "answered on an admin connection: {got:?}");
+    }
+    for hello in [admin_hello(Some(1)), peer_hello(2)] {
+        let mut io = admin_conn(addr, None).await;
+        assert!(exchange(&mut io, &hello).await.is_none());
+    }
+    // An admin request above the admin frame limit.
+    let mut io = admin_conn(addr, None).await;
+    let big = wire::AdminRequest::AddLearner {
+        id: 5,
+        addr: "a".repeat(wire::MAX_NODE_ADDR_LEN),
+        expect: None,
+    };
+    let mut f = wire::encode(
+        &ClientMsg::Admin { id: 1, body: big },
+        wire::DEFAULT_MAX_FRAME,
+    )
+    .expect("encode");
+    f[..4].copy_from_slice(&(wire::ADMIN_MAX_REQUEST_FRAME as u32 + 1).to_be_bytes());
+    let _ = io.write_all(&f).await;
+    let r = tokio::time::timeout(
+        Duration::from_secs(2),
+        wire::read_frame::<_, ServerMsg>(&mut io, wire::DEFAULT_MAX_FRAME),
+    )
+    .await
+    .expect("closed in time");
+    assert!(!matches!(r, Ok(Some(_))), "{r:?}");
+
+    // A peer sending an admin request.
+    for body in [
+        wire::AdminRequest::Membership,
+        mutating_requests().remove(0),
+    ] {
+        let (mut io, h) = hello_with(addr, None, &peer_hello(2))
+            .await
+            .expect("answer");
+        assert!(matches!(h, ServerHello::Accepted { .. }), "{h:?}");
+        assert!(
+            exchange(&mut io, &ClientMsg::Admin { id: 1, body })
+                .await
+                .is_none()
+        );
+    }
+    // An admin request before any hello.
+    let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let mut io: Box<dyn TestIo> = Box::new(tcp);
+    assert!(
+        exchange(
+            &mut io,
+            &ClientMsg::Admin {
+                id: 1,
+                body: wire::AdminRequest::Membership
+            }
+        )
+        .await
+        .is_none()
+    );
+
+    assert_eq!(handler.calls(), 0);
+    assert!(handler.controls.lock().expect("lock").is_empty());
+    assert_eq!(raft.metrics().borrow().vote, vote_before);
+    l.shutdown().await;
+    let _ = raft.shutdown().await;
+}
+
+/// P6-T2: admin connections have their own small budget (beyond it the
+/// hello is refused with a reason) and close when idle; they never take a
+/// peer's slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_connections_are_limited_and_time_out() {
+    let (l, _, _, addr) = admin_target(None, false, |c| {
+        c.max_admin_conns = 1;
+        c.admin_idle_timeout = Duration::from_millis(300);
+    })
+    .await;
+    let mut first = admin_conn(addr, None).await;
+    let h = hello_with(addr, None, &admin_hello(None)).await;
+    assert!(
+        rejected(&h, crate::listener::REJECT_ADMIN_BUSY),
+        "{:?}",
+        h.as_ref().map(|r| &r.1)
+    );
+    // Peers are unaffected.
+    let mut peer = raw_hello(addr, 2).await;
+    // Requests keep it open past the idle timeout; silence closes it.
+    for i in 0..3 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(matches!(
+            admin_call(&mut first, i, wire::AdminRequest::Membership).await,
+            wire::AdminResponse::Membership(_)
+        ));
+    }
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(2), first.read(&mut buf))
+        .await
+        .expect("closed in time");
+    assert!(matches!(n, Ok(0) | Err(_)), "{n:?}");
+    // The slot is free again.
+    let _again = admin_conn(addr, None).await;
+    assert!(!closes_within(&mut peer, Duration::from_millis(100)).await);
+    l.shutdown().await;
+}
+
+/// Whether `s` closes within `d` (false: still open).
+async fn closes_within(s: &mut tokio::net::TcpStream, d: Duration) -> bool {
+    let mut buf = [0u8; 16];
+    matches!(
+        tokio::time::timeout(d, s.read(&mut buf)).await,
+        Ok(Ok(0) | Err(_))
+    )
 }

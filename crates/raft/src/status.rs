@@ -6,6 +6,10 @@
 //! has not started Raft yet (a rejoining node probing its peers, or an
 //! initial node deciding whether to bootstrap) can be asked too.
 //!
+//! [`crate::wire::RpcRequest::StatusEx`] (protocol version 4) answers the same
+//! durable state plus the node's view of the membership ([`NodeStatusEx`]),
+//! in the same situations.
+//!
 //! # Vote order
 //!
 //! Comparisons use openraft's own `PartialOrd` on `Vote`: without its
@@ -17,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
-use openraft::{LogId, Vote};
+use openraft::{BasicNode, LogId, Membership, StoredMembership, Vote};
 use serde::{Deserialize, Serialize};
 
 use crate::NodeId;
@@ -47,9 +51,108 @@ impl NodeStatus {
     }
 }
 
-/// Answers status probes (implemented by the log store).
+/// A node's view of the cluster membership (protocol version 4). Mirrors
+/// openraft's `Membership`: voter sets (`configs`, two in a joint
+/// configuration) and every node, voters and learners, with its address.
+/// Decoding is bounded like the membership of a log entry (see
+/// [`crate::wire`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct MembershipView {
+    /// The membership entry's log id (`None`: no membership).
+    pub log_id: Option<LogId<NodeId>>,
+    /// Whether that entry is committed, as far as this node knows.
+    pub committed: bool,
+    #[serde(deserialize_with = "crate::wire::bounded_voter_sets")]
+    pub configs: Vec<BTreeSet<NodeId>>,
+    #[serde(deserialize_with = "crate::wire::bounded_node_addrs")]
+    pub nodes: BTreeMap<NodeId, String>,
+}
+
+impl MembershipView {
+    pub fn new(
+        log_id: Option<LogId<NodeId>>,
+        m: &Membership<NodeId, BasicNode>,
+        committed: bool,
+    ) -> Self {
+        MembershipView {
+            log_id,
+            committed,
+            configs: m.get_joint_config().clone(),
+            nodes: m.nodes().map(|(&id, n)| (id, n.addr.clone())).collect(),
+        }
+    }
+
+    pub fn from_stored(m: &StoredMembership<NodeId, BasicNode>, committed: bool) -> Self {
+        Self::new(*m.log_id(), m.membership(), committed)
+    }
+
+    pub fn is_joint(&self) -> bool {
+        self.configs.len() > 1
+    }
+
+    /// Voters of every config (both halves of a joint configuration).
+    pub fn voters(&self) -> BTreeSet<NodeId> {
+        self.configs.iter().flatten().copied().collect()
+    }
+
+    /// Nodes that are in no voter set.
+    pub fn learners(&self) -> BTreeSet<NodeId> {
+        let voters = self.voters();
+        self.nodes
+            .keys()
+            .filter(|id| !voters.contains(id))
+            .copied()
+            .collect()
+    }
+
+    pub fn is_member(&self, id: NodeId) -> bool {
+        self.nodes.contains_key(&id)
+    }
+}
+
+/// The answer to a [`crate::wire::RpcRequest::StatusEx`] probe: the durable
+/// state of [`NodeStatus`] plus what the node knows about the cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NodeStatusEx {
+    pub status: NodeStatus,
+    /// Raft runs on the node; otherwise the answer comes from its storage
+    /// alone (a node still probing its peers at startup), so `leader` is
+    /// unknown and `term` is that of its vote.
+    pub raft_running: bool,
+    /// The node rejoins after data loss and does not vote yet.
+    pub rejoining: bool,
+    pub term: u64,
+    pub leader: Option<NodeId>,
+    pub last_applied: Option<LogId<NodeId>>,
+    /// The highest node id this node knows was ever a member: the applied
+    /// record (`SmMeta::highest_member`) or an id of `membership`, whichever
+    /// is higher (0 if none). Ids at or below it are never reused.
+    pub highest_member: NodeId,
+    /// The effective membership (the latest in the node's log, committed
+    /// or not).
+    pub membership: MembershipView,
+}
+
+impl NodeStatusEx {
+    /// What storage alone tells: no membership, Raft not running.
+    pub fn from_status(status: NodeStatus) -> Self {
+        NodeStatusEx {
+            term: status.vote.map_or(0, |v| v.leader_id().term),
+            status,
+            ..NodeStatusEx::default()
+        }
+    }
+}
+
+/// Answers status probes (implemented by the log store, and by the server's
+/// richer source).
 pub trait StatusSource: Send + Sync + 'static {
     fn status(&self) -> NodeStatus;
+
+    /// The default knows only the durable state ([`NodeStatusEx::from_status`]).
+    fn status_ex(&self) -> NodeStatusEx {
+        NodeStatusEx::from_status(self.status())
+    }
 }
 
 pub trait StatusTransport: Clone + Send + Sync + 'static {
@@ -57,6 +160,11 @@ pub trait StatusTransport: Clone + Send + Sync + 'static {
         &self,
         target: NodeId,
     ) -> impl Future<Output = Result<NodeStatus, ForwardError>> + Send;
+
+    fn status_ex(
+        &self,
+        target: NodeId,
+    ) -> impl Future<Output = Result<NodeStatusEx, ForwardError>> + Send;
 }
 
 /// Asks every node of `peers` other than `id` for its status, at once.

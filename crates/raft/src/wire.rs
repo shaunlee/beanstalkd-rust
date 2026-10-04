@@ -8,6 +8,12 @@
 //! [`ServerMsg::Response`] with the same request id. Remote failures are
 //! values ([`WireError`]), never a dropped connection.
 //!
+//! An operator tool sends [`ClientMsg::AdminHello`] instead (protocol version
+//! 4): the connection then carries only [`ClientMsg::Admin`] requests, each
+//! answered by a [`ServerMsg::Admin`]; a peer connection carries no admin
+//! request and an admin connection nothing else (docs/DESIGN.md §8 "Cluster
+//! protocol v4 and the admin channel").
+//!
 //! openraft's own error types are not sent as is: `StorageError` embeds a
 //! recursive `AnyError` chain that could exhaust the receiver's stack while
 //! decoding. [`WireError`] is flat.
@@ -18,7 +24,9 @@
 //! items ([`MAX_BATCH_ITEMS`]), membership node sets ([`MAX_MEMBERS`],
 //! [`MAX_JOINT_CONFIGS`]) and snapshot meta text ([`MAX_SNAPSHOT_ID_LEN`],
 //! [`MAX_NODE_ADDR_LEN`]). A request beyond a limit is a decode error, which
-//! closes the connection. Status probes have a fixed size and need no bound.
+//! closes the connection. Status probes have a fixed size and need no bound;
+//! the membership in a [`RpcResponse::StatusEx`] or an [`AdminResponse`] and
+//! the ids and addresses of an [`AdminRequest`] are bounded the same way.
 
 use std::fmt;
 use std::io;
@@ -34,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::forward::{ControlRequest, ControlResponse};
-use crate::status::NodeStatus;
+use crate::status::{NodeStatus, NodeStatusEx};
 use crate::{ForwardRequest, ForwardResponse, NodeId, TypeConfig};
 
 /// Version of this wire protocol, carried in the hellos.
@@ -44,7 +52,11 @@ use crate::{ForwardRequest, ForwardResponse, NodeId, TypeConfig};
 ///   `-z` are rejected), and control requests ([`RpcRequest::Control`]).
 /// - 3: P3-FC: status probes ([`RpcRequest::Status`]), answered from the
 ///   log store even before Raft runs (safe rejoin, `--cluster-init`).
-pub const PROTOCOL_VERSION: u32 = 3;
+/// - 4: P6-T2: [`RpcRequest::StatusEx`] (status plus membership) and the
+///   admin channel ([`ClientMsg::AdminHello`], [`AdminRequest`]). Appended
+///   variants only; nodes still require an exact version (0.5.0 was never
+///   released, so no deployed cluster needs negotiation).
+pub const PROTOCOL_VERSION: u32 = 4;
 
 pub const HEADER_LEN: usize = 4;
 
@@ -86,6 +98,15 @@ pub const MAX_SNAPSHOT_ID_LEN: usize = 256;
 /// the store's `MAX_META_LEN`).
 pub const MAX_NODE_ADDR_LEN: usize = 1024;
 
+/// Longest refusal reason accepted in an [`AdminResponse`], in bytes.
+pub const MAX_ADMIN_REASON_LEN: usize = 1024;
+
+/// Largest admin request frame a listener reads (the biggest, a `Promote`
+/// of [`MAX_MEMBERS`] ids, is about 1 KiB). Answers may be larger: a
+/// membership of [`MAX_MEMBERS`] nodes with the longest addresses is about
+/// 270 KiB.
+pub const ADMIN_MAX_REQUEST_FRAME: usize = 64 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub version: u32,
@@ -110,16 +131,116 @@ pub enum ServerHello {
     },
 }
 
+/// The hello of an operator tool (protocol version 4). It claims no node
+/// id: under mTLS the client certificate must carry exactly the SAN
+/// [`crate::tls::ADMIN_DNS_NAME`]; in plaintext mode the source must be a
+/// loopback address. Answered by a [`ServerHello`] like a peer's hello.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminHello {
+    pub version: u32,
+    /// The node the tool means to reach (`None`: whichever answers); a
+    /// mismatch is rejected like a misaddressed peer hello.
+    pub to: Option<NodeId>,
+}
+
+/// Variants are only ever appended: their indexes are the encoding.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMsg {
     Hello(Hello),
-    Request { id: u64, body: RpcRequest },
+    Request {
+        id: u64,
+        body: RpcRequest,
+    },
+    /// Version 4.
+    AdminHello(AdminHello),
+    /// Version 4: on an admin connection only.
+    Admin {
+        id: u64,
+        body: AdminRequest,
+    },
 }
 
+/// Variants are only ever appended: their indexes are the encoding.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMsg {
     Hello(ServerHello),
-    Response { id: u64, body: RpcResponse },
+    Response {
+        id: u64,
+        body: RpcResponse,
+    },
+    /// Version 4: the answer to [`ClientMsg::Admin`].
+    Admin {
+        id: u64,
+        body: AdminResponse,
+    },
+}
+
+/// An operator request (protocol version 4). Each change carries `expect`,
+/// the membership log id the operator saw: the node refuses the change with
+/// [`AdminResponse::Conflict`] if its membership is another one
+/// (compare-and-set), so two operators cannot both act on the same view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdminRequest {
+    /// The node's status and membership view ([`AdminResponse::Membership`]).
+    Membership,
+    AddLearner {
+        id: NodeId,
+        #[serde(deserialize_with = "bounded::node_addr")]
+        addr: String,
+        expect: Option<LogId<NodeId>>,
+    },
+    Promote {
+        #[serde(deserialize_with = "bounded::node_ids")]
+        ids: std::collections::BTreeSet<NodeId>,
+        expect: Option<LogId<NodeId>>,
+    },
+    Remove {
+        id: NodeId,
+        expect: Option<LogId<NodeId>>,
+    },
+    SetAddr {
+        id: NodeId,
+        #[serde(deserialize_with = "bounded::node_addr")]
+        addr: String,
+        expect: Option<LogId<NodeId>>,
+    },
+}
+
+impl AdminRequest {
+    /// Whether the request asks for a membership change.
+    pub fn is_change(&self) -> bool {
+        !matches!(self, AdminRequest::Membership)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AdminResponse {
+    Membership(Box<NodeStatusEx>),
+    /// The leader accepted the change and runs it in the background; poll
+    /// [`AdminRequest::Membership`] for the outcome.
+    Started,
+    /// The change is complete (or there was nothing to do); `log_id` is the
+    /// resulting membership's.
+    Done {
+        log_id: Option<LogId<NodeId>>,
+    },
+    /// Changes are made by the leader: ask it.
+    NotLeader {
+        leader: Option<NodeId>,
+        #[serde(deserialize_with = "bounded::opt_node_addr")]
+        addr: Option<String>,
+    },
+    /// `expect` is not the current membership's log id.
+    Conflict {
+        current: Option<LogId<NodeId>>,
+    },
+    /// A guardrail refused the change.
+    Refused {
+        #[serde(deserialize_with = "bounded::admin_reason")]
+        reason: String,
+    },
+    /// This node does not implement the request.
+    Unsupported,
 }
 
 /// A request. The same encoding as the derived one; decoding applies the
@@ -136,6 +257,9 @@ pub enum RpcRequest {
     /// The peer's durable Raft state (version 3), answered from its log
     /// store whether or not its Raft is running (see [`crate::status`]).
     Status,
+    /// [`RpcRequest::Status`] plus the node's membership view (version 4),
+    /// served in the same situations.
+    StatusEx,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -151,6 +275,7 @@ pub enum RpcResponse {
         committed: Option<LogId<NodeId>>,
         has_state: bool,
     },
+    StatusEx(Result<Box<NodeStatusEx>, WireError>),
 }
 
 impl RpcResponse {
@@ -365,6 +490,65 @@ mod bounded {
         }
     }
 
+    pub(super) fn admin_reason<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+        d.deserialize_str(StrVisitor {
+            max: super::MAX_ADMIN_REASON_LEN,
+        })
+    }
+
+    struct OptAddrVisitor;
+
+    impl<'de> Visitor<'de> for OptAddrVisitor {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "an optional string of at most {MAX_NODE_ADDR_LEN} bytes")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            node_addr(d).map(Some)
+        }
+    }
+
+    pub(super) fn opt_node_addr<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<String>, D::Error> {
+        d.deserialize_option(OptAddrVisitor)
+    }
+
+    pub(super) fn node_ids<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeSet<NodeId>, D::Error> {
+        let ids: Vec<NodeId> = seq(d, MAX_MEMBERS)?;
+        Ok(ids.into_iter().collect())
+    }
+
+    pub(super) fn voter_sets<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<BTreeSet<NodeId>>, D::Error> {
+        Ok(configs(d)?.into_iter().map(|c| c.0).collect())
+    }
+
+    struct Addr(String);
+
+    impl<'de> Deserialize<'de> for Addr {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            node_addr(d).map(Addr)
+        }
+    }
+
+    pub(super) fn node_addrs<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<BTreeMap<NodeId, String>, D::Error> {
+        let m: BTreeMap<NodeId, Addr> = d.deserialize_map(MapVisitor {
+            max: MAX_MEMBERS,
+            _kv: PhantomData,
+        })?;
+        Ok(m.into_iter().map(|(id, a)| (id, a.0)).collect())
+    }
+
     fn snapshot_id<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
         d.deserialize_str(StrVisitor {
             max: MAX_SNAPSHOT_ID_LEN,
@@ -377,7 +561,7 @@ mod bounded {
         addr: String,
     }
 
-    fn node_addr<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    pub(super) fn node_addr<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
         d.deserialize_str(StrVisitor {
             max: MAX_NODE_ADDR_LEN,
         })
@@ -588,6 +772,20 @@ mod bounded {
             items: f.items,
         })
     }
+}
+
+/// Bounded decoding of [`crate::status::MembershipView`]'s voter sets.
+pub(crate) fn bounded_voter_sets<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<std::collections::BTreeSet<NodeId>>, D::Error> {
+    bounded::voter_sets(d)
+}
+
+/// Bounded decoding of [`crate::status::MembershipView`]'s node addresses.
+pub(crate) fn bounded_node_addrs<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<std::collections::BTreeMap<NodeId, String>, D::Error> {
+    bounded::node_addrs(d)
 }
 
 /// Longest peer-supplied text kept by [`sanitize`], in characters.
@@ -1250,6 +1448,432 @@ mod tests {
             [2, 0]
         );
         assert_eq!(postcard::to_allocvec(&batch(0)).expect("encode"), [4, 0]);
+    }
+
+    fn lid(term: u64, index: u64) -> LogId<NodeId> {
+        LogId::new(CommittedLeaderId::new(term, 1), index)
+    }
+
+    /// A joint membership: voters {1,2,3} → {2,3,4}, learner 5.
+    fn sample_status_ex() -> NodeStatusEx {
+        let nodes = (1..=5).map(|i| (i, format!("10.0.0.{i}:11400"))).collect();
+        NodeStatusEx {
+            status: NodeStatus {
+                vote: Some(Vote::new_committed(7, 2)),
+                last_log_id: Some(lid(7, 40)),
+                committed: Some(lid(7, 39)),
+                has_state: true,
+            },
+            raft_running: true,
+            rejoining: false,
+            term: 7,
+            leader: Some(2),
+            last_applied: Some(lid(7, 39)),
+            highest_member: 5,
+            membership: crate::status::MembershipView {
+                log_id: Some(lid(7, 38)),
+                committed: true,
+                configs: vec![[1, 2, 3].into(), [2, 3, 4].into()],
+                nodes,
+            },
+        }
+    }
+
+    fn admin_requests() -> Vec<AdminRequest> {
+        vec![
+            AdminRequest::Membership,
+            AdminRequest::AddLearner {
+                id: 6,
+                addr: "10.0.0.6:11400".into(),
+                expect: Some(lid(7, 38)),
+            },
+            AdminRequest::Promote {
+                ids: [4, 6].into(),
+                expect: Some(lid(7, 38)),
+            },
+            AdminRequest::Remove {
+                id: 1,
+                expect: None,
+            },
+            AdminRequest::SetAddr {
+                id: 3,
+                addr: "[::1]:11400".into(),
+                expect: Some(lid(7, 38)),
+            },
+        ]
+    }
+
+    fn admin_responses() -> Vec<AdminResponse> {
+        vec![
+            AdminResponse::Membership(Box::new(sample_status_ex())),
+            AdminResponse::Started,
+            AdminResponse::Done {
+                log_id: Some(lid(7, 41)),
+            },
+            AdminResponse::NotLeader {
+                leader: Some(2),
+                addr: Some("10.0.0.2:11400".into()),
+            },
+            AdminResponse::NotLeader {
+                leader: None,
+                addr: None,
+            },
+            AdminResponse::Conflict {
+                current: Some(lid(7, 38)),
+            },
+            AdminResponse::Refused {
+                reason: "fewer than 3 voters".into(),
+            },
+            AdminResponse::Unsupported,
+        ]
+    }
+
+    /// Every version 4 message, in both directions.
+    fn v4_client_msgs() -> Vec<ClientMsg> {
+        let mut v = vec![
+            ClientMsg::AdminHello(AdminHello {
+                version: PROTOCOL_VERSION,
+                to: Some(1),
+            }),
+            ClientMsg::AdminHello(AdminHello {
+                version: PROTOCOL_VERSION,
+                to: None,
+            }),
+            ClientMsg::Request {
+                id: 14,
+                body: RpcRequest::StatusEx,
+            },
+        ];
+        v.extend(
+            admin_requests()
+                .into_iter()
+                .zip(20..)
+                .map(|(body, id)| ClientMsg::Admin { id, body }),
+        );
+        v
+    }
+
+    fn v4_server_msgs() -> Vec<ServerMsg> {
+        let mut v = vec![
+            ServerMsg::Response {
+                id: 14,
+                body: RpcResponse::StatusEx(Ok(Box::new(sample_status_ex()))),
+            },
+            ServerMsg::Response {
+                id: 15,
+                body: RpcResponse::StatusEx(Ok(Box::default())),
+            },
+            ServerMsg::Response {
+                id: 16,
+                body: RpcResponse::StatusEx(Err(WireError::Rejected("no".into()))),
+            },
+        ];
+        v.extend(
+            admin_responses()
+                .into_iter()
+                .zip(20..)
+                .map(|(body, id)| ServerMsg::Admin { id, body }),
+        );
+        v
+    }
+
+    fn round_trip<T: Serialize + DeserializeOwned + fmt::Debug>(m: &T) {
+        let frame = encode(m, DEFAULT_MAX_FRAME).expect("encode");
+        let (got, used): (T, usize) = decode(&frame, DEFAULT_MAX_FRAME)
+            .expect("decode")
+            .expect("complete");
+        assert_eq!(used, frame.len());
+        assert_eq!(format!("{got:?}"), format!("{m:?}"));
+        assert_eq!(encode(&got, DEFAULT_MAX_FRAME).expect("re"), frame);
+    }
+
+    /// P6-T2: the version 4 messages round-trip, and the views' helpers
+    /// read a joint configuration correctly.
+    #[test]
+    fn version_4_messages_round_trip() {
+        for m in v4_client_msgs() {
+            round_trip(&m);
+        }
+        for m in v4_server_msgs() {
+            round_trip(&m);
+        }
+        let v = sample_status_ex().membership;
+        assert!(v.is_joint());
+        assert_eq!(v.voters(), [1, 2, 3, 4].into());
+        assert_eq!(v.learners(), [5].into());
+        assert!(v.is_member(5) && !v.is_member(6));
+        assert!(!admin_requests()[0].is_change());
+        assert!(admin_requests()[1..].iter().all(AdminRequest::is_change));
+        // A view built from openraft's membership.
+        let m = openraft::Membership::new(
+            vec![[1, 2].into(), [2, 3].into()],
+            (1..=4)
+                .map(|i| (i, openraft::BasicNode::new(format!("h{i}:1"))))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        );
+        let stored = openraft::StoredMembership::new(Some(lid(2, 9)), m);
+        let v = crate::status::MembershipView::from_stored(&stored, false);
+        assert_eq!(v.log_id, Some(lid(2, 9)));
+        assert_eq!(v.voters(), [1, 2, 3].into());
+        assert_eq!(v.learners(), [4].into());
+        assert_eq!(v.nodes[&4], "h4:1");
+    }
+
+    /// P6-T2: the version 3 messages keep their encoding (variant indexes
+    /// and the hello's layout); version 4 only appends variants.
+    #[test]
+    fn version_3_encodings_are_unchanged() {
+        let hello = ClientMsg::Hello(Hello {
+            version: 3,
+            from: 2,
+            to: 1,
+            max_job_size: 100,
+        });
+        assert_eq!(
+            postcard::to_allocvec(&hello).expect("encode"),
+            [0, 3, 2, 1, 100]
+        );
+        let tag = |m: &ClientMsg| postcard::to_allocvec(m).expect("encode")[0];
+        let req = |id, body| ClientMsg::Request { id, body };
+        assert_eq!(tag(&req(1, RpcRequest::Status)), 1);
+        assert_eq!(
+            postcard::to_allocvec(&req(1, RpcRequest::Status)).expect("encode"),
+            [1, 1, 5]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&req(1, RpcRequest::StatusEx)).expect("encode"),
+            [1, 1, 6]
+        );
+        assert_eq!(tag(&v4_client_msgs()[0]), 2);
+        assert_eq!(tag(&v4_client_msgs()[3]), 3);
+        let stag = |m: &ServerMsg| postcard::to_allocvec(m).expect("encode")[0];
+        assert_eq!(
+            stag(&ServerMsg::Hello(ServerHello::Rejected {
+                reason: "x".into()
+            })),
+            0
+        );
+        let status = ServerMsg::Response {
+            id: 1,
+            body: RpcResponse::status(NodeStatus::default()),
+        };
+        assert_eq!(
+            postcard::to_allocvec(&status).expect("encode"),
+            [1, 1, 5, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&v4_server_msgs()[0]).expect("e")[..3],
+            [1, 14, 6]
+        );
+        assert_eq!(stag(&v4_server_msgs()[3]), 2);
+    }
+
+    fn decode_server(m: &ServerMsg) -> Result<ServerMsg, FrameError> {
+        let f = encode(m, usize::MAX >> 1).expect("encode");
+        decode::<ServerMsg>(&f, usize::MAX >> 1).map(|r| r.expect("complete").0)
+    }
+
+    /// P6-T2: memberships in StatusEx answers and admin answers, and the
+    /// ids, addresses and reasons of admin messages, are bounded while
+    /// decoding (the dialer and the admin tool decode the answers).
+    #[test]
+    fn version_4_decoding_is_bounded() {
+        let with_view = |f: &dyn Fn(&mut crate::status::MembershipView)| {
+            let mut s = sample_status_ex();
+            f(&mut s.membership);
+            [
+                ServerMsg::Response {
+                    id: 1,
+                    body: RpcResponse::StatusEx(Ok(Box::new(s.clone()))),
+                },
+                ServerMsg::Admin {
+                    id: 1,
+                    body: AdminResponse::Membership(Box::new(s)),
+                },
+            ]
+        };
+        let many_nodes = |n: u64| {
+            move |v: &mut crate::status::MembershipView| {
+                v.nodes = (1..=n).map(|i| (i, format!("h{i}:1"))).collect();
+            }
+        };
+        let many_voters = |n: u64| {
+            move |v: &mut crate::status::MembershipView| v.configs = vec![(1..=n).collect()]
+        };
+        let joints =
+            |n: usize| move |v: &mut crate::status::MembershipView| v.configs = vec![[1].into(); n];
+        let addr = |n: usize| {
+            move |v: &mut crate::status::MembershipView| {
+                v.nodes = [(1, "a".repeat(n))].into();
+            }
+        };
+        for (ok, over) in [
+            (
+                with_view(&many_nodes(MAX_MEMBERS as u64)),
+                with_view(&many_nodes(MAX_MEMBERS as u64 + 1)),
+            ),
+            (
+                with_view(&many_voters(MAX_MEMBERS as u64)),
+                with_view(&many_voters(MAX_MEMBERS as u64 + 1)),
+            ),
+            (
+                with_view(&joints(MAX_JOINT_CONFIGS)),
+                with_view(&joints(MAX_JOINT_CONFIGS + 1)),
+            ),
+            (
+                with_view(&addr(MAX_NODE_ADDR_LEN)),
+                with_view(&addr(MAX_NODE_ADDR_LEN + 1)),
+            ),
+        ] {
+            for m in &ok {
+                let got = decode_server(m).expect("at the limit");
+                assert_eq!(format!("{got:?}"), format!("{m:?}"));
+            }
+            for m in &over {
+                assert!(matches!(decode_server(m), Err(FrameError::Decode(_))));
+            }
+        }
+        // The largest legal view fits an answer frame comfortably.
+        let biggest = with_view(&|v| {
+            v.configs = vec![(1..=MAX_MEMBERS as u64).collect(); 2];
+            v.nodes = (1..=MAX_MEMBERS as u64)
+                .map(|i| (i, "a".repeat(MAX_NODE_ADDR_LEN)))
+                .collect();
+        });
+        let len = encode(&biggest[1], DEFAULT_MAX_FRAME)
+            .expect("encode")
+            .len();
+        assert!(len < 300 * 1024, "{len}");
+
+        let admin_resp = |body| ServerMsg::Admin { id: 1, body };
+        for (ok, over) in [
+            (
+                AdminResponse::NotLeader {
+                    leader: Some(2),
+                    addr: Some("a".repeat(MAX_NODE_ADDR_LEN)),
+                },
+                AdminResponse::NotLeader {
+                    leader: Some(2),
+                    addr: Some("a".repeat(MAX_NODE_ADDR_LEN + 1)),
+                },
+            ),
+            (
+                AdminResponse::Refused {
+                    reason: "r".repeat(MAX_ADMIN_REASON_LEN),
+                },
+                AdminResponse::Refused {
+                    reason: "r".repeat(MAX_ADMIN_REASON_LEN + 1),
+                },
+            ),
+        ] {
+            assert!(decode_server(&admin_resp(ok)).is_ok());
+            assert!(matches!(
+                decode_server(&admin_resp(over)),
+                Err(FrameError::Decode(_))
+            ));
+        }
+
+        let admin = |body| ClientMsg::Admin { id: 1, body };
+        let long = |n: usize| "a".repeat(n);
+        for (ok, over) in [
+            (
+                AdminRequest::AddLearner {
+                    id: 9,
+                    addr: long(MAX_NODE_ADDR_LEN),
+                    expect: None,
+                },
+                AdminRequest::AddLearner {
+                    id: 9,
+                    addr: long(MAX_NODE_ADDR_LEN + 1),
+                    expect: None,
+                },
+            ),
+            (
+                AdminRequest::SetAddr {
+                    id: 9,
+                    addr: long(MAX_NODE_ADDR_LEN),
+                    expect: None,
+                },
+                AdminRequest::SetAddr {
+                    id: 9,
+                    addr: long(MAX_NODE_ADDR_LEN + 1),
+                    expect: None,
+                },
+            ),
+            (
+                AdminRequest::Promote {
+                    ids: (1..=MAX_MEMBERS as u64).collect(),
+                    expect: None,
+                },
+                AdminRequest::Promote {
+                    ids: (1..=MAX_MEMBERS as u64 + 1).collect(),
+                    expect: None,
+                },
+            ),
+        ] {
+            let m = admin(ok);
+            assert_eq!(
+                format!("{:?}", decode_msg(&m).expect("at the limit")),
+                format!("{m:?}")
+            );
+            // The listener reads admin requests with the admin limit.
+            let f = encode(&m, ADMIN_MAX_REQUEST_FRAME).expect("fits the admin limit");
+            assert!(decode::<ClientMsg>(&f, ADMIN_MAX_REQUEST_FRAME).is_ok());
+            assert!(matches!(
+                decode_msg(&admin(over)),
+                Err(FrameError::Decode(_))
+            ));
+        }
+
+        // An absurd announced id count is refused before allocating: a
+        // Promote whose set length says 2^40.
+        let mut payload = postcard::to_allocvec(&admin(AdminRequest::Promote {
+            ids: Default::default(),
+            expect: None,
+        }))
+        .expect("encode");
+        let n = payload.len();
+        assert_eq!(&payload[n - 2..], &[0, 0]);
+        payload.truncate(n - 2);
+        payload.extend(postcard::to_allocvec(&(1u64 << 40)).expect("len"));
+        payload.push(0);
+        assert!(postcard::from_bytes::<ClientMsg>(&payload).is_err());
+    }
+
+    /// P6-T2: a version 4 frame cut anywhere is incomplete, and a frame
+    /// whose header announces fewer bytes than the message needs is a
+    /// decode error, never a panic or a partial message.
+    #[test]
+    fn version_4_truncated_frames() {
+        fn check<T: Serialize + DeserializeOwned>(m: &T) {
+            let frame = encode(m, DEFAULT_MAX_FRAME).expect("encode");
+            for cut in 0..frame.len() {
+                assert!(
+                    decode::<T>(&frame[..cut], DEFAULT_MAX_FRAME)
+                        .expect("no error")
+                        .is_none()
+                );
+            }
+            let payload = &frame[HEADER_LEN..];
+            for short in 0..payload.len() {
+                let mut f = (short as u32).to_be_bytes().to_vec();
+                f.extend_from_slice(&payload[..short]);
+                assert!(
+                    matches!(
+                        decode::<T>(&f, DEFAULT_MAX_FRAME),
+                        Err(FrameError::Decode(_))
+                    ),
+                    "cut at {short} of {}",
+                    payload.len()
+                );
+            }
+        }
+        for m in v4_client_msgs() {
+            check(&m);
+        }
+        for m in v4_server_msgs() {
+            check(&m);
+        }
     }
 
     #[test]

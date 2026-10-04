@@ -9,12 +9,20 @@
 #                                     extended key usage serverAuth and
 #                                     clientAuth (each node is both a server
 #                                     and a client of its peers)
+#   admin.pem / admin.key             with the argument "admin": the operator
+#                                     certificate for the cluster port's admin
+#                                     channel (`beanstalkd-rs cluster`), signed
+#                                     by the CA, SAN DNS name "bstk-admin" and
+#                                     nothing else, extended key usage
+#                                     clientAuth only (nodes refuse it as a
+#                                     peer and refuse node certificates as an
+#                                     admin)
 #
-# Usage: scripts/mkcluster-certs.sh DIR ID...
+# Usage: scripts/mkcluster-certs.sh DIR ID|admin...
 #   DIR is created; an existing cluster-ca.pem / cluster-ca.key pair in it is
-#   reused, so a replacement node certificate can be issued later with the
-#   same CA (scripts/mkcluster-certs.sh DIR 2). Existing node files for the
-#   given IDs are overwritten.
+#   reused, so a replacement node certificate (or the admin certificate) can
+#   be issued later with the same CA (scripts/mkcluster-certs.sh DIR 2, or
+#   DIR admin). Existing files for the given IDs (or admin) are overwritten.
 # Environment: DAYS (validity of new certificates, default 825), OPENSSL.
 #
 # The node id is bound by the SAN only; the subject CN is informational and
@@ -22,12 +30,13 @@
 # Works with OpenSSL 3 and LibreSSL.
 set -euo pipefail
 
-[ $# -ge 2 ] || { echo "usage: $0 DIR ID..." >&2; exit 2; }
+[ $# -ge 2 ] || { echo "usage: $0 DIR ID|admin..." >&2; exit 2; }
 DIR="$1"
 shift
 for id in "$@"; do
+  [ "$id" = admin ] && continue
   [[ "$id" =~ ^[1-9][0-9]*$ && "$id" -le 65535 ]] || {
-    echo "$0: node id must be 1..65535: $id" >&2
+    echo "$0: node id must be 1..65535 (or \"admin\"): $id" >&2
     exit 2
   }
 done
@@ -52,17 +61,35 @@ else
   echo "created $DIR/cluster-ca.pem"
 fi
 
-for id in "$@"; do
-  name="node$id"
+# issue NAME SAN EKU: a certificate signed by the CA.
+issue() {
+  local name="$1" san="$2" eku="$3"
   key "$DIR/$name.key"
-  "$OPENSSL" req -new -key "$DIR/$name.key" -subj "/CN=bstk-node-$id" -out "$DIR/$name.csr" 2>/dev/null
+  "$OPENSSL" req -new -key "$DIR/$name.key" -subj "/CN=$san" -out "$DIR/$name.csr" 2>/dev/null
   "$OPENSSL" x509 -req -in "$DIR/$name.csr" -CA "$DIR/cluster-ca.pem" -CAkey "$DIR/cluster-ca.key" \
     -set_serial "0x$("$OPENSSL" rand -hex 16)" -days "$DAYS" -sha256 -out "$DIR/$name.pem" \
     -extfile <(printf '%s\n' 'basicConstraints=critical,CA:FALSE' \
-      'keyUsage=critical,digitalSignature' 'extendedKeyUsage=serverAuth,clientAuth' \
-      "subjectAltName=DNS:bstk-node-$id" 'authorityKeyIdentifier=keyid' \
+      'keyUsage=critical,digitalSignature' "extendedKeyUsage=$eku" \
+      "subjectAltName=DNS:$san" 'authorityKeyIdentifier=keyid' \
       'subjectKeyIdentifier=hash') 2>/dev/null
   rm -f "$DIR/$name.csr"
+}
+
+for id in "$@"; do
+  if [ "$id" = admin ]; then
+    issue admin bstk-admin clientAuth
+    # A client only: the server purpose must fail.
+    "$OPENSSL" verify -purpose sslclient -CAfile "$DIR/cluster-ca.pem" "$DIR/admin.pem" >/dev/null
+    if "$OPENSSL" verify -purpose sslserver -CAfile "$DIR/cluster-ca.pem" "$DIR/admin.pem" \
+      >/dev/null 2>&1; then
+      echo "$0: $DIR/admin.pem unexpectedly allows server authentication" >&2
+      exit 1
+    fi
+    echo "created $DIR/admin.pem (SAN DNS:bstk-admin, client only, valid $DAYS days)"
+    continue
+  fi
+  name="node$id"
+  issue "$name" "bstk-node-$id" serverAuth,clientAuth
   # A node presents the same certificate as server and as client.
   "$OPENSSL" verify -purpose sslserver -CAfile "$DIR/cluster-ca.pem" "$DIR/$name.pem" >/dev/null
   "$OPENSSL" verify -purpose sslclient -CAfile "$DIR/cluster-ca.pem" "$DIR/$name.pem" >/dev/null

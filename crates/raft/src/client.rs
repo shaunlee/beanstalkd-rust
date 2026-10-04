@@ -50,7 +50,7 @@ use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 
 use crate::forward::{ControlRequest, ControlResponse, ForwardError, ForwardTransport};
-use crate::status::{NodeStatus, StatusTransport};
+use crate::status::{NodeStatus, NodeStatusEx, StatusTransport};
 use crate::wire::{
     self, ClientMsg, FrameError, Hello, PROTOCOL_VERSION, RpcRequest, RpcResponse, ServerHello,
     ServerMsg, WireError, WireFatal,
@@ -584,7 +584,9 @@ impl Network {
                 }
                 Err(format!("rejected: {reason}"))
             }
-            Ok(Some(ServerMsg::Response { .. })) => Err("response before hello".into()),
+            Ok(Some(ServerMsg::Response { .. } | ServerMsg::Admin { .. })) => {
+                Err("response before hello".into())
+            }
             Ok(None) => Err("connection closed during hello".into()),
             Err(e) => Err(format!("hello: {e}")),
         }
@@ -661,6 +663,9 @@ async fn run_conn(
                     }
                 }
                 Ok(Some(ServerMsg::Hello(_))) => return "unexpected hello".to_string(),
+                Ok(Some(ServerMsg::Admin { .. })) => {
+                    return "admin response on a peer connection".to_string();
+                }
                 Ok(None) => return "closed by peer".to_string(),
                 Err(e) => return e.to_string(),
             }
@@ -711,9 +716,43 @@ impl Network {
     }
 }
 
+impl Network {
+    /// Asks `target` for its status and membership view (protocol version
+    /// 4; answered in the same situations as [`Network::status`]). Uses the
+    /// forward timeout.
+    pub async fn status_ex(&self, target: NodeId) -> Result<NodeStatusEx, ForwardError> {
+        let Some(peer) = self.peer(target, None) else {
+            return Err(ForwardError::Unreachable(format!(
+                "node {target} has no known address"
+            )));
+        };
+        let t = self.inner.cfg.forward_timeout;
+        match self
+            .call(&peer, RpcRequest::StatusEx, t, self.inner.cfg.max_frame)
+            .await
+        {
+            Ok(RpcResponse::StatusEx(Ok(s))) => Ok(*s),
+            Ok(RpcResponse::StatusEx(Err(e))) => {
+                Err(ForwardError::Rejected(wire::sanitize(&e.to_string())))
+            }
+            Ok(_) => Err(ForwardError::Network("unexpected response kind".into())),
+            Err(CallError::Unreachable(m)) => Err(ForwardError::Unreachable(m)),
+            Err(CallError::Timeout(_)) => Err(ForwardError::Timeout),
+            Err(CallError::Network(m)) => Err(ForwardError::Network(m)),
+            Err(CallError::TooLarge { .. }) => Err(ForwardError::Rejected(
+                "request exceeds the maximum frame size".into(),
+            )),
+        }
+    }
+}
+
 impl StatusTransport for Network {
     async fn status(&self, target: NodeId) -> Result<NodeStatus, ForwardError> {
         Network::status(self, target).await
+    }
+
+    async fn status_ex(&self, target: NodeId) -> Result<NodeStatusEx, ForwardError> {
+        Network::status_ex(self, target).await
     }
 }
 

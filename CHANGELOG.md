@@ -22,6 +22,14 @@ Release tags are `v<version>` and match the workspace version in
 
 ### Changed
 
+- **Cluster protocol version 4** (incompatible): nodes of 0.5.x cannot join
+  a cluster of later versions, or the reverse. Upgrade a 0.5.x cluster by
+  stopping every node, upgrading all of them, then starting them again; a
+  rolling upgrade from 0.5.x is not possible. Version 4 adds an extended
+  status probe and an authenticated admin channel on the cluster port (for
+  membership changes in a later release);
+  `scripts/mkcluster-certs.sh DIR admin` issues its client certificate
+  (SAN `bstk-admin`).
 - Log lines carry ANSI color codes only when stderr is a terminal, so
   journald, `docker logs` and log files get plain text.
 

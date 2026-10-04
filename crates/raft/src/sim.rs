@@ -56,7 +56,7 @@ use openraft::{BasicNode, Raft};
 use tokio::sync::Notify;
 
 use crate::forward::{ForwardError, ForwardHandler, ForwardTransport};
-use crate::status::{NodeStatus, StatusSource, StatusTransport};
+use crate::status::{NodeStatus, NodeStatusEx, StatusSource, StatusTransport};
 use crate::wire::{RpcRequest, RpcResponse, WireError};
 use crate::{ForwardRequest, ForwardResponse, NodeId, TypeConfig};
 
@@ -512,11 +512,15 @@ impl SimNetwork {
             if d.drop_request {
                 std::future::pending::<()>().await;
             }
-            if matches!(body, RpcRequest::Status) {
+            if matches!(body, RpcRequest::Status | RpcRequest::StatusEx) {
                 let Some(src) = self.status_source(to) else {
                     return Err(SimError::Unreachable(format!("node {to} is not running")));
                 };
-                let resp = RpcResponse::status(src.status());
+                let resp = if matches!(body, RpcRequest::Status) {
+                    RpcResponse::status(src.status())
+                } else {
+                    RpcResponse::StatusEx(Ok(Box::new(src.status_ex())))
+                };
                 if d.drop_response || self.is_blocked(to, from) {
                     std::future::pending::<()>().await;
                 }
@@ -615,6 +619,21 @@ impl StatusTransport for SimNode {
             Ok(r) => r
                 .into_status()
                 .ok_or_else(|| ForwardError::Network("unexpected response kind".into())),
+            Err(SimError::Unreachable(m)) => Err(ForwardError::Unreachable(m)),
+            Err(SimError::Timeout(_)) => Err(ForwardError::Timeout),
+        }
+    }
+
+    async fn status_ex(&self, target: NodeId) -> Result<NodeStatusEx, ForwardError> {
+        let t = self.net.inner.cfg.forward_timeout;
+        match self
+            .net
+            .call(self.id, target, RpcRequest::StatusEx, t)
+            .await
+        {
+            Ok(RpcResponse::StatusEx(Ok(s))) => Ok(*s),
+            Ok(RpcResponse::StatusEx(Err(e))) => Err(ForwardError::Rejected(e.to_string())),
+            Ok(_) => Err(ForwardError::Network("unexpected response kind".into())),
             Err(SimError::Unreachable(m)) => Err(ForwardError::Unreachable(m)),
             Err(SimError::Timeout(_)) => Err(ForwardError::Timeout),
         }

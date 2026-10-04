@@ -4,7 +4,12 @@
 //! a decoded message must re-encode to bytes that decode to the same
 //! encoding (the bounded deserializers accept what the encoder emits).
 //!
-//! Input: `selector`, then one frame (u32 big-endian length and payload).
+//! Both message enums include the protocol version 4 messages (StatusEx,
+//! the admin hello, admin requests and answers, P6-T2).
+//!
+//! Input: `selector` (bit 0: server message; bits 1-2: frame limit, the
+//! default, 256 bytes, or the listener's admin request limit), then one
+//! frame (u32 big-endian length and payload).
 #![no_main]
 
 use std::sync::OnceLock;
@@ -43,7 +48,11 @@ fn check<T: Serialize + DeserializeOwned>(frame: &[u8], max: usize) {
 
 fuzz_target!(|data: &[u8]| {
     let [sel, frame @ ..] = data else { return };
-    let max = if sel & 2 == 0 { DEFAULT_MAX_FRAME } else { 256 };
+    let max = match (sel >> 1) & 3 {
+        0 | 3 => DEFAULT_MAX_FRAME,
+        1 => 256,
+        _ => wire::ADMIN_MAX_REQUEST_FRAME,
+    };
     if sel & 1 == 0 {
         check::<ClientMsg>(frame, max);
     } else {

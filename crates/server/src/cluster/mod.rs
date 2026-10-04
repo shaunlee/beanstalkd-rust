@@ -84,7 +84,7 @@ use std::time::{Duration, Instant};
 
 use openraft::metrics::RaftServerMetrics;
 use openraft::storage::RaftLogStorage;
-use openraft::{BasicNode, Raft, RaftMetrics, ServerState, SnapshotPolicy, Vote};
+use openraft::{BasicNode, Raft, RaftMetrics, ServerState, SnapshotPolicy, StoredMembership, Vote};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use bstk_engine::{ConnId, EngineConfig, Nanos};
@@ -92,7 +92,7 @@ use bstk_proto::Response;
 use bstk_raft::client::{Network, NetworkConfig};
 use bstk_raft::forward::{ControlRequest, ControlResponse, ForwardError};
 use bstk_raft::listener::{ClusterListener, ListenerConfig, VoteGate};
-use bstk_raft::status::{self, Adopt, Bootstrap, StatusSource};
+use bstk_raft::status::{self, Adopt, Bootstrap, MembershipView, NodeStatusEx, StatusSource};
 use bstk_raft::storage::{self, LogOptions, LogStore, ReplySink, SmOptions, StateHandle};
 use bstk_raft::tls::ClusterTls;
 use bstk_raft::{CONN_SEQ_BITS, NodeId, Op, Request, TypeConfig, owner_of};
@@ -230,7 +230,9 @@ struct Status {
     /// Client sockets are closed because no leader was reachable for
     /// `node_timeout`.
     isolated: AtomicBool,
-    rejoining: AtomicBool,
+    /// Shared with the status source ([`StatusView`]), which answers before
+    /// `Core` exists.
+    rejoining: Arc<AtomicBool>,
     committed: AtomicU64,
     queue_len: AtomicU64,
     queue_bytes: AtomicU64,
@@ -246,6 +248,65 @@ struct Status {
     rewinds_stall: AtomicU64,
     rewinds_dropped: AtomicU64,
     drop_node_proposals: AtomicU64,
+}
+
+/// Answers the cluster port's status probes from the log store, and
+/// `StatusEx` probes and admin `Membership` requests from everything this
+/// node knows: before Raft runs, the effective membership read from storage
+/// at startup; once it runs, openraft's metrics.
+struct StatusView {
+    log: LogStore,
+    state: StateHandle,
+    rejoining: Arc<AtomicBool>,
+    startup_membership: StoredMembership<NodeId, BasicNode>,
+    metrics: OnceLock<watch::Receiver<Metrics>>,
+}
+
+impl StatusSource for StatusView {
+    fn status(&self) -> status::NodeStatus {
+        self.log.status()
+    }
+
+    fn status_ex(&self) -> NodeStatusEx {
+        let durable = self.log.status();
+        let mut ex = NodeStatusEx::from_status(durable);
+        ex.rejoining = self.rejoining.load(Ordering::Relaxed);
+        ex.highest_member = self.state.highest_member();
+        let membership = match self.metrics.get() {
+            Some(rx) => {
+                let m = rx.borrow();
+                ex.raft_running = m.running_state.is_ok();
+                ex.term = m.current_term;
+                ex.leader = m.current_leader;
+                ex.last_applied = m.last_applied;
+                (*m.membership_config).clone()
+            }
+            None => {
+                ex.last_applied = self.state.last_applied();
+                self.startup_membership.clone()
+            }
+        };
+        // By index: both come from this node's log, whose committed prefix
+        // never diverges from the leader's.
+        let known = [durable.committed, ex.last_applied]
+            .into_iter()
+            .flatten()
+            .map(|l| l.index)
+            .max();
+        let committed = membership
+            .log_id()
+            .is_some_and(|l| known.is_some_and(|k| k >= l.index));
+        ex.membership = MembershipView::from_stored(&membership, committed);
+        // Before Raft runs only a snapshot is applied, so the effective
+        // membership may name higher ids than the applied record.
+        ex.highest_member = ex
+            .membership
+            .nodes
+            .keys()
+            .copied()
+            .fold(ex.highest_member, NodeId::max);
+        ex
+    }
 }
 
 pub struct Core {
@@ -913,7 +974,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         sys: Arc::new(move || Box::new(SharedSysInfo(sys.clone()))),
         sink: clients.clone(),
     };
-    let (log, sm) = match storage::open(&c.data_dir, LogOptions::default(), sm_opts) {
+    let (log, mut sm) = match storage::open(&c.data_dir, LogOptions::default(), sm_opts) {
         Ok(opened) => opened,
         Err(storage::OpenError::Locked(p)) => return Err(StartError::Locked(p)),
         Err(e) => return Err(other("cannot open cluster.data_dir", &e)),
@@ -962,10 +1023,30 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
     if let Some(m) = state.membership() {
         initial.extend(membership::addresses(&m).into_keys());
     }
+    // What a StatusEx probe reports before Raft runs: the latest
+    // membership in storage, as Raft will load it (nothing appends a
+    // membership entry before Raft runs).
+    let startup_membership = {
+        let mut l = log.clone();
+        let m = openraft::storage::StorageHelper::new(&mut l, &mut sm)
+            .get_membership()
+            .await
+            .map_err(|e| other("cannot read the membership from cluster.data_dir", &e))?;
+        let e = m.effective();
+        StoredMembership::new(*e.log_id(), e.membership().clone())
+    };
+    let rejoining = Arc::new(AtomicBool::new(mode == Mode::Rejoin));
+    let status_view = Arc::new(StatusView {
+        log: log.clone(),
+        state: state.clone(),
+        rejoining: rejoining.clone(),
+        startup_membership,
+        metrics: OnceLock::new(),
+    });
     let mut lcfg = ListenerConfig::new(id, initial, args.tls.as_ref().map(|t| t.server.clone()));
     lcfg.max_job_size = args.engine.max_job_size;
     lcfg.vote_gate = Some(gate.clone());
-    lcfg.status = Some(Arc::new(log.clone()));
+    lcfg.status = Some(status_view.clone());
     let (listener, service) =
         ClusterListener::spawn_deferred::<handler::Handler>(args.listener, lcfg)
             .map_err(|e| StartError::Other(format!("cluster listener: {e}")))?;
@@ -993,6 +1074,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
              must not bootstrap one; joining it in rejoin mode instead"
         );
         mode = Mode::Rejoin;
+        rejoining.store(true, Ordering::Release);
         enter_rejoin(false)?;
     }
     if mode == Mode::Rejoin {
@@ -1009,6 +1091,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
     let raft = Raft::new(id, config, net.clone(), log.clone(), sm)
         .await
         .map_err(|e| StartError::Other(format!("cannot start raft: {e}")))?;
+    let _ = status_view.metrics.set(raft.metrics());
 
     let (reaper, reaper_rx) = mpsc::unbounded_channel();
     let reaper_task = tokio::spawn(reap(reaper_rx));
@@ -1030,7 +1113,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         clients,
         status: Status {
             committed: AtomicU64::new(u64::MAX),
-            rejoining: AtomicBool::new(mode == Mode::Rejoin),
+            rejoining: rejoining.clone(),
             ..Status::default()
         },
         gate: gate.clone(),
