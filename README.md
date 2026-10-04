@@ -2,69 +2,83 @@
 
 [![CI](https://github.com/shaunlee/beanstalkd-rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shaunlee/beanstalkd-rust/actions/workflows/ci.yml)
 
-A Rust reimplementation of [beanstalkd](https://github.com/beanstalkd/beanstalkd), the simple work queue, that is byte-for-byte compatible with the original protocol so existing clients work unmodified.
+`beanstalkd-rs` is a Rust reimplementation of
+[beanstalkd](https://github.com/beanstalkd/beanstalkd), the simple work
+queue. It speaks the beanstalkd protocol byte for byte, so existing
+clients work unmodified, and adds TLS, monitoring and an optional
+replicated cluster mode.
 
-Status: **P3 complete**: a server compatible with the reference, with an optional write-ahead log (`-b`), TLS / mTLS, optional token authentication, Prometheus metrics, and an optional Raft cluster mode (3 or 5 nodes) that keeps serving through the loss of a minority of nodes. Performance work (P4) is next; see `docs/PLAN.md`.
+**Status**: phases P0 to P4 are done (protocol compatibility, write-ahead
+log, TLS and operability, Raft cluster mode, performance); P5 (production
+readiness: Linux validation, CI, packaging, operations guide, hardening)
+is in progress. 0.5.0 is the first release. See [CHANGELOG.md](CHANGELOG.md)
+and the plan in [docs/PLAN.md](docs/PLAN.md).
 
-## Install
+## Features
 
-- **Release archives** (Linux x86_64 and aarch64 as `-gnu`, needing glibc 2.34 or newer, and as static `-musl` builds; macOS aarch64), once a version is tagged, on the [releases page](https://github.com/shaunlee/beanstalkd-rust/releases), with `SHA256SUMS`: each holds the `beanstalkd-rs` binary, the example configuration and `packaging/`.
+- Every command, reply and edge case of the beanstalkd protocol, checked
+  against the reference server by differential tests and real clients;
+  the reference's command line (`-l -p -z -b -f -F -s -V -v`).
+- Write-ahead log (`-b`) with the reference's fsync policies; jobs survive
+  restarts and crashes, and no reply is sent before its change is logged.
+- Graceful shutdown on SIGTERM, drain mode on SIGUSR1.
+- TOML configuration (`--config`, `--check-config`): several listeners,
+  each plaintext or TLS, with mutual TLS or token authentication.
+- HTTP endpoints: `/healthz`, `/readyz`, `/metrics` (Prometheus) and
+  `/admin` (JSON).
+- Cluster mode: 3 or 5 nodes replicate every job and connection through
+  Raft over mutual TLS and keep serving through the loss of a minority of
+  nodes; clients connect to any node.
+- More operations per CPU second than the reference in standalone
+  plaintext mode ([docs/BENCH.md](docs/BENCH.md)).
 
-  ```sh
-  sha256sum -c --ignore-missing SHA256SUMS
-  tar -xzf beanstalkd-rs-<version>-<target>.tar.gz
-  ```
+The few intentional differences from the reference are listed in
+[docs/COMPAT.md](docs/COMPAT.md).
 
-- **Container image**: build it from the `Dockerfile` (no image is published). It runs as a non-root user, listens on port 11300 and keeps data in the `/data` volume:
+## Quick start
 
-  ```sh
-  docker build -t beanstalkd-rs .
-  docker run -d -p 11300:11300 -v bstk:/data beanstalkd-rs -l 0.0.0.0 -p 11300 -b /data
-  ```
-
-- **systemd**: `packaging/systemd/beanstalkd-rs.service` (hardened; install steps in its header) runs `beanstalkd-rs --config /etc/beanstalkd-rs/config.toml`. Ready-made configurations for standalone, binlog, TLS / mTLS / token / HTTP and a 3-node cluster are in `packaging/examples/`.
-
-Changes per version: `CHANGELOG.md`.
-
-## Build and run
-
-```sh
-cargo build --release -p bstk-server
-./target/release/beanstalkd-rs -l 127.0.0.1 -p 11300
-```
-
-Flags: `-l ADDR`, `-p PORT`, `-z MAX_JOB_SIZE`, `-V` (verbose), `-v` (version). `SIGUSR1` enters drain mode.
-
-Persistence, as in the reference:
-
-- `-b DIR`: write-ahead log directory
-- `-f MS`: fsync at most once every MS milliseconds (default 50); `-f0` fsyncs every write before replying
-- `-F`: never fsync
-- `-s BYTES`: binlog file size (default 10 MiB)
-
-Behavior across restarts and the intentional differences from the reference are listed in `docs/COMPAT.md` (section "Binlog" and the D list).
-
-## Configuration, TLS and monitoring
+From source (Rust 1.98 or newer):
 
 ```sh
-beanstalkd-rs --config /etc/beanstalkd-rs.toml
-beanstalkd-rs --config /etc/beanstalkd-rs.toml --check-config
+cargo build --release --locked -p bstk-server
+./target/release/beanstalkd-rs -l 127.0.0.1 -p 11300 -b ./binlog
 ```
 
-The TOML file (fully commented example: `docs/beanstalkd-rs.example.toml`) can define several listeners, each plaintext or TLS with `auth = "none"`, `"token"` or `"mtls"`, plus binlog, logging and an HTTP listener serving `/healthz`, `/readyz`, `/metrics` (Prometheus) and `/admin` (JSON). Everything is off by default; without a config file the server behaves exactly like the reference. Token authentication is a beanstalkd-rs extension (`auth <token>`), so it needs client support; mTLS works with any client that can use TLS.
+With Docker (the image is built locally; none is published):
 
-## Cluster mode
+```sh
+docker build -t beanstalkd-rs .
+docker run -d -p 127.0.0.1:11300:11300 -v bstk-data:/data beanstalkd-rs -l 0.0.0.0 -p 11300 -b /data
+```
 
-With a `[cluster]` section (see the example file and `docs/DESIGN.md` §8), 3 or 5 nodes replicate every job and connection through Raft; clients connect to any node with the same protocol.
+From a release archive (Linux x86_64 / aarch64, glibc or static musl;
+macOS aarch64), on the
+[releases page](https://github.com/shaunlee/beanstalkd-rust/releases):
 
-- **Bootstrap** a new cluster by starting every initial node with `--cluster-init`, all with the same `[[cluster.peer]]` list. It is refused if the node's `data_dir` already holds state; if a reachable peer already belongs to a running cluster, the node does not bootstrap but joins as below.
-- **Restart** a node without `--cluster-init`.
-- **Rejoin**: a node started with an empty `data_dir` (a new disk, or after losing its data) and without `--cluster-init` rejoins its cluster. Until it has caught up with a leader it does not vote, does not stand for election and serves no clients (`/readyz` is 503); a `rejoin` marker in `data_dir` keeps it in this mode across crashes. It needs a running leader, so at most a minority of nodes may be rejoining at once. Never restore an old copy of a `data_dir`: wipe it instead.
-- Cluster traffic uses mTLS (`[cluster.tls]`). `insecure_plaintext = true` is for tests and is accepted only on loopback addresses unless `insecure_plaintext_allow_remote = true` is also set.
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+tar -xzf beanstalkd-rs-<version>-<target>.tar.gz
+```
 
-## Test
+Each archive holds the binary, a systemd unit, example configurations,
+the cluster certificate script and the operations guide. Installation
+with systemd, configuration, clusters, backups, upgrades and monitoring:
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
 
-The differential tests compare against the reference C beanstalkd, which must be built first:
+## Documentation
+
+- [docs/OPERATIONS.md](docs/OPERATIONS.md): operations guide
+- [docs/beanstalkd-rs.example.toml](docs/beanstalkd-rs.example.toml): every configuration key
+- [docs/DESIGN.md](docs/DESIGN.md): architecture and design
+- [docs/COMPAT.md](docs/COMPAT.md): differences from the reference beanstalkd
+- [docs/BENCH.md](docs/BENCH.md): performance results
+- [docs/PLAN.md](docs/PLAN.md): development, test and acceptance plan
+- [CHANGELOG.md](CHANGELOG.md): changes per release
+
+## Development and CI
+
+The differential tests compare against the reference C beanstalkd, built
+first:
 
 ```sh
 scripts/build-ref.sh      # builds the pinned reference into .ref/
@@ -72,28 +86,24 @@ scripts/check.sh          # fmt, clippy, build, all tests incl. differential
 clients/run-smoke.sh      # real-client smoke tests (needs python3 and go)
 ```
 
-Benchmarks: see `docs/BENCH.md` (`scripts/build-ref.sh --optimized`, then `bench/run-matrix.sh`).
-
-## Continuous integration
-
 `.github/workflows/ci.yml` runs on every push and pull request:
 
 | Job | Runner | What |
 |---|---|---|
 | `check` | `ubuntu-latest` (x86_64), `ubuntu-24.04-arm` (aarch64), `macos-latest` | builds the reference, then `scripts/check.sh --no-fail-fast` (fmt, clippy, build, all tests including the differential and stunnel suites) |
-| `smoke` | `ubuntu-latest` | `clients/run-smoke.sh` in plain, binlog, restart, TLS, mTLS (with restart, token and HTTP), cluster and cluster leader-kill modes |
+| `smoke` | `ubuntu-latest` | `clients/run-smoke.sh` in plain, binlog, restart, TLS, mTLS, cluster and cluster leader-kill modes |
 | `chaos` | `ubuntu-latest` | 200 in-process seeds and 5 multi-process runs |
-| `docker` | `ubuntu-latest` | builds the image (not pushed) and runs `scripts/docker-smoke.sh`: the default command and the healthcheck, then a binlog on a volume across a graceful restart |
-| `deny` | `ubuntu-latest` | `cargo deny check` (advisories, bans, licenses, sources; `deny.toml`) |
+| `docker` | `ubuntu-latest` | builds the image and runs `scripts/docker-smoke.sh` |
+| `deny` | `ubuntu-latest` | `cargo deny check` (`deny.toml`) |
 
-`.github/workflows/release.yml` runs on a `v*` tag (which must equal `v` + the workspace version in `Cargo.toml`): it builds and smoke-tests the release archives, writes `SHA256SUMS` and publishes a GitHub Release. Started by hand (`workflow_dispatch`) it is a dry run that keeps the archives as a workflow artifact, unless `publish` is set for an existing tag.
-
-`.github/workflows/weekly.yml` (weekly and on demand) runs 1,000 in-process seeds and 50 multi-process runs.
+`.github/workflows/release.yml` builds, smoke-tests and publishes the
+release archives on a `v*` tag equal to `v` + the workspace version (a
+manual run is a dry run). `.github/workflows/weekly.yml` runs 1,000
+in-process chaos seeds and 50 multi-process runs.
 
 The same locally:
 
 ```sh
-scripts/build-ref.sh
 BSTK_REQUIRE_STUNNEL=1 scripts/check.sh --no-fail-fast   # needs stunnel (stunnel4 on Debian/Ubuntu)
 SMOKE_CLUSTER_KILL=1 clients/run-smoke.sh                 # one smoke mode; see clients/README.md
 cargo build -p bstk-server
@@ -102,15 +112,11 @@ BSTK_CHAOS_MP_RUNS=5 cargo test --release -p bstk-chaos --test multiprocess full
 cargo deny check
 ```
 
-Platform notes: `BSTK_REQUIRE_STUNNEL=1` makes the stunnel suites fail instead of skipping when stunnel is missing. On macOS, stunnel must be 5.82 or newer: older versions close a half-closed connection before forwarding the reply, which fails the half-close cases of `ref_vs_stunnel_ref` (the CI job runs `brew update` first and checks the version). Ubuntu's `stunnel4` (5.72) is not affected.
-
-## Documentation
-
-- `docs/DESIGN.md`: architecture and design
-- `docs/PLAN.md`: development, test and acceptance plan
-- `docs/COMPAT.md`: behavior quirks of the reference we mirror, and known differences
-- `docs/BENCH.md`: performance results
+On macOS, stunnel must be 5.82 or newer for the stunnel suites (older
+versions close a half-closed connection before forwarding the reply).
+Benchmarks: [docs/BENCH.md](docs/BENCH.md) (`scripts/build-ref.sh
+--optimized`, then `bench/run-matrix.sh`).
 
 ## License
 
-MIT, see `LICENSE`. beanstalkd itself is also MIT-licensed.
+MIT, see [LICENSE](LICENSE). beanstalkd itself is also MIT-licensed.

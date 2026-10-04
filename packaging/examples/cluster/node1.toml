@@ -1,8 +1,8 @@
 # beanstalkd-rs: node 1 of a 3-node cluster (node1.toml, node2.toml and
 # node3.toml differ only in node_id, cluster.listen, the [cluster.tls] node
-# certificate and the HTTP address). See docs/DESIGN.md §8 and the "Cluster
-# mode" section of README.md. Every key is documented in
-# docs/beanstalkd-rs.example.toml.
+# certificate and the HTTP address). See docs/OPERATIONS.md section 5
+# (certificates: scripts/mkcluster-certs.sh) and docs/DESIGN.md §8. Every
+# key is documented in docs/beanstalkd-rs.example.toml.
 #
 # Addresses: nodes at 10.0.0.1, 10.0.0.2 and 10.0.0.3; clients use port
 # 11300 on any node, nodes talk to each other on port 11400.

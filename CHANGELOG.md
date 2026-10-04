@@ -11,6 +11,26 @@ Release tags are `v<version>` and match the workspace version in
 
 ## [Unreleased]
 
+### Added
+
+- **Operations guide** ([docs/OPERATIONS.md](https://github.com/shaunlee/beanstalkd-rust/blob/main/docs/OPERATIONS.md)):
+  install, configuration, persistence, security, cluster bootstrap, node
+  loss and rejoin, backup and restore, upgrades, monitoring and alerts,
+  troubleshooting. Shipped in the release archives with
+  `scripts/mkcluster-certs.sh`, which creates a cluster CA and node
+  certificates.
+
+### Changed
+
+- Log lines carry ANSI color codes only when stderr is a terminal, so
+  journald, `docker logs` and log files get plain text.
+
+### Fixed
+
+- Cluster `/readyz` (and `beanstalkd_cluster_ready`) now reports 503 while
+  the node is isolated from the cluster and closing client connections;
+  before, a cut-off leader kept answering 200.
+
 ## [0.5.0]
 
 First release. A Rust reimplementation of
@@ -48,7 +68,7 @@ clients can use unmodified.
   a minority of nodes, and look like one beanstalkd server to clients
   connected to any node. Bootstrap with `--cluster-init`; a node with an
   empty data directory rejoins safely. See [docs/DESIGN.md](https://github.com/shaunlee/beanstalkd-rust/blob/main/docs/DESIGN.md)
-  §8 and the cluster section of [README.md](https://github.com/shaunlee/beanstalkd-rust/blob/main/README.md).
+  §8 and [docs/OPERATIONS.md](https://github.com/shaunlee/beanstalkd-rust/blob/main/docs/OPERATIONS.md).
 - **Performance**: in standalone plaintext mode, more operations per CPU
   second than the reference (1.04x to 1.29x on the benchmark matrix);
   worker threads are tunable with `--threads` / `server.threads`. See

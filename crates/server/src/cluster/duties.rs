@@ -168,8 +168,12 @@ pub async fn readiness(core: Arc<Core>) {
             .committed
             .store(committed.unwrap_or(u64::MAX), Ordering::Release);
         let caught_up = committed.is_none_or(|c| core.applied_index().is_some_and(|a| a >= c));
-        let ready =
-            core.status.started.load(Ordering::Acquire) && core.leader().is_some() && caught_up;
+        // An isolated node still names a leader (a partitioned openraft 0.9
+        // leader names itself) but closes every client connection.
+        let ready = core.status.started.load(Ordering::Acquire)
+            && core.leader().is_some()
+            && caught_up
+            && !core.status.isolated.load(Ordering::Relaxed);
         core.status.ready.store(ready, Ordering::Release);
     }
 }

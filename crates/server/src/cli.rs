@@ -103,8 +103,8 @@ pub struct Cli {
     #[arg(long = "check-config", action = ArgAction::SetTrue)]
     pub check_config: bool,
 
-    /// Cluster mode: bootstrap the cluster membership from [[cluster.peer]]
-    /// (once, on one node, with an empty cluster.data_dir)
+    /// Cluster mode: bootstrap a new cluster from [[cluster.peer]] (first
+    /// start only, on every initial node, with an empty cluster.data_dir)
     #[arg(long = "cluster-init", action = ArgAction::SetTrue)]
     pub cluster_init: bool,
 

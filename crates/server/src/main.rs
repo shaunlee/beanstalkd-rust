@@ -43,7 +43,7 @@ mod pending;
 mod sysinfo;
 mod tls;
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -337,8 +337,11 @@ fn check_config(cli: &Cli) -> ExitCode {
 }
 
 fn init_logging(log: LogSettings) {
+    // Color codes only help a person at a terminal; journald, `docker logs`
+    // and log files would store them as literal escape sequences.
     let builder = tracing_subscriber::fmt()
         .with_max_level(log.level.to_tracing())
+        .with_ansi(io::stderr().is_terminal())
         .with_writer(io::stderr);
     match log.format {
         LogFormat::Text => builder.init(),

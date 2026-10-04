@@ -159,6 +159,22 @@ fn json_log_format() {
     assert!(log.contains("beanstalkd-rs listening"), "{log}");
 }
 
+/// Logs written to a file (or journald, or `docker logs`) carry no ANSI
+/// color codes: stderr is not a terminal here.
+#[test]
+fn text_log_has_no_color_codes_off_a_terminal() {
+    let (mut server, _) = ConfigServer::start(
+        "[[listener]]\naddr = \"127.0.0.1:{port0}\"\n[log]\nlevel = \"info\"\n",
+        1,
+        &[],
+    );
+    let status = server.stop(nix::sys::signal::Signal::SIGTERM);
+    assert!(status.success());
+    let log = server.stderr();
+    assert!(log.contains("beanstalkd-rs listening"), "{log}");
+    assert!(!log.contains('\x1b'), "escape codes in {log:?}");
+}
+
 /// F5 (P2 security review): a tokens file readable by group or others is
 /// reported by `--check-config` and logged at startup, but still used.
 #[test]

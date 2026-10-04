@@ -132,9 +132,10 @@ jobs:
         run: |
           name="beanstalkd-rs-$VERSION-$TARGET"
           stage="$RUNNER_TEMP/stage/$name"
-          mkdir -p "$stage/docs"
+          mkdir -p "$stage/docs" "$stage/scripts"
           cp "target/$TARGET/release/beanstalkd-rs" LICENSE README.md CHANGELOG.md "$stage/"
-          cp docs/beanstalkd-rs.example.toml "$stage/docs/"
+          cp docs/beanstalkd-rs.example.toml docs/OPERATIONS.md "$stage/docs/"
+          cp scripts/mkcluster-certs.sh "$stage/scripts/"
           cp -R packaging "$stage/"
           tar -czf "$name.tar.gz" -C "$RUNNER_TEMP/stage" "$name"
           tar -tzvf "$name.tar.gz"

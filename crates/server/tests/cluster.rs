@@ -1074,6 +1074,11 @@ fn one_way_partition_isolates_the_follower_and_the_leader_drops_it() {
     let a = c.nodes[f].admin().unwrap();
     assert_eq!(a["cluster"]["leader_id"], lid, "{a}");
     assert_eq!(a["cluster"]["isolated"], true, "{a}");
+    // It still names the leader, but must not look ready to a load balancer.
+    wait_for(Duration::from_secs(2), || {
+        (c.nodes[f].readyz() == 503).then_some(())
+    })
+    .expect("an isolated node kept answering /readyz with 200");
 
     // Reconnecting to the isolated node creates no state: refused at
     // accept, nothing queued.
@@ -1512,7 +1517,8 @@ fn stale_leader_is_rejected_by_a_rejoined_node() {
             .map(str::to_owned)
     })
     .expect("the rejoining node never adopted a vote");
-    // The log is colored: escape codes sit between `vote`, `=` and `T<term>`.
+    // Tolerates color codes between `vote`, `=` and `T<term>` (logs are
+    // plain off a terminal, but the parse must not depend on that).
     let adopted_term: u64 = adopted
         .rsplit_once("vote")
         .and_then(|(_, v)| v.split_once('T'))
