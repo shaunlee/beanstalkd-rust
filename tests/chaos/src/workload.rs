@@ -121,6 +121,11 @@ impl ClientState {
         }
     }
 
+    /// Jobs this connection holds reserved (as far as its replies tell).
+    pub fn holds(&self) -> usize {
+        self.held.len()
+    }
+
     pub fn observe(&mut self, cmd: &Cmd, reply: &Reply, known: &mut Known) {
         match (cmd, reply) {
             (_, Reply::Inserted(id) | Reply::BuriedId(id)) => {

@@ -33,6 +33,11 @@
 //! before it starts Raft); links, pauses and faults apply as to any
 //! request.
 //!
+//! A node may be given a peer allowlist ([`SimNetwork::set_admits`]), as
+//! the TCP listener's (membership-driven, P6-T1): Raft RPCs and forwards
+//! from a node it does not admit fail as `Unreachable` (status probes are
+//! always answered, as over probe connections).
+//!
 //! [`SimCluster`] starts N nodes over one `SimNetwork`, generic over the
 //! storage via a builder closure.
 
@@ -199,8 +204,14 @@ struct SimInner {
     /// Vote gates by node (kept across re-registration and restarts).
     vote_gates: RwLock<HashMap<NodeId, Arc<crate::listener::VoteGate>>>,
     status: RwLock<HashMap<NodeId, Arc<dyn StatusSource>>>,
+    admits: RwLock<HashMap<NodeId, Admits>>,
+    /// When `to` last answered `from`: `(from, to)` -> time.
+    answered: Mutex<HashMap<(NodeId, NodeId), tokio::time::Instant>>,
     resumed: Notify,
 }
+
+/// Whether a node accepts peer requests from another node.
+pub type Admits = Arc<dyn Fn(NodeId) -> bool + Send + Sync>;
 
 #[derive(Clone)]
 pub struct SimNetwork {
@@ -254,6 +265,8 @@ impl SimNetwork {
                 endpoints: RwLock::new(HashMap::new()),
                 vote_gates: RwLock::new(HashMap::new()),
                 status: RwLock::new(HashMap::new()),
+                admits: RwLock::new(HashMap::new()),
+                answered: Mutex::new(HashMap::new()),
                 resumed: Notify::new(),
             }),
         }
@@ -333,6 +346,26 @@ impl SimNetwork {
             Some(s) => st.insert(id, s),
             None => st.remove(&id),
         };
+    }
+
+    /// Gives node `id` a peer allowlist (`None`: it admits every node).
+    /// It stays in place across restarts of the node until changed.
+    pub fn set_admits(&self, id: NodeId, admits: Option<Admits>) {
+        let mut a = self.inner.admits.write().unwrap_or_else(|e| e.into_inner());
+        match admits {
+            Some(f) => a.insert(id, f),
+            None => a.remove(&id),
+        };
+    }
+
+    fn admits(&self, to: NodeId, from: NodeId) -> bool {
+        let a = self.inner.admits.read().unwrap_or_else(|e| e.into_inner());
+        a.get(&to).is_none_or(|f| f(from))
+    }
+
+    /// When `to` last answered a request of `from` (any kind), if ever.
+    pub fn last_response(&self, from: NodeId, to: NodeId) -> Option<tokio::time::Instant> {
+        lock(&self.inner.answered).get(&(from, to)).copied()
     }
 
     fn status_source(&self, id: NodeId) -> Option<Arc<dyn StatusSource>> {
@@ -530,6 +563,11 @@ impl SimNetwork {
             let Some(ep) = self.endpoint(to) else {
                 return Err(SimError::Unreachable(format!("node {to} is not running")));
             };
+            if !self.admits(to, from) {
+                return Err(SimError::Unreachable(format!(
+                    "node {to} refused node {from}: not a member of this cluster"
+                )));
+            }
             let gate = self.vote_gate(to);
             if d.duplicate {
                 let (ep2, body2, delay) = (ep.clone(), body.clone(), d.dup_delay);
@@ -561,7 +599,12 @@ impl SimNetwork {
             Ok(resp)
         };
         match tokio::time::timeout(timeout, exchange).await {
-            Ok(r) => r,
+            Ok(r) => {
+                if r.is_ok() {
+                    lock(&self.inner.answered).insert((from, to), tokio::time::Instant::now());
+                }
+                r
+            }
             Err(_) => Err(SimError::Timeout(timeout)),
         }
     }

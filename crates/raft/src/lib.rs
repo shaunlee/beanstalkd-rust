@@ -10,6 +10,7 @@
 //! ([`owner_of`]). Nothing is acknowledged to a client before its input is
 //! committed on a majority.
 
+pub mod admin;
 pub mod client;
 pub mod forward;
 pub mod listener;
@@ -81,11 +82,12 @@ pub enum Op {
     SetDraining(bool),
     /// The node is gone: disconnect every connection owned by `node` whose
     /// local number is at most `up_to_local`, in ascending `ConnId` order.
-    /// The bound is the `highest_local(node)` the proposer observed, so a
-    /// `DropNode` that commits late (for example a leader's, proposed for a
-    /// node that has meanwhile restarted) never touches the connections the
-    /// node accepted afterwards: a restarted node numbers its new
-    /// connections above every local number the state has seen for it.
+    /// A leader bounds it by the `highest_local(node)` it observed, a
+    /// restarted node its own by its numbering floor minus one, so a
+    /// `DropNode` that commits late never touches the connections the node
+    /// accepted afterwards: a restarted node numbers its new connections
+    /// above every local number the state has seen for it and every number
+    /// its earlier processes reserved.
     DropNode {
         node: NodeId,
         up_to_local: u64,

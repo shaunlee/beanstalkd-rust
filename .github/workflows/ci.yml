@@ -148,9 +148,13 @@ jobs:
           echo "BSTK_CHAOS_DIR=$RUNNER_TEMP/chaos" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/chaos"
       - name: In-process chaos (200 seeds)
-        run: BSTK_CHAOS_SEEDS=200 cargo test --release -p bstk-chaos --test inprocess full -- --ignored --nocapture
+        run: BSTK_CHAOS_SEEDS=200 cargo test --release -p bstk-chaos --test inprocess full -- --ignored --exact --nocapture
+      - name: In-process membership chaos (100 seeds)
+        run: BSTK_CHAOS_SEEDS=100 cargo test --release -p bstk-chaos --test inprocess membership -- --ignored --exact --nocapture
       - name: Multi-process chaos (5 runs)
-        run: BSTK_CHAOS_MP_RUNS=5 cargo test --release -p bstk-chaos --test multiprocess full -- --ignored --nocapture
+        run: BSTK_CHAOS_MP_RUNS=5 cargo test --release -p bstk-chaos --test multiprocess full -- --ignored --exact --nocapture
+      - name: Multi-process membership chaos (2 runs)
+        run: BSTK_CHAOS_MP_RUNS=2 cargo test --release -p bstk-chaos --test multiprocess membership -- --ignored --exact --nocapture
       - name: Upload chaos logs
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

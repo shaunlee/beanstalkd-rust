@@ -23,6 +23,11 @@
 //! everything, drain), check that every node's replicated counters agree, scan
 //! the node logs for panics, and run the history checker. Processes are killed
 //! (SIGKILL) when the run ends or fails, including on panic (`Drop`).
+//!
+//! With [`MpConfig::membership`], spare node ids are configured too (every
+//! node's `[[cluster.peer]]` lists them, behind their own per-link proxies)
+//! and the schedule also runs membership scenarios through the real
+//! `beanstalkd-rs cluster` command; see [`membership`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
@@ -40,6 +45,8 @@ use crate::client::{BsClient, http_get};
 use crate::history::{Cmd, ConnKey, History, JobId, Recorder, Reply};
 use crate::proxy::Proxy;
 use crate::workload::{ClientState, Known, WorkloadConfig};
+
+pub mod membership;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -76,6 +83,11 @@ pub struct MpConfig {
     pub node_timeout: &'static str,
     pub snapshot_every: u64,
     pub wipe: bool,
+    /// Run the membership scenarios (see [`membership`]).
+    pub membership: bool,
+    /// Ids above the initial voters, configured on every node from the
+    /// start.
+    pub spares: u64,
     pub work: WorkloadConfig,
     /// Where run directories go (a temporary directory if `None`); failed
     /// runs keep theirs.
@@ -93,12 +105,28 @@ impl MpConfig {
             node_timeout: "1s",
             snapshot_every: 150,
             wipe: std::env::var("BSTK_CHAOS_NO_WIPE").is_err(),
+            membership: false,
+            spares: 0,
             work: WorkloadConfig {
                 max_puts: 150,
                 ..WorkloadConfig::default()
             },
             base_dir: std::env::var("BSTK_CHAOS_DIR").ok().map(PathBuf::from),
         }
+    }
+
+    /// The membership mix: the fixed mix's faults plus the membership
+    /// scenarios, with three spare ids.
+    pub fn membership_from_seed(seed: u64, duration: Duration) -> MpConfig {
+        MpConfig {
+            membership: true,
+            spares: 3,
+            ..MpConfig::from_seed(seed, duration)
+        }
+    }
+
+    pub fn ids(&self) -> Vec<u64> {
+        (1..=self.nodes + self.spares).collect()
     }
 }
 
@@ -120,6 +148,7 @@ pub enum MpFault {
     Latency(u64),
     Heal(bool),
     Wipe(u64),
+    Member(membership::Step),
 }
 
 pub fn generate(seed: u64, nodes: u64, duration: Duration, wipe: bool) -> Vec<(Duration, MpFault)> {
@@ -174,6 +203,8 @@ struct Node {
     child: Option<Child>,
     stopped: bool,
     starts: u32,
+    /// Removed from the membership and stopped: never started again.
+    retired: bool,
 }
 
 impl Node {
@@ -240,6 +271,9 @@ struct Cluster {
     _tmp: Option<tempfile::TempDir>,
     nodes: Vec<Node>,
     proxies: BTreeMap<(u64, u64), Proxy>,
+    /// Initial voters: ids `1..=initial`.
+    initial: u64,
+    membership: bool,
 }
 
 impl Drop for Cluster {
@@ -288,7 +322,8 @@ impl Cluster {
         };
         let mut held = Vec::new();
         let mut nodes = Vec::new();
-        for id in 1..=cfg.nodes {
+        let ids = cfg.ids();
+        for &id in &ids {
             nodes.push(Node {
                 id,
                 client: free_addr(&mut held)?,
@@ -300,11 +335,12 @@ impl Cluster {
                 child: None,
                 stopped: false,
                 starts: 0,
+                retired: false,
             });
         }
         let mut proxies = BTreeMap::new();
-        for a in 1..=cfg.nodes {
-            for b in 1..=cfg.nodes {
+        for &a in &ids {
+            for &b in &ids {
                 if a != b {
                     let target = nodes[(b - 1) as usize].cluster;
                     let p = Proxy::start(target)
@@ -331,11 +367,18 @@ impl Cluster {
                     m.id
                 ));
             }
+            let initial = if cfg.spares > 0 {
+                let v: Vec<String> = (1..=cfg.nodes).map(|i| i.to_string()).collect();
+                format!("initial_voters = [{}]\n", v.join(", "))
+            } else {
+                String::new()
+            };
             let text = format!(
                 "[[listener]]\naddr = \"{}\"\n\
                  [http]\naddr = \"{}\"\nsnapshot_min_interval = \"0s\"\n\
                  [cluster]\nnode_id = {}\nlisten = \"{}\"\ndata_dir = \"{}\"\n\
-                 node_timeout = \"{}\"\nsnapshot_every = {}\ninsecure_plaintext = true\n\n{peers}",
+                 node_timeout = \"{}\"\nsnapshot_every = {}\ninsecure_plaintext = true\n\
+                 {initial}\n{peers}",
                 n.client,
                 n.http,
                 n.id,
@@ -352,6 +395,8 @@ impl Cluster {
             _tmp: tmp,
             nodes,
             proxies,
+            initial: cfg.nodes,
+            membership: cfg.membership,
         })
     }
 
@@ -377,7 +422,10 @@ impl Cluster {
             .is_some_and(|(s, _)| s == 200)
     }
 
+    /// The node that leads in the highest term (a node cut off may still
+    /// believe it leads an older one).
     async fn leader(&self) -> Option<u64> {
+        let mut best: Option<(u64, u64)> = None;
         for n in &self.nodes {
             if n.child.is_none() || n.stopped {
                 continue;
@@ -385,10 +433,31 @@ impl Cluster {
             if let Some(a) = self.admin(n.id).await
                 && a["cluster"]["role"] == "leader"
             {
-                return Some(n.id);
+                let term = a["cluster"]["term"].as_u64().unwrap_or(0);
+                if best.is_none_or(|(_, t)| term > t) {
+                    best = Some((n.id, term));
+                }
             }
         }
-        None
+        best.map(|(id, _)| id)
+    }
+
+    /// Nodes started at least once and not retired.
+    fn started_ids(&self) -> Vec<u64> {
+        self.nodes
+            .iter()
+            .filter(|n| !n.retired && n.starts > 0)
+            .map(|n| n.id)
+            .collect()
+    }
+
+    /// Nodes that may run: not retired.
+    fn live_ids(&self) -> Vec<u64> {
+        self.nodes
+            .iter()
+            .filter(|n| !n.retired)
+            .map(|n| n.id)
+            .collect()
     }
 
     fn links_of(&self, id: u64) -> Vec<&Proxy> {
@@ -428,17 +497,27 @@ impl MpOutcome {
 
     pub fn describe(&self) -> String {
         let mut s = format!(
-            "mp seed {} ({} nodes, {} clients, {:?} faults{}): {} in {:.1?} \
-             [replay: BSTK_CHAOS_MP_SEED={} cargo test -p bstk-chaos --test multiprocess replay \
+            "mp seed {} ({} nodes{}, {} clients, {:?} faults{}): {} in {:.1?} \
+             [replay: BSTK_CHAOS_MP_SEED={} cargo test -p bstk-chaos --test multiprocess {} \
              -- --ignored --nocapture]\n",
             self.cfg.seed,
             self.cfg.nodes,
+            if self.cfg.membership {
+                format!(" + {} spares, membership scenarios", self.cfg.spares)
+            } else {
+                String::new()
+            },
             self.cfg.clients,
             self.cfg.duration,
             if self.cfg.wipe { ", wipes" } else { "" },
             if self.passed() { "ok" } else { "FAILED" },
             self.wall,
             self.cfg.seed,
+            if self.cfg.membership {
+                "churn_seed"
+            } else {
+                "replay"
+            },
         );
         for f in &self.failures {
             s.push_str(&format!("  failure: {f}\n"));
@@ -461,6 +540,11 @@ struct Shared {
     events: Mutex<Vec<String>>,
     problems: Mutex<Vec<String>>,
     faults: Mutex<BTreeMap<String, u64>>,
+    /// When faults were applied (a removed node's connections must be gone
+    /// within the bound after the later of its removal and the last one).
+    disruptions: Mutex<Vec<Duration>>,
+    /// The memberships the operator's answered changes allow.
+    models: Mutex<Option<membership::Models>>,
 }
 
 impl Shared {
@@ -489,6 +573,8 @@ pub async fn run(cfg: MpConfig) -> MpOutcome {
         events: Mutex::new(Vec::new()),
         problems: Mutex::new(Vec::new()),
         faults: Mutex::new(BTreeMap::new()),
+        disruptions: Mutex::new(Vec::new()),
+        models: Mutex::new(None),
     });
     let rec = Recorder::new();
     let mut dir = None;
@@ -581,10 +667,11 @@ async fn start_cluster(cfg: &MpConfig, attempt: u64, sh: &Shared) -> Result<Clus
 
 async fn start_nodes(mut c: Cluster, sh: &Shared) -> Result<Cluster, String> {
     let bin = c.bin.clone();
-    for i in 0..c.nodes.len() {
-        c.nodes[i].start(&bin, true)?;
+    // The spares start only when a scenario adds them.
+    let ids: Vec<u64> = (1..=c.initial).collect();
+    for &id in &ids {
+        c.nodes[(id - 1) as usize].start(&bin, true)?;
     }
-    let ids: Vec<u64> = c.nodes.iter().map(|n| n.id).collect();
     let cref = &c;
     let ok = wait_for(Duration::from_secs(30), || async {
         for &id in &ids {
@@ -608,7 +695,7 @@ async fn start_nodes(mut c: Cluster, sh: &Shared) -> Result<Cluster, String> {
     };
     for ((a, b), p) in &c.proxies {
         let (up, down) = p.bytes();
-        if *a == l && (up == 0 || down == 0) {
+        if *a == l && *b <= c.initial && (up == 0 || down == 0) {
             return Err(format!(
                 "link {a} -> {b} of leader {l} carried no traffic through its proxy \
                  (up {up}, down {down})"
@@ -621,7 +708,44 @@ async fn start_nodes(mut c: Cluster, sh: &Shared) -> Result<Cluster, String> {
     Ok(c)
 }
 
+/// In the membership mix a fault's node `id` (1..=initial voters) names
+/// the `id`-th node that may run now, so faults follow the membership.
+fn resolve(c: &Cluster, f: &MpFault) -> MpFault {
+    if !c.membership {
+        return f.clone();
+    }
+    let live: Vec<u64> = c
+        .nodes
+        .iter()
+        .filter(|n| !n.retired && n.starts > 0)
+        .map(|n| n.id)
+        .collect();
+    let r = |id: &u64| {
+        if live.is_empty() {
+            *id
+        } else {
+            live[((*id - 1) as usize) % live.len()]
+        }
+    };
+    match f {
+        MpFault::Kill(id) => MpFault::Kill(r(id)),
+        MpFault::Restart(id) => MpFault::Restart(r(id)),
+        MpFault::Stop(id) => MpFault::Stop(r(id)),
+        MpFault::Cont(id) => MpFault::Cont(r(id)),
+        MpFault::Isolate(id) => MpFault::Isolate(r(id)),
+        MpFault::Wipe(id) => MpFault::Wipe(r(id)),
+        MpFault::Cut(a, b) => MpFault::Cut(r(a), r(b)),
+        MpFault::OneWay(a, b) => MpFault::OneWay(r(a), r(b)),
+        MpFault::Stall(a, b, up, down) => MpFault::Stall(r(a), r(b), *up, *down),
+        other => other.clone(),
+    }
+}
+
 async fn apply(c: &mut Cluster, f: &MpFault, sh: &Shared) {
+    let f = &resolve(c, f);
+    if !matches!(f, MpFault::Member(_)) {
+        lock(&sh.disruptions).push(sh.elapsed());
+    }
     let bin = c.bin.clone();
     let leader = match f {
         MpFault::KillLeader | MpFault::StopLeader | MpFault::IsolateLeader => c.leader().await,
@@ -646,28 +770,20 @@ async fn apply(c: &mut Cluster, f: &MpFault, sh: &Shared) {
         }
         MpFault::Restart(id) => restart(c, &bin, *id, false, sh),
         MpFault::RestartAll => {
-            for id in 1..=c.nodes.len() as u64 {
+            for id in c.started_ids() {
                 restart(c, &bin, id, false, sh);
             }
         }
         MpFault::Wipe(id) => {
-            // Never more rejoining nodes than a majority can spare: the
-            // nodes with their data must still form a quorum.
-            let n = c.nodes.len();
-            let spare = n - (n / 2 + 1);
-            let others = c
-                .nodes
-                .iter()
-                .filter(|m| m.id != *id && rejoin_pending(&m.data_dir))
-                .count();
-            if others + 1 > spare {
-                sh.event(format!("wipe of node {id} skipped (others rejoining)"));
+            if let Err(why) = wipe_allowed(c, *id).await {
+                sh.event(format!("wipe of node {id} skipped ({why})"));
                 sh.count("WipeSkipped");
                 return;
             }
             kill(c, *id, sh);
             restart(c, &bin, *id, true, sh);
         }
+        MpFault::Member(step) => membership::run_step(c, step, sh).await,
         MpFault::Stop(id) => stop(c, *id, sh),
         MpFault::StopLeader => {
             if let Some(l) = leader {
@@ -766,9 +882,65 @@ fn rejoin_pending(data_dir: &Path) -> bool {
     !has_state || data_dir.join("rejoin").exists()
 }
 
+/// The wipe rule: every voter set of the current membership must keep a
+/// quorum of voters with their data (wiped and rejoining voters count
+/// against it); never while it is joint. The fixed mix counts every node
+/// (its membership never changes); the membership mix asks the leader for
+/// the voters, and skips the wipe when no leader answers.
+async fn wipe_allowed(c: &Cluster, id: u64) -> Result<(), String> {
+    let voters: BTreeSet<u64> = if c.membership {
+        let Some(l) = c.leader().await else {
+            return Err("no leader to read the membership from".into());
+        };
+        let Some(a) = c.admin(l).await else {
+            return Err("no membership from the leader".into());
+        };
+        let m = &a["cluster"]["membership"];
+        if m["joint"].as_bool() != Some(false) {
+            return Err("a joint configuration is current".into());
+        }
+        m["voters"]
+            .as_array()
+            .map(|v| v.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default()
+    } else {
+        c.nodes.iter().map(|n| n.id).collect()
+    };
+    if !voters.contains(&id) {
+        return Ok(());
+    }
+    let n = voters.len();
+    let spare = n - (n / 2 + 1);
+    let others = c
+        .nodes
+        .iter()
+        .filter(|m| m.id != id && voters.contains(&m.id) && rejoin_pending(&m.data_dir))
+        .count();
+    if others + 1 > spare {
+        return Err("others rejoining".into());
+    }
+    Ok(())
+}
+
 fn restart(c: &mut Cluster, bin: &Path, id: u64, wipe: bool, sh: &Shared) {
+    let c_membership = c.membership;
     let Some(n) = c.node(id) else { return };
+    if n.retired {
+        return;
+    }
     if let Some(st) = n.exited() {
+        // A node whose id is not a member (a spare added by a change that
+        // never happened, then skipped by a later add) refuses to start;
+        // `membership::settle` reports a member that was refused.
+        let log = std::fs::read_to_string(&n.log).unwrap_or_default();
+        if c_membership && st.code() == Some(1) && log.contains("node ids are never reused") {
+            n.retired = true;
+            sh.event(format!(
+                "node {id} refused to start: its id is not a member"
+            ));
+            sh.count("RefusedToStart");
+            return;
+        }
         sh.problem(format!("node {id} exited on its own: {st}"));
     }
     if n.child.is_some() {
@@ -870,18 +1042,25 @@ async fn drive(c: &mut Cluster, cfg: &MpConfig, sh: &Arc<Shared>, rec: &Recorder
             until,
         )));
     }
-    for (at, f) in generate(cfg.seed, cfg.nodes, cfg.duration, cfg.wipe) {
+    let mut schedule = generate(cfg.seed, cfg.nodes, cfg.duration, cfg.wipe);
+    if cfg.membership {
+        membership::init_models(c, sh).await;
+        schedule.extend(membership::schedule(cfg.seed, cfg.duration));
+        schedule.sort_by_key(|(at, _)| *at);
+    }
+    for (at, f) in schedule {
         tokio::time::sleep_until((start + at).into()).await;
         apply(c, &f, sh).await;
     }
     tokio::time::sleep_until(until.into()).await;
 
     sh.event("heal: links, SIGCONT, restart".into());
+    lock(&sh.disruptions).push(sh.elapsed());
     for p in c.proxies.values() {
         p.heal(false);
     }
     let bin = c.bin.clone();
-    for id in 1..=c.nodes.len() as u64 {
+    for id in c.started_ids() {
         if let Some(n) = c.node(id)
             && n.stopped
         {
@@ -889,7 +1068,19 @@ async fn drive(c: &mut Cluster, cfg: &MpConfig, sh: &Arc<Shared>, rec: &Recorder
         }
         restart(c, &bin, id, false, sh);
     }
-    let ids: Vec<u64> = c.nodes.iter().map(|n| n.id).collect();
+    let ids: Vec<u64> = if cfg.membership {
+        match membership::settle(c, sh).await {
+            Some(m) => m.into_iter().collect(),
+            None => {
+                for cl in clients {
+                    cl.abort();
+                }
+                return;
+            }
+        }
+    } else {
+        c.nodes.iter().map(|n| n.id).collect()
+    };
     let cref = &*c;
     let ready = wait_for(Duration::from_secs(60), || async {
         for &id in &ids {
@@ -922,7 +1113,10 @@ async fn drive(c: &mut Cluster, cfg: &MpConfig, sh: &Arc<Shared>, rec: &Recorder
     }
     tokio::time::sleep(Duration::from_secs(u64::from(cfg.work.ttr.1) + 3)).await;
     verify(c, sh, rec).await;
-    compare_replicas(c, sh).await;
+    if cfg.membership {
+        membership::check_final(c, sh, &ids).await;
+    }
+    compare_replicas(c, sh, &ids).await;
 }
 
 async fn verify(c: &Cluster, sh: &Shared, rec: &Recorder) {
@@ -1009,11 +1203,10 @@ const REPLICATED: &[&str] = &[
     "current-tubes",
 ];
 
-async fn compare_replicas(c: &Cluster, sh: &Shared) {
-    let ids: Vec<u64> = c.nodes.iter().map(|n| n.id).collect();
+async fn compare_replicas(c: &Cluster, sh: &Shared, ids: &[u64]) {
     let same = wait_for(Duration::from_secs(20), || async {
         let mut idx = BTreeSet::new();
-        for &id in &ids {
+        for &id in ids {
             match c.admin(id).await {
                 Some(a) => {
                     idx.insert(a["cluster"]["applied_index"].as_u64());
@@ -1029,7 +1222,7 @@ async fn compare_replicas(c: &Cluster, sh: &Shared) {
         return;
     }
     let mut seen: Option<(u64, BTreeMap<String, String>)> = None;
-    for n in &c.nodes {
+    for n in c.nodes.iter().filter(|n| ids.contains(&n.id)) {
         let Ok(mut cl) = BsClient::connect(n.client, Duration::from_secs(2)).await else {
             sh.problem(format!("stats: cannot connect to node {}", n.id));
             return;
@@ -1099,6 +1292,8 @@ pub async fn check_peer_addresses() -> Result<String, String> {
         events: Mutex::new(Vec::new()),
         problems: Mutex::new(Vec::new()),
         faults: Mutex::new(BTreeMap::new()),
+        disruptions: Mutex::new(Vec::new()),
+        models: Mutex::new(None),
     };
     let mut c = start_cluster(&cfg, 0, &sh).await?;
     kill(&mut c, 1, &sh);
@@ -1206,6 +1401,8 @@ pub async fn reconnect_storm_probe(isolate: Duration) -> Result<String, String> 
         events: Mutex::new(Vec::new()),
         problems: Mutex::new(Vec::new()),
         faults: Mutex::new(BTreeMap::new()),
+        disruptions: Mutex::new(Vec::new()),
+        models: Mutex::new(None),
     };
     let c = start_cluster(&cfg, 0, &sh).await?;
     let l = c.leader().await.ok_or("no leader")?;

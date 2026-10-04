@@ -15,7 +15,10 @@
 //! appended but not committed is still admitted (P6-T4): the allowlist is
 //! the effective membership's nodes plus the committed membership's, so a
 //! removed leader can still tell the others that its removal is committed,
-//! and an entry that is truncated never cut anyone off.
+//! and an entry that is truncated never cut anyone off. The listener also
+//! admits every id above [`admit_above`]: such a node was added by entries
+//! this node has not seen, and may lead a cluster whose membership moved on
+//! while this node was down (docs/DESIGN.md §8 "Allowlist").
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -57,6 +60,18 @@ pub fn allowed(
     } else {
         seeds.clone()
     }
+}
+
+/// The highest id this node knows was ever a member: its applied
+/// `highest_member`, raised to the ids of `m` and `committed` (entries
+/// appended or committed but not applied yet). Ids are never reused and new
+/// ones are always above every earlier member, so an id above it can only
+/// come from entries this node has not received.
+pub fn admit_above(m: &Membership, committed: &Membership, highest_member: NodeId) -> NodeId {
+    m.nodes()
+        .chain(committed.nodes())
+        .map(|(&id, _)| id)
+        .fold(highest_member, NodeId::max)
 }
 
 /// Whether `id` is a node (voter or learner) of `m`.
@@ -141,14 +156,16 @@ fn apply(
     core.net.set_members(addrs);
     let allow = allowed(m, committed, seeds);
     core.set_admitted(allow.clone());
-    if allow != allowlist.get() {
+    let above = admit_above(m, committed, core.state.highest_member());
+    if allow != allowlist.get() || Some(above) != allowlist.floor() {
         tracing::info!(
             membership = ?m.log_id(),
             committed = ?committed.log_id(),
             allowed = ?allow,
+            admit_above = above,
             "cluster allowlist updated"
         );
-        allowlist.set(allow);
+        allowlist.set_with_floor(allow, Some(above));
     }
 }
 
@@ -240,6 +257,9 @@ mod tests {
         assert_eq!(allowed(&m, &none, &seeds), set(&[1, 2, 3, 4]));
         assert!(is_member(&m, 4) && !is_member(&m, 5));
         assert_eq!(voter_count(&m), 3);
+        // Ids above every member this node has seen may be newer members.
+        assert_eq!(admit_above(&m, &none, 2), 4);
+        assert_eq!(admit_above(&m, &m, 7), 7);
     }
 
     #[test]

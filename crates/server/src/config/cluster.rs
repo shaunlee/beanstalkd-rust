@@ -412,15 +412,7 @@ fn resolve_cluster(
     })
 }
 
-/// Whether `addr` (`host:port`) names a loopback address (`127.0.0.0/8`,
-/// `::1` or `localhost`).
-pub fn is_loopback(addr: &str) -> bool {
-    if let Ok(a) = addr.parse::<SocketAddr>() {
-        return a.ip().is_loopback();
-    }
-    addr.rsplit_once(':')
-        .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost"))
-}
+pub use bstk_raft::admin::is_loopback;
 
 pub fn cluster_summary(c: &ClusterSettings) -> String {
     let mut s = String::new();

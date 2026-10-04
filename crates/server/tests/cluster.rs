@@ -2549,6 +2549,111 @@ fn admin_replaces_a_node_and_moves_it() {
 }
 
 /// The value of the unlabelled sample `name` in a `/metrics` text.
+/// P6-T7 regression (found by the multi-process chaos harness): a node whose
+/// state predates the entries that added every current voter (here a
+/// learner that was down while the cluster was replaced around it) must
+/// still accept the new leader's hello and catch up; its allowlist, built
+/// from its own stale membership, used to reject every newer id forever.
+#[test]
+fn stale_learner_accepts_a_leader_added_while_it_was_down() {
+    let opts = Opts {
+        node_timeout: "5s",
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(3, &opts);
+    let l = c.leader();
+    let lp = c.nodes[l].cluster;
+    let n4 = c.configure_extra_node(&[1, 2, 3, 4], &[], &opts);
+    add_and_start(&mut c, lp, n4);
+    wait_membership(&mut c, &[0, 1, 2, n4], &[1, 2, 3], &[4]);
+    c.nodes[n4].stop(Signal::SIGTERM);
+
+    let mut fresh = Vec::new();
+    for id in [5, 6, 7] {
+        let n = c.configure_extra_node(&[1, 2, 3, id], &[], &opts);
+        add_and_start(&mut c, lp, n);
+        change(lp, |e| promote(&[id], e, false));
+        fresh.push(n);
+    }
+    wait_membership(&mut c, &fresh, &[1, 2, 3, 5, 6, 7], &[4]);
+    for id in [1, 2, 3] {
+        let l = c.leader();
+        let lp = c.nodes[l].cluster;
+        change(lp, |e| remove(id, e, false));
+        c.nodes[id as usize - 1].stop(Signal::SIGTERM);
+    }
+    wait_membership(&mut c, &fresh, &[5, 6, 7], &[4]);
+
+    let mut on_new = c.nodes[fresh[0]].connect();
+    let job = inserted(&on_new.put(b"after the replacement"));
+    c.nodes[n4].start(&[]);
+    assert!(
+        c.nodes[n4].wait_ready(Duration::from_secs(20)),
+        "the stale learner never caught up: {:?}",
+        admin_status(c.nodes[n4].cluster)
+    );
+    let mut on_4 = c.nodes[n4].connect();
+    assert_eq!(
+        on_4.cmd(&format!("peek {job}")).split(' ').nth(1),
+        Some(&*job.to_string())
+    );
+}
+
+/// P6-T7 regression (found by the multi-process chaos harness): a restarted
+/// node whose own log is behind must still close out every connection of its
+/// previous process. Here the old process's client reserved a job through
+/// the leader while the leader could not replicate to it, so the restarted
+/// node's state lacks that connection; its startup `DropNode` used to be
+/// bounded by the stale local view (or skipped), leaving the connection,
+/// and the reservation, in the replicated state with a live owner that no
+/// leader duty ever drops.
+#[test]
+fn restarted_node_behind_its_previous_process_still_drops_its_connections() {
+    // The leader drops a silent node after 2 x node_timeout: well past the
+    // cut below, so only the restarted node's own DropNode can release.
+    let opts = Opts {
+        node_timeout: "10s",
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(3, &opts);
+    let l = c.leader();
+    let lp = c.nodes[l].cluster;
+    let n4 = c.configure_extra_node(&[1, 2, 3, 4], &[], &opts);
+    // The others dial node 4 at its membership address: this proxy.
+    let to4 = Proxy::start(([127, 0, 0, 1], c.nodes[n4].cluster).into());
+    let addr = to4.addr.to_string();
+    assert_eq!(change(lp, |e| add(4, &addr, e)), None);
+    c.nodes[n4].start(&[]);
+    assert!(c.nodes[n4].wait_ready(Duration::from_secs(30)));
+
+    let mut on_leader = c.nodes[l].connect();
+    let job = inserted(&on_leader.put(b"held by a connection node 4 never saw"));
+    let cut = Instant::now();
+    to4.cut();
+    let mut worker = c.nodes[n4].connect();
+    // No reply: node 4 cannot apply it. The leader can.
+    worker.send(b"reserve\r\n");
+    wait_for(Duration::from_secs(5), || {
+        on_leader
+            .yaml(&format!("stats-job {job}"))
+            .contains("state: reserved")
+            .then_some(())
+    })
+    .expect("the reserve through node 4 was not applied by the leader");
+    c.nodes[n4].kill9();
+    drop(worker);
+    c.nodes[n4].start(&[]);
+    std::thread::sleep(Duration::from_secs(3));
+    to4.heal();
+    assert!(
+        cut.elapsed() < Duration::from_secs(15),
+        "too slow: the leader's liveness duty may have dropped node 4"
+    );
+    assert!(c.nodes[n4].wait_ready(Duration::from_secs(30)));
+    assert_eq!(reserve(&mut on_leader, "reserve-with-timeout 4"), job);
+    assert_eq!(on_leader.stat("stats", "current-connections"), "1");
+}
+
 fn gauge(metrics: &str, name: &str) -> Option<String> {
     metrics
         .lines()

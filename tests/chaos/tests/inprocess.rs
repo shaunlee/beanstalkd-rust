@@ -5,8 +5,12 @@
 //!   --test inprocess full -- --ignored --nocapture` (optionally
 //!   `BSTK_CHAOS_FIRST`, `BSTK_CHAOS_JOBS`, `BSTK_CHAOS_NO_WIPE=1` to leave
 //!   wipes out);
+//! - membership changes (P6-T7): the same with `membership` instead of
+//!   `full` (the fixed mix's faults plus membership changes through the
+//!   server's executor; see `bstk_chaos::inproc::membership`);
 //! - replay one seed: `BSTK_CHAOS_SEED=<seed> cargo test -p bstk-chaos
-//!   --test inprocess replay -- --ignored --nocapture`.
+//!   --test inprocess replay -- --ignored --nocapture` (`churn_seed`
+//!   for a seed of the membership mix).
 
 #![allow(clippy::unwrap_used)]
 
@@ -35,12 +39,12 @@ fn jobs() -> usize {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
 }
 
-fn run_many(first: u64, count: u64, verbose: bool) -> Vec<Outcome> {
+fn run_many(first: u64, count: u64, verbose: bool, make: fn(u64) -> RunConfig) -> Vec<Outcome> {
     let started = Instant::now();
     let seeds: Vec<u64> = (first..first + count).collect();
     let outs = bstk_chaos::parallel(seeds, jobs(), |seed| {
         let t = Instant::now();
-        let o = run_seed(RunConfig::from_seed(seed));
+        let o = run_seed(make(seed));
         if verbose || !o.passed() {
             eprintln!(
                 "seed {seed}: {} in {:.1?} wall / {:.1?} virtual, {}",
@@ -87,7 +91,7 @@ fn run_many(first: u64, count: u64, verbose: bool) -> Vec<Outcome> {
 
 #[test]
 fn smoke() {
-    let outs = run_many(0, 4, false);
+    let outs = run_many(0, 4, false, RunConfig::from_seed);
     let failed: Vec<u64> = outs
         .iter()
         .filter(|o| !o.passed())
@@ -101,7 +105,12 @@ fn smoke() {
 fn full() {
     let first = env_u64("BSTK_CHAOS_FIRST").unwrap_or(1000);
     let count = env_u64("BSTK_CHAOS_SEEDS").unwrap_or(1000);
-    let outs = run_many(first, count, std::env::var("BSTK_CHAOS_VERBOSE").is_ok());
+    let outs = run_many(
+        first,
+        count,
+        std::env::var("BSTK_CHAOS_VERBOSE").is_ok(),
+        RunConfig::from_seed,
+    );
     let failed: Vec<u64> = outs
         .iter()
         .filter(|o| !o.passed())
@@ -111,22 +120,63 @@ fn full() {
 }
 
 #[test]
-#[ignore = "replays BSTK_CHAOS_SEED"]
-fn replay() {
+fn smoke_membership() {
+    let outs = run_many(0, 3, false, RunConfig::membership_from_seed);
+    let failed: Vec<u64> = outs
+        .iter()
+        .filter(|o| !o.passed())
+        .map(|o| o.cfg.seed)
+        .collect();
+    assert!(failed.is_empty(), "failed seeds: {failed:?}");
+}
+
+#[test]
+#[ignore = "full membership chaos run; see the module docs"]
+fn membership() {
+    let first = env_u64("BSTK_CHAOS_FIRST").unwrap_or(1000);
+    let count = env_u64("BSTK_CHAOS_SEEDS").unwrap_or(1000);
+    let outs = run_many(
+        first,
+        count,
+        std::env::var("BSTK_CHAOS_VERBOSE").is_ok(),
+        RunConfig::membership_from_seed,
+    );
+    let failed: Vec<u64> = outs
+        .iter()
+        .filter(|o| !o.passed())
+        .map(|o| o.cfg.seed)
+        .collect();
+    assert!(failed.is_empty(), "failed seeds: {failed:?}");
+}
+
+fn replay_with(make: fn(u64) -> RunConfig) {
     let seed = env_u64("BSTK_CHAOS_SEED").expect("set BSTK_CHAOS_SEED");
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .try_init();
     let t = Instant::now();
-    let o = run_seed(RunConfig::from_seed(seed));
+    let o = run_seed(make(seed));
     eprintln!("{}", o.describe());
     eprintln!("{} in {:.1?} wall", o.report.summary(), t.elapsed());
     for e in &o.events {
         eprintln!("  {e}");
     }
+    eprintln!("stats: {:?}", o.stats);
     if std::env::var("BSTK_CHAOS_DUMP").is_ok() {
         eprintln!("{}", o.history.dump());
     }
     assert!(o.passed());
+}
+
+#[test]
+#[ignore = "replays BSTK_CHAOS_SEED"]
+fn replay() {
+    replay_with(RunConfig::from_seed);
+}
+
+#[test]
+#[ignore = "replays BSTK_CHAOS_SEED of the membership mix"]
+fn churn_seed() {
+    replay_with(RunConfig::membership_from_seed);
 }

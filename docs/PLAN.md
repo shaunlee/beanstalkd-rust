@@ -516,7 +516,7 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 - Add, remove and replace cluster nodes, and change a node's address, without stopping the cluster; grow a cluster (1 → 3, 3 → 5) and shrink it.
 - An authenticated operator interface, status and metrics for membership, runbooks in `docs/OPERATIONS.md`.
 - Chaos coverage of membership changes under faults.
-- **Out of scope**: automatic membership management (auto-removal of dead nodes), openraft 0.10, certificate revocation lists (removed nodes are kept out by the membership allowlist; ids are never reused).
+- **Out of scope**: automatic membership management (auto-removal of dead nodes), openraft 0.10, certificate revocation lists (removed nodes are kept out by the membership allowlist of every node that has seen their add, and by Raft's quorum rules everywhere; ids are never reused).
 - **Invariant**: no change to replicated semantics (the `Op` set and how the state machine applies it), so a mixed-version cluster cannot diverge; client protocol unchanged.
 
 ### 9.2 Facts checked before planning (design survey, HEAD `5004d6e`)

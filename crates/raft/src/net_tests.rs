@@ -1752,6 +1752,19 @@ async fn allowlist_update_closes_departed_peers_and_admits_new_ones() {
     allow.set([1, 2].into());
     assert_eq!(allow.handshakes_per_ip(), 6);
     assert!(closes(&mut peer4).await);
+
+    // P6-T7: ids above the floor are admitted (newer members this node
+    // has not seen yet); those at or below it only if listed.
+    allow.set_with_floor([1, 2].into(), Some(6));
+    assert!(rejected_with(
+        &hello_answer(addr, 5).await,
+        REJECT_NOT_MEMBER
+    ));
+    let mut peer7 = raw_hello(addr, 7).await;
+    assert!(raw_forward(&mut peer7, 7).await);
+    // Raising the floor past a connected id closes its connection.
+    allow.set_with_floor([1, 2].into(), Some(7));
+    assert!(closes(&mut peer7).await);
     l.shutdown().await;
     let _ = raft.shutdown().await;
 }

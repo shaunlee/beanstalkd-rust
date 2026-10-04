@@ -583,17 +583,19 @@ impl Core {
     }
 
     /// The startup cleanup: `DropNode(self)` applied here, so that no
-    /// connection of this node's previous process is left in the state
-    /// (their reservations would otherwise stay held). Its bound is the
-    /// `highest_local(self)` observed now; new connections are numbered
-    /// above it, so neither this proposal nor a leader's for the old
-    /// process can reach them, however late it commits.
-    async fn drop_previous_connections(&self) {
+    /// connection of this node's previous processes is left in the state
+    /// (their reservations would otherwise stay held, and no leader drops
+    /// the connections of a live node). Its bound is `first_local - 1`, this
+    /// process's numbering floor: every number an earlier process handed
+    /// out is below it, whether or not this node's log has caught up with
+    /// their connects yet (P6-T7), and this process's own are above it, so
+    /// a late or duplicate proposal never reaches them.
+    async fn drop_previous_connections(&self, first_local: u64) {
         loop {
             self.caught_up().await;
             let op = Op::DropNode {
                 node: self.id,
-                up_to_local: self.state.highest_local(self.id),
+                up_to_local: first_local.saturating_sub(1),
             };
             match self.control(op).await {
                 ControlOutcome::Applied(i) => {
@@ -609,17 +611,14 @@ impl Core {
                 }
                 ControlOutcome::Unknown => {
                     // The proposal may still commit. Give it time (or a
-                    // leader change) to settle, then check whether anything
-                    // is left to close out. (A late duplicate is harmless:
-                    // its bound is below every new connection.)
+                    // leader change) to settle, then propose again: whether
+                    // anything is left cannot be read from a state that may
+                    // lag the old process's connects, and a duplicate is
+                    // harmless.
                     let (_, term) = self.view();
                     let deadline = Instant::now() + Duration::from_secs(2);
                     while Instant::now() < deadline && self.view().1 == term {
                         tokio::time::sleep(Duration::from_millis(50)).await;
-                    }
-                    self.caught_up().await;
-                    if !self.owns_connections(self.id) {
-                        return;
                     }
                 }
             }
@@ -1512,11 +1511,11 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
             tracing::info!("waiting for a leader");
         }
     }
-    core.drop_previous_connections().await;
-
     // Connection numbers: above everything an earlier process may have
     // handed out (the persisted block end, the replicated state, and the
     // time floor for a wiped node's lost block; see `durable::first_local`).
+    // Taken before the startup `DropNode`, whose bound it is: the block end
+    // and the time floor do not depend on how far this node's log is.
     let highest = core.state.highest_local(id);
     if persisted_ids.is_none() {
         // The floor is taken at least a second after this process started,
@@ -1539,6 +1538,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
                 return Err(StartError::Other(format!("connection numbers: {e}")));
             }
         };
+    core.drop_previous_connections(first_local).await;
     let _ = core.conn_ids.set(conn_ids.clone());
     core.status.started.store(true, Ordering::Release);
     tracing::info!(node = id, first_local, "cluster node ready");

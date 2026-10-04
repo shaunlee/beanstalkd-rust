@@ -5,8 +5,9 @@
 //! must name this node as `to`, use this protocol version, come `from` a node
 //! whose identity the connection proves (with TLS the certificate must be
 //! valid for `bstk-node-<from>`, [`crate::tls::verify_peer_identity`]), and
-//! that node must be allowed ([`PeerAllowlist`]: the effective membership once
-//! the node has one, the config seeds before); otherwise the listener answers
+//! that node must be allowed ([`PeerAllowlist`]: the effective membership,
+//! plus any id above the highest member this node has applied, once the node
+//! has one; the config seeds before); otherwise the listener answers
 //! `Rejected` and closes. No request is read before the hello is accepted.
 //! Identity is checked before membership, so only an authenticated node
 //! learns that it is not a member ([`REJECT_NOT_MEMBER`]).
@@ -239,17 +240,29 @@ impl PeerAllowlist {
     /// `peers` is closed. The per-address handshake budget becomes
     /// `max(configured, 2 × peers)`.
     pub fn set(&self, peers: BTreeSet<NodeId>) {
+        self.set_with_floor(peers, None);
+    }
+
+    /// As [`set`](Self::set), but ids above `above` are admitted too.
+    /// Given this node's applied highest member: such an id can only have
+    /// been added by entries this node has not seen yet, so it may be the
+    /// current leader of a cluster whose membership moved on while this
+    /// node's state stood still (docs/DESIGN.md §8 "Allowlist"); ids at or
+    /// below it are members only if `peers` says so (removed ids are never
+    /// reused).
+    pub fn set_with_floor(&self, peers: BTreeSet<NodeId>, above: Option<NodeId>) {
         let sh = &self.shared;
+        let next = Allowed { ids: peers, above };
         let per_ip = sh
             .cfg
             .max_handshakes_per_ip
-            .max(peers.len().saturating_mul(2));
+            .max(next.ids.len().saturating_mul(2));
         sh.per_ip_limit.store(per_ip, Ordering::Relaxed);
         let mut allowed = lock(&sh.allowed);
         // Under the `allowed` lock, as `register` checks it: a connection
         // registered concurrently is either refused there or closed here.
         for (&peer, (_, close)) in lock(&sh.peers).iter() {
-            if !peers.contains(&peer) {
+            if !next.admits(peer) {
                 tracing::warn!(
                     peer,
                     "cluster peer is no longer allowed: closing its connection"
@@ -257,11 +270,17 @@ impl PeerAllowlist {
                 close.notify_one();
             }
         }
-        *allowed = peers;
+        *allowed = next;
     }
 
+    /// The ids allowed by membership (without the ids above the floor).
     pub fn get(&self) -> BTreeSet<NodeId> {
-        lock(&self.shared.allowed).clone()
+        lock(&self.shared.allowed).ids.clone()
+    }
+
+    /// Ids above this are admitted too ([`set_with_floor`](Self::set_with_floor)).
+    pub fn floor(&self) -> Option<NodeId> {
+        lock(&self.shared.allowed).above
     }
 
     /// The current per-address handshake budget.
@@ -324,7 +343,10 @@ impl ClusterListener {
             probes: Arc::new(Semaphore::new(cfg.max_probe_conns)),
             probers: Arc::new(StdMutex::new(HashMap::new())),
             per_ip_limit: AtomicUsize::new(cfg.max_handshakes_per_ip),
-            allowed: StdMutex::new(cfg.peers.clone()),
+            allowed: StdMutex::new(Allowed {
+                ids: cfg.peers.clone(),
+                above: None,
+            }),
             cfg,
             per_ip: StdMutex::new(HashMap::new()),
             peers: StdMutex::new(HashMap::new()),
@@ -435,12 +457,24 @@ struct Shared {
     /// Handshakes allowed per source address (see [`PeerAllowlist::set`]).
     per_ip_limit: AtomicUsize,
     /// Nodes allowed to connect. Lock order: `allowed`, then `peers`.
-    allowed: StdMutex<BTreeSet<NodeId>>,
+    allowed: StdMutex<Allowed>,
     per_ip: StdMutex<HashMap<IpAddr, usize>>,
     /// The authenticated connection of each peer: generation and closer.
     peers: StdMutex<HashMap<NodeId, (u64, Arc<Notify>)>>,
     next_gen: AtomicU64,
     rejects: RateLimit,
+}
+
+/// See [`PeerAllowlist::set_with_floor`].
+struct Allowed {
+    ids: BTreeSet<NodeId>,
+    above: Option<NodeId>,
+}
+
+impl Allowed {
+    fn admits(&self, peer: NodeId) -> bool {
+        self.ids.contains(&peer) || self.above.is_some_and(|floor| peer > floor)
+    }
 }
 
 fn lock<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -460,7 +494,7 @@ impl Shared {
     /// its hello was accepted).
     fn register(&self, peer: NodeId) -> Option<(u64, Arc<Notify>)> {
         let allowed = lock(&self.allowed);
-        if !allowed.contains(&peer) {
+        if !allowed.admits(peer) {
             return None;
         }
         let generation = self.next_gen.fetch_add(1, Ordering::Relaxed);
@@ -474,7 +508,7 @@ impl Shared {
     }
 
     fn is_allowed(&self, peer: NodeId) -> bool {
-        lock(&self.allowed).contains(&peer)
+        lock(&self.allowed).admits(peer)
     }
 
     fn unregister(&self, peer: NodeId, generation: u64) {
