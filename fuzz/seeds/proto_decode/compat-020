@@ -1,0 +1,11 @@
+
+@use p
+put 0 0 60 1
+a
+pause-tube p 60
+watch p
+reserve-with-timeout 0
+stats-tube p
+stats-tube p
+watch p
+reserve-with-timeout 0

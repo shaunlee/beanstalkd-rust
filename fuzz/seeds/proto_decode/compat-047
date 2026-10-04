@@ -1,0 +1,16 @@
+
+@put 3 0 60 1
+a
+put 2 0 60 1
+b
+put 1 0 60 1
+c
+reserve
+reserve
+reserve
+list-tube-used
+list-tube-used
+reserve
+reserve
+peek-ready
+stats

@@ -445,3 +445,67 @@ fn churn_keeps_disk_usage_bounded() {
     let (_wal, r) = Wal::open(opts(t.path(), fs)).unwrap();
     assert!(model.same_set(&r));
 }
+
+/// Fuzzing (wal_read): a segment named at the top of the `u64` range made
+/// the next segment number overflow (a panic, or with overflow checks off
+/// a wrap to `binlog.0`, which replay never reads); a few below the top, the
+/// binlog opened once and then ran out of numbers. Numbers above
+/// `MAX_SEGMENT_INDEX` (2^62, far beyond one per segment ever written) are
+/// corruption.
+#[test]
+fn segment_numbers_above_the_maximum_are_corrupt() {
+    use crate::wal::MAX_SEGMENT_INDEX;
+    let setup = |top: u64| {
+        let t = tmp();
+        let (mut wal, _) = Wal::open(opts(t.path(), 4096)).unwrap();
+        write(&mut wal, &[put(1, "t", b"x")]);
+        drop(wal);
+        let files = seg_files(t.path());
+        for (index, path) in &files {
+            let name = top - (files.len() as u64 - index);
+            std::fs::rename(path, t.path().join(format!("binlog.{name}"))).unwrap();
+        }
+        t
+    };
+    for top in [u64::MAX, u64::MAX - 2, MAX_SEGMENT_INDEX + 1] {
+        let t = setup(top);
+        let e = Wal::open(opts(t.path(), 4096)).unwrap_err();
+        assert!(matches!(e, WalError::Corrupt(_)), "binlog.{top}: {e:?}");
+        assert!(!t.path().join("binlog.0").exists());
+    }
+    let t = setup(MAX_SEGMENT_INDEX);
+    let (_wal, r) = Wal::open(opts(t.path(), 4096)).unwrap();
+    assert_eq!(r.jobs.len(), 1);
+}
+
+/// Fuzzing (wal_read): a record with job id `u64::MAX` (a forged or damaged
+/// file whose CRC matches) made recovery hand that id out again, or overflow
+/// in the engine. Ids above `MAX_RECORD_ID` are corruption.
+#[test]
+fn job_ids_above_the_maximum_are_corrupt() {
+    use crate::format::MAX_RECORD_ID;
+    let put = |id| {
+        let JournalEntry::Put { tube, body, .. } = put(1, "t", b"x") else {
+            unreachable!()
+        };
+        let mut record = rec(1);
+        record.id = id;
+        JournalEntry::Put { record, tube, body }
+    };
+    for id in [MAX_RECORD_ID + 1, u64::MAX] {
+        for entries in [vec![put(id)], vec![put(1), JournalEntry::Delete(id)]] {
+            let t = tmp();
+            let (mut wal, _) = Wal::open(opts(t.path(), 4096)).unwrap();
+            write(&mut wal, &entries);
+            drop(wal);
+            let e = Wal::open(opts(t.path(), 4096)).unwrap_err();
+            assert!(matches!(e, WalError::Corrupt(_)), "id {id}: {e:?}");
+        }
+    }
+    let t = tmp();
+    let (mut wal, _) = Wal::open(opts(t.path(), 4096)).unwrap();
+    write(&mut wal, &[put(MAX_RECORD_ID)]);
+    drop(wal);
+    let (_wal, r) = Wal::open(opts(t.path(), 4096)).unwrap();
+    assert_eq!(r.next_id, MAX_RECORD_ID + 1);
+}

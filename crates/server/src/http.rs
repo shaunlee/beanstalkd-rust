@@ -120,15 +120,16 @@ pub async fn serve(listener: TcpListener, state: Arc<HttpState>, mut stop: watch
                 Err(_) => return,
             },
         };
-        let (tcp, peer) = tokio::select! {
+        let accepted = tokio::select! {
             _ = stop.wait_for(|&s| s) => return,
-            accepted = listener.accept() => match accepted {
-                Ok(pair) => pair,
-                Err(e) => {
-                    tracing::warn!("HTTP accept() failed: {e}");
-                    continue;
-                }
-            },
+            accepted = listener.accept() => accepted,
+        };
+        let (tcp, peer) = match accepted {
+            Ok(pair) => pair,
+            Err(e) => {
+                crate::accept_failed("HTTP accept() failed", &e).await;
+                continue;
+            }
         };
         let state = Arc::clone(&state);
         tokio::spawn(async move {

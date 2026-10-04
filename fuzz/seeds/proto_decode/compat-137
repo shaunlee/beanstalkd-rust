@@ -1,0 +1,5 @@
+
+@pause-tube default 1
+reserve
+put 0 0 60 1
+x

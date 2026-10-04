@@ -1,0 +1,8 @@
+
+@put 0 0 60 1
+x
+pause-tube default 1
+pause-tube default 4
+stats-tube default
+reserve-with-timeout 2
+stats-tube default

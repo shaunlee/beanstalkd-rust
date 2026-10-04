@@ -1,0 +1,11 @@
+
+@put 0 0 60 1
+a
+put 0 0 60 1
+b
+delete 1
+peek 1
+peek 1
+peek-ready
+put 0 0 60 1
+c

@@ -1,0 +1,14 @@
+
+@put 1 0 60 1
+A
+put 2 0 60 1
+B
+reserve
+reserve
+bury 2 5
+bury 1 5
+peek-buried
+peek-buried
+kick 1
+peek-ready
+peek-buried

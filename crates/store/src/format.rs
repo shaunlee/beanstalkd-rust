@@ -43,6 +43,13 @@ pub(crate) const SEG_HEADER_LEN: u64 = 16;
 pub(crate) const REC_HEADER_LEN: u64 = 8;
 pub(crate) const JOBREC_LEN: usize = 57;
 
+/// Largest job id a record may carry. Replay sets the engine's next id to
+/// the highest id seen plus one, and the engine allocates by `+= 1`, so an
+/// id near `u64::MAX` (only possible in a damaged or forged file whose CRC
+/// matches) would overflow or hand out a live id again. The engine applies
+/// the same bound to snapshots (`MAX_NEXT_JOB_ID`).
+pub(crate) const MAX_RECORD_ID: JobId = (1 << 62) - 1;
+
 pub(crate) const KIND_PUT: u8 = 1;
 pub(crate) const KIND_UPDATE: u8 = 2;
 pub(crate) const KIND_DELETE: u8 = 3;
@@ -130,7 +137,7 @@ fn decode_jobrec(c: &mut Cur<'_>) -> Option<JobRecord> {
     let release_ct = c.u32()?;
     let bury_ct = c.u32()?;
     let kick_ct = c.u32()?;
-    if id == 0 {
+    if id == 0 || id > MAX_RECORD_ID {
         return None;
     }
     Some(JobRecord {
@@ -304,7 +311,7 @@ fn decode_payload(payload: &[u8]) -> Result<Rec<'_>, &'static str> {
         }
         KIND_DELETE => {
             let id = c.u64().ok_or("truncated delete record")?;
-            if id == 0 || !c.0.is_empty() {
+            if id == 0 || id > MAX_RECORD_ID || !c.0.is_empty() {
                 return Err("bad delete record");
             }
             Ok(Rec::Delete(id))

@@ -1,0 +1,16 @@
+
+@put 0 60 60 1
+d
+put 0 0 60 1
+a
+put 0 0 60 1
+b
+reserve
+reserve
+bury 3 0
+bury 2 0
+kick 1
+peek-ready
+kick 5
+kick 5
+stats

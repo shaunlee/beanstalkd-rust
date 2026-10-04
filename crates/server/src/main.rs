@@ -584,6 +584,18 @@ async fn serve(
     ExitCode::SUCCESS
 }
 
+/// Logs a failed `accept` and pauses the accept loop briefly. The usual
+/// cause is EMFILE / ENFILE (no descriptor free): the connection stays in
+/// the backlog and the listener stays readable, so retrying at once spins a
+/// core and floods the log until a descriptor is freed (P5-T6). The cluster
+/// listener does the same.
+pub(crate) async fn accept_failed(what: &str, e: &std::io::Error) {
+    tracing::warn!("{what}: {e}");
+    tokio::time::sleep(ACCEPT_ERROR_PAUSE).await;
+}
+
+const ACCEPT_ERROR_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Accept loop of a plaintext listener: exactly the P1 path. `Connect` is
 /// sent here, before the connection task is spawned.
 async fn accept_plain(
@@ -602,7 +614,7 @@ async fn accept_plain(
         let (stream, _peer) = match accepted {
             Ok(pair) => pair,
             Err(e) => {
-                tracing::warn!("accept() failed: {e}");
+                accept_failed("accept() failed", &e).await;
                 continue;
             }
         };
@@ -668,7 +680,7 @@ async fn accept_tls(
         let (stream, peer) = match accepted {
             Ok(pair) => pair,
             Err(e) => {
-                tracing::warn!("accept() failed: {e}");
+                accept_failed("accept() failed", &e).await;
                 continue;
             }
         };

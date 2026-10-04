@@ -1,0 +1,6 @@
+
+@put 0 0 1 5
+hello
+reserve
+peek-ready
+stats-job 1

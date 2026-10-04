@@ -1,0 +1,6 @@
+
+@put 0 0 60 5
+hello
+reserve
+release 1 0 0
+peek-ready

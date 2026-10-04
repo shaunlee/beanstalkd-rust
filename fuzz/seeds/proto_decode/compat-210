@@ -1,0 +1,22 @@
+
+@list-tube-used
+list-tube-used
+list-tube-used
+list-tube-used
+list-tube-used
+reserve
+reserve
+reserve
+reserve
+put 0 0 60 1
+a
+delete 1
+reserve
+put 0 0 60 1
+b
+put 0 0 60 1
+c
+put 0 0 60 1
+d
+put 0 0 60 1
+e

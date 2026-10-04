@@ -1,0 +1,16 @@
+
+@watch zz
+watch yy
+watch xx
+use xx
+put 0 0 60 1
+x
+use zz
+put 0 0 60 1
+z
+use yy
+put 0 0 60 1
+y
+list-tubes
+list-tubes
+stats-tube zz

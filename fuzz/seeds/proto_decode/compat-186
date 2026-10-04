@@ -1,0 +1,6 @@
+
+@put 0 0 2 5
+hello
+reserve
+touch 1
+stats-job 1

@@ -3,3 +3,8 @@
 *.swp
 .DS_Store
 .codegraph
+# cargo-fuzz output; the committed seeds are in fuzz/seeds
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage

@@ -1,0 +1,11 @@
+
+@use a
+put 0 0 60 1
+x
+reserve-job 1
+bury 1 0
+use default
+watch a
+reserve
+kick-job 1
+stats-job 1

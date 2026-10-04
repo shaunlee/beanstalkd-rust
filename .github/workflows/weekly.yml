@@ -1,4 +1,4 @@
-name: Weekly chaos
+name: Weekly chaos and fuzzing
 
 on:
   schedule:
@@ -58,4 +58,43 @@ jobs:
         with:
           name: chaos-logs
           path: ${{ runner.temp }}/chaos
+          if-no-files-found: ignore
+
+  fuzz:
+    runs-on: ubuntu-latest
+    # One job per target: 5 minutes of fuzzing (docs/DESIGN.md §9.2) plus the
+    # nightly toolchain, cargo-fuzz and an ASan build.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [proto_decode, wal_read, raft_wire, snapshot_decode]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master (2026-10-04)
+        with:
+          toolchain: nightly-2026-10-01
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz ${{ matrix.target }} (5 minutes)
+        working-directory: fuzz
+        run: |
+          mkdir -p corpus/${{ matrix.target }}
+          cargo fuzz run -a ${{ matrix.target }} corpus/${{ matrix.target }} seeds/${{ matrix.target }} -- \
+            -fork=2 -max_total_time=300 -timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=128
+          # With -fork, libFuzzer exits 0 even after a crash (it passes the
+          # child's raw wait status to exit()), so look for artifacts instead.
+          if find artifacts/${{ matrix.target }} -type f | grep -q .; then
+            echo "::error::${{ matrix.target }} found a crash, timeout or OOM"
+            exit 1
+          fi
+      - name: Upload crashes
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
           if-no-files-found: ignore

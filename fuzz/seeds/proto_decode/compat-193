@@ -1,0 +1,14 @@
+
+@use t
+put 0 0 60 1
+x
+use default
+watch t
+reserve
+ignore t
+list-tubes
+release 1 0 0
+list-tubes
+reserve-job 1
+delete 1
+list-tubes

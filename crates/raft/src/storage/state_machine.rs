@@ -59,6 +59,10 @@ use super::snapshot::{HEADER_LEN, SnapshotStore};
 use crate::snapshot_file::DEFAULT_MAX_SNAPSHOT_BYTES;
 use crate::{Applied, CONN_SEQ_BITS, NodeId, Op, Request, SnapshotFile, TypeConfig, owner_of};
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
+
 type Sid = LogId<NodeId>;
 type SResult<T> = Result<T, StorageError<NodeId>>;
 type Membership = StoredMembership<NodeId, BasicNode>;

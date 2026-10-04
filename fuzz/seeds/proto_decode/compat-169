@@ -1,0 +1,11 @@
+
+@reserve-with-timeout 2147483648
+reserve-with-timeout 4294967295
+reserve-with-timeout 4294967296
+reserve-with-timeout -1
+reserve-with-timeout
+reserve-with-timeout 2147483647
+put 0 0 60 1
+x
+reserve-with-timeout 1 junk
+stats

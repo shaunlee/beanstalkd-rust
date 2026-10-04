@@ -1,0 +1,29 @@
+
+@put 0 0 60 2
+j1
+put 0 0 60 2
+j2
+put 0 0 60 2
+j3
+put 0 0 60 2
+j4
+put 0 0 60 2
+j5
+reserve
+bury 1 0
+reserve
+bury 2 0
+reserve
+bury 3 0
+reserve
+bury 4 0
+reserve
+bury 5 0
+kick 1abc
+kick 	1
+kick +1 junk
+kick 0x2
+kick abc
+kick  
+kick ++1
+stats-tube default

@@ -1333,3 +1333,18 @@ fn ttr_deadline_equal_to_now_is_not_lost() {
         )]
     );
 }
+
+/// The snapshot side of the job id overflow the wal_read fuzz target found
+/// in the binlog (P5-T6): a next job id near `u64::MAX` overflows the
+/// `+= 1` of the next put.
+#[test]
+fn next_job_id_above_the_maximum_is_rejected() {
+    let e = new_engine(false);
+    let mut s = e.export_state();
+    s.next_job_id = crate::engine::MAX_NEXT_JOB_ID;
+    assert!(Engine::import_state(s.clone(), sys()).is_ok());
+    for id in [crate::engine::MAX_NEXT_JOB_ID + 1, u64::MAX] {
+        s.next_job_id = id;
+        assert!(Engine::import_state(s.clone(), sys()).is_err(), "{id}");
+    }
+}

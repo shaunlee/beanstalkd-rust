@@ -1,0 +1,22 @@
+
+@put 0 0 60 1
+a
+put 0 0 60 1
+b
+put 0 60 60 1
+c
+put 0 60 60 1
+d
+reserve
+bury 1 0
+reserve
+bury 2 0
+kick 1
+kick-job 2
+kick 1
+kick-job 4
+stats-job 1
+stats-job 2
+stats-job 3
+stats-job 4
+stats

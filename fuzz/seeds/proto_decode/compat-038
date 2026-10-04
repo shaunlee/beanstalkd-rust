@@ -1,0 +1,13 @@
+
+@put 0 0 10 4
+long
+put 0 0 2 5
+short
+reserve
+reserve
+reserve-with-timeout 5
+release 2 0 0
+reserve-job 2
+delete 2
+reserve-with-timeout 1
+stats

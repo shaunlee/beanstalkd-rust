@@ -1,0 +1,17 @@
+
+@put 0 0 60 1
+x
+put 0 0 60 1
+y
+put 3 0 60 1
+z
+put 0 0 60 1
+abcput 0 0 60 6
+123456
+stats
+reserve
+stats-job 1
+delete 1
+put 0 0 60 1
+w
+stats

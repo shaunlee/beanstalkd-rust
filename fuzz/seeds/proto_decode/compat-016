@@ -1,0 +1,25 @@
+
+@use t1
+put 0 0 60 1
+1
+use t2
+put 0 0 60 1
+2
+use t3
+put 0 0 60 1
+3
+use t4
+put 0 0 60 1
+4
+use t5
+put 0 0 60 1
+5
+delete 3
+list-tubes
+list-tubes
+use t3
+put 0 0 60 1
+x
+list-tubes
+list-tubes
+peek 6

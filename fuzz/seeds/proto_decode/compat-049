@@ -1,0 +1,14 @@
+
+@watch a
+watch b
+watch b
+ignore default
+reserve
+reserve
+use a
+put 5 0 60 2
+a5
+use b
+put 9 0 60 2
+b9
+stats

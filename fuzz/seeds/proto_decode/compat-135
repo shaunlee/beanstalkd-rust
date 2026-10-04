@@ -1,0 +1,7 @@
+
+@put 0 0 60 1
+abc
+put 0 0 60 2
+ab
+list-tube-used
+stats

@@ -1,0 +1,7 @@
+
+@put 0 0 1 1
+x
+reserve
+pause-tube default 3
+reserve
+stats-job 1

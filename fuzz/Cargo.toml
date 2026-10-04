@@ -1,0 +1,68 @@
+# Fuzz targets (cargo-fuzz, nightly). Not a member of the main workspace, so
+# `scripts/check.sh` on stable never builds it. docs/DESIGN.md §9.2.
+[package]
+name = "bstk-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+crc32c = "0.6.8"
+tempfile = "3"
+serde = "1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+openraft = { version = "=0.9.25", features = ["serde", "storage-v2", "loosen-follower-log-revert"] }
+tokio = { version = "1", features = ["rt", "io-util"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bstk-proto = { path = "../crates/proto" }
+bstk-engine = { path = "../crates/engine" }
+bstk-store = { path = "../crates/store" }
+bstk-raft = { path = "../crates/raft", features = ["fuzzing"] }
+
+[[bin]]
+name = "proto_decode"
+path = "fuzz_targets/proto_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_read"
+path = "fuzz_targets/wal_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "raft_wire"
+path = "fuzz_targets/raft_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_decode"
+path = "fuzz_targets/snapshot_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Writes the seed corpora (`cargo run --bin gen_seeds`); see src/bin/gen_seeds.rs.
+[[bin]]
+name = "gen_seeds"
+path = "src/bin/gen_seeds.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

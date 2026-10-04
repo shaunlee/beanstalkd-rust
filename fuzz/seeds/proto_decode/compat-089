@@ -1,0 +1,14 @@
+
+@watch a
+watch b
+watch c
+watch d
+ignore b
+list-tubes-watched
+list-tubes
+ignore default
+list-tubes-watched
+list-tubes
+watch b
+list-tubes-watched
+list-tubes

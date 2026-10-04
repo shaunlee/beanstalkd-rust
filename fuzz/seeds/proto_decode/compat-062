@@ -1,0 +1,6 @@
+
+@put 0 0 60 17 x
+put 0 0 60 1
+z
+stats-job 1
+stats

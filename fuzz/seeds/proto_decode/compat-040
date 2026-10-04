@@ -1,0 +1,9 @@
+
+@put 0 0 1 1
+a
+put 0 0 60 1
+b
+reserve
+reserve
+reserve-with-timeout 0
+stats

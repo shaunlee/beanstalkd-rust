@@ -1,0 +1,10 @@
+
+@put 0 0 60 1
+a
+put 0 0 60 1
+b
+delete 1
+delete 2
+stats
+put 0 0 60 1
+c

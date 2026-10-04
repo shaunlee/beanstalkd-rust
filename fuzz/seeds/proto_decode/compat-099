@@ -1,0 +1,8 @@
+
+@watch t
+pause-tube t 100
+stats-tube t
+ignore t
+stats-tube t
+watch t
+stats-tube t

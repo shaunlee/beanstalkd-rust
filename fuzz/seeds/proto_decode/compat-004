@@ -1,0 +1,24 @@
+
+@put 0 0 60 1
+a
+put 0 0 60 1
+b
+put 0 0 60 1
+c
+put 0 30 60 1
+d
+put 0 0 60 1
+e
+reserve
+reserve
+bury 2 0
+delete 1
+delete 2
+delete 3
+delete 4
+peek 1
+peek 2
+peek 3
+peek 4
+peek 5
+stats

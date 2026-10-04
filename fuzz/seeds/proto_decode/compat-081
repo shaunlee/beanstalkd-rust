@@ -1,0 +1,10 @@
+
+@use a
+put 0 0 60 1
+x
+reserve-job 1
+bury 1 0
+kick 5
+use a
+kick 5
+stats-tube a

@@ -1,0 +1,8 @@
+
+@put 0 0 3 1
+x
+reserve
+reserve-with-timeout 0
+touch 1
+reserve-with-timeout 0
+stats-job 1

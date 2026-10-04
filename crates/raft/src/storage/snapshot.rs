@@ -219,6 +219,16 @@ impl SnapshotStore {
             }
         }
         seqs.sort_unstable();
+        // A name at the top of the range would make the next one overflow.
+        let next_seq = match seqs.last() {
+            None => 1,
+            Some(&newest) => newest.checked_add(1).ok_or_else(|| {
+                OpenError::Corrupt(format!(
+                    "{}: sequence number out of range",
+                    snap_name(newest)
+                ))
+            })?,
+        };
         let mut current = None;
         if let Some(&newest) = seqs.last() {
             let path = dir.join(snap_name(newest));
@@ -246,7 +256,7 @@ impl SnapshotStore {
             dir: dir.to_path_buf(),
             _lock: lock,
             current,
-            next_seq: seqs.last().map_or(1, |s| s + 1),
+            next_seq,
             next_tmp: 1,
         })
     }
@@ -342,7 +352,9 @@ impl SnapshotStore {
             return Err(io::Error::other("injected crash before rename"));
         }
         let seq = self.next_seq;
-        self.next_seq += 1;
+        self.next_seq = seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("snapshot sequence numbers exhausted"))?;
         let path = self.dir.join(snap_name(seq));
         std::fs::rename(temp.path(), &path)?;
         temp.keep();
@@ -525,5 +537,26 @@ mod tests {
         assert!(store(&mut s, &meta("new"), true).unwrap());
         assert_eq!(s.current_meta().unwrap().snapshot_id, "new");
         assert!(dir.path().join(snap_name(2)).is_file());
+    }
+
+    /// The same overflow the wal_read fuzz target found in the binlog
+    /// (P5-T6): a file named with the largest sequence number made the next
+    /// one overflow on open (or, at one below it, on the next commit).
+    #[test]
+    fn sequence_numbers_at_the_top_of_the_range_do_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = SnapshotStore::open(dir.path()).unwrap();
+        store(&mut s, &meta("a"), true).unwrap();
+        drop(s);
+        let top = dir.path().join(snap_name(u64::MAX));
+        std::fs::rename(dir.path().join(snap_name(1)), &top).unwrap();
+        let e = SnapshotStore::open(dir.path()).unwrap_err();
+        assert!(e.to_string().contains("out of range"), "{e}");
+
+        std::fs::rename(&top, dir.path().join(snap_name(u64::MAX - 1))).unwrap();
+        let mut s = SnapshotStore::open(dir.path()).unwrap();
+        assert_eq!(s.current_meta().unwrap().snapshot_id, "a");
+        store(&mut s, &meta("b"), true).unwrap_err();
+        assert_eq!(s.current_meta().unwrap().snapshot_id, "a");
     }
 }

@@ -182,6 +182,26 @@ Tube creation and destruction follow the reference's refcounting (use + watch + 
 - **HTTP** (off by default; binds 127.0.0.1 unless configured): `/healthz`, `/readyz` (503 until recovery completes), `/metrics` (Prometheus), `/admin` (read-only JSON). Snapshots come from the engine via `EngineMsg::Snapshot` → `Engine::snapshot_limited` (at most `max_tube_series + 1` tubes) and are cached for `http.snapshot_min_interval` (default 1 s). Up to 256 connections, 2 s header timeout, health endpoints never wait behind the 4-request limit on `/metrics` / `/admin`.
 - **Server-side counters** outside `stats` (which stays byte-identical to the reference): pending connections, pending rejections, auth timeouts, auth failures (in `/metrics` and `/admin` `server_rs`).
 
+### 6.3 Resource limits (P5-T6)
+
+What one client can make the server hold, and where each bound is tested. Protocol limits follow the reference; the reference has no per-connection caps, so neither do we where a cap would change replies.
+
+| Pressure | Bound | Test |
+|---|---|---|
+| Long command line (no CRLF) | discarded in 224-byte windows as it arrives, then `BAD_FORMAT` (`STATE_WANT_ENDLINE`) | `resource_limits::an_endless_line_is_discarded_as_it_arrives`; pre-auth: `security_review::hold_pre_auth_overlong_line_is_refused` |
+| `put` body over `-z` | discarded as it arrives, then `JOB_TOO_BIG` (`STATE_BITBUCKET`) | `resource_limits::an_oversized_put_body_is_discarded_as_it_arrives` |
+| `put` body within `-z` | buffered as it arrives (the codec reserves at most 64 KiB ahead of what was received), so up to `-z` per connection; the reference allocates the whole job at the header | — |
+| Pre-auth `put` | refused at the header, body never read | `security_review::hold_pre_auth_put_body_is_not_buffered` |
+| Client that never reads | one command in flight; while its reply is unwritten nothing is read, so TCP back-pressure stops the client (64 KiB read cap while a reply is pending, §6) | `resource_limits::a_client_that_never_reads_is_held_by_back_pressure` |
+| Idle plaintext connections | none beyond `RLIMIT_NOFILE` (as the reference). With every descriptor in use, `accept` fails with EMFILE and the connection waits in the backlog; the accept loops (plaintext, TLS, HTTP; the cluster listener already did) pause 50 ms per failure. Before P5-T6 they retried at once: on Linux 328,000 log lines and 1.76 s of CPU in 2 s | `resource_limits::accept_backs_off_while_descriptors_are_exhausted` |
+| Idle / slow TLS and token connections | `server.max_pending_connections`, 10 s handshake, `auth.timeout` | `security_review::f1_*` |
+| Auth floods | a wrong token closes the connection; concurrency is bounded by the pending cap; no rate limit (failures are counted in `beanstalkd_auth_failures_total`) | `auth::wrong_token_gets_unauthorized_and_close`, `security_review::f1_*` |
+| HTTP slowloris | 256 connections, 2 s header timeout, health endpoints never queue | `security_review::f4_slow_http_clients_do_not_starve_healthz` |
+| `/admin`, `/metrics` size | `max_tube_series`, snapshot cache | `security_review::f3_*` |
+| Watched tubes / tubes per connection | unbounded, as in the reference (`watch` and `use` create tubes; a tube is freed with its last reference). Measured with 100,000 `watch`es on one connection: about 300 bytes per tube (the reference: about 690) | — |
+| Waiting `reserve`s | one per connection | `resource_limits::a_reserve_storm_hands_each_waiter_one_job` |
+| Cluster port | frames up to 32 MiB, read as they arrive; collection sizes bounded before allocation (§8) | fuzzing (§9.2) |
+
 ### 6.2 Monitoring reference (`/metrics`, `/admin`; `metrics.rs`)
 
 Both renderers are pure functions of an engine snapshot, so every value they print is exactly what `stats` / `stats-tube` report at the same instant.
@@ -499,6 +519,23 @@ Spontaneous transitions, allowed but never required:
 
 Unacknowledged operations are optional: each took effect at a point after its send time, or never. An unacknowledged `reserve` may have reserved any job, so it is part of every job's history. When a job's search fails, the failure is classified (lost job, resurrected job, exclusive holding broken, or another inconsistency) and reported with the job's operations.
 
+### 9.2 Fuzzing (`fuzz/`, P5-T6)
+
+`cargo-fuzz` targets for the four surfaces that decode untrusted bytes. The crate is outside the workspace (nightly; `scripts/check.sh` never builds it); seeds are in `fuzz/seeds` (`cargo run --bin gen_seeds` from `fuzz/` rewrites them from the compat cases and the project's own encoders).
+
+| Target | Input | Checks beyond "no panic" |
+|---|---|---|
+| `proto_decode` | `ServerCodec` with `-z` 0, 4, 65535 or 1 GiB, auth and put-started on or off, the stream split at fuzzed points | the frames and the leftover buffer do not depend on the split |
+| `wal_read` | up to 8 `binlog.N` files (any `N`), optionally with a valid header and recomputed CRCs; `Wal::open` | an opened binlog reopens with the same live jobs, and the next id is above every live id |
+| `raft_wire` | one frame as `ClientMsg` or `ServerMsg`, max frame 32 MiB or 256 bytes | `decode` and `read_frame` agree; a decoded message re-encodes to bytes that decode and re-encode identically |
+| `snapshot_decode` | a snapshot payload (through `restore_from`), or a `.snap` file (fuzzed meta and payload with a correct header and CRC, or raw bytes) opened by `ClusterStateMachine::open` | an accepted payload re-encodes stably, and the restored engine survives commands, connects, puts, ticks to every deadline and disconnects |
+
+The snapshot entry points are `bstk_raft::storage::state_machine::fuzzing` behind the `fuzzing` feature (never enabled by the server). Run, for example, `cargo +nightly fuzz run -a wal_read corpus/wal_read seeds/wal_read -- -max_total_time=600 -timeout=10 -rss_limit_mb=2048 -malloc_limit_mb=128` from `fuzz/` (`-a`: debug assertions and overflow checks). The weekly workflow runs each target for 5 minutes with `-fork=2` and uploads crashes; it fails on any file in `artifacts/`, because with `-fork` libFuzzer exits 0 after a crash (it passes the child's raw wait status to `exit()`), and in fork mode a seed that crashes is silently skipped.
+
+Findings (P5-T6), each fixed with a regression test in the owning crate:
+- `binlog.18446744073709551615` made the next segment number overflow (`wal.rs`; without overflow checks it wrapped to `binlog.0`, which replay never reads), and a number a few below the top let the binlog open once and then run out of numbers. Segment numbers above 2^62 (`MAX_SEGMENT_INDEX`; one is used per segment written) are now `Corrupt`, and new numbers are allocated with a checked add. The snapshot store had the same overflow in its sequence numbers (`snapshot.rs`; found by review, now `Corrupt` / an error).
+- A record with job id `u64::MAX` (a forged or damaged file whose CRC matches) set the next id to that live id, so the next put reused it (or overflowed). Records with ids above 2^62 - 1 are now malformed, and `import_state` refuses a next job id above 2^62 (`MAX_NEXT_JOB_ID`), as it already bounded `next_list_seq`.
+
 ## 10. Changelog
 
 **v0.5 (P3 shipped)**: Raft replication (`bstk-raft`, cluster mode in the server), engine state export / import, cluster differential suites and chaos testing; the entries below record the changes made during P3's fix rounds.
@@ -552,3 +589,8 @@ Unacknowledged operations are optional: each took effect at a point after its se
 - Server: manual decoding instead of `Framed`, 64 KiB read cap while waiting (COMPAT D3), sticky half-close, tick after every message.
 
 **v0.1**: initial P0 design.
+
+**P5-T6 (hardening)**
+- `fuzz/` (cargo-fuzz, outside the workspace) with four targets (§9.2); `bstk-raft` feature `fuzzing` exposes `storage::state_machine::fuzzing::{restore_payload, sample_payload, MAX_JOB_SIZE, NODE}` (`#[doc(hidden)]`, never enabled by the server).
+- `Wal::open` returns `Corrupt` for a segment number above `MAX_SEGMENT_INDEX` (2^62) and for records with a job id above `MAX_RECORD_ID` (2^62 - 1); `Engine::import_state` refuses `next_job_id` above `MAX_NEXT_JOB_ID` (2^62); the snapshot store refuses a file named with the largest sequence number. Replies and file formats unchanged.
+- The server's accept loops pause 50 ms after a failed `accept` (§6.3).

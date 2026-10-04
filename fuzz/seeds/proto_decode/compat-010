@@ -1,0 +1,8 @@
+
+@put 0 4 60 1
+d
+stats-job 1
+reserve-with-timeout 0
+peek-delayed
+reserve-with-timeout 0
+stats-job 1

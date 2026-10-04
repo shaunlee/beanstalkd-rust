@@ -1,0 +1,17 @@
+
+@put 4294967295 0 60 3
+max
+put 1024 0 60 5
+p1024
+put 1023 0 60 5
+p1023
+put 0 0 60 2
+p0
+put 4294967296 0 60 1
+stats
+stats-tube default
+reserve
+reserve
+reserve
+reserve
+stats

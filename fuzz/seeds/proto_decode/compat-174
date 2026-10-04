@@ -1,0 +1,6 @@
+
+@reserve
+stats
+put 0 0 60 1
+x
+stats-job 1

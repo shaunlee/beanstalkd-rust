@@ -40,6 +40,11 @@ const MAX_TUBE_SLOTS: usize = if cfg!(test) { 1 << 12 } else { 1 << 24 };
 /// no healthy node buries or reserves anywhere near this many jobs.
 pub(crate) const MAX_LIST_SEQ: u64 = 1 << 62;
 
+/// Largest `next_job_id` accepted by `import_state`, for the same reason:
+/// ids are allocated by `+= 1` per put. The binlog applies the same bound
+/// to the ids it replays (`bstk-store`'s `MAX_RECORD_ID`).
+pub(crate) const MAX_NEXT_JOB_ID: JobId = 1 << 62;
+
 /// "default" is created first and never destroyed, so it always has id 0.
 const DEFAULT_TUBE: TubeId = 0;
 
@@ -1656,6 +1661,11 @@ impl Engine {
         }
 
         ensure!(self.next_job_id >= 1, "next job id is 0");
+        ensure!(
+            self.next_job_id <= MAX_NEXT_JOB_ID,
+            "next job id {} exceeds the maximum of {MAX_NEXT_JOB_ID}",
+            self.next_job_id
+        );
 
         // --- Connections -------------------------------------------------
         let mut using = vec![0u64; n_tubes];

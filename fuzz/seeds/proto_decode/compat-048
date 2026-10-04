@@ -1,0 +1,18 @@
+
+@put 0 0 60 1
+a
+put 0 0 60 1
+b
+put 0 0 60 1
+c
+reserve
+reserve
+release 1 0 0
+reserve
+reserve
+list-tube-used
+list-tube-used
+list-tube-used
+reserve
+reserve
+reserve

@@ -29,6 +29,9 @@ const BLOCK: u64 = 4096;
 
 use crate::MAX_FILE_SIZE as MAX_SEGMENT_SIZE;
 
+/// Largest segment number `open` accepts (see there).
+pub(crate) const MAX_SEGMENT_INDEX: u64 = 1 << 62;
+
 #[derive(Debug)]
 struct Seg {
     index: u64,
@@ -139,6 +142,17 @@ impl Inner {
         let lock = lock_dir(&opts.dir)?;
         let dir_file = File::open(&opts.dir)?;
         let scan = replay::scan(&opts.dir)?;
+        // New segments are numbered after the highest one found, so a number
+        // near the top of the range would run out (or wrap to `binlog.0`,
+        // which replay skips) a few segments later. Real numbers stay far
+        // below the bound: one per segment written.
+        if scan.max_index > MAX_SEGMENT_INDEX {
+            return Err(WalError::Corrupt(format!(
+                "binlog.{}: segment number out of range (max {MAX_SEGMENT_INDEX})",
+                scan.max_index
+            )));
+        }
+        let next_index = scan.max_index + 1;
         if let Some((index, off, why)) = scan.torn {
             let len = scan
                 .segs
@@ -226,7 +240,7 @@ impl Inner {
             limit,
             segs,
             cur: 0,
-            next_index: scan.max_index + 1,
+            next_index,
             jobs,
             live_bytes,
             disk_total: 0,
@@ -315,6 +329,11 @@ impl Inner {
             )));
         }
         let index = self.next_index;
+        let Some(after) = index.checked_add(1) else {
+            return Err(WalError::Io(io::Error::other(
+                "binlog segment numbers exhausted",
+            )));
+        };
         let path = segment_path(&self.dir, index);
         let mut file = OpenOptions::new()
             .read(true)
@@ -322,7 +341,7 @@ impl Inner {
             .create_new(true)
             .mode(0o600)
             .open(&path)?;
-        self.next_index += 1;
+        self.next_index = after;
         if let Err(e) = preallocate(&mut file, self.seg_size) {
             drop(file);
             let _ = std::fs::remove_file(&path);

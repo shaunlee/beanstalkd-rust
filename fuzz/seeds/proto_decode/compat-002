@@ -1,0 +1,10 @@
+
+@use foo
+watch foo
+put 0 0 60 1
+a
+reserve
+list-tube-used
+list-tubes-watched
+reserve-with-timeout 0
+stats

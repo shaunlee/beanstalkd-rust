@@ -1,0 +1,5 @@
+
+@put 0 100 60 5
+hello
+kick 10
+peek-ready

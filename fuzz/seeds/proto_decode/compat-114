@@ -1,0 +1,6 @@
+
+@put 0 0 60 5
+hello
+reserve
+bury 1 0
+peek-buried

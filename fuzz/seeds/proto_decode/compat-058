@@ -1,0 +1,13 @@
+
+@bogus
+stats-job x
+put 0 0 60 1
+a
+peek 1
+reserve-
+use t1
+bury 1
+list-tube-used
+put 1 0 60 2
+bc
+stats-tube t1

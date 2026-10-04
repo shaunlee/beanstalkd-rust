@@ -1,0 +1,7 @@
+
+@put 0 0 60 5
+hello
+reserve
+bury 1 0
+kick-job 1
+peek-ready

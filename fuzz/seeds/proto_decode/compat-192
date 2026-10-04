@@ -1,0 +1,12 @@
+
+@put 0 0 1 1
+a
+put 0 0 1 1
+b
+reserve
+reserve
+list-tube-used
+list-tube-used
+reserve
+reserve
+stats

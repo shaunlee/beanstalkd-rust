@@ -34,6 +34,8 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 # The in-process simulated network and cluster harness (tests only; never
 # enabled by the server).
 sim = []
+# Entry points for the fuzz targets in `fuzz/` (never enabled by the server).
+fuzzing = []
 
 [lints]
 workspace = true

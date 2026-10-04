@@ -1,0 +1,28 @@
+
+@put 0 0 1 1
+a
+put 0 2 60 1
+b
+stats
+reserve
+touch 1
+release 1 3 0
+peek 1
+peek-ready
+peek-delayed
+peek-buried
+use foo
+watch bar
+ignore bar
+pause-tube default 1
+list-tubes
+stats-tube default
+stats-job 1
+delete 99
+bury 1 0
+kick-job 1
+stats
+reserve-with-timeout 0
+stats-job 1
+stats-job 2
+stats

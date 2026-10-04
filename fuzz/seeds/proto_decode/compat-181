@@ -1,0 +1,5 @@
+
+@use mytube
+put 0 0 60 5
+hello
+stats-tube mytube

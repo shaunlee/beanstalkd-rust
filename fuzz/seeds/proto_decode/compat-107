@@ -1,0 +1,12 @@
+
+@use a
+put 0 0 60 3
+ina
+use b
+put 5 0 60 3
+inb
+watch a
+watch b
+pause-tube a 5
+reserve-with-timeout 0
+reserve-with-timeout 0

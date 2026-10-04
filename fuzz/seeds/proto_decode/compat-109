@@ -1,0 +1,9 @@
+
+@pause-tube default 1
+watch other
+pause-tube other 7
+pause-tube other 8
+stats-tube default
+stats-tube other
+stats-tube default
+stats

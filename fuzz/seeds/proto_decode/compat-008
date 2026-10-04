@@ -1,0 +1,20 @@
+
+@use t
+put 0 0 60 1
+a
+put 0 0 60 1
+b
+put 0 5 60 1
+c
+watch t
+reserve
+bury 1 0
+reserve
+stats-tube t
+stats
+stats-tube t
+stats
+use t
+put 0 0 60 1
+d
+stats-tube t

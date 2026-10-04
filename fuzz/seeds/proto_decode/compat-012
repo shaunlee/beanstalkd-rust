@@ -1,0 +1,9 @@
+
+@put 0 0 60 1
+a
+put 0 0 60 1
+b
+stats
+stats
+put 0 0 60 1
+c

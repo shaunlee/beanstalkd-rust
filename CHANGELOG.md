@@ -27,6 +27,13 @@ Release tags are `v<version>` and match the workspace version in
 
 ### Fixed
 
+- When every file descriptor is in use, the accept loops pause 50 ms after
+  each failed `accept` instead of retrying at once, which on Linux spun a
+  core and logged hundreds of thousands of warnings per second.
+- A binlog with a segment number or job id at the top of the 64-bit range
+  (only possible in a damaged or hand-made file) is reported as corrupt at
+  startup instead of crashing or reusing a job id. The same applies to
+  snapshot file names and to snapshot payloads in cluster mode.
 - Cluster `/readyz` (and `beanstalkd_cluster_ready`) now reports 503 while
   the node is isolated from the cluster and closing client connections;
   before, a cut-off leader kept answering 200.

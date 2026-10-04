@@ -1,0 +1,16 @@
+
+@put 0 0 0 2
+t0
+put 0 4294967295 4294967295 3
+big
+stats-job 1
+stats-job 2
+put 0 4294967296 60 1
+put 0 0 4294967296 1
+reserve
+release 1 4294967295 0
+stats-job 1
+kick-job 2
+reserve
+bury 2 4294967295
+stats-job 2

@@ -1,0 +1,13 @@
+
+@list-tube-used
+list-tube-used
+list-tube-used
+list-tube-used
+reserve
+reserve
+reserve
+put 0 0 60 2
+j1
+put 0 0 60 2
+j2
+stats-tube default

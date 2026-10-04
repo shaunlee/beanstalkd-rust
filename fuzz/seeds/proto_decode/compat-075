@@ -1,0 +1,17 @@
+
+@put 0 0 60 2
+j1
+put 0 0 60 2
+j2
+put 0 0 60 2
+j3
+reserve
+bury 1 0
+reserve
+bury 2 0
+reserve
+bury 3 0
+kick 18446744073709551616
+kick 99999999999999999999
+kick 18446744073709551615
+stats
