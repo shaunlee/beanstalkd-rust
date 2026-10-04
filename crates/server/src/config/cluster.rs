@@ -412,7 +412,9 @@ fn resolve_cluster(
     })
 }
 
-fn is_loopback(addr: &str) -> bool {
+/// Whether `addr` (`host:port`) names a loopback address (`127.0.0.0/8`,
+/// `::1` or `localhost`).
+pub fn is_loopback(addr: &str) -> bool {
     if let Ok(a) = addr.parse::<SocketAddr>() {
         return a.ip().is_loopback();
     }

@@ -11,7 +11,7 @@
 
 mod common;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -71,10 +71,12 @@ impl Default for Opts {
 /// A TCP proxy for one directed cluster link that can be cut: while cut,
 /// its connections are closed and new ones are closed at accept, so
 /// nothing the dialing node sends on this link (requests, and the answers
-/// to them) gets through. The opposite direction is a separate link.
+/// to them) gets through. The opposite direction is a separate link. While
+/// muted, requests get through but the target's answers are discarded.
 struct Proxy {
     addr: SocketAddr,
     cut: Arc<AtomicBool>,
+    mute: Arc<AtomicBool>,
     conns: Arc<Mutex<Vec<TcpStream>>>,
 }
 
@@ -89,8 +91,9 @@ impl Proxy {
         };
         let addr = listener.local_addr().unwrap();
         let cut = Arc::new(AtomicBool::new(false));
+        let mute = Arc::new(AtomicBool::new(false));
         let conns: Arc<Mutex<Vec<TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
-        let (cut2, conns2) = (cut.clone(), conns.clone());
+        let (cut2, mute2, conns2) = (cut.clone(), mute.clone(), conns.clone());
         std::thread::spawn(move || {
             for down in listener.incoming() {
                 let Ok(down) = down else { continue };
@@ -107,19 +110,33 @@ impl Proxy {
                     cs.push(down.try_clone().unwrap());
                     cs.push(up.try_clone().unwrap());
                 }
-                for (mut from, mut to) in [
-                    (down.try_clone().unwrap(), up.try_clone().unwrap()),
-                    (up, down),
+                for (mut from, mut to, mute) in [
+                    (down.try_clone().unwrap(), up.try_clone().unwrap(), None),
+                    (up, down, Some(mute2.clone())),
                 ] {
                     std::thread::spawn(move || {
-                        let _ = std::io::copy(&mut from, &mut to);
+                        use std::io::{Read, Write};
+                        let mut buf = [0u8; 16 * 1024];
+                        while let Ok(n @ 1..) = from.read(&mut buf) {
+                            if mute.as_ref().is_some_and(|m| m.load(Ordering::SeqCst)) {
+                                continue;
+                            }
+                            if to.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
                         let _ = to.shutdown(Shutdown::Both);
                         let _ = from.shutdown(Shutdown::Both);
                     });
                 }
             }
         });
-        Proxy { addr, cut, conns }
+        Proxy {
+            addr,
+            cut,
+            mute,
+            conns,
+        }
     }
 
     fn cut(&self) {
@@ -131,6 +148,13 @@ impl Proxy {
 
     fn heal(&self) {
         self.cut.store(false, Ordering::SeqCst);
+        self.mute.store(false, Ordering::SeqCst);
+    }
+
+    /// Lets requests through but discards the answers (see [`Proxy`]).
+    #[cfg(feature = "test-hooks")]
+    fn mute_replies(&self) {
+        self.mute.store(true, Ordering::SeqCst);
     }
 }
 
@@ -431,6 +455,87 @@ impl Cluster {
         (0..self.nodes.len())
             .filter(|&i| i != leader && self.nodes[i].running())
             .collect()
+    }
+}
+
+impl Cluster {
+    /// Configures node `n + 1` (not started, not a member) with `peers`
+    /// as its `[[cluster.peer]]` list (ids of this cluster, plus `extra`
+    /// unbound entries); the existing nodes' configs are left alone, so
+    /// they know it only from the membership.
+    fn configure_extra_node(&mut self, peers: &[u64], extra: &[u64], opts: &Opts) -> usize {
+        let id = self.nodes.len() as u64 + 1;
+        let (client, http, cluster) = (claim_port(), claim_port(), claim_port());
+        let dir = self._dir.path().to_path_buf();
+        let mut lines = String::new();
+        for &p in peers {
+            let port = if p == id {
+                cluster
+            } else {
+                self.nodes[p as usize - 1].cluster
+            };
+            lines.push_str(&format!(
+                "[[cluster.peer]]\nid = {p}\naddr = \"127.0.0.1:{port}\"\n"
+            ));
+        }
+        for &p in extra {
+            // A claimed port nobody listens on.
+            lines.push_str(&format!(
+                "[[cluster.peer]]\nid = {p}\naddr = \"127.0.0.1:{}\"\n",
+                claim_port()
+            ));
+        }
+        let node = Node {
+            id,
+            client,
+            http,
+            cluster,
+            data_dir: dir.join(format!("data{id}")),
+            config: dir.join(format!("node{id}.toml")),
+            log: dir.join(format!("node{id}.log")),
+            child: None,
+            starts: 0,
+        };
+        write_node_config(&node, opts, &lines);
+        self.nodes.push(node);
+        self.nodes.len() - 1
+    }
+}
+
+fn write_node_config(n: &Node, opts: &Opts, peers: &str) {
+    let text = format!(
+        "[[listener]]\naddr = \"127.0.0.1:{}\"\n\
+         [http]\naddr = \"127.0.0.1:{}\"\nsnapshot_min_interval = \"0s\"\n\
+         [cluster]\nnode_id = {}\nlisten = \"127.0.0.1:{}\"\n\
+         data_dir = \"{}\"\nnode_timeout = \"{}\"\nsnapshot_every = {}\n\
+         insecure_plaintext = true\n{peers}",
+        n.client,
+        n.http,
+        n.id,
+        n.cluster,
+        n.data_dir.display(),
+        opts.node_timeout,
+        opts.snapshot_every,
+    );
+    std::fs::write(&n.config, text).unwrap();
+}
+
+#[cfg(feature = "test-hooks")]
+impl Node {
+    /// Waits until the process has exited; its exit status.
+    fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        let c = self.child.as_mut()?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(st) = c.try_wait().unwrap() {
+                self.child = None;
+                return Some(st);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -1923,7 +2028,8 @@ fn admin_status(port: u16) -> Option<bstk_raft::status::NodeStatusEx> {
 
 /// P6-T2: the admin channel's membership read reports each node's view,
 /// while Raft runs and before it does (a node waiting for its rejoin
-/// probes); membership changes answer `Unsupported` until P6-T4.
+/// probes). P6-T4: a change sent to a follower names the leader, one with
+/// a stale `expect` is a conflict, and before Raft runs there is no leader.
 #[test]
 fn admin_status_reports_the_membership_before_and_after_raft_runs() {
     use bstk_raft::wire::{AdminRequest, AdminResponse};
@@ -1951,31 +2057,55 @@ fn admin_status_reports_the_membership_before_and_after_raft_runs() {
         assert!(log_id.is_none() || log_id == m.log_id, "{s:?}");
         log_id = m.log_id;
     }
-    for req in [
-        AdminRequest::AddLearner {
-            id: 4,
-            addr: "127.0.0.1:1".into(),
-            expect: log_id,
-        },
-        AdminRequest::Promote {
-            ids: [3].into(),
-            expect: log_id,
-        },
-        AdminRequest::Remove {
-            id: 3,
-            expect: log_id,
-        },
-        AdminRequest::SetAddr {
-            id: 3,
-            addr: "127.0.0.1:1".into(),
-            expect: log_id,
-        },
-    ] {
+    let stale = log_id.map(|mut l| {
+        l.index += 1;
+        l
+    });
+    let changes = |expect| {
+        [
+            AdminRequest::AddLearner {
+                id: 4,
+                addr: "127.0.0.1:1".into(),
+                expect,
+            },
+            AdminRequest::Promote {
+                ids: [3].into(),
+                expect,
+                force: false,
+            },
+            AdminRequest::Remove {
+                id: 3,
+                expect,
+                force: false,
+            },
+            AdminRequest::SetAddr {
+                id: 3,
+                addr: "127.0.0.1:1".into(),
+                expect,
+                force: false,
+            },
+        ]
+    };
+    let f = c.followers(l)[0];
+    for req in changes(log_id) {
         assert_eq!(
-            admin_request(c.nodes[l].cluster, req),
-            Some(AdminResponse::Unsupported)
+            admin_request(c.nodes[f].cluster, req),
+            Some(AdminResponse::NotLeader {
+                leader: Some(leader_id),
+                addr: Some(format!("127.0.0.1:{}", c.nodes[l].cluster)),
+            })
         );
     }
+    for req in changes(stale) {
+        assert_eq!(
+            admin_request(c.nodes[l].cluster, req),
+            Some(AdminResponse::Conflict { current: log_id })
+        );
+    }
+    assert_eq!(
+        admin_status(c.nodes[l].cluster).unwrap().membership.log_id,
+        log_id
+    );
 
     // Node 1 alone, in rejoin mode with its state kept (as after a crash
     // during a rejoin): its probes find nobody, so Raft never starts, and
@@ -1995,6 +2125,409 @@ fn admin_status_reports_the_membership_before_and_after_raft_runs() {
     assert_eq!(s.membership.log_id, log_id, "{s:?}");
     assert_eq!(s.highest_member, 3, "{s:?}");
     assert_eq!(s.term, s.status.vote.unwrap().leader_id().term, "{s:?}");
+    for req in changes(log_id) {
+        assert_eq!(
+            admin_request(c.nodes[0].cluster, req),
+            Some(AdminResponse::NotLeader {
+                leader: None,
+                addr: None
+            })
+        );
+    }
+}
+
+// P6-T4: membership changes through the admin channel (a minimal client;
+// the operator CLI is P6-T5).
+
+type Expect = Option<openraft::LogId<u64>>;
+use bstk_raft::wire::{AdminRequest as Req, AdminResponse as Resp};
+
+fn admin(port: u16, body: Req) -> Resp {
+    admin_request(port, body).expect("the admin channel did not answer")
+}
+
+/// The membership log id node `port` reports.
+fn current(port: u16) -> Expect {
+    admin_status(port).expect("status").membership.log_id
+}
+
+fn add(id: u64, addr: &str, expect: Expect) -> Req {
+    Req::AddLearner {
+        id,
+        addr: addr.into(),
+        expect,
+    }
+}
+
+fn promote(ids: &[u64], expect: Expect, force: bool) -> Req {
+    Req::Promote {
+        ids: ids.iter().copied().collect(),
+        expect,
+        force,
+    }
+}
+
+fn remove(id: u64, expect: Expect, force: bool) -> Req {
+    Req::Remove { id, expect, force }
+}
+
+fn set_addr(id: u64, addr: &str, expect: Expect, force: bool) -> Req {
+    Req::SetAddr {
+        id,
+        addr: addr.into(),
+        expect,
+        force,
+    }
+}
+
+fn refused(r: &Resp, text: &str) -> bool {
+    matches!(r, Resp::Refused { reason } if reason.contains(text))
+}
+
+/// Sends `make(current membership)` to the leader at `port` until it is
+/// accepted, retrying the refusals that clear by themselves (a learner
+/// still catching up or rejoining, a change in progress) for up to 30 s;
+/// the note of the `Done` or `Started` answer.
+fn change(port: u16, make: impl Fn(Expect) -> Req) -> Option<String> {
+    let transient = [
+        "not caught up",
+        "has not replicated",
+        "rejoining",
+        "in progress",
+        "did not answer",
+    ];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let req = make(current(port));
+        match admin(port, req.clone()) {
+            Resp::Done { note, .. } | Resp::Started { note } => return note,
+            r @ Resp::Refused { .. } if transient.iter().any(|t| refused(&r, t)) => {
+                assert!(Instant::now() < deadline, "{req:?}: {r:?}");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            r => panic!("{req:?}: {r:?}"),
+        }
+    }
+}
+
+/// Waits until every running node in `among` reports the committed uniform
+/// membership `voters` + `learners`.
+fn wait_membership(c: &mut Cluster, among: &[usize], voters: &[u64], learners: &[u64]) {
+    let (voters, learners): (BTreeSet<u64>, BTreeSet<u64>) = (
+        voters.iter().copied().collect(),
+        learners.iter().copied().collect(),
+    );
+    for &i in among {
+        if !c.nodes[i].running() {
+            continue;
+        }
+        wait_for(Duration::from_secs(30), || {
+            let m = admin_status(c.nodes[i].cluster)?.membership;
+            (m.committed && !m.is_joint() && m.voters() == voters && m.learners() == learners)
+                .then_some(())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "node {} never reported voters {voters:?} learners {learners:?}: {:?}",
+                c.nodes[i].id,
+                admin_status(c.nodes[i].cluster)
+            )
+        });
+    }
+}
+
+/// Adds node `n` as a learner through the leader at `port` and starts it.
+fn add_and_start(c: &mut Cluster, port: u16, n: usize) {
+    let id = c.nodes[n].id;
+    let addr = format!("127.0.0.1:{}", c.nodes[n].cluster);
+    assert_eq!(change(port, |e| add(id, &addr, e)), None);
+    c.nodes[n].start(&[]);
+    assert!(
+        c.nodes[n].wait_ready(Duration::from_secs(30)),
+        "node {id} never became ready"
+    );
+}
+
+/// P6-T4: grow 3 -> 5 one voter at a time (add a learner, start it, promote
+/// it) and shrink back to 3, through the admin channel; the guardrails that
+/// need no fault: one voter per promote, only learners are promoted, ids
+/// never reused, no fewer than 3 voters without force, no promotion of a
+/// learner that has not caught up, concurrent requests.
+#[test]
+fn admin_grows_three_to_five_and_shrinks_back() {
+    let opts = Opts {
+        node_timeout: "2s",
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(3, &opts);
+    let l = c.leader();
+    let lp = c.nodes[l].cluster;
+    let n4 = c.configure_extra_node(&[1, 2, 3, 4], &[], &opts);
+    let n5 = c.configure_extra_node(&[1, 2, 3, 5], &[], &opts);
+    add_and_start(&mut c, lp, n4);
+    add_and_start(&mut c, lp, n5);
+    wait_membership(&mut c, &[0, 1, 2, n4, n5], &[1, 2, 3], &[4, 5]);
+
+    // One voter per step; never a node that is not a learner (A1).
+    let r = admin(lp, promote(&[4, 5], current(lp), true));
+    assert!(refused(&r, "one node at a time"), "{r:?}");
+    let r = admin(lp, promote(&[6], current(lp), true));
+    assert!(refused(&r, "not a learner"), "{r:?}");
+
+    let note = change(lp, |e| promote(&[4], e, false)).expect("a note");
+    assert!(note.contains("4 voters"), "{note}");
+    assert_eq!(change(lp, |e| promote(&[5], e, false)), None);
+    wait_membership(&mut c, &[0, 1, 2, n4, n5], &[1, 2, 3, 4, 5], &[]);
+    // Promoting a voter again: nothing to do.
+    let cur = current(lp);
+    assert_eq!(
+        admin(lp, promote(&[5], cur, false)),
+        Resp::Done {
+            log_id: cur,
+            note: None
+        }
+    );
+    let mut on_5 = c.nodes[n5].connect();
+    let job = inserted(&on_5.put(b"five"));
+    let mut on_l = c.nodes[l].connect();
+    assert_eq!(reserve(&mut on_l, "reserve-with-timeout 5"), job);
+    assert_eq!(on_l.cmd(&format!("delete {job}")), "DELETED");
+    drop(on_5);
+
+    // Shrink: each removed node is told to be stopped.
+    for n in [n5, n4] {
+        let id = c.nodes[n].id;
+        let note = change(lp, |e| remove(id, e, false)).expect("a note");
+        assert!(note.contains("stop its process"), "{note}");
+        c.nodes[n].stop(Signal::SIGTERM);
+    }
+    wait_membership(&mut c, &[0, 1, 2], &[1, 2, 3], &[]);
+    assert_eq!(admin_status(lp).unwrap().highest_member, 5);
+
+    // Ids are never reused, nor skipped ones readmitted.
+    for id in [5, 4, 2] {
+        let r = admin(lp, add(id, "127.0.0.1:1", current(lp)));
+        assert!(
+            refused(&r, "never reused") || refused(&r, "already a member"),
+            "{id}: {r:?}"
+        );
+    }
+    // No fewer than 3 voters without force.
+    let f0 = c.followers(l)[0];
+    let r = admin(lp, remove(c.nodes[f0].id, current(lp), false));
+    assert!(refused(&r, "fewer than 3"), "{r:?}");
+    // A learner that never ran is not promoted (not even replicated to).
+    assert_eq!(change(lp, |e| add(6, "127.0.0.1:1", e)), None);
+    let r = admin(lp, promote(&[6], current(lp), false));
+    assert!(refused(&r, "not replicated anything"), "{r:?}");
+    assert!(change(lp, |e| remove(6, e, false)).is_some());
+
+    // Concurrent requests against one membership: exactly one applies.
+    let cur = current(lp);
+    let answers: Vec<Resp> = std::thread::scope(|s| {
+        let hs: Vec<_> = [7, 8]
+            .into_iter()
+            .map(|id| s.spawn(move || admin(lp, add(id, &format!("127.0.0.1:{id}"), cur))))
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let applied = answers
+        .iter()
+        .filter(|r| matches!(r, Resp::Done { .. } | Resp::Started { .. }))
+        .count();
+    assert_eq!(applied, 1, "{answers:?}");
+    assert!(
+        answers
+            .iter()
+            .any(|r| refused(r, "in progress") || matches!(r, Resp::Conflict { .. })),
+        "{answers:?}"
+    );
+}
+
+/// P6-T4: removing a follower that holds a reservation (below 3 voters
+/// only with force): the job is released at once and the removed node's
+/// client is closed.
+#[test]
+fn admin_removes_a_follower_holding_a_reservation() {
+    let opts = Opts {
+        node_timeout: "1s",
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(3, &opts);
+    let l = c.leader();
+    let lp = c.nodes[l].cluster;
+    let fs = c.followers(l);
+    let (f, keep) = (fs[0], fs[1]);
+    let fid = c.nodes[f].id;
+    let mut on_leader = c.nodes[l].connect();
+    let job = inserted(&on_leader.put(b"x"));
+    let mut worker = c.nodes[f].connect();
+    assert_eq!(reserve(&mut worker, "reserve-with-timeout 5"), job);
+    let mut waiter = c.nodes[keep].connect();
+    waiter.send(b"reserve-with-timeout 30\r\n");
+
+    let r = admin(lp, remove(fid, current(lp), false));
+    assert!(refused(&r, "fewer than 3"), "{r:?}");
+    let removed = Instant::now();
+    let note = change(lp, |e| remove(fid, e, true)).expect("a note");
+    assert!(
+        note.contains("stop its process") && note.contains("below 3"),
+        "{note}"
+    );
+    let (id, _) = read_reserved(&mut waiter);
+    assert_eq!(id, job);
+    assert!(
+        removed.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        removed.elapsed()
+    );
+    worker
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let (_, end) = worker.read_to_end(Duration::from_secs(10));
+    assert!(matches!(end, End::Closed | End::Error(_)), "{end:?}");
+    c.nodes[f].stop(Signal::SIGTERM);
+    let voters = [c.nodes[l].id, c.nodes[keep].id];
+    wait_membership(&mut c, &[l, keep], &voters, &[]);
+    let mut on_keep = c.nodes[keep].connect();
+    inserted(&on_keep.put(b"y"));
+}
+
+/// P6-T4: the leader removes itself: the answer says to stop it, another
+/// node leads, and the removed node's connections are closed out (its
+/// reservation is released to a waiter on another node). The followers keep
+/// admitting the removed leader until they know the removal is committed,
+/// so they learn the commit from it, before any election; openraft 0.9
+/// still needs an election afterwards (the old leader steps down without
+/// handing over), so `node_timeout` must outlast one, and then the remaining
+/// nodes' clients stay connected.
+#[test]
+fn admin_removes_the_leader() {
+    let opts = Opts {
+        node_timeout: "5s",
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(3, &opts);
+    let l = c.leader();
+    let lp = c.nodes[l].cluster;
+    let lid = c.nodes[l].id;
+    let fs = c.followers(l);
+    let mut on_leader = c.nodes[l].connect();
+    let job = inserted(&on_leader.put(b"held"));
+    assert_eq!(reserve(&mut on_leader, "reserve-with-timeout 5"), job);
+    let mut waiter = c.nodes[fs[0]].connect();
+    waiter.send(b"reserve-with-timeout 30\r\n");
+    let mut bystander = c.nodes[fs[1]].connect();
+    let term = admin_status(lp).unwrap().term;
+
+    let note = change(lp, |e| remove(lid, e, true)).expect("a note");
+    let removal = current(lp);
+    // The followers learn that the removal is committed from the old
+    // leader, in its term (no election yet).
+    for &f in &fs {
+        let s = wait_for(Duration::from_millis(1000), || {
+            admin_status(c.nodes[f].cluster).filter(|s| {
+                s.membership.log_id == removal && s.membership.committed && s.term == term
+            })
+        });
+        assert!(
+            s.is_some(),
+            "node {} did not learn the commit from the removed leader: {:?}",
+            c.nodes[f].id,
+            admin_status(c.nodes[f].cluster)
+        );
+    }
+    assert!(
+        note.contains("steps down") && note.contains("stop its process"),
+        "{note}"
+    );
+    let (id, _) = read_reserved(&mut waiter);
+    assert_eq!(id, job);
+    let nl = wait_for(Duration::from_secs(15), || {
+        fs.iter().copied().find(|&i| {
+            c.nodes[i]
+                .admin()
+                .is_some_and(|a| a["cluster"]["role"] == "leader" && a["cluster"]["ready"] == true)
+        })
+    })
+    .expect("no new leader");
+    let voters: Vec<u64> = fs.iter().map(|&i| c.nodes[i].id).collect();
+    wait_membership(&mut c, &fs, &voters, &[]);
+    // A change on the removed node is answered with the new leader.
+    let r = admin(lp, add(9, "127.0.0.1:1", None));
+    assert!(
+        matches!(r, Resp::NotLeader { leader, .. } if leader != Some(lid)),
+        "{r:?}"
+    );
+    on_leader
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let (_, end) = on_leader.read_to_end(Duration::from_secs(10));
+    assert!(matches!(end, End::Closed | End::Error(_)), "{end:?}");
+    c.nodes[l].stop(Signal::SIGTERM);
+    // The remaining nodes' clients were never closed.
+    let j = inserted(&bystander.put(b"bystander"));
+    assert_eq!(bystander.cmd(&format!("delete {j}")), "DELETED");
+    let mut on_new = c.nodes[nl].connect();
+    let job = inserted(&on_new.put(b"after"));
+    let other = fs.iter().copied().find(|&i| i != nl).unwrap();
+    let mut on_other = c.nodes[other].connect();
+    assert_eq!(reserve(&mut on_other, "reserve-with-timeout 10"), job);
+}
+
+/// P6-T4: replace a follower by a node with a new id (add, promote, remove
+/// the old one), then move the new node to another address (`SetAddr`; no
+/// other node's config names it, so they follow the membership) and restart
+/// it there.
+#[test]
+fn admin_replaces_a_node_and_moves_it() {
+    let opts = Opts {
+        node_timeout: "2s",
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(3, &opts);
+    let l = c.leader();
+    let lp = c.nodes[l].cluster;
+    let old = c.followers(l)[0];
+    let old_id = c.nodes[old].id;
+    let n4 = c.configure_extra_node(&[1, 2, 3, 4], &[], &opts);
+    add_and_start(&mut c, lp, n4);
+    change(lp, |e| promote(&[4], e, false));
+    change(lp, |e| remove(old_id, e, false));
+    c.nodes[old].stop(Signal::SIGTERM);
+    let keep: Vec<usize> = (0..3).filter(|&i| i != old).chain([n4]).collect();
+    let mut voters: Vec<u64> = keep.iter().map(|&i| c.nodes[i].id).collect();
+    voters.sort_unstable();
+    wait_membership(&mut c, &keep, &voters, &[]);
+
+    // Move node 4.
+    c.nodes[n4].stop(Signal::SIGTERM);
+    let (was, port) = (c.nodes[n4].cluster, claim_port());
+    c.nodes[n4].cluster = port;
+    let text = std::fs::read_to_string(&c.nodes[n4].config).unwrap();
+    std::fs::write(
+        &c.nodes[n4].config,
+        text.replace(&format!(":{was}\""), &format!(":{port}\"")),
+    )
+    .unwrap();
+    let addr = format!("127.0.0.1:{port}");
+    let r = admin(lp, set_addr(4, "10.1.2.3:1", current(lp), true));
+    assert!(refused(&r, "loopback"), "{r:?}");
+    assert_eq!(change(lp, |e| set_addr(4, &addr, e, false)), None);
+    c.nodes[n4].start(&[]);
+    assert!(
+        c.nodes[n4].wait_ready(Duration::from_secs(30)),
+        "the moved node never caught up at its new address"
+    );
+    let s = admin_status(lp).unwrap();
+    assert_eq!(s.membership.nodes[&4], addr, "{s:?}");
+    let mut on_4 = c.nodes[n4].connect();
+    let job = inserted(&on_4.put(b"moved"));
+    let mut on_l = c.nodes[l].connect();
+    assert_eq!(reserve(&mut on_l, "reserve-with-timeout 5"), job);
+    release(was);
 }
 
 /// P6-T1: membership changes through the test-only hook (feature
@@ -2006,48 +2539,6 @@ mod membership {
     use super::*;
 
     impl Cluster {
-        /// Configures node `n + 1` (not started, not a member) with `peers`
-        /// as its `[[cluster.peer]]` list (ids of this cluster, plus `extra`
-        /// unbound entries); the existing nodes' configs are left alone, so
-        /// they know it only from the membership.
-        fn configure_extra_node(&mut self, peers: &[u64], extra: &[u64], opts: &Opts) -> usize {
-            let id = self.nodes.len() as u64 + 1;
-            let (client, http, cluster) = (claim_port(), claim_port(), claim_port());
-            let dir = self._dir.path().to_path_buf();
-            let mut lines = String::new();
-            for &p in peers {
-                let port = if p == id {
-                    cluster
-                } else {
-                    self.nodes[p as usize - 1].cluster
-                };
-                lines.push_str(&format!(
-                    "[[cluster.peer]]\nid = {p}\naddr = \"127.0.0.1:{port}\"\n"
-                ));
-            }
-            for &p in extra {
-                // A claimed port nobody listens on.
-                lines.push_str(&format!(
-                    "[[cluster.peer]]\nid = {p}\naddr = \"127.0.0.1:{}\"\n",
-                    claim_port()
-                ));
-            }
-            let node = Node {
-                id,
-                client,
-                http,
-                cluster,
-                data_dir: dir.join(format!("data{id}")),
-                config: dir.join(format!("node{id}.toml")),
-                log: dir.join(format!("node{id}.log")),
-                child: None,
-                starts: 0,
-            };
-            write_node_config(&node, opts, &lines);
-            self.nodes.push(node);
-            self.nodes.len() - 1
-        }
-
         /// Runs a membership command on node `i` (the leader) through the
         /// test hook; returns the log index of its (last) entry.
         fn hook(&self, i: usize, cmd: &str) -> Result<u64, String> {
@@ -2078,24 +2569,6 @@ mod membership {
                 .unwrap_or_else(|| panic!("node {} never applied {index}", self.nodes[i].id));
             }
         }
-    }
-
-    fn write_node_config(n: &Node, opts: &Opts, peers: &str) {
-        let text = format!(
-            "[[listener]]\naddr = \"127.0.0.1:{}\"\n\
-             [http]\naddr = \"127.0.0.1:{}\"\nsnapshot_min_interval = \"0s\"\n\
-             [cluster]\nnode_id = {}\nlisten = \"127.0.0.1:{}\"\n\
-             data_dir = \"{}\"\nnode_timeout = \"{}\"\nsnapshot_every = {}\n\
-             insecure_plaintext = true\n{peers}",
-            n.client,
-            n.http,
-            n.id,
-            n.cluster,
-            n.data_dir.display(),
-            opts.node_timeout,
-            opts.snapshot_every,
-        );
-        std::fs::write(&n.config, text).unwrap();
     }
 
     fn rejected_hellos(n: &Node, from: u64) -> usize {
@@ -2353,24 +2826,6 @@ mod membership {
         let mut client = c.nodes[l].connect();
         let job = inserted(&client.put(b"alone"));
         assert_eq!(reserve(&mut client, "reserve-with-timeout 5"), job);
-    }
-
-    impl Node {
-        /// Waits until the process has exited; its exit status.
-        fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
-            let c = self.child.as_mut()?;
-            let deadline = Instant::now() + timeout;
-            loop {
-                if let Some(st) = c.try_wait().unwrap() {
-                    self.child = None;
-                    return Some(st);
-                }
-                if Instant::now() >= deadline {
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
     }
 
     /// P6-T3: grow 1 -> 2 -> 3 with Join and promote. Node 2 is started
@@ -2702,5 +3157,144 @@ mod membership {
         // The two remaining voters serve on.
         let mut on_leader = c.nodes[l].connect();
         inserted(&on_leader.put(b"after-removal"));
+    }
+
+    /// P6-T4 (A2): while a voter is rejoining (held by the test hook),
+    /// voter changes are refused, the rejoining voter cannot be removed,
+    /// learner changes go through; once it has caught up the promote does.
+    /// Then a voter that does not answer blocks voter changes, except its
+    /// own removal.
+    #[test]
+    fn admin_voter_changes_wait_for_rejoining_and_silent_voters() {
+        let opts = Opts {
+            node_timeout: "2s",
+            ..Opts::default()
+        };
+        let mut c = Cluster::start(3, &opts);
+        let l = c.leader();
+        let lp = c.nodes[l].cluster;
+        let n4 = c.configure_extra_node(&[1, 2, 3, 4], &[], &opts);
+        add_and_start(&mut c, lp, n4);
+        let fs: Vec<usize> = c.followers(l).into_iter().filter(|&i| i != n4).collect();
+        let (f, o) = (fs[0], fs[1]);
+        let fid = c.nodes[f].id;
+        let skip = c.nodes[f].log_text().lines().count();
+        c.nodes[f].kill9();
+        c.nodes[f].wipe();
+        std::fs::create_dir_all(&c.nodes[f].data_dir).unwrap();
+        let hold = c.nodes[f].data_dir.join("test-hold-rejoin");
+        std::fs::write(&hold, "").unwrap();
+        c.nodes[f].start(&[]);
+        wait_for(Duration::from_secs(20), || {
+            c.nodes[f]
+                .log_text()
+                .lines()
+                .skip(skip)
+                .any(|l| l.contains("rejoin: adopted the highest vote"))
+                .then_some(())
+        })
+        .unwrap_or_else(|| panic!("{}", c.nodes[f].log_text()));
+        wait_for(Duration::from_secs(10), || {
+            admin_status(c.nodes[f].cluster)
+                .filter(|s| s.rejoining && s.raft_running)
+                .map(|_| ())
+        })
+        .expect("never reported rejoining with Raft running");
+
+        let cur = current(lp);
+        let r = admin(lp, promote(&[4], cur, true));
+        assert!(refused(&r, &format!("voter {fid} is rejoining")), "{r:?}");
+        let r = admin(lp, remove(c.nodes[o].id, cur, true));
+        assert!(refused(&r, &format!("voter {fid} is rejoining")), "{r:?}");
+        let r = admin(lp, remove(fid, cur, true));
+        assert!(refused(&r, "stop it before removing it"), "{r:?}");
+        // Learner changes: a quorum of the same voters commits them, and
+        // the rejoining node's re-check decides again on a newer membership.
+        assert_eq!(change(lp, |e| add(5, "127.0.0.1:1", e)), None);
+        assert!(change(lp, |e| remove(5, e, false)).is_some());
+
+        std::fs::remove_file(&hold).unwrap();
+        assert!(c.nodes[f].wait_ready(Duration::from_secs(30)));
+        change(lp, |e| promote(&[4], e, false));
+        wait_membership(&mut c, &[0, 1, 2, n4], &[1, 2, 3, 4], &[]);
+
+        // A voter that does not answer: other voter changes wait; its own
+        // removal (the usual reason to remove a voter) does not.
+        let oid = c.nodes[o].id;
+        c.nodes[o].kill9();
+        let r = admin(lp, remove(4, current(lp), false));
+        assert!(refused(&r, &format!("voter {oid} did not answer")), "{r:?}");
+        let note = change(lp, |e| remove(oid, e, false)).expect("a note");
+        assert!(note.contains("stop its process"), "{note}");
+        let mut voters: Vec<u64> = [l, f, n4].iter().map(|&i| c.nodes[i].id).collect();
+        voters.sort_unstable();
+        wait_membership(&mut c, &[l, f, n4], &voters, &[]);
+    }
+
+    /// P6-T4 (A1): a joint configuration left behind by a leader that died
+    /// between openraft's two steps is finished by the next leader towards
+    /// the new voters, never back. The test hook holds the promote after its
+    /// checks (meanwhile a second request is refused); the leader's links to
+    /// the two original followers then deliver its requests but drop the
+    /// answers, so they append the joint entry but it never commits on the
+    /// leader, which is then killed.
+    #[test]
+    fn admin_joint_leftover_is_finished_by_the_next_leader() {
+        let opts = Opts {
+            node_timeout: "5s",
+            proxied: true,
+            ..Opts::default()
+        };
+        let mut c = Cluster::start(3, &opts);
+        let l = c.leader();
+        let lp = c.nodes[l].cluster;
+        let lid = c.nodes[l].id;
+        let n4 = c.configure_extra_node(&[1, 2, 3, 4], &[], &opts);
+        add_and_start(&mut c, lp, n4);
+        let fs: Vec<usize> = c.followers(l).into_iter().filter(|&i| i != n4).collect();
+        let hold = c.nodes[l].data_dir.join("test-hold-change");
+        std::fs::write(&hold, "").unwrap();
+        let cur = current(lp);
+        let held = std::thread::spawn(move || admin(lp, promote(&[4], cur, false)));
+        assert!(
+            c.nodes[l].wait_log(
+                "test hook: holding the membership change",
+                Duration::from_secs(20)
+            ),
+            "{}",
+            c.nodes[l].log_text()
+        );
+        let r = admin(lp, add(5, "127.0.0.1:1", cur));
+        assert!(refused(&r, "in progress"), "{r:?}");
+        let r = held.join().unwrap();
+        assert!(matches!(r, Resp::Started { .. }), "{r:?}");
+
+        for &f in &fs {
+            c.proxies[&(lid, c.nodes[f].id)].mute_replies();
+        }
+        std::fs::remove_file(&hold).unwrap();
+        for &f in &fs {
+            wait_for(Duration::from_secs(15), || {
+                admin_status(c.nodes[f].cluster)
+                    .filter(|s| s.membership.is_joint())
+                    .map(|_| ())
+            })
+            .unwrap_or_else(|| panic!("node {} never appended the joint entry", c.nodes[f].id));
+        }
+        let s = admin_status(lp).unwrap();
+        assert!(s.membership.is_joint() && !s.membership.committed, "{s:?}");
+        c.nodes[l].kill9();
+
+        let others: Vec<usize> = fs.iter().copied().chain([n4]).collect();
+        wait_membership(&mut c, &others, &[1, 2, 3, 4], &[]);
+        assert!(
+            others.iter().any(|&i| c.nodes[i]
+                .log_text()
+                .contains("finished a joint configuration left by an earlier leader")),
+            "nobody finished the joint configuration"
+        );
+        let nl = c.leader();
+        let mut on_new = c.nodes[nl].connect();
+        inserted(&on_new.put(b"after-joint"));
     }
 }

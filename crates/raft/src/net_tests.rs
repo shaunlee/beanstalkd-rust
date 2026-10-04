@@ -39,6 +39,7 @@ struct CountingHandler {
     calls: AtomicUsize,
     last: Mutex<Option<ForwardRequest>>,
     controls: Mutex<Vec<ControlRequest>>,
+    admins: Mutex<Vec<(wire::AdminRequest, SocketAddr)>>,
 }
 
 impl CountingHandler {
@@ -57,6 +58,20 @@ impl ForwardHandler for CountingHandler {
     async fn control(&self, req: ControlRequest) -> ControlResponse {
         self.controls.lock().expect("lock").push(req);
         ControlResponse::Accepted { index: Some(7) }
+    }
+
+    async fn admin(&self, req: wire::AdminRequest, from: SocketAddr) -> wire::AdminResponse {
+        self.admins.lock().expect("lock").push((req, from));
+        wire::AdminResponse::Conflict { current: None }
+    }
+}
+
+/// Implements only `forward`: the trait's defaults answer the rest.
+struct PlainHandler;
+
+impl ForwardHandler for PlainHandler {
+    async fn forward(&self, _req: ForwardRequest) -> ForwardResponse {
+        ForwardResponse::Accepted
     }
 }
 
@@ -1350,12 +1365,7 @@ async fn control_requests_are_checked_and_served() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn default_control_handler_refuses() {
-    struct Plain;
-    impl ForwardHandler for Plain {
-        async fn forward(&self, _req: ForwardRequest) -> ForwardResponse {
-            ForwardResponse::Accepted
-        }
-    }
+    use PlainHandler as Plain;
     let tcp = bind().await;
     let addr = tcp.local_addr().expect("addr").to_string();
     let addrs: BTreeMap<NodeId, String> = [(1, addr.clone()), (2, "127.0.0.1:1".into())].into();
@@ -2040,12 +2050,18 @@ fn mutating_requests() -> Vec<wire::AdminRequest> {
         wire::AdminRequest::Promote {
             ids: [4].into(),
             expect,
+            force: false,
         },
-        wire::AdminRequest::Remove { id: 3, expect },
+        wire::AdminRequest::Remove {
+            id: 3,
+            expect,
+            force: true,
+        },
         wire::AdminRequest::SetAddr {
             id: 2,
             addr: "127.0.0.1:22".into(),
             expect,
+            force: false,
         },
     ]
 }
@@ -2124,8 +2140,9 @@ async fn status_ex_is_answered_before_and_after_raft_runs() {
 /// P6-T2: under mTLS the admin channel takes exactly the `bstk-admin`
 /// certificate from the cluster CA; node certificates, certificates from
 /// another CA and certificates naming both identities are refused, and the
-/// admin certificate is refused as a peer. Membership changes answer
-/// `Unsupported` and leave Raft untouched.
+/// admin certificate is refused as a peer. Membership changes go to the
+/// handler (P6-T4) with the admin's address; the listener itself leaves
+/// Raft untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admin_channel_identity_under_mtls() {
     let pki = Pki::new("cluster CA");
@@ -2142,9 +2159,18 @@ async fn admin_channel_identity_under_mtls() {
     for (i, req) in (2..).zip(mutating_requests()) {
         assert_eq!(
             admin_call(&mut io, i, req).await,
-            wire::AdminResponse::Unsupported
+            wire::AdminResponse::Conflict { current: None }
         );
     }
+    let admins = handler.admins.lock().expect("lock").clone();
+    assert_eq!(
+        admins.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(),
+        mutating_requests()
+    );
+    assert!(
+        admins.iter().all(|(_, a)| a.ip().is_loopback()),
+        "{admins:?}"
+    );
     assert_eq!(raft.metrics().borrow().membership_config, before);
     // Any node may be asked without naming it; naming another is refused.
     drop(io);
@@ -2232,7 +2258,9 @@ fn plaintext_admin_only_from_loopback() {
 }
 
 /// P6-T2: in plaintext mode an admin tool on loopback is accepted (and its
-/// membership read is served before Raft runs too).
+/// membership read is served before Raft runs too). P6-T4: before Raft runs
+/// a change answers `NotLeader` without a leader; with a handler that does
+/// not implement changes, `Unsupported`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plaintext_admin_from_loopback_is_accepted() {
     let (l, _, _, addr) = admin_target(None, false, |_| {}).await;
@@ -2244,10 +2272,33 @@ async fn plaintext_admin_from_loopback_is_accepted() {
     for (i, req) in (2..).zip(mutating_requests()) {
         assert_eq!(
             admin_call(&mut io, i, req).await,
+            wire::AdminResponse::NotLeader {
+                leader: None,
+                addr: None
+            }
+        );
+    }
+    l.shutdown().await;
+
+    let tcp = bind().await;
+    let addr = tcp.local_addr().expect("addr");
+    let (l, slot) =
+        ClusterListener::spawn_deferred::<PlainHandler>(tcp, listener_config(1, &[1, 2, 3], None))
+            .expect("listener");
+    let net = Network::new(net_config(1, [(1, addr.to_string())].into(), None));
+    let raft = Raft::new(1, raft_config(), net, MemLog::default(), MemSm::default())
+        .await
+        .expect("raft");
+    assert!(slot.set(raft.clone(), Arc::new(PlainHandler)));
+    let mut io = admin_conn(addr, None).await;
+    for (i, req) in (1..).zip(mutating_requests()) {
+        assert_eq!(
+            admin_call(&mut io, i, req).await,
             wire::AdminResponse::Unsupported
         );
     }
     l.shutdown().await;
+    let _ = raft.shutdown().await;
 
     // Without a status source the read is refused, not failed.
     let (l, raft, addr) = lone_listener(|_| {}).await;

@@ -344,6 +344,7 @@ fn raft() {
             body: AdminRequest::Promote {
                 ids: [3, 4].into(),
                 expect: Some(LogId::new(leader, 13)),
+                force: false,
             },
         },
         ClientMsg::Admin {
@@ -351,6 +352,7 @@ fn raft() {
             body: AdminRequest::Remove {
                 id: 1,
                 expect: None,
+                force: true,
             },
         },
         ClientMsg::Admin {
@@ -359,6 +361,7 @@ fn raft() {
                 id: 2,
                 addr: "[::1]:7002".into(),
                 expect: Some(LogId::new(leader, 13)),
+                force: false,
             },
         },
     ];
@@ -397,12 +400,15 @@ fn raft() {
         },
         ServerMsg::Admin {
             id: 2,
-            body: AdminResponse::Started,
+            body: AdminResponse::Started {
+                note: Some("stop node 1".into()),
+            },
         },
         ServerMsg::Admin {
             id: 3,
             body: AdminResponse::Done {
                 log_id: Some(LogId::new(leader, 15)),
+                note: None,
             },
         },
         ServerMsg::Admin {

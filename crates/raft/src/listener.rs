@@ -45,9 +45,10 @@
 //! admin connection carries only admin requests (frames of at most
 //! [`wire::ADMIN_MAX_REQUEST_FRAME`]) and closes after
 //! [`ListenerConfig::admin_idle_timeout`] without one; a peer connection
-//! that sends an admin request is closed. Membership changes answer
-//! [`AdminResponse::Unsupported`] until the leader-side executor exists
-//! (P6-T4); [`AdminRequest::Membership`] answers the status source's
+//! that sends an admin request is closed. Membership changes go to the
+//! service's [`ForwardHandler::admin`] (the server's leader-side executor,
+//! P6-T4); before Raft runs they answer [`AdminResponse::NotLeader`] without
+//! a leader. [`AdminRequest::Membership`] answers the status source's
 //! [`crate::status::NodeStatusEx`].
 //!
 //! Probe connections ([`ClientMsg::ProbeHello`], P6-T3) let a node that is
@@ -687,7 +688,7 @@ where
         }
         Ok(Ok((io, Caller::Admin(permit)))) => {
             drop(slot);
-            serve_admin(io, addr, permit, shared).await
+            serve_admin(io, addr, permit, shared, service).await
         }
         Ok(Ok((io, Caller::Prober(probe)))) => {
             drop(slot);
@@ -747,14 +748,16 @@ where
 
 /// Serves an admin connection until it ends, goes idle or sends anything
 /// but an admin request. Every request is logged at info.
-async fn serve_admin<S>(
+async fn serve_admin<S, H>(
     mut io: S,
     addr: SocketAddr,
     _permit: OwnedSemaphorePermit,
     shared: &Shared,
+    service: &OnceLock<Service<H>>,
 ) -> Result<(), Phase>
 where
     S: AsyncRead + AsyncWrite + Unpin,
+    H: ForwardHandler,
 {
     let cfg = &shared.cfg;
     tracing::info!(%addr, "cluster admin connection accepted");
@@ -791,7 +794,18 @@ where
         } else {
             tracing::info!(%addr, request = ?body, "cluster admin request");
         }
-        let resp = admin_dispatch(body, cfg.status.as_deref());
+        let resp = if body.is_change() {
+            match service.get() {
+                Some(svc) => svc.handler.admin(body, addr).await,
+                // Without Raft this node leads nothing and knows no leader.
+                None => AdminResponse::NotLeader {
+                    leader: None,
+                    addr: None,
+                },
+            }
+        } else {
+            admin_read(cfg.status.as_deref())
+        };
         let frame = wire::encode(&ServerMsg::Admin { id, body: resp }, cfg.max_frame)
             .map_err(|e| Phase::Serve(e.to_string()))?;
         wire::write_frame(&mut io, &frame)
@@ -847,23 +861,13 @@ where
     Ok(())
 }
 
-/// Answers one admin request. Membership changes are not implemented yet
-/// (P6-T4), so nothing here reaches openraft's membership API.
-pub(crate) fn admin_dispatch(
-    req: AdminRequest,
-    status: Option<&dyn StatusSource>,
-) -> AdminResponse {
-    match req {
-        AdminRequest::Membership => match status {
-            Some(s) => AdminResponse::Membership(Box::new(s.status_ex())),
-            None => AdminResponse::Refused {
-                reason: NO_STATUS.into(),
-            },
+/// Answers [`AdminRequest::Membership`] from the status source.
+fn admin_read(status: Option<&dyn StatusSource>) -> AdminResponse {
+    match status {
+        Some(s) => AdminResponse::Membership(Box::new(s.status_ex())),
+        None => AdminResponse::Refused {
+            reason: NO_STATUS.into(),
         },
-        AdminRequest::AddLearner { .. }
-        | AdminRequest::Promote { .. }
-        | AdminRequest::Remove { .. }
-        | AdminRequest::SetAddr { .. } => AdminResponse::Unsupported,
     }
 }
 

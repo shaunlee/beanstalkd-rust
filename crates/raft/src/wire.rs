@@ -100,7 +100,8 @@ pub const MAX_SNAPSHOT_ID_LEN: usize = 256;
 /// the store's `MAX_META_LEN`).
 pub const MAX_NODE_ADDR_LEN: usize = 1024;
 
-/// Longest refusal reason accepted in an [`AdminResponse`], in bytes.
+/// Longest refusal reason or note accepted in an [`AdminResponse`], in
+/// bytes.
 pub const MAX_ADMIN_REASON_LEN: usize = 1024;
 
 /// Largest admin request frame a listener reads (the biggest, a `Promote`
@@ -186,6 +187,9 @@ pub enum ServerMsg {
 /// the membership log id the operator saw: the node refuses the change with
 /// [`AdminResponse::Conflict`] if its membership is another one
 /// (compare-and-set), so two operators cannot both act on the same view.
+/// `force` overrides only the guardrails that protect availability, never
+/// those the rejoin argument depends on (docs/DESIGN.md §8, "Membership
+/// changes (P6-T4)").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminRequest {
     /// The node's status and membership view ([`AdminResponse::Membership`]).
@@ -200,16 +204,23 @@ pub enum AdminRequest {
         #[serde(deserialize_with = "bounded::node_ids")]
         ids: std::collections::BTreeSet<NodeId>,
         expect: Option<LogId<NodeId>>,
+        /// Promote a learner that is not caught up.
+        force: bool,
     },
     Remove {
         id: NodeId,
         expect: Option<LogId<NodeId>>,
+        /// Go below 3 voters.
+        force: bool,
     },
     SetAddr {
         id: NodeId,
         #[serde(deserialize_with = "bounded::node_addr")]
         addr: String,
         expect: Option<LogId<NodeId>>,
+        /// Change an address over plaintext cluster traffic that may leave
+        /// loopback (`insecure_plaintext_allow_remote`).
+        force: bool,
     },
 }
 
@@ -224,12 +235,18 @@ impl AdminRequest {
 pub enum AdminResponse {
     Membership(Box<NodeStatusEx>),
     /// The leader accepted the change and runs it in the background; poll
-    /// [`AdminRequest::Membership`] for the outcome.
-    Started,
+    /// [`AdminRequest::Membership`] for the outcome. `note`: what the
+    /// operator must know or do (e.g. stop a removed node).
+    Started {
+        #[serde(deserialize_with = "bounded::opt_admin_reason")]
+        note: Option<String>,
+    },
     /// The change is complete (or there was nothing to do); `log_id` is the
-    /// resulting membership's.
+    /// resulting membership's. `note` as for `Started`.
     Done {
         log_id: Option<LogId<NodeId>>,
+        #[serde(deserialize_with = "bounded::opt_admin_reason")]
+        note: Option<String>,
     },
     /// Changes are made by the leader: ask it.
     NotLeader {
@@ -503,13 +520,15 @@ mod bounded {
         })
     }
 
-    struct OptAddrVisitor;
+    struct OptStrVisitor {
+        max: usize,
+    }
 
-    impl<'de> Visitor<'de> for OptAddrVisitor {
+    impl<'de> Visitor<'de> for OptStrVisitor {
         type Value = Option<String>;
 
         fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "an optional string of at most {MAX_NODE_ADDR_LEN} bytes")
+            write!(f, "an optional string of at most {} bytes", self.max)
         }
 
         fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
@@ -517,14 +536,24 @@ mod bounded {
         }
 
         fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
-            node_addr(d).map(Some)
+            d.deserialize_str(StrVisitor { max: self.max }).map(Some)
         }
     }
 
     pub(super) fn opt_node_addr<'de, D: Deserializer<'de>>(
         d: D,
     ) -> Result<Option<String>, D::Error> {
-        d.deserialize_option(OptAddrVisitor)
+        d.deserialize_option(OptStrVisitor {
+            max: MAX_NODE_ADDR_LEN,
+        })
+    }
+
+    pub(super) fn opt_admin_reason<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<String>, D::Error> {
+        d.deserialize_option(OptStrVisitor {
+            max: super::MAX_ADMIN_REASON_LEN,
+        })
     }
 
     pub(super) fn node_ids<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeSet<NodeId>, D::Error> {
@@ -1497,15 +1526,18 @@ mod tests {
             AdminRequest::Promote {
                 ids: [4, 6].into(),
                 expect: Some(lid(7, 38)),
+                force: false,
             },
             AdminRequest::Remove {
                 id: 1,
                 expect: None,
+                force: true,
             },
             AdminRequest::SetAddr {
                 id: 3,
                 addr: "[::1]:11400".into(),
                 expect: Some(lid(7, 38)),
+                force: false,
             },
         ]
     }
@@ -1513,9 +1545,17 @@ mod tests {
     fn admin_responses() -> Vec<AdminResponse> {
         vec![
             AdminResponse::Membership(Box::new(sample_status_ex())),
-            AdminResponse::Started,
+            AdminResponse::Started { note: None },
+            AdminResponse::Started {
+                note: Some("stop node 3".into()),
+            },
             AdminResponse::Done {
                 log_id: Some(lid(7, 41)),
+                note: None,
+            },
+            AdminResponse::Done {
+                log_id: Some(lid(7, 41)),
+                note: Some("4 voters".into()),
             },
             AdminResponse::NotLeader {
                 leader: Some(2),
@@ -1780,6 +1820,24 @@ mod tests {
                     reason: "r".repeat(MAX_ADMIN_REASON_LEN + 1),
                 },
             ),
+            (
+                AdminResponse::Started {
+                    note: Some("n".repeat(MAX_ADMIN_REASON_LEN)),
+                },
+                AdminResponse::Started {
+                    note: Some("n".repeat(MAX_ADMIN_REASON_LEN + 1)),
+                },
+            ),
+            (
+                AdminResponse::Done {
+                    log_id: None,
+                    note: Some("n".repeat(MAX_ADMIN_REASON_LEN)),
+                },
+                AdminResponse::Done {
+                    log_id: None,
+                    note: Some("n".repeat(MAX_ADMIN_REASON_LEN + 1)),
+                },
+            ),
         ] {
             assert!(decode_server(&admin_resp(ok)).is_ok());
             assert!(matches!(
@@ -1808,21 +1866,25 @@ mod tests {
                     id: 9,
                     addr: long(MAX_NODE_ADDR_LEN),
                     expect: None,
+                    force: true,
                 },
                 AdminRequest::SetAddr {
                     id: 9,
                     addr: long(MAX_NODE_ADDR_LEN + 1),
                     expect: None,
+                    force: true,
                 },
             ),
             (
                 AdminRequest::Promote {
                     ids: (1..=MAX_MEMBERS as u64).collect(),
                     expect: None,
+                    force: false,
                 },
                 AdminRequest::Promote {
                     ids: (1..=MAX_MEMBERS as u64 + 1).collect(),
                     expect: None,
+                    force: false,
                 },
             ),
         ] {
@@ -1845,13 +1907,15 @@ mod tests {
         let mut payload = postcard::to_allocvec(&admin(AdminRequest::Promote {
             ids: Default::default(),
             expect: None,
+            force: false,
         }))
         .expect("encode");
         let n = payload.len();
-        assert_eq!(&payload[n - 2..], &[0, 0]);
-        payload.truncate(n - 2);
+        // The empty set's length, `expect: None`, `force: false`.
+        assert_eq!(&payload[n - 3..], &[0, 0, 0]);
+        payload.truncate(n - 3);
         payload.extend(postcard::to_allocvec(&(1u64 << 40)).expect("len"));
-        payload.push(0);
+        payload.extend([0, 0]);
         assert!(postcard::from_bytes::<ClientMsg>(&payload).is_err());
     }
 

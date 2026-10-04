@@ -13,6 +13,9 @@
 //!   one second, for it to be applied, so the requester knows its index. These
 //!   are rare (SIGUSR1, startup, rejoin).
 //!
+//! - An operator's membership change (the admin channel): see
+//!   [`super::admin`].
+//!
 //! Every forward, ping and control request records that its sender was heard
 //! from (node liveness, [`super::duties`]).
 //!
@@ -22,9 +25,11 @@
 //! being served, or one racing the allowlist update, could otherwise still
 //! reach the proposer (docs/DESIGN.md §8, "Membership-driven networking").
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bstk_raft::forward::{ControlRequest, ControlResponse, ForwardHandler};
+use bstk_raft::wire::{AdminRequest, AdminResponse};
 use bstk_raft::{ForwardRequest, ForwardResponse};
 
 use super::{ControlOutcome, Core};
@@ -88,5 +93,9 @@ impl ForwardHandler for Handler {
             ControlOutcome::Unknown => ControlResponse::Accepted { index: None },
             ControlOutcome::NotProposed => ControlResponse::NotLeader { leader: None },
         }
+    }
+
+    async fn admin(&self, req: AdminRequest, from: SocketAddr) -> AdminResponse {
+        super::admin::handle(self.core.clone(), req, from).await
     }
 }

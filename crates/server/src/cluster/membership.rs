@@ -11,10 +11,15 @@
 //! [`watch`] follows openraft's server metrics (published when the
 //! membership changes) and updates the dialer's address book
 //! (`Network::set_members`) and the listener's allowlist (which closes the
-//! connections of nodes that left).
+//! connections of nodes that left). A node removed by an entry this node has
+//! appended but not committed is still admitted (P6-T4): the allowlist is
+//! the effective membership's nodes plus the committed membership's, so a
+//! removed leader can still tell the others that its removal is committed,
+//! and an entry that is truncated never cut anyone off.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bstk_raft::NodeId;
 use bstk_raft::listener::PeerAllowlist;
@@ -36,11 +41,19 @@ pub fn has_members(m: &Membership) -> bool {
     m.nodes().next().is_some()
 }
 
-/// Who may connect: every node of the effective membership once there is
-/// one, the config seeds before.
-pub fn allowed(m: &Membership, seeds: &BTreeSet<NodeId>) -> BTreeSet<NodeId> {
+/// Who may connect: every node of the effective membership and of the
+/// committed one (`committed`; the same, or older, while a membership entry
+/// is uncommitted) once there is one, the config seeds before.
+pub fn allowed(
+    m: &Membership,
+    committed: &Membership,
+    seeds: &BTreeSet<NodeId>,
+) -> BTreeSet<NodeId> {
     if has_members(m) {
-        m.nodes().map(|(&id, _)| id).collect()
+        m.nodes()
+            .chain(committed.nodes())
+            .map(|(&id, _)| id)
+            .collect()
     } else {
         seeds.clone()
     }
@@ -108,27 +121,51 @@ fn apply(
     allowlist: &PeerAllowlist,
     seeds: &BTreeSet<NodeId>,
     overrides: &BTreeMap<NodeId, String>,
-    m: &Membership,
+    (m, committed): (&Membership, &Membership),
     last_warned: &mut Vec<String>,
 ) {
     if !has_members(m) {
         return;
     }
-    let addrs = addresses(m);
-    let diffs = config_differences(overrides, &addrs);
+    let diffs = config_differences(overrides, &addresses(m));
     if diffs != *last_warned {
         for d in &diffs {
             tracing::warn!(membership = ?m.log_id(), "cluster config differs from the membership: {d}");
         }
         *last_warned = diffs;
     }
+    // A node only in the committed membership keeps its address until its
+    // removal is committed; the effective membership's address wins.
+    let mut addrs = addresses(committed);
+    addrs.extend(addresses(m));
     core.net.set_members(addrs);
-    let allow = allowed(m, seeds);
+    let allow = allowed(m, committed, seeds);
+    core.set_admitted(allow.clone());
     if allow != allowlist.get() {
-        tracing::info!(membership = ?m.log_id(), allowed = ?allow, "cluster allowlist updated");
+        tracing::info!(
+            membership = ?m.log_id(),
+            committed = ?committed.log_id(),
+            allowed = ?allow,
+            "cluster allowlist updated"
+        );
         allowlist.set(allow);
     }
 }
+
+/// The committed membership in openraft's state (`None`: Raft stopped).
+async fn committed(core: &Core) -> Option<Membership> {
+    core.raft
+        .with_raft_state(|st| {
+            let c = st.membership_state.committed();
+            Membership::new(*c.log_id(), c.membership().clone())
+        })
+        .await
+        .ok()
+}
+
+/// How often [`watch`] looks again while the effective membership is not
+/// committed (a commit does not change the server metrics it wakes on).
+const UNCOMMITTED_POLL: Duration = Duration::from_millis(50);
 
 /// Follows the effective membership until Raft stops (see the module docs).
 pub async fn watch(
@@ -138,16 +175,31 @@ pub async fn watch(
     overrides: BTreeMap<NodeId, String>,
 ) {
     let mut rx = core.watch_view();
-    let mut seen: Option<Membership> = None;
+    let mut seen: Option<(Membership, Membership)> = None;
     let mut last_warned = Vec::new();
     loop {
         let m = rx.borrow_and_update().membership_config.clone();
-        if seen.as_ref() != Some(&*m) {
-            apply(&core, &allowlist, &seeds, &overrides, &m, &mut last_warned);
-            seen = Some((*m).clone());
+        let pending = seen.as_ref().is_some_and(|(e, c)| e.log_id() != c.log_id());
+        if pending || seen.as_ref().is_none_or(|(e, _)| e != &*m) {
+            let Some(c) = committed(&core).await else {
+                return;
+            };
+            if seen.as_ref() != Some(&((*m).clone(), c.clone())) {
+                apply(
+                    &core,
+                    &allowlist,
+                    &seeds,
+                    &overrides,
+                    (&m, &c),
+                    &mut last_warned,
+                );
+            }
+            seen = Some(((*m).clone(), c));
         }
-        if rx.changed().await.is_err() {
-            return;
+        let pending = seen.as_ref().is_some_and(|(e, c)| e.log_id() != c.log_id());
+        tokio::select! {
+            r = rx.changed() => if r.is_err() { return },
+            () = tokio::time::sleep(UNCOMMITTED_POLL), if pending => {}
         }
     }
 }
@@ -179,11 +231,13 @@ mod tests {
     #[test]
     fn allowlist_is_seeds_without_membership_then_every_node() {
         let seeds = set(&[1, 2, 3]);
-        assert_eq!(allowed(&Membership::default(), &seeds), seeds);
+        let none = Membership::default();
+        assert_eq!(allowed(&none, &none, &seeds), seeds);
 
         // Voters 1..=3 and learner 4.
         let m = stored(vec![set(&[1, 2, 3])], &[1, 2, 3, 4]);
-        assert_eq!(allowed(&m, &seeds), set(&[1, 2, 3, 4]));
+        assert_eq!(allowed(&m, &m, &seeds), set(&[1, 2, 3, 4]));
+        assert_eq!(allowed(&m, &none, &seeds), set(&[1, 2, 3, 4]));
         assert!(is_member(&m, 4) && !is_member(&m, 5));
         assert_eq!(voter_count(&m), 3);
     }
@@ -192,12 +246,20 @@ mod tests {
     fn joint_configs_allow_both_halves() {
         // Replacing 3 with 5: joint {1,2,3} + {1,2,5}, then {1,2,5}.
         let joint = stored(vec![set(&[1, 2, 3]), set(&[1, 2, 5])], &[1, 2, 3, 5]);
-        assert_eq!(allowed(&joint, &set(&[1, 2, 3])), set(&[1, 2, 3, 5]));
+        assert_eq!(
+            allowed(&joint, &joint, &set(&[1, 2, 3])),
+            set(&[1, 2, 3, 5])
+        );
         assert!(is_member(&joint, 3) && is_member(&joint, 5));
         assert_eq!(voter_count(&joint), 3);
 
         let after = stored(vec![set(&[1, 2, 5])], &[1, 2, 5]);
-        assert_eq!(allowed(&after, &set(&[1, 2, 3])), set(&[1, 2, 5]));
+        // Node 3 stays admitted until its removal is committed here.
+        assert_eq!(
+            allowed(&after, &joint, &set(&[1, 2, 3])),
+            set(&[1, 2, 3, 5])
+        );
+        assert_eq!(allowed(&after, &after, &set(&[1, 2, 3])), set(&[1, 2, 5]));
         assert!(!is_member(&after, 3));
 
         // Shrinking 3 -> 1 through a joint config: the larger half counts.

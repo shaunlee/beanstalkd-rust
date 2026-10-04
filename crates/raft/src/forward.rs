@@ -4,9 +4,11 @@
 
 use std::fmt;
 use std::future::Future;
+use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::wire::{AdminRequest, AdminResponse};
 use crate::{ForwardRequest, ForwardResponse, NodeId, Op};
 
 /// A cluster-wide operation a node asks the leader to propose (wire
@@ -55,6 +57,20 @@ pub trait ForwardHandler: Send + Sync + 'static {
     fn control(&self, req: ControlRequest) -> impl Future<Output = ControlResponse> + Send {
         let _ = req;
         async { ControlResponse::NotLeader { leader: None } }
+    }
+
+    /// Serves an operator's membership change ([`AdminRequest::is_change`])
+    /// from the admin connection at `from`, after the listener checked the
+    /// admin identity. Requests of one admin connection are served one at a
+    /// time; a call may wait, briefly, for the change to complete. The
+    /// default answers [`AdminResponse::Unsupported`].
+    fn admin(
+        &self,
+        req: AdminRequest,
+        from: SocketAddr,
+    ) -> impl Future<Output = AdminResponse> + Send {
+        let _ = (req, from);
+        async { AdminResponse::Unsupported }
     }
 }
 

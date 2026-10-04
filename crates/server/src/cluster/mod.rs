@@ -35,6 +35,9 @@
 //! - [`membership`] makes the effective Raft membership the authority for
 //!   peer addresses and the listener allowlist once the node has one; the
 //!   config's `[[cluster.peer]]` list is seeds plus local address overrides.
+//! - [`admin`] runs operators' membership changes on the leader (the admin
+//!   channel of the cluster port) and finishes a joint configuration left
+//!   by an earlier leader.
 //!
 //! # Startup ([`start`])
 //!
@@ -70,6 +73,7 @@
 //! blocks ([`durable::ConnIdBlocks`], starting at [`durable::first_local`]).
 
 pub mod actor;
+pub mod admin;
 pub mod durable;
 pub mod duties;
 pub mod handler;
@@ -338,6 +342,15 @@ pub struct Core {
     heard: Mutex<HashMap<NodeId, Instant>>,
     conn_ids: OnceLock<Arc<durable::ConnIdBlocks>>,
     snapshot_size: Mutex<Option<(Instant, u64)>>,
+    /// Held by the membership change in progress ([`admin`]): one at a
+    /// time, including the finishing of a leftover joint configuration.
+    admin_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The nodes the listener admits (see [`Core::is_member`]).
+    admitted: Mutex<BTreeSet<NodeId>>,
+    /// Cluster traffic uses mTLS (the admin executor's address checks).
+    tls: bool,
+    plaintext_allow_remote: bool,
+    heartbeat: Duration,
 }
 
 /// How often `/metrics` rescans the snapshot directory at most.
@@ -521,9 +534,20 @@ impl Core {
         self.server.borrow().membership_config.clone()
     }
 
-    /// Whether `node` is a voter or learner of the effective membership.
+    /// Whether `node` may send forwards and control requests: a node the
+    /// listener admits ([`membership::allowed`]: the effective and the
+    /// committed membership), or of the effective membership before
+    /// [`membership::watch`] first ran.
     fn is_member(&self, node: NodeId) -> bool {
-        membership::is_member(&self.server.borrow().membership_config, node)
+        let admitted = lock(&self.admitted);
+        if admitted.is_empty() {
+            return membership::is_member(&self.server.borrow().membership_config, node);
+        }
+        admitted.contains(&node)
+    }
+
+    fn set_admitted(&self, nodes: BTreeSet<NodeId>) {
+        *lock(&self.admitted) = nodes;
     }
 
     fn owns_connections(&self, node: NodeId) -> bool {
@@ -1265,6 +1289,11 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         heard: Mutex::new(HashMap::new()),
         conn_ids: OnceLock::new(),
         snapshot_size: Mutex::new(None),
+        admin_lock: Arc::new(tokio::sync::Mutex::new(())),
+        admitted: Mutex::new(BTreeSet::new()),
+        tls: args.tls.is_some(),
+        plaintext_allow_remote: c.plaintext_allow_remote,
+        heartbeat: c.heartbeat,
     });
 
     if mode == Mode::Bootstrap {
@@ -1297,6 +1326,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         tokio::spawn(duties::leader_duties(core.clone())),
         tokio::spawn(duties::readiness(core.clone())),
         reaper_task,
+        tokio::spawn(admin::finish_joint(core.clone())),
         tokio::spawn(membership::watch(
             core.clone(),
             listener.allowlist(),

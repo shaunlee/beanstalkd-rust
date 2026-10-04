@@ -20,8 +20,7 @@ Release tags are `v<version>` and match the workspace version in
   `scripts/mkcluster-certs.sh`, which creates a cluster CA and node
   certificates.
 
-- **Cluster startup modes for changing membership** (no operator command
-  changes membership yet): `[[cluster.peer]]` now lists seeds and address
+- **Cluster startup modes for changing membership**: `[[cluster.peer]]` now lists seeds and address
   overrides (any number; a node need not list itself), and the new
   `cluster.initial_voters` chooses the voters `--cluster-init` creates (all
   peers by default; 1, 3 or 5). A node whose id is not a member yet waits
@@ -29,6 +28,19 @@ Release tags are `v<version>` and match the workspace version in
   node that lost its data rejoins against the cluster's current voters,
   learned from any reachable member, and waits while a membership change is
   in progress.
+
+- **Membership changes at runtime**, run by the leader on requests over the
+  cluster port's authenticated admin channel (the operator command follows
+  in a later release): add a node as a learner, promote a learner to voter,
+  remove a node (the leader too), and change a node's address. Each request
+  names the membership it was based on and is refused if that changed; one
+  change runs at a time. Guardrails: one voter added or removed per change;
+  only a learner that has caught up is promoted; no voter change while a
+  voter is rejoining after data loss or does not answer (except removing
+  that voter, if it is down); node ids are never reused; fewer than 3 voters
+  only when forced; a plaintext address off loopback only when forced. A
+  change interrupted by a leader change is finished by the next leader. A
+  removed node is not told: stop it. Removing the leader costs one election.
 
 ### Changed
 
@@ -53,7 +65,7 @@ Release tags are `v<version>` and match the workspace version in
   stopping every node, upgrading all of them, then starting them again; a
   rolling upgrade from 0.5.x is not possible. Version 4 adds an extended
   status probe and an authenticated admin channel on the cluster port (for
-  membership changes in a later release);
+  membership changes);
   `scripts/mkcluster-certs.sh DIR admin` issues its client certificate
   (SAN `bstk-admin`).
 - Log lines carry ANSI color codes only when stderr is a terminal, so
