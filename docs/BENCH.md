@@ -2,7 +2,7 @@
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`). The newest numbers
-are from task P4-T6 (the final P4 matrix), then P4-T6b (thread default per mode), then P4-T5c (snapshot memory), then P4-T5b
+are from task P5-T2 (Linux, ratios only), then P4-T6 (the final P4 matrix), then P4-T6b (thread default per mode), then P4-T5c (snapshot memory), then P4-T5b
 (cluster wake-ups at low load), then
 P4-T4 (footprint: memory per job, binlog bytes per operation). P4-T2 (tokio worker-thread count and its
 default, the lever the P4-T1 spike found for CPU efficiency) follows,
@@ -16,6 +16,77 @@ end.
 
 - **Reference build.** `scripts/build-ref.sh` (both the debug and the `--optimized` tree, which the benchmarks use) patches one comparison in the reference's `conn_timeout` (docs/COMPAT.md D14) and, where the compiler knows it, passes `-Wno-error=stringop-truncation` (gcc 14). Neither changes the hot paths, so the numbers below, measured before the patch existed, stay comparable.
 - **Linux container.** Copy the tree in with `COPYFILE_DISABLE=1` (no `._*` files from macOS tar) and leave out `clients/python/.venv`, `target/`, `.ref/` and `.git`; rebuild `.ref/` inside the container. Run it with `docker run --init`, so that orphaned servers are reaped.
+
+## P5-T2: Linux (ratios only)
+
+### Summary
+
+Linux aarch64 in a `rust:1.98.1-slim` container (`--cpus=12`, kernel
+7.0 under OrbStack) on the same shared Mac, server and `bstk-bench` in the
+container over loopback. The container host is the loaded VM (1-minute
+load 3 to 15), so only alternated or paired ratios are reported; absolute
+Linux figures need real hardware. The stock `run-matrix.sh` reads CPU with
+`ps -o cputime` (1 s resolution on Linux) and load with `sysctl`; the runs
+used a container copy reading `/proc/PID/stat` and `/proc/loadavg`.
+Cluster cells use node data on `/dev/shm`: on the container's overlay
+filesystem each fsync costs about 2 ms and dominates every cluster number.
+
+| Criterion | Linux result |
+|---|---|
+| Standalone ops per CPU-second ≥ 0.8x the reference at 10 and 100 connections | 0.98 to 1.23x: met |
+| Standalone throughput ≥ 1.0x the reference at 10 and 100 connections | after the `QuietTcp` fix below: 1.01 to 1.22x in 7 of 8 cells; producers-consumers 10×16 0.98x (a high-spread cell) |
+| `-b` not below P3 (±5%) | 0.96 to 1.05x paired: met |
+| TLS not below P3 (±5%) | 16 B cells 0.975 to 0.98x paired: met; 100×4096 0.91 to 0.94x in three sets, at 0.87x of P3's CPU (P3 runs 12 workers here, ours 2; `--threads 4` gives 0.97x) |
+| Cluster throughput not below P3 | via the leader 1.06 to 1.20x, via a follower 1.03 to 1.08x (paired, tmpfs) |
+| Cluster CPU per operation at 100 connections ≤ 15 µs | via the leader 11.8 µs (P3 14.2): met; via a follower 15.9 (P3 16.3) |
+| One-connection cluster CPU per operation halved | 0.78x via the leader, 0.80x via a follower: not met |
+| 1 and 2 connections vs the reference | 0.94 to 0.97x, the same pre-existing gap as on macOS |
+
+### `QuietTcp` on epoll
+
+The first Linux run found that `QuietTcp` (P4-T5b) made standalone
+plaintext slower than tokio's `TcpStream`: +13 to 16% CPU per operation,
+-7 to -14% throughput. `strace -c` at 10 connections showed 2.00
+`recvfrom` calls per command, one of them failing with `EAGAIN`:
+`QuietTcp` kept read readiness after a short read, which tokio's
+`TcpStream` clears. With that fixed (`d4306ab`), 1.005 `recvfrom` per
+command and no `EAGAIN`; alternated against the unfixed build (6 runs,
+put-reserve-delete):
+
+| conns | body | throughput fixed/base | server µs/op fixed/base |
+|---:|---:|---:|---:|
+| 1 | 16 | 1.05 | 0.91 |
+| 1 | 4096 | 1.04 | 0.93 |
+| 10 | 16 | 1.10 | 0.90 |
+| 10 | 4096 | 1.10 | 0.88 |
+| 100 | 16 | 1.16 | 0.87 |
+| 100 | 4096 | 1.03 | 1.04 (noise) |
+
+In cluster mode the read-only registration still pays on Linux: plain
+`TcpStream` everywhere costs 5 to 13% more cluster CPU per operation at
+one connection (macOS: 24 to 31%), as P4-T5b expected for epoll.
+
+### Fixed build vs the reference (5 runs, alternated)
+
+| scenario | conns | body | throughput | ops per CPU-s |
+|---|---:|---:|---:|---:|
+| put-reserve-delete | 10 | 16 | 1.09 | 1.07 |
+| put-reserve-delete | 10 | 4096 | 1.02 | 1.03 |
+| put-reserve-delete | 100 | 16 | 1.22 | 1.23 |
+| put-reserve-delete | 100 | 4096 | 1.18 | 1.18 |
+| producers-consumers | 10 | 16 | 0.98 | 0.98 |
+| producers-consumers | 10 | 4096 | 1.01 | 1.04 |
+| producers-consumers | 100 | 16 | 1.15 | 1.07 |
+| producers-consumers | 100 | 4096 | 1.01 | 1.05 |
+
+### Worker threads on Linux
+
+One worker is not CPU-bound here (59 to 76% of a core). Two workers give
+1.20 to 1.44x plaintext throughput for 1.15 to 1.24x CPU per operation,
+which would still be about 0.83 to 0.91x the reference's efficiency
+(an estimate from two ratios, not measured directly); TLS 10×4096 with
+one worker is 0.75x of two. The per-mode defaults (P4-T6b) stand; on
+Linux, `--threads 2` is a reasonable choice for plaintext throughput.
 
 ## P4-T6: final P4 matrix
 
