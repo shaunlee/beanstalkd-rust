@@ -203,7 +203,7 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 | P3 | Raft replication; see §6 (done) | see §6.6 |
 | P4 | Performance; see §7 (done) | see §7.5 |
 | P5 | Production readiness: Linux validation, CI, packaging, operations guide, hardening; see §8 (done) | see §8.5 |
-| P6 | Dynamic cluster membership (add, remove, replace a node online) | planned when P5 is accepted |
+| P6 | Dynamic cluster membership (add, remove, replace a node online); see §9 | see §9.5 |
 | later | openraft 0.10 (cluster CPU targets of §7.5), once it leaves alpha | — |
 
 ## 4. P1: Write-Ahead Log (detailed plan)
@@ -508,3 +508,52 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 - [x] `docs/OPERATIONS.md` covers every item in §8.1; every command in it was run
 - [x] Each fuzz target ran its budget without an open crash; `cargo deny` clean or each exception justified — no exceptions
 - [x] No client-visible behavior change (differential suites unchanged) — protocol unchanged; the visible changes are fixes or additions recorded in CHANGELOG: `--version`, `/readyz` 503 while isolated, a disconnect ordered before later commands, binlog ids above 2^62 rejected as corrupt; differential cases were only made timing-robust and one was added
+
+## 9. P6: Dynamic Cluster Membership (detailed plan)
+
+### 9.1 Scope
+
+- Add, remove and replace cluster nodes, and change a node's address, without stopping the cluster; grow a cluster (1 → 3, 3 → 5) and shrink it.
+- An authenticated operator interface, status and metrics for membership, runbooks in `docs/OPERATIONS.md`.
+- Chaos coverage of membership changes under faults.
+- **Out of scope**: automatic membership management (auto-removal of dead nodes), openraft 0.10, certificate revocation lists (removed nodes are kept out by the membership allowlist; ids are never reused).
+- **Invariant**: no change to replicated semantics (the `Op` set and how the state machine applies it), so a mixed-version cluster cannot diverge; client protocol unchanged.
+
+### 9.2 Facts checked before planning (design survey, HEAD `5004d6e`)
+
+- openraft's log and snapshot already carry membership (`EntryPayload::Membership`, `SnapshotMeta.last_membership`), and on restart the log wins inside Raft. Our layers around it do not follow it: peer addresses, the listener allowlist, liveness (`DropNode` on silent peers), `leader_reachable` and the rejoin quorum all read the config's `[[cluster.peer]]` list, and `Network::peer` caches a slot per id forever (`client.rs:254`). A runtime membership change today would leave nodes unable to reach or accept the new member, and the connections of a node outside the config would never be dropped (their reservations leak).
+- openraft 0.9: `add_learner(…, blocking=false)` and `change_membership` (joint consensus, two commits; a leader change in between leaves the joint config, which the next call finalizes; `InProgress` while the effective membership is uncommitted). Promotion does not check learner lag; there is no leader transfer; a removed node is not told and keeps campaigning (contained by the leader lease and, after P6-T1, the allowlist).
+- `insecure_plaintext` and the multi-process chaos harness give each node its own address for a peer (per-link proxies), so config addresses must keep working as local overrides.
+- The listener requires an exact cluster protocol version (`listener.rs:515`, `client.rs:477`); any new message needs a version bump and, for rolling upgrades, negotiation.
+
+### 9.3 Design decisions
+
+1. **Membership is the authority once a node has Raft state.** `[[cluster.peer]]` becomes seeds plus local address overrides. Address resolution: config override if present, else the membership's `BasicNode.addr`; peer slots are invalidated when an address changes. The listener allowlist is the effective membership (voters and learners, both halves of a joint config); config seeds are used only before the node has any membership. A node logs a warning when its config and the log's membership differ.
+2. **Liveness covers non-members**: the leader proposes `DropNode` for every connection owner that is a silent member or not a member at all (re-proposed whenever a non-member's highest local number grows), and immediately after a removal is applied. Forwards and controls from non-members are refused. No state-machine rule changes.
+3. **Startup modes**: `--cluster-init` takes an explicit initial voter set (all config peers by default, as today); a new **Join** mode for an id that is not yet a member (no vote adoption: it never voted; waits until the membership lists it). Runbook order is add-then-start (the leader retries replication to an unreachable learner), but Join also tolerates start-then-add; **Rejoin** (same id, wiped disk) probes a quorum of the *current* voters learned from a new status reply carrying the membership and its log id, and refuses while that membership is joint or uncommitted. The rejoin safety argument (DESIGN §8) is re-derived for changing voter sets and reviewed by a separate agent before merge, covering at least: a joint configuration in flight during a rejoin, a removed voter trying to rejoin, growth 1 → 2 (`quorum(2) = 2`), and a stale seed list naming no current voter. Until P6-T3 is merged, nothing reachable by an operator can change membership.
+4. **Ids are never reused.** The state machine records the highest node id that was ever a member (`SmMeta`, applied from membership entries; snapshot `PAYLOAD_VERSION` bump, older payloads still read), and the operator interface refuses any id at or below it that is not a current member, so a removed node's certificate can never be readmitted, even if it never served a client; replacing a node uses a new id (add learner → catch up → promote → remove old), or the same id with a wiped disk through Rejoin.
+5. **Operator interface: a `beanstalkd-rs cluster` subcommand** speaking the cluster port with a separate admin identity: an `AdminHello` (no peer slot), mTLS with SAN `bstk-admin` from the cluster CA (`scripts/mkcluster-certs.sh` issues it), loopback-only in plaintext mode. Requests `status`, `add` (learner), `promote`, `remove`, `set-addr`, each with a compare-and-set on the membership log id; non-leaders answer with the leader's id and address; the leader runs a change in the background and the CLI polls. Guardrails (overridable with `--force` where safe): one voter change per request, no fewer than 3 voters, promote only a caught-up learner, refuse while any voter is rejoining or the membership is joint. HTTP stays read-only; config-file reconciliation was rejected (stale configs on a new leader would revert membership).
+6. **Cluster protocol v4 with negotiation**: new messages are appended variants (`AdminHello`, admin RPCs, `StatusEx`); `Hello` stays byte-identical. A v4 listener accepts 3 and 4; a v4 dialer falls back to 3 on the explicit version rejection; v4-only requests are never sent on a v3 link; the leader refuses membership changes until every member speaks v4. Rolling upgrade from 0.5.x is supported; downgrading after a membership change is not.
+7. **Observability**: voters, learners, joint flag, membership log id and commit state, per-learner lag, `is_member` in `/admin` and `/metrics`; readiness is false on a non-member.
+
+### 9.4 Tasks (sequential: one subagent at a time; the lead picks each subagent's model)
+
+| ID | Task | Owner |
+|---|---|---|
+| P6-T1 | Membership-driven address book and listener allowlist; hello checks identity first and names the rejection; liveness and `DropNode` for non-member owners; voter count in `leader_reachable`; highest-ever member id in `SmMeta`; a test-only hook (not reachable from the wire or CLI) to change membership, never combined with a wipe before P6-T3; existing rejoin and wipe chaos runs stay green | subagent |
+| P6-T2 | Cluster wire v4: `StatusEx`, `AdminHello` and admin RPC shells that never change membership (they answer "unsupported" until P6-T4), v3/v4 negotiation (first confirm against a 0.5.0 build which rejection reason actually crosses the wire); rolling-upgrade test with a v3 node | subagent |
+| P6-T3 | Startup modes: seeds and overrides, initial voter set, Join, Rejoin against current voters; DESIGN §8 safety argument rewritten and reviewed | subagent + reviewer |
+| P6-T4 | Leader-side membership executor: add learner, lag-gated promote, remove (incl. the leader) followed by `DropNode`, set-addr, compare-and-set, finishing a leftover joint config, guardrails | subagent |
+| P6-T5 | `beanstalkd-rs cluster` CLI and the `bstk-admin` identity; security tests | subagent |
+| P6-T6 | Observability and docs: metrics, `/admin`, OPERATIONS runbooks (grow, shrink, replace, address change, upgrade), COMPAT, CHANGELOG | subagent |
+| P6-T7 | Chaos: membership faults in the in-process and multi-process harnesses with new invariants (owners ⊆ members after settle, a removed node's reservations released, final membership uniform and as requested) | subagent |
+| P6-T8 | P6 acceptance | lead |
+
+### 9.5 Acceptance
+
+- [ ] Deterministic tests: grow 1→3 and 3→5, shrink 5→3, remove a follower holding reservations (released), remove the leader (new leader, its clients dropped), replace with a new id, replace with the same id and a wiped disk at a new address, restart with a stale config (log wins), a removed node is rejected and isolates, concurrent admin requests (one wins), admin identity checks, v3/v4 negotiation, guardrails
+- [ ] Chaos with membership faults: ≥ 1,000 in-process seeds and ≥ 100 multi-process runs, 0 violations; the existing acceptance runs still green
+- [ ] Rolling upgrade from 0.5.0 to the P6 build under load, then a membership change, scripted and green
+- [ ] The rejoin safety argument for changing voter sets written in DESIGN §8 and reviewed
+- [ ] No hot-path regression (cluster benchmark at 100 connections within ±5%)
+- [ ] OPERATIONS runbooks executed as written; CI green; CHANGELOG updated
