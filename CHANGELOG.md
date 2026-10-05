@@ -106,6 +106,20 @@ Release tags are `v<version>` and match the workspace version in
   (SAN `bstk-admin`).
 - Log lines carry ANSI color codes only when stderr is a terminal, so
   journald, `docker logs` and log files get plain text.
+- **A removed cluster node stops by itself.** Once a majority of the
+  remaining voters (of the latest membership it can learn) report a
+  committed membership without it, the node logs an `ERROR` naming the
+  removal and exits with status 11, whether it was running when it was
+  removed or was restarted with its data; before, it ran isolated, or
+  waited for a leader, until an operator stopped it. It never exits on its
+  own evidence alone: a node that is partitioned, or whose removal was not
+  committed (and is later truncated), keeps running. The refusal to start a
+  removed id with an empty data directory also exits with 11 now (it was
+  1). The packaged systemd unit does not restart on 11
+  (`RestartPreventExitStatus=10 11`); Docker's `--restart on-failure`
+  does, so remove the container of a removed node. The notes of
+  `beanstalkd-rs cluster remove` and the runbooks say so (stopping the node
+  yourself is still fine).
 
 ### Fixed
 

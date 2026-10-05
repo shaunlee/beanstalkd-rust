@@ -48,7 +48,12 @@
 //!    is at most the highest vote of the answers from voters holding the
 //!    membership and not rejoining by the harness's own record (checked in
 //!    `discover`), a removed node's discovery never decides join or rejoin,
-//!    and no status answer hides a rejoin.
+//!    and no status answer hides a rejoin;
+//! 7. a removed node stops by itself (the server's exit status 11) once the
+//!    cluster confirms the removal, also when the operator does not stop it
+//!    (about one in three), within [`REMOVED_EXIT_BOUND`] of healing; and no
+//!    node ever stops that way unless a committed membership entry removed
+//!    it (a member exiting would be a violation).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -74,6 +79,9 @@ use super::{NodeInc, RunShared, StartMode, lock, wait_until};
 const NODE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Invariant 3: `2 × node_timeout` plus a margin.
 pub const RELEASE_BOUND: Duration = Duration::from_secs(5);
+/// How long after healing a removed node the operator left running may take
+/// to stop by itself (invariant 7).
+const REMOVED_EXIT_BOUND: Duration = Duration::from_secs(30);
 const _: () = assert!(RELEASE_BOUND.as_secs() >= 2 * NODE_TIMEOUT.as_secs());
 /// How long a multi-step flow keeps retrying one step.
 const STEP_BUDGET: Duration = Duration::from_secs(20);
@@ -410,8 +418,14 @@ fn pick<T: Copy>(v: &[T], draw: u64) -> Option<T> {
 }
 
 /// Stops removed node `id` (the runbook's "stop its process") `delay`
-/// after its removal is committed, if it is within 10 s.
+/// after its removal is committed, if it is within 10 s. For about one node
+/// in three the operator does not (P7-T2: a removed node stops by itself;
+/// invariant 7 checks that it does).
 fn retire_later(run: &Arc<RunShared>, id: NodeId, delay: Duration) {
+    if (id + delay.as_millis() as u64).is_multiple_of(3) {
+        run.count("RemovedLeftRunning");
+        return;
+    }
     let run2 = run.clone();
     let h = tokio::spawn(async move {
         let removed = wait_until(Duration::from_secs(10), || {
@@ -875,6 +889,29 @@ pub(super) async fn settle(run: &Arc<RunShared>) -> Option<BTreeSet<NodeId>> {
         return None;
     };
     run.event(format!("settled membership: {members:?}"));
+    // Invariant 7: a removed node the operator left running stops by itself
+    // once the cluster can be asked (nodes still in discovery decide by
+    // themselves too, but are not counted here).
+    let outsiders: Vec<NodeId> = lock(&run.nodes)
+        .keys()
+        .copied()
+        .filter(|id| !members.contains(id))
+        .collect();
+    if !outsiders.is_empty() {
+        wait_until(REMOVED_EXIT_BOUND, || {
+            let nodes = lock(&run.nodes);
+            outsiders.iter().all(|id| !nodes.contains_key(id))
+        })
+        .await;
+        for id in outsiders {
+            if lock(&run.nodes).contains_key(&id) {
+                run.problem(format!(
+                    "invariant 7: removed node {id} still runs {REMOVED_EXIT_BOUND:?} after                      healing: {}",
+                    super::cluster_view(run)
+                ));
+            }
+        }
+    }
     for id in run.running() {
         if !members.contains(&id) {
             retire(run, id);
@@ -985,6 +1022,14 @@ pub(super) async fn check_final(run: &Arc<RunShared>, members: &BTreeSet<NodeId>
         ));
     }
     let l = lock(&run.ledger);
+    for (id, at) in lock(&run.exited).iter() {
+        if !l.removed.contains_key(id) {
+            run.problem(format!(
+                "invariant 7: node {id} exited as removed at {at:?}, but no membership entry \
+                 that removes it was ever committed"
+            ));
+        }
+    }
     let disruptions = lock(&run.disruptions).clone();
     for (&x, &(index, removed_at)) in &l.removed {
         let Some(&released) = l.released.get(&x) else {

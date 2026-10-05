@@ -216,7 +216,8 @@ impl Node {
     }
 
     fn stop(&mut self, sig: Signal) -> ExitStatus {
-        self.signal(sig);
+        // A removed node may have stopped by itself already (P7-T2).
+        let _ = nix::sys::signal::kill(self.pid(), sig);
         let mut c = self.child.take().unwrap();
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
@@ -525,7 +526,6 @@ fn write_node_config(n: &Node, opts: &Opts, peers: &str) {
     std::fs::write(&n.config, text).unwrap();
 }
 
-#[cfg(feature = "test-hooks")]
 impl Node {
     /// Waits until the process has exited; its exit status.
     fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
@@ -2475,18 +2475,20 @@ fn admin_removes_the_leader() {
     let voters: Vec<u64> = fs.iter().map(|&i| c.nodes[i].id).collect();
     wait_membership(&mut c, &fs, &voters, &[]);
     // A change on the removed node is answered with the new leader.
-    let r = admin(lp, add(9, "127.0.0.1:1", None));
-    assert!(
-        matches!(r, Resp::NotLeader { leader, .. } if leader != Some(lid)),
-        "{r:?}"
-    );
+    // (Unless it has stopped by itself already.)
+    if let Some(r) = admin_request(lp, add(9, "127.0.0.1:1", None)) {
+        assert!(
+            matches!(r, Resp::NotLeader { leader, .. } if leader != Some(lid)),
+            "{r:?}"
+        );
+    }
     on_leader
         .stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .unwrap();
     let (_, end) = on_leader.read_to_end(Duration::from_secs(10));
     assert!(matches!(end, End::Closed | End::Error(_)), "{end:?}");
-    c.nodes[l].stop(Signal::SIGTERM);
+    assert_removed_exit(&mut c.nodes[l], "removed leader");
     // The remaining nodes' clients were never closed.
     let j = inserted(&bystander.put(b"bystander"));
     assert_eq!(bystander.cmd(&format!("delete {j}")), "DELETED");
@@ -2656,6 +2658,144 @@ fn restarted_node_behind_its_previous_process_still_drops_its_connections() {
     assert_eq!(on_leader.stat("stats", "current-connections"), "1");
 }
 
+/// Exit status of a node the cluster removed (`cluster::EXIT_REMOVED`).
+const EXIT_REMOVED: i32 = 11;
+
+/// How long a removed node may take to stop by itself after its removal is
+/// committed: a few election timeouts and probe rounds, generous for a
+/// loaded machine. OPERATIONS says "within about 15 seconds".
+const REMOVED_EXIT_BOUND: Duration = Duration::from_secs(40);
+
+fn assert_removed_exit(n: &mut Node, what: &str) -> Duration {
+    let started = Instant::now();
+    let st = n
+        .wait_exit(REMOVED_EXIT_BOUND)
+        .unwrap_or_else(|| panic!("{what}: node {} kept running: {}", n.id, n.log_text()));
+    assert_eq!(st.code(), Some(EXIT_REMOVED), "{what}: {}", n.log_text());
+    let log = n.log_text();
+    assert!(
+        log.contains(&format!("node {} was removed from the cluster", n.id)),
+        "{what}: {log}"
+    );
+    started.elapsed()
+}
+
+/// P7-T2: a follower removed while it runs is not told, but stops by itself
+/// with exit status 11 once the cluster confirms the removal; the others go
+/// on.
+#[test]
+fn removed_follower_exits_by_itself() {
+    let opts = Opts {
+        node_timeout: "2s",
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(5, &opts);
+    let l = c.leader();
+    let lp = c.nodes[l].cluster;
+    let f = c.followers(l)[0];
+    let fid = c.nodes[f].id;
+    let keep: Vec<usize> = (0..5).filter(|&i| i != f).collect();
+    assert!(change(lp, |e| remove(fid, e, false)).is_some());
+    let took = assert_removed_exit(&mut c.nodes[f], "removed follower");
+    eprintln!("removed follower exited {took:?} after the removal was answered");
+    let voters: Vec<u64> = keep.iter().map(|&i| c.nodes[i].id).collect();
+    wait_membership(&mut c, &keep, &voters, &[]);
+    let nl = c.leader();
+    let mut on_leader = c.nodes[nl].connect();
+    inserted(&on_leader.put(b"after-removal"));
+}
+
+/// P7-T2: a removed node restarted with its data (it still lists itself,
+/// waits for a leader and campaigns) stops with status 11 as soon as the
+/// peers' refusals make it ask, the same as one removed while running.
+#[test]
+fn removed_node_restarted_with_its_data_exits() {
+    let opts = Opts {
+        node_timeout: "2s",
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(5, &opts);
+    let l = c.leader();
+    let lp = c.nodes[l].cluster;
+    let f = c.followers(l)[0];
+    let fid = c.nodes[f].id;
+    let keep: Vec<usize> = (0..5).filter(|&i| i != f).collect();
+    // Stopped first, so that it never learns anything about its removal.
+    c.nodes[f].stop(Signal::SIGTERM);
+    assert!(change(lp, |e| remove(fid, e, false)).is_some());
+    let voters: Vec<u64> = keep.iter().map(|&i| c.nodes[i].id).collect();
+    wait_membership(&mut c, &keep, &voters, &[]);
+    assert!(c.nodes[f].has_raft_state());
+    c.nodes[f].start(&[]);
+    let took = assert_removed_exit(&mut c.nodes[f], "restarted removed node");
+    eprintln!("restarted removed node exited {took:?} after its start");
+    // What made it ask: its peers refuse it as not a member.
+    assert!(
+        c.nodes[f]
+            .log_text()
+            .contains("peers refuse it as not a member"),
+        "{}",
+        c.nodes[f].log_text()
+    );
+    // Started again, it exits again: the data still says it was a member.
+    c.nodes[f].start(&[]);
+    assert_removed_exit(&mut c.nodes[f], "restarted twice");
+}
+
+/// P7-T2: a member that cannot reach anyone keeps running (a partition is
+/// not a removal) and is ready again after it heals.
+#[test]
+fn partitioned_member_keeps_running() {
+    let opts = Opts {
+        node_timeout: "2s",
+        proxied: true,
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(3, &opts);
+    let l = c.leader();
+    let f = c.followers(l)[0];
+    c.cut_node(c.nodes[f].id);
+    let cut = Instant::now();
+    // Several election timeouts and probe rounds.
+    while cut.elapsed() < Duration::from_secs(15) {
+        assert!(c.nodes[f].running(), "{}", c.nodes[f].log_text());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_ne!(c.nodes[f].readyz(), 200);
+    c.heal_all();
+    assert!(
+        c.nodes[f].wait_ready(Duration::from_secs(30)),
+        "{}",
+        c.nodes[f].log_text()
+    );
+    assert!(!c.nodes[f].log_text().contains("was removed"));
+}
+
+/// P7-T2: a removed node that cannot reach anyone keeps running, since
+/// nothing confirms its removal, and stops once it can ask.
+#[test]
+fn partitioned_removed_node_exits_once_it_can_ask() {
+    let opts = Opts {
+        node_timeout: "2s",
+        proxied: true,
+        ..Opts::default()
+    };
+    let mut c = Cluster::start(5, &opts);
+    let l = c.leader();
+    let lp = c.nodes[l].cluster;
+    let gone = c.followers(l)[0];
+    let gone_id = c.nodes[gone].id;
+    c.cut_node(gone_id);
+    let removal = Instant::now();
+    assert!(change(lp, |e| remove(gone_id, e, false)).is_some());
+    while removal.elapsed() < Duration::from_secs(15) {
+        assert!(c.nodes[gone].running(), "{}", c.nodes[gone].log_text());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    c.heal_all();
+    assert_removed_exit(&mut c.nodes[gone], "removed after the partition");
+}
+
 fn gauge(metrics: &str, name: &str) -> Option<String> {
     metrics
         .lines()
@@ -2775,18 +2915,15 @@ fn membership_metrics_and_readiness_of_joining_and_removed_nodes() {
         "{a}"
     );
 
-    // Removed while running: not ready from then on.
+    // Removed while running: not ready from then on, and it stops by itself
+    // (P7-T2).
     assert!(change(lp, |e| remove(4, e, false)).is_some());
     wait_membership(&mut c, &[0, 1, 2], &[1, 2, 3], &[]);
     let not_ready = wait_for(Duration::from_secs(10), || {
-        (c.nodes[n4].readyz() == 503).then_some(())
+        (c.nodes[n4].readyz() != 200).then_some(())
     });
     assert!(not_ready.is_some(), "the removed node stayed ready");
-    std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(c.nodes[n4].readyz(), 503);
-    let a = c.nodes[n4].admin().unwrap();
-    assert_eq!(a["cluster"]["ready"], false, "{a}");
-    c.nodes[n4].stop(Signal::SIGTERM);
+    assert_removed_exit(&mut c.nodes[n4], "removed learner");
     let m = c.nodes[l].metrics();
     assert_eq!(
         gauge(&m, "beanstalkd_cluster_learners").as_deref(),
@@ -3367,10 +3504,9 @@ mod membership {
 
     /// Removing a follower that holds a reservation: the leader drops the
     /// non-member's connections at once (the job goes back to ready), the
-    /// removed node's hellos are refused with the specific reason, and it
-    /// isolates (closes its clients).
+    /// removed node's clients are closed, and it stops by itself (P7-T2).
     #[test]
-    fn removed_follower_is_dropped_rejected_and_isolates() {
+    fn removed_follower_is_dropped_rejected_and_stops() {
         let opts = Opts {
             node_timeout: "1s",
             ..Opts::default()
@@ -3379,7 +3515,6 @@ mod membership {
         let l = c.leader();
         let fs = c.followers(l);
         let (f, keep) = (fs[0], fs[1]);
-        let fid = c.nodes[f].id;
 
         let mut on_leader = c.nodes[l].connect();
         let job = inserted(&on_leader.put(b"x"));
@@ -3412,26 +3547,15 @@ mod membership {
             matches!(end, End::Closed | End::Error(_)),
             "the removed node's client was not closed: {end:?}"
         );
-        wait_for(Duration::from_secs(10), || {
-            (c.nodes[f].admin()?["cluster"]["isolated"] == true).then_some(())
-        })
-        .expect("the removed node did not isolate");
-        wait_for(Duration::from_secs(10), || {
+        // The removed node is refused by its peers, asks the cluster and
+        // stops by itself.
+        assert_removed_exit(&mut c.nodes[f], "removed follower");
+        assert!(
             c.nodes[f]
                 .log_text()
-                .contains("this node is not a member of the cluster")
-                .then_some(())
-        })
-        .expect("the removed node never logged the specific rejection");
-        wait_for(Duration::from_secs(10), || {
-            (rejected_hellos(&c.nodes[l], fid) + rejected_hellos(&c.nodes[keep], fid) > 0)
-                .then_some(())
-        })
-        .expect("nobody rejected the removed node's hello");
-        assert!(
-            c.nodes[l]
-                .log_text()
-                .contains(&format!("node {fid} is not a member of the cluster")),
+                .contains("it is not in its own membership"),
+            "{}",
+            c.nodes[f].log_text()
         );
 
         // The two remaining voters keep serving.
@@ -3736,7 +3860,7 @@ mod membership {
         let st = c.nodes[f]
             .wait_exit(Duration::from_secs(20))
             .expect("the removed node kept running");
-        assert_eq!(st.code(), Some(1), "{}", c.nodes[f].log_text());
+        assert_eq!(st.code(), Some(EXIT_REMOVED), "{}", c.nodes[f].log_text());
         let log = c.nodes[f].log_text();
         assert!(log.contains("never reused"), "{log}");
         assert!(!c.nodes[f].has_raft_state());
@@ -3827,13 +3951,15 @@ mod membership {
         let st = c.nodes[f]
             .wait_exit(Duration::from_secs(30))
             .unwrap_or_else(|| panic!("still running: {}", c.nodes[f].log_text()));
-        assert!(!st.success(), "{st:?}");
+        assert_eq!(st.code(), Some(EXIT_REMOVED), "{st:?}");
+        // Either the rejoin loop's own re-check or the removal watch got
+        // there first; both name the removal.
         let log = since(&c.nodes[f]);
         assert!(
             log.iter().any(
-                |l| l.contains(&format!("cannot finish rejoining node {f_id}"))
-                    && l.contains("never reused")
-            ),
+                |l| l.contains(&format!("node {f_id} was removed from the cluster"))
+                    || l.contains(&format!("cannot finish rejoining node {f_id}"))
+            ) && log.iter().any(|l| l.contains("never reused")),
             "{}",
             log.join("\n")
         );
@@ -3979,5 +4105,102 @@ mod membership {
         let nl = c.leader();
         let mut on_new = c.nodes[nl].connect();
         inserted(&on_new.put(b"after-joint"));
+    }
+
+    /// P7-T2: a removal that is appended on the removed node but never
+    /// commits, and is truncated by a new leader, never stops it. Five
+    /// voters: the leader (held by the test hook, then cut off from three
+    /// followers) appends the joint configuration and replicates it only to
+    /// the removed node `r`; the three others elect a new leader that cannot
+    /// reach `r` yet. `r` lists itself only in the old half, so it asks the
+    /// cluster, which still reports the old committed membership; it must
+    /// stay up through many probe rounds and after the new leader truncates
+    /// the entry.
+    #[test]
+    fn truncated_removal_never_stops_the_node() {
+        let opts = Opts {
+            node_timeout: "5s",
+            proxied: true,
+            ..Opts::default()
+        };
+        let mut c = Cluster::start(5, &opts);
+        let l = c.leader();
+        let lp = c.nodes[l].cluster;
+        let lid = c.nodes[l].id;
+        let fs = c.followers(l);
+        let (r, others) = (fs[0], fs[1..].to_vec());
+        let rid = c.nodes[r].id;
+        let hold = c.nodes[l].data_dir.join("test-hold-change");
+        std::fs::write(&hold, "").unwrap();
+        let cur = current(lp);
+        let held = std::thread::spawn(move || admin(lp, remove(rid, cur, false)));
+        assert!(
+            c.nodes[l].wait_log(
+                "test hook: holding the membership change",
+                Duration::from_secs(20)
+            ),
+            "{}",
+            c.nodes[l].log_text()
+        );
+        let r_answer = held.join().unwrap();
+        assert!(matches!(r_answer, Resp::Started { .. }), "{r_answer:?}");
+
+        for &o in &others {
+            let oid = c.nodes[o].id;
+            for link in [(lid, oid), (oid, lid), (oid, rid)] {
+                c.proxies[&link].cut();
+            }
+        }
+        std::fs::remove_file(&hold).unwrap();
+        let joint = wait_for(Duration::from_secs(20), || {
+            admin_status(c.nodes[r].cluster)
+                .filter(|s| s.membership.is_joint() && !s.membership.committed)
+        });
+        assert!(
+            joint.is_some(),
+            "the removed node never appended the joint entry: {:?}",
+            admin_status(c.nodes[r].cluster)
+        );
+        let nl = leader_among(&c, &others);
+        assert!(
+            c.nodes[r].wait_log("asking the cluster to confirm", Duration::from_secs(10)),
+            "{}",
+            c.nodes[r].log_text()
+        );
+        // Several probe rounds (the interval grows to 5 s), the others
+        // answering with the old committed membership.
+        let waited = Instant::now();
+        while waited.elapsed() < Duration::from_secs(15) {
+            assert!(c.nodes[r].running(), "{}", c.nodes[r].log_text());
+            let s = admin_status(c.nodes[r].cluster).expect("status");
+            assert!(s.membership.is_joint() && !s.membership.committed, "{s:?}");
+            std::thread::sleep(Duration::from_millis(250));
+        }
+
+        c.heal_all();
+        let voters: BTreeSet<u64> = (1..=5).collect();
+        wait_for(Duration::from_secs(30), || {
+            let m = admin_status(c.nodes[r].cluster)?.membership;
+            (m.committed && !m.is_joint() && m.voters() == voters).then_some(())
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the joint entry was never truncated on the removed node: {:?}",
+                admin_status(c.nodes[r].cluster)
+            )
+        });
+        let truncated = Instant::now();
+        while truncated.elapsed() < Duration::from_secs(10) {
+            assert!(c.nodes[r].running(), "{}", c.nodes[r].log_text());
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert!(!c.nodes[r].log_text().contains("was removed"));
+        let all: Vec<usize> = (0..5).collect();
+        wait_membership(&mut c, &all, &[1, 2, 3, 4, 5], &[]);
+        assert!(c.nodes[r].wait_ready(Duration::from_secs(30)));
+        let mut on_r = c.nodes[r].connect();
+        let job = inserted(&on_r.put(b"after-truncation"));
+        let mut on_new = c.nodes[nl].connect();
+        assert_eq!(reserve(&mut on_new, "reserve-with-timeout 5"), job);
     }
 }

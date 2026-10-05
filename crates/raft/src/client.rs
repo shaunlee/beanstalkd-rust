@@ -159,6 +159,13 @@ struct Inner {
     /// must not make the target look silent to the leader's liveness check.
     last_response: StdMutex<HashMap<NodeId, Arc<StdMutex<Option<std::time::Instant>>>>>,
     next_id: AtomicU64,
+    /// Hellos refused with `REJECT_NOT_MEMBER`, ever (the removal watch
+    /// reads its growth, docs/DESIGN.md §8 "A removed node stops by
+    /// itself").
+    not_member_refusals: AtomicU64,
+    /// Addresses learned from other nodes' memberships, used for status
+    /// probes only (see [`Network::learn_addresses`]).
+    learned: StdMutex<BTreeMap<NodeId, String>>,
 }
 
 struct Peer {
@@ -275,6 +282,8 @@ impl Network {
                 members: StdMutex::new(BTreeMap::new()),
                 last_response: StdMutex::new(HashMap::new()),
                 next_id: AtomicU64::new(1),
+                not_member_refusals: AtomicU64::new(0),
+                learned: StdMutex::new(BTreeMap::new()),
             }),
         }
     }
@@ -299,7 +308,22 @@ impl Network {
     /// and status probes (`None`: unknown).
     pub fn address(&self, target: NodeId) -> Option<String> {
         let members = lock(&self.inner.members);
-        resolve(&self.inner.cfg.peers, &members, target, None).map(str::to_string)
+        resolve(&self.inner.cfg.peers, &members, target, None)
+            .map(str::to_string)
+            .or_else(|| lock(&self.inner.learned).get(&target).cloned())
+    }
+
+    /// Remembers addresses of nodes this node's own membership does not
+    /// list (a removed node probing the cluster that moved on without it).
+    /// Used only where [`Network::address`] is: probes, never Raft traffic.
+    pub fn learn_addresses(&self, nodes: &BTreeMap<NodeId, String>) {
+        lock(&self.inner.learned).extend(nodes.iter().map(|(&n, a)| (n, a.clone())));
+    }
+
+    /// How many hellos peers refused because this node is not a member, so
+    /// far (only ever grows).
+    pub fn not_member_refusals(&self) -> u64 {
+        self.inner.not_member_refusals.load(Ordering::Relaxed)
     }
 
     /// The shared connection slot for `target`, at the address it resolves
@@ -574,6 +598,9 @@ impl Network {
                 // Peer-supplied text: escaped and truncated before use.
                 let reason = wire::sanitize(&reason);
                 if reason == crate::listener::REJECT_NOT_MEMBER {
+                    self.inner
+                        .not_member_refusals
+                        .fetch_add(1, Ordering::Relaxed);
                     if !peer.not_member_logged.swap(true, Ordering::Relaxed) {
                         tracing::warn!(
                             target_node = peer.target,

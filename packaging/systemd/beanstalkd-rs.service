@@ -33,9 +33,11 @@ KillSignal=SIGTERM
 TimeoutStopSec=30
 Restart=on-failure
 RestartSec=2s
-# Status 10 means another process holds the binlog directory lock;
-# restarting cannot fix that.
-RestartPreventExitStatus=10
+# Status 10 means another process holds the binlog directory lock, and
+# status 11 that the cluster removed this node (it exits once a quorum of
+# the remaining voters confirms it); restarting cannot fix either. A node
+# that exits with 11 stays failed until its unit is disabled.
+RestartPreventExitStatus=10 11
 # One descriptor per client connection.
 LimitNOFILE=65536
 

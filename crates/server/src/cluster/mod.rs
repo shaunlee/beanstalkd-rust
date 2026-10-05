@@ -121,6 +121,48 @@ pub const SHUTDOWN_BOUND: Duration = Duration::from_secs(1);
 /// so the packaged systemd unit restarts it.
 pub const EXIT_RAFT_FAILURE: i32 = 21;
 
+/// Exit status of a node the cluster removed (confirmed by a quorum, or a
+/// removed id refused at startup). Not restarted by the packaged unit
+/// (`RestartPreventExitStatus=10 11`): restarting cannot help.
+pub const EXIT_REMOVED: i32 = 11;
+
+/// Stops the process once the cluster confirms this node's removal.
+/// Safety: docs/DESIGN.md §8 "A removed node stops by itself".
+async fn exit_when_removed(core: Arc<Core>, seeds: BTreeSet<NodeId>) {
+    let reason = bstk_raft::removal::watch(&*core, core.id, seeds).await;
+    let id = core.id;
+    tracing::error!(
+        node = id,
+        "node {id} was removed from the cluster and exits: {reason}. Do not restart it; remove \
+         its container or unit. To use this machine again, wipe its data directory and add it \
+         under a new node id"
+    );
+    eprintln!("beanstalkd-rs: node {id} was removed from the cluster: {reason}");
+    std::process::exit(EXIT_REMOVED);
+}
+
+impl bstk_raft::removal::RemovalHost for Core {
+    fn effective(&self) -> StoredMembership<NodeId, BasicNode> {
+        (*self.membership()).clone()
+    }
+
+    fn refusals(&self) -> u64 {
+        self.net.not_member_refusals()
+    }
+
+    fn isolated(&self) -> bool {
+        self.status.isolated.load(Ordering::Relaxed)
+    }
+
+    fn learned(&self, nodes: &BTreeMap<NodeId, String>) {
+        self.net.learn_addresses(nodes);
+    }
+
+    async fn probe(&self, targets: &BTreeSet<NodeId>) -> BTreeMap<NodeId, NodeStatusEx> {
+        status::probe_ex(&self.net, self.id, targets).await.0
+    }
+}
+
 /// Exits the process when Raft stops on a fatal error: nothing restarts the
 /// core, and a node that serves nothing but looks alive is never restarted
 /// by a supervisor. docs/DESIGN.md §8, "Fatal Raft stop".
@@ -722,7 +764,7 @@ impl Core {
             if checked.elapsed() >= REJOIN_RECHECK {
                 checked = Instant::now();
                 if let Some(reason) = self.removed_while_rejoining(targets).await {
-                    return Err(StartError::Other(format!(
+                    return Err(StartError::Removed(format!(
                         "cannot finish rejoining node {}: {reason}",
                         self.id
                     )));
@@ -917,7 +959,7 @@ async fn discover(
                 }
             }
             status::Startup::Refuse(reason) => {
-                return Err(StartError::Other(format!(
+                return Err(StartError::Removed(format!(
                     "cannot start node {id}: {reason}"
                 )));
             }
@@ -1186,6 +1228,8 @@ impl ClusterInfo for ClusterView {
 #[derive(Debug)]
 pub enum StartError {
     Locked(PathBuf),
+    /// This node's id was removed from the cluster ([`EXIT_REMOVED`]).
+    Removed(String),
     Other(String),
 }
 
@@ -1484,6 +1528,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         tokio::spawn(duties::leader_duties(core.clone())),
         tokio::spawn(duties::readiness(core.clone())),
         tokio::spawn(exit_on_fatal(raft.clone())),
+        tokio::spawn(exit_when_removed(core.clone(), peers.clone())),
         reaper_task,
         tokio::spawn(admin::finish_joint(core.clone())),
         tokio::spawn(membership::watch(
@@ -1519,9 +1564,9 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
             if membership::has_members(m) && !membership::is_member(m, id) {
                 tracing::warn!(
                     membership = ?m.log_id(),
-                    "this node is not in the membership of its own log: it was removed (or its \
-                     removal was not committed yet); a removed node never serves clients again \
-                     and its id is never reused: stop it"
+                    "this node is not in the membership of its own log: it was removed, or the \
+                     removal is not committed yet. It exits (status 11) once the cluster \
+                     confirms the removal; until then it waits for a leader"
                 );
             }
             tracing::info!("waiting for a leader");

@@ -93,7 +93,11 @@ docker stop bstk                                      # SIGTERM: graceful, exit 
 Arguments replace the image's default command (`-l 0.0.0.0 -p 11300`), so
 repeat `-l` / `-p` when adding flags. Run cluster nodes with
 `--restart on-failure`: a node exits with status 21 when Raft stops on a
-fatal error (section 1.3) and expects to be restarted. With a configuration file, mount it
+fatal error (section 1.3) and expects to be restarted. A node the cluster
+removed exits with status 11, which Docker's `on-failure` policy restarts
+too (it would exit again after a few seconds, over and over): after
+removing a node, remove its container (`docker rm -f`) instead of leaving
+it to the restart policy. With a configuration file, mount it
 read-only and point `binlog.dir` (or `cluster.data_dir`) at `/data`:
 
 ```sh
@@ -172,8 +176,11 @@ Notes on the unit:
   `systemctl restart`.
 - `Restart=on-failure` restarts after a crash or an exit status other than
   0 (a cluster node also exits with status 21 when Raft stops on a fatal
-  error, and so is restarted), except status 10 (the data directory is locked by another process,
-  which a restart cannot fix).
+  error, and so is restarted), except status 10 (the data directory is
+  locked by another process) and status 11 (the cluster removed the node,
+  section 5.8): a restart cannot fix either, and the unit sets
+  `RestartPreventExitStatus=10 11`. A removed node stays failed until
+  you disable the unit.
 - `LimitNOFILE=65536`: one descriptor per client connection. Raise it for
   more connections.
 - Ports below 1024 need `AmbientCapabilities=CAP_NET_BIND_SERVICE` and the
@@ -843,7 +850,7 @@ option.
 | `status` | voters, learners, the leader, the highest member id ever, the membership's log id and whether it is committed, whether a joint configuration is in effect, and for each member its address, applied index, lag behind the leader, and state (`ok`, `rejoining`, `starting`, or unreachable). Exit 0 whenever a node answered. |
 | `add ID HOST:PORT` | adds node `ID` as a learner (it replicates, it does not vote). |
 | `promote ID [--force]` | makes a caught-up learner a voter. `--force` promotes a learner that is not caught up. |
-| `remove ID [--force]` | removes a learner or a voter, the leader too. The node is not told: stop its process. `--force` goes below 3 voters. |
+| `remove ID [--force]` | removes a learner or a voter, the leader too. The node is not told; it exits with status 11 once the cluster confirms the removal (normally within a few seconds), and you remove its unit or container. `--force` goes below 3 voters. |
 | `set-addr ID HOST:PORT [--force]` | changes a node's cluster address. `--force` allows a non-loopback address over plaintext cluster traffic. |
 
 Options common to all commands (before or after the command):
@@ -944,8 +951,8 @@ start_node() {    # start_node ID [ARGS...]
   "$BIN" --config "$W/node$i.toml" "$@" >> "$W/node$i.log" 2>&1 &
   echo $! > "$W/node$i.pid"
 }
-stop_node() {     # stop_node ID: SIGTERM and wait for the exit
-  pid=$(cat "$W/node$1.pid"); kill -TERM "$pid"
+stop_node() {     # stop_node ID: SIGTERM and wait for the exit (a removed node may have exited already)
+  pid=$(cat "$W/node$1.pid"); kill -TERM "$pid" 2>/dev/null || true
   while kill -0 "$pid" 2>/dev/null; do sleep 0.1; done
 }
 wait_ready() {    # wait_ready ID
@@ -993,13 +1000,24 @@ Rules that hold for every runbook:
   busy cluster (a sustained load of thousands of puts per second, a node
   that has just restarted or joined). Poll it, as `wait_ready` does, and do
   not treat one 503 as a failure; a node that stays 503 is the signal.
-- **A removed node is not told**: stop it right after `remove`. Until then
+- **A removed node is not told, but stops by itself.** Once a majority of
+  the remaining voters (of the latest membership it can learn) report a
+  committed membership without it, it logs an `ERROR` (`node N was removed
+  from the cluster and exits: ...`) and exits with status 11, normally
+  within a few seconds (allow up to about 15 s on a loaded cluster; it
+  needs those voters to be up and reachable). It never exits on its own
+  evidence alone, so a node that is cut off, or whose removal did not
+  commit, keeps running. Stopping it right after `remove` is still fine and
+  is what the runbooks show; if it is still running well after the removal
+  is committed, stop it. Until it exits
   it serves nothing (`/readyz` 503), its clients' connections are dropped
   (their reservations return to ready), it logs failed vote requests
   (`... rejected: not a member of this cluster`) and closes new client
   connections after `node_timeout`. Restarted with its data it logs `this
-  node is not in the membership of its own log: it was removed ...` and
-  waits forever; with an empty data directory it refuses to start (`cannot
+  node is not in the membership of its own log: it was removed ...`, waits
+  for a leader, and exits with status 11 as soon as the cluster confirms
+  the removal; with an empty data directory it refuses to start, also with
+  status 11 (`cannot
   start node 1: node id 1 is not a member, and ids up to 6 have been used:
   node ids are never reused ...`).
 
@@ -1074,7 +1092,8 @@ voter(s): below 3, a wiped voter may be unable to rejoin`.
 
 #### Shrink from 5 to 3 nodes
 
-Remove one voter at a time, and stop each removed node:
+Remove one voter at a time, and stop each removed node (it would stop by
+itself within seconds, exit status 11; the explicit stop does no harm):
 
 ```sh
 bcl remove 5
@@ -1090,7 +1109,7 @@ membership (term 1 index 16, committed)
   voters:   1 2 3 4
   learners: -
 
-NOTE: node 5 is not told it was removed (it isolates itself): stop its process; its id can never be used again; 4 voters: an even count tolerates no more failures than 3 voters; change to an odd count
+NOTE: node 5 is not told it was removed: it exits (status 11) once the cluster confirms it, normally within seconds; stop its process if it does not, and remove its container or unit (its id can never be used again); 4 voters: an even count tolerates no more failures than 3 voters; change to an odd count
 ```
 
 Removing a voter below 3 needs `--force`: `refused: removing node 1 leaves
@@ -1170,7 +1189,8 @@ ID  ROLE    ADDRESS          APPLIED  LAG  STATE
 
 #### Remove a node that is still running, or the leader
 
-`remove` works on a running node (shrink above): stop it afterwards.
+`remove` works on a running node (shrink above): it stops by itself within
+seconds (exit status 11); stop it yourself if it does not.
 Removing the leader (4 voters, node 3 leading, a client putting jobs in a
 loop on each node):
 
@@ -1187,7 +1207,7 @@ membership (term 2 index 1394, committed)
   voters:   2 4 5
   learners: -
 
-NOTE: node 3 (the leader that ran this change) steps down once it is committed; another node leads, and node 3 is not told it was removed: stop its process
+NOTE: node 3 (the leader that ran this change) steps down once it is committed; another node leads, and node 3 is not told it was removed: it exits (status 11) once the cluster confirms it, normally within seconds; stop its process if it does not
 ```
 
 openraft 0.9 has no leader transfer: the old leader steps down and the
@@ -1541,7 +1561,9 @@ Startup errors are printed to stderr (the journal under systemd) as
 startup errors, 10 for a locked data directory, 20 for a binlog error
 while serving, 21 for a cluster node whose Raft stopped on a fatal error
 (systemd restarts it; if it keeps coming back, read the `ERROR` line above
-the exit: a disk or snapshot problem), 2 for a command-line syntax error, 5 for `-u`.
+the exit: a disk or snapshot problem), 11 for a node the cluster removed
+(systemd does not restart it; remove its unit or container), 2 for a
+command-line syntax error, 5 for `-u`.
 
 | Message | Cause and fix |
 |---|---|
@@ -1564,9 +1586,9 @@ the exit: a disk or snapshot problem), 2 for a command-line syntax error, 5 for 
 | Stays at `waiting for a leader`, `/readyz` 503 | No majority is reachable: check that enough nodes run, that the cluster ports are open between all nodes (both directions), and the TLS / `-z` errors above. A new cluster started with `--cluster-init` waits until a majority of the other nodes answer (section 5.3). |
 | `startup: waiting for the cluster's status (join: node 5 is not a member of the cluster yet (voters {1, 2, 3, 4}, highest member id 4); waiting until it is added as a learner)` | The node was started before it was added (`beanstalkd_cluster_joining` 1, `/readyz` 503): add it (`beanstalkd-rs cluster add`, section 5.9) and it continues by itself. |
 | `startup: waiting for the cluster's status (1 of the 2 answers needed from the current voters {3, 6} holding the membership at index 29 and not rejoining themselves)` | A rejoining node (section 5.6) is waiting for answers: a rejoin needs `n - quorum(n) + 1` of the other current voters that are not rejoining themselves (1 with 2 voters, 2 with 3 or 4, 3 with 5); start them, or wait until another rejoin finishes. With `... a membership change is in progress` or `... a joint configuration ...: waiting until it is uniform` it waits until the change is committed. |
-| `cannot start node 1: node id 1 is not a member, and ids up to 6 have been used: node ids are never reused (a removed node joins again only under a new id above 6)` (exit 1) | A removed id was started with an empty data directory. Use a new id (section 5.9). |
-| `this node is not in the membership of its own log: it was removed (or its removal was not committed yet) ...`, then `waiting for a leader` forever | A removed node was restarted with its data. Stop it; it never serves again under this id. |
-| A removed node that still runs: ERROR `while requesting vote ... rejected: not a member of this cluster` every election timeout, `/readyz` 503, `beanstalkd_cluster_is_member` 0, and after `node_timeout` `no leader reachable: closing every client connection` | It was not told of its removal and isolates itself. Stop it. |
+| `cannot start node 1: node id 1 is not a member, and ids up to 6 have been used: node ids are never reused (a removed node joins again only under a new id above 6)` (exit 11) | A removed id was started with an empty data directory. Use a new id (section 5.9). |
+| `this node is not in the membership of its own log: it was removed (or its removal was not committed yet) ...`, then `waiting for a leader` forever | A removed node was restarted with its data. It exits with status 11 (`node N was removed from the cluster ...`) as soon as a majority of the current voters confirm the removal; until then (or if they cannot be reached) it waits. It never serves again under this id: remove its unit or container. |
+| A removed node that still runs: ERROR `while requesting vote ... rejected: not a member of this cluster` every election timeout, `/readyz` 503, `beanstalkd_cluster_is_member` 0, and after `node_timeout` `no leader reachable: closing every client connection` | It was not told of its removal. It asks the cluster and exits with status 11 (`node N was removed from the cluster and exits ...`), normally within a few seconds; if it keeps running, the voters that could confirm it are down or unreachable, or it was not removed (a removal that did not commit): check `cluster status`. |
 | `cluster config differs from the membership: node 2: config address 127.0.0.1:11402 overrides membership address 127.0.0.1:11412` | This node's `[[cluster.peer]]` entry overrides the membership address of node 2 (after a `set-addr`): it dials the old address. Remove or correct the entry and restart this node (section 5.9, "Change a node's address"). `members not in the config` and `config peers not in the membership` in the same message are informational. |
 | `refused: a membership change is in progress` (CLI exit 1) | Another change is running (a voter change takes two commits; a new leader first finishes a change its predecessor left). Run `status` and the command again. |
 | `conflict: the membership changed while this request was being made (it was based on ..., it is now ...); nothing was changed ...` (CLI exit 1) | Another change got in between the tool's read and its request. Check `status` and decide again. |
@@ -1594,7 +1616,7 @@ extensions (token authentication).
 
 - **Membership changes** (section 5.9): no leader transfer (openraft
   0.9), so removing the leader costs one election (about 1.3 s); a removed
-  node is not told and must be stopped; node ids are never reused; one
+  node is not told, stops by itself (exit status 11) once the cluster confirms the removal, and its container or unit is to be removed; node ids are never reused; one
   voter per change, and none while a voter is down (except removing it) or
   rejoining; no automatic removal of dead nodes. With 1 or 2 voters a
   wiped voter cannot (1) or can only while the other leads (2) rejoin, so

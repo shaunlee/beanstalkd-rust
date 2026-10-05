@@ -535,6 +535,9 @@ impl MpOutcome {
     }
 }
 
+/// The server's `cluster::EXIT_REMOVED`.
+const EXIT_REMOVED: i32 = 11;
+
 struct Shared {
     t0: Instant,
     events: Mutex<Vec<String>>,
@@ -545,6 +548,9 @@ struct Shared {
     disruptions: Mutex<Vec<Duration>>,
     /// The memberships the operator's answered changes allow.
     models: Mutex<Option<membership::Models>>,
+    /// Ids some change asked to remove (any outcome): the only nodes that
+    /// may exit with status 11.
+    removals: Mutex<BTreeSet<u64>>,
 }
 
 impl Shared {
@@ -575,6 +581,7 @@ pub async fn run(cfg: MpConfig) -> MpOutcome {
         faults: Mutex::new(BTreeMap::new()),
         disruptions: Mutex::new(Vec::new()),
         models: Mutex::new(None),
+        removals: Mutex::new(BTreeSet::new()),
     });
     let rec = Recorder::new();
     let mut dir = None;
@@ -929,16 +936,34 @@ fn restart(c: &mut Cluster, bin: &Path, id: u64, wipe: bool, sh: &Shared) {
         return;
     }
     if let Some(st) = n.exited() {
-        // A node whose id is not a member (a spare added by a change that
-        // never happened, then skipped by a later add) refuses to start;
-        // `membership::settle` reports a member that was refused.
         let log = std::fs::read_to_string(&n.log).unwrap_or_default();
-        if c_membership && st.code() == Some(1) && log.contains("node ids are never reused") {
-            n.retired = true;
-            sh.event(format!(
-                "node {id} refused to start: its id is not a member"
-            ));
-            sh.count("RefusedToStart");
+        // Exit status 11: the cluster removed this node (it stopped by itself
+        // once a quorum confirmed it, or its removed or skipped id was refused
+        // at startup; the packaged unit does not restart on it). Only a node
+        // some change asked to remove, or a spare whose id was skipped, may.
+        if st.code() == Some(EXIT_REMOVED) {
+            let skipped = log.contains("cannot start node") && log.contains("never reused");
+            let removed = lock(&sh.removals).contains(&id);
+            if c_membership && (removed || skipped) {
+                n.retired = true;
+                if skipped && !removed {
+                    sh.event(format!(
+                        "node {id} refused to start: its id is not a member"
+                    ));
+                    sh.count("RefusedToStart");
+                } else {
+                    sh.event(format!(
+                        "node {id} exited by itself: removed from the cluster"
+                    ));
+                    sh.count("RemovedExit");
+                }
+            } else {
+                sh.problem(format!(
+                    "node {id} exited with status {EXIT_REMOVED} (removed), but no change asked \
+                     to remove it: {}",
+                    log.lines().rev().take(3).collect::<Vec<_>>().join(" | ")
+                ));
+            }
             return;
         }
         // The openraft 0.9 race of docs/DESIGN.md §8 ("Fatal Raft stop"):
@@ -1302,6 +1327,7 @@ pub async fn check_peer_addresses() -> Result<String, String> {
         faults: Mutex::new(BTreeMap::new()),
         disruptions: Mutex::new(Vec::new()),
         models: Mutex::new(None),
+        removals: Mutex::new(BTreeSet::new()),
     };
     let mut c = start_cluster(&cfg, 0, &sh).await?;
     kill(&mut c, 1, &sh);
@@ -1411,6 +1437,7 @@ pub async fn reconnect_storm_probe(isolate: Duration) -> Result<String, String> 
         faults: Mutex::new(BTreeMap::new()),
         disruptions: Mutex::new(Vec::new()),
         models: Mutex::new(None),
+        removals: Mutex::new(BTreeSet::new()),
     };
     let c = start_cluster(&cfg, 0, &sh).await?;
     let l = c.leader().await.ok_or("no leader")?;

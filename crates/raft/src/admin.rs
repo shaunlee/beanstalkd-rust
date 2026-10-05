@@ -665,12 +665,15 @@ fn note<H: AdminHost>(
         notes.push(if *id == host.id() {
             format!(
                 "node {id} (the leader that ran this change) steps down once it is committed; \
-                 another node leads, and node {id} is not told it was removed: stop its process"
+                 another node leads, and node {id} is not told it was removed: it exits (status \
+                 11) once the cluster confirms it, normally within seconds; stop its process if \
+                 it does not"
             )
         } else {
             format!(
-                "node {id} is not told it was removed (it isolates itself): stop its process; its \
-                 id can never be used again"
+                "node {id} is not told it was removed: it exits (status 11) once the cluster \
+                 confirms it, normally within seconds; stop its process if it does not, and \
+                 remove its container or unit (its id can never be used again)"
             )
         });
     }

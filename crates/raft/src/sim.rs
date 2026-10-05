@@ -207,6 +207,8 @@ struct SimInner {
     admits: RwLock<HashMap<NodeId, Admits>>,
     /// When `to` last answered `from`: `(from, to)` -> time.
     answered: Mutex<HashMap<(NodeId, NodeId), tokio::time::Instant>>,
+    /// Requests of `from` refused because it is not a member, per sender.
+    refusals: Mutex<HashMap<NodeId, u64>>,
     resumed: Notify,
 }
 
@@ -267,6 +269,7 @@ impl SimNetwork {
                 status: RwLock::new(HashMap::new()),
                 admits: RwLock::new(HashMap::new()),
                 answered: Mutex::new(HashMap::new()),
+                refusals: Mutex::new(HashMap::new()),
                 resumed: Notify::new(),
             }),
         }
@@ -361,6 +364,12 @@ impl SimNetwork {
     fn admits(&self, to: NodeId, from: NodeId) -> bool {
         let a = self.inner.admits.read().unwrap_or_else(|e| e.into_inner());
         a.get(&to).is_none_or(|f| f(from))
+    }
+
+    /// How many requests of `from` were refused as coming from a non-member
+    /// (the server's `Network::not_member_refusals`).
+    pub fn not_member_refusals(&self, from: NodeId) -> u64 {
+        lock(&self.inner.refusals).get(&from).copied().unwrap_or(0)
     }
 
     /// When `to` last answered a request of `from` (any kind), if ever.
@@ -564,6 +573,7 @@ impl SimNetwork {
                 return Err(SimError::Unreachable(format!("node {to} is not running")));
             };
             if !self.admits(to, from) {
+                *lock(&self.inner.refusals).entry(from).or_default() += 1;
                 return Err(SimError::Unreachable(format!(
                     "node {to} refused node {from}: not a member of this cluster"
                 )));

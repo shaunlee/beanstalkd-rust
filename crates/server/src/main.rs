@@ -28,8 +28,10 @@
 //! replay or I/O, `--cluster-init` on a data directory with state); 5 for a
 //! usage error (`-u`); 10 when another process holds the binlog (or cluster
 //! data) directory lock, as the reference; 20 after a binlog write, fsync or
-//! compaction error while serving (`engine_actor::EXIT_WAL_FAILURE`); clap's
-//! usage errors exit with 2.
+//! compaction error while serving (`engine_actor::EXIT_WAL_FAILURE`); 21 when
+//! Raft stops on a fatal error (`cluster::EXIT_RAFT_FAILURE`); 11 when the
+//! cluster removed this node (`cluster::EXIT_REMOVED`); clap's usage errors
+//! exit with 2.
 
 mod auth;
 mod cli;
@@ -300,6 +302,10 @@ async fn start_cluster(args: cluster::StartArgs<'_>) -> Result<cluster::ClusterN
                     p.display()
                 );
                 Err(ExitCode::from(EXIT_LOCKED))
+            }
+            Err(cluster::StartError::Removed(e)) => {
+                eprintln!("beanstalkd-rs: {e}");
+                Err(ExitCode::from(cluster::EXIT_REMOVED as u8))
             }
             Err(cluster::StartError::Other(e)) => {
                 eprintln!("beanstalkd-rs: {e}");

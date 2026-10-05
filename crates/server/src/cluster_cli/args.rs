@@ -122,7 +122,8 @@ pub enum ClusterCmd {
         force: bool,
     },
     /// Remove a node (a learner or a voter, the leader too). The node is not
-    /// told: stop its process.
+    /// told; it exits with status 11 once the cluster confirms the removal
+    /// (stop its process if it does not).
     Remove {
         #[arg(value_name = "ID", value_parser = parse_id)]
         id: NodeId,

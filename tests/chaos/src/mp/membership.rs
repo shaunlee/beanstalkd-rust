@@ -42,7 +42,10 @@
 //! (so every owner is a member: a removed node's connections were closed);
 //! the removed node's reservation was released within [`RELEASE_BOUND`] of
 //! the later of its removal and the last fault before; the highest member
-//! id never decreased and a removed id was refused. The rejoin decisions'
+//! id never decreased and a removed id was refused; a removed node the
+//! operator left running (about one in three) stops by itself (exit status
+//! 11) within [`REMOVED_EXIT_BOUND`] of healing, and only a node some change
+//! asked to remove ever exits that way (invariant 7). The rejoin decisions'
 //! inputs (invariant 6 of the in-process harness) are not observable here.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -60,6 +63,9 @@ use crate::history::Cmd;
 pub const RELEASE_BOUND: Duration = Duration::from_secs(5);
 /// How long a step retries a change that a guardrail refuses for now.
 const RETRY_BUDGET: Duration = Duration::from_secs(30);
+/// How long after healing a removed node the operator left running may take
+/// to stop by itself (invariant 7).
+const REMOVED_EXIT_BOUND: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
@@ -264,6 +270,9 @@ async fn send(cl: &mut Cluster, sh: &Shared, ch: &Change) -> CliOut {
         Change::Remove(id) => vec!["remove".into(), id.to_string()],
         Change::SetAddr(id, addr) => vec!["set-addr".into(), id.to_string(), addr.clone()],
     };
+    if let Change::Remove(id) = ch {
+        lock(&sh.removals).insert(*id);
+    }
     let o = cli(cl, &args).await;
     let why = if o.code == Some(0) {
         String::new()
@@ -442,7 +451,12 @@ pub(super) async fn run_step(c: &mut Cluster, step: &Step, sh: &Shared) {
             if until_done(c, sh, &Change::Remove(l)).await {
                 sh.count("RemovedLeader");
                 tokio::time::sleep(Duration::from_millis(draw % 2000)).await;
-                retire(c, l, sh);
+                if draw.is_multiple_of(3) {
+                    // The node must stop by itself (invariant 7).
+                    sh.count("RemovedLeftRunning");
+                } else {
+                    retire(c, l, sh);
+                }
             }
         }
         Step::ReuseRemovedId => {
@@ -636,7 +650,12 @@ async fn remove_holding(c: &mut Cluster, sh: &Shared, draw: u64) {
     let removed = sh.elapsed();
     sh.count("RemovedNodeHoldingReservation");
     tokio::time::sleep(Duration::from_millis(draw % 2000)).await;
-    retire(c, x, sh);
+    if draw.is_multiple_of(3) {
+        // The node must stop by itself (invariant 7).
+        sh.count("RemovedLeftRunning");
+    } else {
+        retire(c, x, sh);
+    }
     drop(holder);
     // Until the job is ready again (only the removal can release it: its TTR
     // is 10 minutes), from the leader.
@@ -790,6 +809,35 @@ pub(super) async fn settle(c: &mut Cluster, sh: &Shared) -> Option<BTreeSet<u64>
     members.extend(ids_of(&m["learners"]));
     sh.event(format!("settled membership: {m}"));
     let ids: Vec<u64> = c.nodes.iter().map(|n| n.id).collect();
+    // Invariant 7: a removed node the operator left running stops by itself
+    // once the cluster can be asked.
+    let outsiders: Vec<u64> = ids
+        .iter()
+        .copied()
+        .filter(|id| !members.contains(id) && c.nodes[(id - 1) as usize].child.is_some())
+        .collect();
+    let deadline = Instant::now() + REMOVED_EXIT_BOUND;
+    loop {
+        let bin = c.bin.clone();
+        for &id in &outsiders {
+            restart(c, &bin, id, false, sh);
+        }
+        if outsiders
+            .iter()
+            .all(|id| c.nodes[(id - 1) as usize].child.is_none())
+            || Instant::now() >= deadline
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    for &id in &outsiders {
+        if c.nodes[(id - 1) as usize].child.is_some() {
+            sh.problem(format!(
+                "invariant 7: removed node {id} still runs {REMOVED_EXIT_BOUND:?} after healing"
+            ));
+        }
+    }
     for id in ids {
         let running = c.nodes[(id - 1) as usize].child.is_some();
         if !members.contains(&id) && running {

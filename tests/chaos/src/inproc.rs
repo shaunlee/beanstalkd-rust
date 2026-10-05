@@ -945,6 +945,89 @@ async fn owner(
     }
 }
 
+/// How long without a reachable leader makes a node count as isolated (the
+/// server's `node_timeout` in these runs).
+const ISOLATED_AFTER: Duration = Duration::from_secs(5);
+/// As the server's `ping_interval(node_timeout)`.
+const PING_EVERY: Duration = Duration::from_millis(1250);
+
+/// The server's `exit_when_removed` (docs/DESIGN.md §8 "Why a removed node's
+/// exit is safe"): the shared watch decides, the node then exits (status 11
+/// in the server) and is never restarted, as the packaged unit does not
+/// restart it. Whether the exit was right is checked at the end
+/// (invariant 7).
+async fn removal_watch(inc: Arc<NodeInc>) {
+    let id = inc.id;
+    let run = inc.run.clone();
+    let last_ok = Arc::new(Mutex::new(Instant::now()));
+    let pinger = tokio::spawn(ping_leader(inc.clone(), last_ok.clone()));
+    inc.track(pinger.abort_handle());
+    let seeds: BTreeSet<NodeId> = run.all_ids.iter().copied().filter(|&p| p != id).collect();
+    let host = SimRemoval { inc, last_ok };
+    let reason = bstk_raft::removal::watch(&host, id, seeds).await;
+    run.event(format!("node {id} exits: removed ({reason})"));
+    run.count("RemovedExit");
+    lock(&run.exited).push((id, run.elapsed()));
+    lock(&run.retired).insert(id);
+    run.crash(id);
+}
+
+/// The actor's ping: an empty forward to the leader, so that a node that
+/// has been removed is refused (and a cut-off one notices it).
+async fn ping_leader(inc: Arc<NodeInc>, last_ok: Arc<Mutex<Instant>>) {
+    let net = inc.run.net.node(inc.id);
+    let mut tick = tokio::time::interval(PING_EVERY);
+    loop {
+        tick.tick().await;
+        let leader = inc.raft.metrics().borrow().current_leader;
+        let Some(target) = leader.filter(|&l| l != inc.id) else {
+            continue;
+        };
+        let req = ForwardRequest {
+            from: inc.id,
+            items: Vec::new(),
+        };
+        if matches!(
+            net.forward(target, req).await,
+            Ok(ForwardResponse::Accepted)
+        ) {
+            *lock(&last_ok) = Instant::now();
+        }
+    }
+}
+
+struct SimRemoval {
+    inc: Arc<NodeInc>,
+    last_ok: Arc<Mutex<Instant>>,
+}
+
+impl bstk_raft::removal::RemovalHost for SimRemoval {
+    fn effective(&self) -> StoredMembership<NodeId, BasicNode> {
+        (*self.inc.effective()).clone()
+    }
+
+    fn refusals(&self) -> u64 {
+        self.inc.run.net.not_member_refusals(self.inc.id)
+    }
+
+    fn isolated(&self) -> bool {
+        let m = self.inc.raft.metrics().borrow().clone();
+        if self.inc.is_leader() {
+            return m
+                .millis_since_quorum_ack
+                .is_some_and(|ms| Duration::from_millis(ms) > ISOLATED_AFTER);
+        }
+        lock(&self.last_ok).elapsed() > ISOLATED_AFTER
+    }
+
+    fn learned(&self, _nodes: &BTreeMap<NodeId, String>) {}
+
+    async fn probe(&self, targets: &BTreeSet<NodeId>) -> BTreeMap<NodeId, NodeStatusEx> {
+        let net = self.inc.run.net.node(self.inc.id);
+        status::probe_ex(&net, self.inc.id, targets).await.0
+    }
+}
+
 /// The server's `exit_on_fatal` and the service manager: when Raft stops on
 /// the openraft 0.9 race of docs/DESIGN.md §8 ("Fatal Raft stop"), the
 /// process exits and starts again after [`SUPERVISOR_RESTART`]. Any other
@@ -1074,6 +1157,10 @@ pub(crate) struct RunShared {
     retired: Mutex<BTreeSet<NodeId>>,
     /// Nodes whose discovery refused their id (the server exits).
     refused: Mutex<BTreeSet<NodeId>>,
+    /// Nodes that stopped by themselves after the cluster confirmed their
+    /// removal (the server exits with status 11), with the time of each
+    /// exit. Invariant 7 checks every one against the committed log.
+    exited: Mutex<Vec<(NodeId, Duration)>>,
     /// The next spare id to add.
     next_spare: AtomicU64,
     /// Every membership change requested, with its outcome.
@@ -1532,6 +1619,7 @@ impl RunShared {
             tokio::spawn(watch_members(inc.clone())),
             tokio::spawn(supervise(inc.clone())),
             tokio::spawn(bstk_raft::admin::finish_joint(inc.clone())),
+            tokio::spawn(removal_watch(inc.clone())),
         ];
         for t in tasks {
             inc.track(t.abort_handle());
@@ -2103,6 +2191,7 @@ pub async fn run(cfg: RunConfig) -> Outcome {
         started: Mutex::new(BTreeSet::new()),
         retired: Mutex::new(BTreeSet::new()),
         refused: Mutex::new(BTreeSet::new()),
+        exited: Mutex::new(Vec::new()),
         next_spare: AtomicU64::new(cfg.nodes + 1),
         attempts: Mutex::new(Vec::new()),
         disruptions: Mutex::new(Vec::new()),

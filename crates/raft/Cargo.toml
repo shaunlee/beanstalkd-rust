@@ -31,6 +31,7 @@ tokio-rustls = "0.26"
 proptest.workspace = true
 tempfile = "3.27.0"
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 # The in-process simulated network and cluster harness (tests only; never

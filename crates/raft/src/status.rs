@@ -499,6 +499,26 @@ pub fn startup_decision(
     }
 }
 
+/// `Some(reason)` if the answers of other nodes confirm that node `id`,
+/// which has Raft state, was removed from the cluster: [`startup_decision`]
+/// refuses its id, and at least [`quorum`]`(n)` of the `n` voters of the
+/// membership it learned (a uniform one: a joint configuration waits) report
+/// exactly that committed membership and are not rejoining. Local evidence
+/// is never an input. Why a node that is still a member never gets here:
+/// docs/DESIGN.md §8 "A removed node stops by itself".
+pub fn removal_confirmed(id: NodeId, answers: &BTreeMap<NodeId, NodeStatusEx>) -> Option<String> {
+    let Startup::Refuse(reason) = startup_decision(id, answers, None) else {
+        return None;
+    };
+    let m = learned_membership(answers)?;
+    let voters = m.voters();
+    let holding = answers
+        .iter()
+        .filter(|(n, a)| voters.contains(n) && !a.rejoining && a.membership.log_id == m.log_id)
+        .count();
+    (holding >= quorum(voters.len())).then_some(reason)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bootstrap {
     Initialize,
@@ -1061,6 +1081,55 @@ mod tests {
             ),
             "{d:?}"
         );
+    }
+
+    #[test]
+    fn removal_needs_a_quorum_of_the_voters_of_a_uniform_committed_membership() {
+        // Node 3 was removed: voters {1,2,4}, a quorum is 2.
+        let m = view(12, true, &[&[1, 2, 4]], &[]);
+        let one = exs(&[(1, ex(None, &m, 12))]);
+        assert!(removal_confirmed(3, &one).is_none());
+        let two = exs(&[(1, ex(None, &m, 12)), (2, ex(None, &m, 12))]);
+        assert!(removal_confirmed(3, &two).is_some());
+        // Nobody answered (a partitioned node): nothing is confirmed.
+        assert!(removal_confirmed(3, &BTreeMap::new()).is_none());
+        // A current member never gets a confirmation.
+        assert!(removal_confirmed(2, &two).is_none());
+        // A voter that has not applied the removal yet does not count.
+        let old = view(5, true, &[&[1, 2, 3, 4]], &[]);
+        let lag = exs(&[(1, ex(None, &m, 12)), (2, ex(None, &old, 5))]);
+        assert!(removal_confirmed(3, &lag).is_none());
+        // Four voters need three (the rejoin bound would accept two).
+        let four = view(12, true, &[&[1, 2, 4, 5]], &[]);
+        let two = exs(&[(1, ex(None, &four, 12)), (2, ex(None, &four, 12))]);
+        assert!(removal_confirmed(3, &two).is_none());
+        let three = exs(&[
+            (1, ex(None, &four, 12)),
+            (2, ex(None, &four, 12)),
+            (4, ex(None, &four, 12)),
+        ]);
+        assert!(removal_confirmed(3, &three).is_some());
+        // A joint configuration waits, even without the node in either half.
+        let joint = view(12, true, &[&[1, 2, 4], &[1, 2, 5]], &[]);
+        let a = exs(&[(1, ex(None, &joint, 12)), (2, ex(None, &joint, 12))]);
+        assert!(removal_confirmed(3, &a).is_none());
+        // A removed learner: the voters' membership lacks it and its id is
+        // below their highest member.
+        let m = view(12, true, &[&[1, 2, 4]], &[]);
+        let a = exs(&[(1, ex(None, &m, 12)), (2, ex(None, &m, 12))]);
+        assert!(removal_confirmed(3, &a).is_some());
+        // A demoted voter is a learner, still a member.
+        let kept = view(12, true, &[&[1, 2, 4]], &[3]);
+        let a = exs(&[(1, ex(None, &kept, 12)), (2, ex(None, &kept, 12))]);
+        assert!(removal_confirmed(3, &a).is_none());
+        // An id above every id used is not yet added, never removed.
+        let a = exs(&[(1, ex(None, &m, 12)), (2, ex(None, &m, 12))]);
+        assert!(removal_confirmed(9, &a).is_none());
+        // A rejoining voter's answer does not count.
+        let mut rj = ex(None, &m, 12);
+        rj.rejoining = true;
+        let a = exs(&[(1, ex(None, &m, 12)), (2, rj)]);
+        assert!(removal_confirmed(3, &a).is_none());
     }
 
     #[test]

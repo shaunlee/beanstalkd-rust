@@ -17,6 +17,7 @@ pub mod forward;
 pub mod listener;
 #[cfg(test)]
 mod net_tests;
+pub mod removal;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
 #[cfg(test)]
