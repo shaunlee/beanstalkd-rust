@@ -564,4 +564,4 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 - [x] Rolling restart of a P6 cluster under load, then a membership change, scripted and green (`scripts/rolling-restart.py`: 4 runs with TLS and 2 in plaintext, no job lost)
 - [x] The rejoin safety argument for changing voter sets written in DESIGN §8 and reviewed
 - [x] No hot-path regression (cluster benchmark at 100 connections within ±5%; BENCH.md P6-T8: 0.98 of P5 through the leader and through a follower)
-- [ ] OPERATIONS runbooks executed as written; CI green; CHANGELOG updated
+- [x] OPERATIONS runbooks executed as written; CI green; CHANGELOG updated (P6-T8 ran §5.3 and the §5.9 grow and shrink blocks as written; leader removal is covered by `admin_removes_the_leader`; CI run 37250025340 green)
