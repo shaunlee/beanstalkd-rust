@@ -4010,7 +4010,17 @@ mod membership {
         })
         .expect("never reported rejoining with Raft running");
 
+        // The leader's dial to the restarted node may still be backing off
+        // from while it was down; wait until its probe gets through.
         let cur = current(lp);
+        wait_for(Duration::from_secs(30), || {
+            refused(
+                &admin(lp, promote(&[4], cur, true)),
+                &format!("voter {fid} is rejoining"),
+            )
+            .then_some(())
+        })
+        .expect("the leader never saw the rejoining voter");
         let r = admin(lp, promote(&[4], cur, true));
         assert!(refused(&r, &format!("voter {fid} is rejoining")), "{r:?}");
         let r = admin(lp, remove(c.nodes[o].id, cur, true));
