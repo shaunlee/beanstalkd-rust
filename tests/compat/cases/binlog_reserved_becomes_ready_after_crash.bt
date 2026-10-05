@@ -1,12 +1,12 @@
-# SIGKILL while a job is reserved (and another client is waiting): after the crash the job is ready with counters from its last record (a release-with-delay).
+# SIGKILL while a job is reserved (and another client is waiting): after the crash the job is ready with counters from its last record (a release-with-delay). The 3s delay is outlasted by the sleep with 1.5s to spare.
 !binlog
 @a send "put 0 0 60 3\r\nabc\r\n"
 @a recv
 @a send "reserve\r\n"
 @a recv
-@a send "release 1 7 1\r\n"
+@a send "release 1 7 3\r\n"
 @a recv
-sleep 1800ms
+sleep 4500ms
 @a send "reserve\r\n"
 @a recv
 @w send "reserve\r\n"
