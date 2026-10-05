@@ -91,7 +91,9 @@ docker stop bstk                                      # SIGTERM: graceful, exit 
 ```
 
 Arguments replace the image's default command (`-l 0.0.0.0 -p 11300`), so
-repeat `-l` / `-p` when adding flags. With a configuration file, mount it
+repeat `-l` / `-p` when adding flags. Run cluster nodes with
+`--restart on-failure`: a node exits with status 21 when Raft stops on a
+fatal error (section 1.3) and expects to be restarted. With a configuration file, mount it
 read-only and point `binlog.dir` (or `cluster.data_dir`) at `/data`:
 
 ```sh
