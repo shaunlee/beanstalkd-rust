@@ -595,5 +595,5 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 
 - [ ] Full test suite green 5 times in a row under CPU load
 - [ ] Removed node exits on confirmed removal; never on an uncommitted removal (deterministic test with a truncated removal); chaos `membership` 1,000 in-process seeds and 20 multi-process runs green
-- [ ] openraft 0.10 report in BENCH.md with a recommendation
+- [x] openraft 0.10 report in BENCH.md with a recommendation (BENCH.md P7-T3: stay on 0.9.25 until 0.10.0)
 - [ ] CI and the weekly workflow green; CHANGELOG updated

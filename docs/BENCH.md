@@ -17,6 +17,58 @@ end.
 - **Reference build.** `scripts/build-ref.sh` (both the debug and the `--optimized` tree, which the benchmarks use) patches one comparison in the reference's `conn_timeout` (docs/COMPAT.md D14) and, where the compiler knows it, passes `-Wno-error=stringop-truncation` (gcc 14). Neither changes the hot paths, so the numbers below, measured before the patch existed, stay comparable.
 - **Linux container.** Copy the tree in with `COPYFILE_DISABLE=1` (no `._*` files from macOS tar) and leave out `clients/python/.venv`, `target/`, `.ref/` and `.git`; rebuild `.ref/` inside the container. Run it with `docker run --init`, so that orphaned servers are reaped.
 
+## P7-T3: openraft 0.10 evaluation (2026-10-05)
+
+Question: does `openraft 0.10.0-alpha.36` reach the cluster CPU targets of
+PLAN §7.5, and what would moving to it cost? A port was made on a
+throwaway branch (`eval-openraft-0.10`, not merged).
+
+**Port.** About an hour of work: 38 files, about 600 net lines. The
+changes are mostly mechanical: type parameters, the storage-v2 apply
+stream and its responders, metrics watch types, and
+`allow_log_reversion = Some(true)` in place of the `loosen-follower-log-revert`
+feature. Chunked snapshots keep the 0.9 wire format through the companion
+crate `openraft-legacy` (`network_v1::Adapter`). `PayloadTooLarge` is
+gone, so the client trims a batch itself and answers `PartialSuccess`.
+Leader transfer exists (`trigger().transfer_leader`) but needs our own
+RPC. On the branch, the bstk-raft tests (155), the cluster integration
+tests (37) and in-process chaos (`full` and `membership`, 300 seeds each)
+passed. The fuzz crate was not ported, and leader transfer was compiled
+but not run.
+
+**Source findings.** The append is no longer awaited per command
+(`core/raft_core.rs` `run_append_entries`). The "replication channel
+closed" path behind DESIGN §8 "Fatal Raft stop" no longer exists: a
+closed replication channel is ignored, and snapshots go through a
+separate transmitter task.
+
+**CPU per operation.** The machine was shared (load average 11–18), so
+absolute values are higher than in P4-T6, and only the ratios are
+meaningful. Method: 3-node cluster, put-reserve-delete, release builds,
+14 interleaved rounds alternating 0.9 and 0.10 (the order flipped every
+round), CPU summed over the three node processes. The table shows the
+median and Q1–Q3.
+
+| Configuration | 0.9 µs/op | 0.10 µs/op | 0.10 / 0.9 (paired) |
+|---|---:|---:|---:|
+| via leader, 100 connections | 24.1 (22.9–26.5) | 25.1 (24.0–25.8) | 1.03 (0.92–1.16) |
+| via follower, 100 connections | 30.9 (30.2–32.0) | 31.5 (29.7–33.7) | 1.04 (1.00–1.07) |
+| via leader, 1 connection | 394 (342–412) | 457 (406–470) | 1.13 (1.06–1.17) |
+| via follower, 1 connection | 398 (371–479) | 497 (430–521) | 1.12 (1.06–1.27) |
+
+Throughput differences were within the noise (interquartile ranges
+spanned 1.5–3×).
+
+**Conclusion.** 0.10 does not lower CPU per operation. It is level at
+100 connections and costs 12–13% more at one connection, so it does not
+reach the §7.5 targets by itself. The remaining cluster cost is in our
+use of Raft (an entry per operation, replication rounds), not in the
+awaited flush. Its benefits are leader transfer and removal of the fatal
+race, which the exit-on-fatal supervisor (P7) already contains.
+Recommendation: stay on 0.9.25 and revisit when 0.10.0 is released
+(alphas still change the replication core: 15 files from alpha.35 to
+alpha.36).
+
 ## P6-T8: hot-path regression check (2026-10-05)
 
 HEAD `3ce7157` against the accepted P5 build (`5004d6e`, built from a git
