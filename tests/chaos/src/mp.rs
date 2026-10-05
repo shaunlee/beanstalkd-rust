@@ -941,7 +941,15 @@ fn restart(c: &mut Cluster, bin: &Path, id: u64, wipe: bool, sh: &Shared) {
             sh.count("RefusedToStart");
             return;
         }
-        sh.problem(format!("node {id} exited on its own: {st}"));
+        // The openraft 0.9 race of docs/DESIGN.md §8 ("Fatal Raft stop"):
+        // the server exits and the service manager would start it again,
+        // which is what this restart does.
+        if st.code() == Some(21) && log.contains("replication channel closed") {
+            sh.event(format!("node {id} exited: Raft stopped on a fatal error"));
+            sh.count("RaftFatalExit");
+        } else {
+            sh.problem(format!("node {id} exited on its own: {st}"));
+        }
     }
     if n.child.is_some() {
         return;

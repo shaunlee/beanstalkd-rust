@@ -109,6 +109,11 @@ Release tags are `v<version>` and match the workspace version in
 
 ### Fixed
 
+- A cluster node whose Raft core stopped on a fatal error (for example the
+  openraft race that can kill a leader replicating to a lagging node with a
+  higher term, or a storage error) used to keep running without serving
+  anything. It now exits with status 21 so that the service manager
+  restarts it (the packaged unit already does).
 - When every file descriptor is in use, the accept loops pause 50 ms after
   each failed `accept` instead of retrying at once, which on Linux spun a
   core and logged hundreds of thousands of warnings per second.

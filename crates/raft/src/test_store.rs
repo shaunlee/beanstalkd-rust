@@ -6,6 +6,7 @@ use crate::SnapshotFile;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::ops::RangeBounds;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
@@ -31,6 +32,9 @@ struct LogData {
 #[derive(Clone, Default)]
 pub struct MemLog {
     inner: Arc<Mutex<LogData>>,
+    /// While set, `append` fails, which stops the Raft core with a fatal
+    /// storage error.
+    pub fail_appends: Arc<AtomicBool>,
 }
 
 impl RaftLogReader<TypeConfig> for MemLog {
@@ -92,6 +96,12 @@ impl RaftLogStorage<TypeConfig> for MemLog {
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
         I::IntoIter: Send,
     {
+        if self.fail_appends.load(Ordering::Relaxed) {
+            return Err(StorageIOError::write_logs(&std::io::Error::other(
+                "injected append failure",
+            ))
+            .into());
+        }
         {
             let mut d = lock(&self.inner);
             for e in entries {

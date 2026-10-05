@@ -12,6 +12,7 @@
 
 pub mod admin;
 pub mod client;
+pub mod fatal;
 pub mod forward;
 pub mod listener;
 #[cfg(test)]

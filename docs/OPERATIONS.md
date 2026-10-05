@@ -169,7 +169,8 @@ Notes on the unit:
   shutdown, exit status 129, like the reference). Apply changes with
   `systemctl restart`.
 - `Restart=on-failure` restarts after a crash or an exit status other than
-  0, except status 10 (the data directory is locked by another process,
+  0 (a cluster node also exits with status 21 when Raft stops on a fatal
+  error, and so is restarted), except status 10 (the data directory is locked by another process,
   which a restart cannot fix).
 - `LimitNOFILE=65536`: one descriptor per client connection. Raise it for
   more connections.
@@ -1536,7 +1537,9 @@ mode a log write error stops the node.
 Startup errors are printed to stderr (the journal under systemd) as
 `beanstalkd-rs: ...` with a non-zero exit status: 1 for configuration and
 startup errors, 10 for a locked data directory, 20 for a binlog error
-while serving, 2 for a command-line syntax error, 5 for `-u`.
+while serving, 21 for a cluster node whose Raft stopped on a fatal error
+(systemd restarts it; if it keeps coming back, read the `ERROR` line above
+the exit: a disk or snapshot problem), 2 for a command-line syntax error, 5 for `-u`.
 
 | Message | Cause and fix |
 |---|---|

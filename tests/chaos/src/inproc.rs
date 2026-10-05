@@ -147,6 +147,11 @@ const NON_MEMBER_RETRY: Duration = Duration::from_secs(1);
 /// As the server's `REJOIN_RECHECK`.
 const REJOIN_RECHECK: Duration = Duration::from_secs(3);
 /// As the server's discovery backoff (`PROBE_BACKOFF_MAX`).
+/// The packaged unit's `RestartSec`: a node that exits on a fatal Raft stop
+/// starts again after it.
+/// What the openraft 0.9 race reports (`raft_core.rs`, `Command::Replicate`).
+const KNOWN_FATAL: &str = "replication channel closed";
+const SUPERVISOR_RESTART: Duration = Duration::from_secs(2);
 const PROBE_BACKOFF_MAX: Duration = Duration::from_secs(2);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -940,6 +945,49 @@ async fn owner(
     }
 }
 
+/// The server's `exit_on_fatal` and the service manager: when Raft stops on
+/// the openraft 0.9 race of docs/DESIGN.md §8 ("Fatal Raft stop"), the
+/// process exits and starts again after [`SUPERVISOR_RESTART`]. Any other
+/// fatal error is a finding.
+fn supervise(inc: Arc<NodeInc>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    // Boxed: the restart calls `start`, which spawns this function again,
+    // and the opaque future types would be recursive.
+    Box::pin(async move {
+        let id = inc.id;
+        let Some(e) = bstk_raft::fatal::wait_fatal(inc.raft.metrics()).await else {
+            return;
+        };
+        let run = inc.run.clone();
+        if !e.to_string().contains(KNOWN_FATAL) {
+            run.problem(format!("node {id}: Raft stopped on a fatal error: {e}"));
+            return;
+        }
+        let current = lock(&run.nodes)
+            .get(&id)
+            .is_some_and(|n| Arc::ptr_eq(n, &inc));
+        drop(inc);
+        if !current {
+            return;
+        }
+        run.event(format!(
+            "node {id} exits: Raft stopped on a fatal error ({e})"
+        ));
+        run.count("RaftFatalExit");
+        lock(&run.disruptions).push(run.elapsed());
+        // The restart outlives this incarnation's tasks, which `crash` aborts.
+        tokio::spawn(async move {
+            run.crash(id);
+            tokio::time::sleep(SUPERVISOR_RESTART).await;
+            if run.ended.load(Ordering::Relaxed) || !run.restartable().contains(&id) {
+                return;
+            }
+            if let Err(e) = run.start(id, StartMode::Normal).await {
+                run.problem(e);
+            }
+        });
+    })
+}
+
 /// Follows a node's memberships into its allowlist (as the server's
 /// `membership::watch`): the nodes of its effective and committed
 /// memberships once it has one, and for the listener (not the forward
@@ -1034,6 +1082,8 @@ pub(crate) struct RunShared {
     /// connections must be gone within the bound after the later of its
     /// removal and the last of these.
     disruptions: Mutex<Vec<Duration>>,
+    /// Set when the run is over, so that no supervised restart starts a node.
+    ended: AtomicBool,
     /// Jobs each client connection holds reserved: `(node, count)`.
     holding: Mutex<HashMap<ConnKey, (NodeId, usize)>>,
     /// Operator tasks (membership changes in progress).
@@ -1480,6 +1530,7 @@ impl RunShared {
             tokio::spawn(owner(inc.clone(), owner_rx, applied_rx)),
             tokio::spawn(startup(inc.clone())),
             tokio::spawn(watch_members(inc.clone())),
+            tokio::spawn(supervise(inc.clone())),
             tokio::spawn(bstk_raft::admin::finish_joint(inc.clone())),
         ];
         for t in tasks {
@@ -2055,6 +2106,7 @@ pub async fn run(cfg: RunConfig) -> Outcome {
         next_spare: AtomicU64::new(cfg.nodes + 1),
         attempts: Mutex::new(Vec::new()),
         disruptions: Mutex::new(Vec::new()),
+        ended: AtomicBool::new(false),
         holding: Mutex::new(HashMap::new()),
         operators: Mutex::new(Vec::new()),
         partitioned: AtomicBool::new(false),
@@ -2068,6 +2120,7 @@ pub async fn run(cfg: RunConfig) -> Outcome {
     for h in lock(&run.operators).drain(..) {
         h.abort();
     }
+    run.ended.store(true, Ordering::Relaxed);
     for id in run.running() {
         run.crash(id);
     }

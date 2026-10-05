@@ -399,3 +399,68 @@ fn sim_same_seed_same_faults() {
     assert_ne!(s1, s3);
     assert_eq!(s1.steps.len(), 51);
 }
+
+/// A node whose Raft core dies on a fatal error (the openraft 0.9 race of
+/// docs/DESIGN.md §8, "Fatal Raft stop", ends this way) is reported by
+/// `wait_fatal`; a node stopped on purpose is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fatal_raft_stop_is_detected_and_a_clean_stop_is_not() {
+    let fail = Arc::new(std::sync::atomic::AtomicBool::default());
+    let f = fail.clone();
+    let sms: Sms = Arc::default();
+    let s = sms.clone();
+    let c = SimCluster::start(
+        &[1],
+        config(),
+        SimNetwork::new(7, SimConfig::default()),
+        move |id| {
+            let sm = MemSm::default();
+            s.lock().expect("lock").insert(id, sm.clone());
+            let mut log = MemLog::default();
+            log.fail_appends = f.clone();
+            async move { (log, sm) }
+        },
+    )
+    .await
+    .expect("start");
+    c.initialize().await.expect("initialize");
+    let raft = c.raft(1).expect("running").clone();
+    write(&c, &[1], req(1), Duration::from_secs(10)).await;
+
+    let watcher = tokio::spawn(crate::fatal::wait_fatal(raft.metrics()));
+    tokio::task::yield_now().await;
+    assert!(!watcher.is_finished(), "a healthy node is not fatal");
+
+    fail.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = tokio::time::timeout(Duration::from_secs(5), raft.client_write(req(2))).await;
+    let got = tokio::time::timeout(Duration::from_secs(10), watcher)
+        .await
+        .expect("detected")
+        .expect("join");
+    assert!(
+        matches!(got, Some(openraft::error::Fatal::StorageError(_))),
+        "{got:?}"
+    );
+
+    // A watcher started after the stop sees it too.
+    let late = tokio::spawn(crate::fatal::wait_fatal(raft.metrics()));
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), late).await,
+        Ok(Ok(Some(_)))
+    ));
+    c.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_raft_shutdown_is_not_fatal() {
+    let (c, _sms) = start(1, SimNetwork::new(8, SimConfig::default()), config()).await;
+    let raft = c.raft(1).expect("running").clone();
+    let watcher = tokio::spawn(crate::fatal::wait_fatal(raft.metrics()));
+    raft.shutdown().await.expect("shutdown");
+    let got = tokio::time::timeout(Duration::from_secs(5), watcher)
+        .await
+        .expect("resolved")
+        .expect("join");
+    assert!(got.is_none(), "{got:?}");
+    c.shutdown().await;
+}

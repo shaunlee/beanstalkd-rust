@@ -117,6 +117,21 @@ const CONTROL_APPLY_BOUND: Duration = Duration::from_secs(1);
 /// client connections to be applied.
 pub const SHUTDOWN_BOUND: Duration = Duration::from_secs(1);
 
+/// Exit status of a node whose Raft core stopped on a fatal error. Not 10,
+/// so the packaged systemd unit restarts it.
+pub const EXIT_RAFT_FAILURE: i32 = 21;
+
+/// Exits the process when Raft stops on a fatal error: nothing restarts the
+/// core, and a node that serves nothing but looks alive is never restarted
+/// by a supervisor. docs/DESIGN.md §8, "Fatal Raft stop".
+async fn exit_on_fatal(raft: Raft<TypeConfig>) {
+    if let Some(e) = bstk_raft::fatal::wait_fatal(raft.metrics()).await {
+        tracing::error!("raft stopped on a fatal error, exiting: {e}");
+        eprintln!("beanstalkd-rs: raft stopped on a fatal error: {e}");
+        std::process::exit(EXIT_RAFT_FAILURE);
+    }
+}
+
 type Metrics = RaftMetrics<NodeId, BasicNode>;
 type ServerMetrics = RaftServerMetrics<NodeId, BasicNode>;
 
@@ -1468,6 +1483,7 @@ pub async fn start(args: StartArgs<'_>) -> Result<ClusterNode, StartError> {
         tokio::spawn(proposer::run(core.clone(), proposer_rx)),
         tokio::spawn(duties::leader_duties(core.clone())),
         tokio::spawn(duties::readiness(core.clone())),
+        tokio::spawn(exit_on_fatal(raft.clone())),
         reaper_task,
         tokio::spawn(admin::finish_joint(core.clone())),
         tokio::spawn(membership::watch(
