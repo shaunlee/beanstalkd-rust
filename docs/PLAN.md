@@ -204,6 +204,7 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 | P4 | Performance; see §7 (done) | see §7.5 |
 | P5 | Production readiness: Linux validation, CI, packaging, operations guide, hardening; see §8 (done) | see §8.5 |
 | P6 | Dynamic cluster membership (add, remove, replace a node online); see §9 | see §9.5 |
+| P7 | Consolidation: robust timing-sensitive tests, a removed node stops by itself, an openraft 0.10 evaluation; see §10 | see §10.4 |
 | later | openraft 0.10 (cluster CPU targets of §7.5), once it leaves alpha | — |
 
 ## 4. P1: Write-Ahead Log (detailed plan)
@@ -565,3 +566,34 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 - [x] The rejoin safety argument for changing voter sets written in DESIGN §8 and reviewed
 - [x] No hot-path regression (cluster benchmark at 100 connections within ±5%; BENCH.md P6-T8: 0.98 of P5 through the leader and through a follower)
 - [x] OPERATIONS runbooks executed as written; CI green; CHANGELOG updated (P6-T8 ran §5.3 and the §5.9 grow and shrink blocks as written; leader removal is covered by `admin_removes_the_leader`; CI run 37250025340 green)
+
+## 10. P7: Consolidation (detailed plan)
+
+### 10.1 Scope
+
+- Tests that fail on a loaded machine are made robust without weakening what they check.
+- A removed node stops by itself, with a clear error, once the cluster confirms its removal, instead of running isolated (or waiting forever after a restart) until an operator stops it.
+- An evaluation of openraft 0.10 (still alpha, `0.10.0-alpha.36` on 2026-09-29) on a throwaway branch: port effort, the cluster CPU per operation of §7.5, leader transfer for removing the leader. The result is a report in BENCH.md and DESIGN; nothing from the branch is merged.
+- **Out of scope**: new protocol features, replicated-semantics changes, a release (tagging is the owner's decision).
+
+### 10.2 Decisions
+
+1. **Robust, not slower**: a timing-sensitive test is fixed by making the check independent of scheduling (wait for a condition, widen a delay that only needs to exceed the run time), never by a retry loop around the assertion. Flakes are found by running the full suite under artificial CPU load (one busy thread per core) several times.
+2. **A removed node exits only on confirmation**: being absent from its own effective membership is not enough (the removal may be uncommitted and later truncated). The node exits when a quorum of the voters of the latest committed membership it can learn (StatusEx from its seeds and last known members) report a committed membership without it, with an id it held `<=` their `highest_member`. Exit status 1 with an `ERROR` naming the removal; the packaged systemd unit does not restart on that status (`RestartPreventExitStatus`). A node that cannot reach anyone keeps running isolated, as today.
+3. **0.10 evaluation is time-boxed** to a working three-node cluster passing the cluster integration tests and the in-process chaos `full` scenario at 300 seeds, then the P4-T6 benchmark. If the port does not converge, the report says where it stopped.
+
+### 10.3 Tasks
+
+| Task | Content | Owner |
+|---|---|---|
+| P7-T1 | Find and fix timing-sensitive tests (full suite under CPU load, ≥ 5 runs); the `ref_vs_cluster_follower` delayed-job case seen in P6-T8 | subagent |
+| P7-T2 | A removed node exits on confirmed removal (running or restarted), systemd unit, OPERATIONS and CHANGELOG, deterministic tests, membership chaos still green | subagent |
+| P7-T3 | openraft 0.10 evaluation branch and report | subagent |
+| P7-T4 | P7 acceptance | lead |
+
+### 10.4 Acceptance
+
+- [ ] Full test suite green 5 times in a row under CPU load
+- [ ] Removed node exits on confirmed removal; never on an uncommitted removal (deterministic test with a truncated removal); chaos `membership` 1,000 in-process seeds and 20 multi-process runs green
+- [ ] openraft 0.10 report in BENCH.md with a recommendation
+- [ ] CI and the weekly workflow green; CHANGELOG updated

@@ -699,8 +699,10 @@ fn leader_kill_keeps_follower_connections_and_reservations() {
     let reply = producer.put(b"after failover");
     let took = killed.elapsed();
     let second = inserted(&reply);
+    // Election timers run on wall time, so a loaded machine stretches the
+    // failover; the bound only separates "failed over" from "stuck".
     assert!(
-        took <= Duration::from_secs(2),
+        took <= Duration::from_secs(10),
         "the put after the leader kill took {took:?}"
     );
     let (id, body) = read_reserved(&mut waiter);
@@ -2395,7 +2397,7 @@ fn admin_removes_a_follower_holding_a_reservation() {
     let (id, _) = read_reserved(&mut waiter);
     assert_eq!(id, job);
     assert!(
-        removed.elapsed() < Duration::from_secs(3),
+        removed.elapsed() < Duration::from_secs(10),
         "{:?}",
         removed.elapsed()
     );
@@ -3189,8 +3191,12 @@ fn cli_exit_statuses_and_concurrent_changes() {
         let err = String::from_utf8_lossy(&o.stderr);
         match o.status.code() {
             Some(0) => applied += 1,
+            // A process that starts after a higher id was added is refused by
+            // the id rule instead of the race, depending only on scheduling.
             Some(1) => assert!(
-                err.contains("conflict") || err.contains("in progress"),
+                err.contains("conflict")
+                    || err.contains("in progress")
+                    || err.contains("the highest id ever used"),
                 "{err}"
             ),
             other => panic!("{other:?}: {err}"),
@@ -3388,7 +3394,9 @@ mod membership {
         let (id, _) = read_reserved(&mut waiter);
         assert_eq!(id, job);
         let took = removed.elapsed();
-        assert!(took < Duration::from_secs(2), "{took:?}");
+        // node_timeout is 1s; the bound only separates "dropped after the
+        // timeout" from "held until the 30s reserve timeout".
+        assert!(took < Duration::from_secs(10), "{took:?}");
         let a = c.nodes[l].admin().unwrap();
         assert!(
             a["cluster"]["drop_node_proposals"].as_u64().unwrap() >= 1,

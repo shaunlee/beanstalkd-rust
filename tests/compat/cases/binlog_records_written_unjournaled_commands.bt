@@ -1,8 +1,8 @@
-# commands that are not journaled leave binlog-records-written unchanged: reserve, touch, release 0, peek*, stats*, use/watch/ignore, pause-tube, list-*, delay expiry, rejected commands.
+# commands that are not journaled leave binlog-records-written unchanged: reserve, touch, release 0, peek*, stats*, use/watch/ignore, pause-tube, list-*, delay expiry, rejected commands. The delay only has to outlast every command before the sleep, which a loaded machine can stretch.
 !binlog
 @a send "put 0 0 1 1\r\na\r\n"
 @a recv
-@a send "put 0 2 60 1\r\nb\r\n"
+@a send "put 0 6 60 1\r\nb\r\n"
 @a recv
 @a send "stats\r\n"
 @a recv
@@ -42,7 +42,7 @@
 @a recv
 @a send "stats\r\n"
 @a recv
-sleep 2800ms
+sleep 6800ms
 @a send "reserve-with-timeout 0\r\n"
 @a recv
 @a send "stats-job 1\r\n"
