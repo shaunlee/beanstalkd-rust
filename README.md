@@ -8,10 +8,10 @@ queue. It speaks the beanstalkd protocol byte for byte, so existing
 clients work unmodified, and adds TLS, monitoring and an optional
 replicated cluster mode.
 
-**Status**: phases P0 to P6 are done (protocol compatibility, write-ahead
+**Status**: phases P0 to P7 are done (protocol compatibility, write-ahead
 log, TLS and operability, Raft cluster mode, performance, production
 readiness: Linux validation, CI, packaging, operations guide, hardening;
-dynamic cluster membership). 0.5.0 is the first release. See [CHANGELOG.md](CHANGELOG.md)
+dynamic cluster membership; consolidation). 0.5.0 is the first release. See [CHANGELOG.md](CHANGELOG.md)
 and the plan in [docs/PLAN.md](docs/PLAN.md).
 
 ## Features

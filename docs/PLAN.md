@@ -204,7 +204,7 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 | P4 | Performance; see §7 (done) | see §7.5 |
 | P5 | Production readiness: Linux validation, CI, packaging, operations guide, hardening; see §8 (done) | see §8.5 |
 | P6 | Dynamic cluster membership (add, remove, replace a node online); see §9 | see §9.5 |
-| P7 | Consolidation: robust timing-sensitive tests, a removed node stops by itself, an openraft 0.10 evaluation; see §10 | see §10.4 |
+| P7 | Consolidation: robust timing-sensitive tests, a removed node stops by itself, an openraft 0.10 evaluation; see §10 (done) | see §10.4 |
 | later | openraft 0.10 (cluster CPU targets of §7.5), once it leaves alpha | — |
 
 ## 4. P1: Write-Ahead Log (detailed plan)
@@ -454,7 +454,7 @@ Only one agent at a time edits the server's wiring (T4); T1–T3 work in separat
 - [x] TLS, `-b` and cluster throughput not below their P3 numbers (±5%) — TLS and `-b` after P4-T6b (2 workers): 0.98–1.07x; cluster 1.06–1.52x; one cluster mTLS cell 0.94x, single block (BENCH P4-T6)
 - [x] Deleting or kicking 1M buried jobs, and releasing 100k reservations of one connection in random order, run in time linear in the count; the oracle proptest still passes (P4-T3)
 - [x] Memory per job ≤ 1.5x the reference and binlog bytes written per operation ≤ 1.2x the reference (or a documented reason) — worst 1.19x and 0.95x
-- [ ] Cluster: CPU per operation at 100 connections ≤ 15 µs (was 20); one-connection CPU per operation at least halved; snapshot peak memory ≤ 1.5x the state size — **partly met**: snapshot peak 0.04–0.17x (P4-T5c); CPU per operation 17.4–17.8 µs (P3 measured 24–26 on the same loaded machine) and one connection 0.55–0.77x of P3: not met, cause and next step in BENCH P4-T6
+- [ ] Cluster: CPU per operation at 100 connections ≤ 15 µs (was 20); one-connection CPU per operation at least halved; snapshot peak memory ≤ 1.5x the state size — **partly met**: snapshot peak 0.04–0.17x (P4-T5c); CPU per operation 17.4–17.8 µs (P3 measured 24–26 on the same loaded machine) and one connection 0.55–0.77x of P3: not met, cause and next step in BENCH P4-T6; openraft 0.10 does not lower it (BENCH P7-T3)
 - [x] All differential suites, chaos acceptance (≥ 1,000 in-process seeds, ≥ 100 multi-process runs) and smoke tests green
 - [x] `docs/BENCH.md`, `docs/DESIGN.md` updated
 
@@ -594,6 +594,6 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 ### 10.4 Acceptance
 
 - [x] Full test suite green 5 times in a row under CPU load (2026-10-05, one busy loop per core: every test outside the reference comparisons green in all 5 rounds; the reference comparisons with 1–3 s timing windows failed in 2 rounds, and their windows were widened. On a host whose own load average was 15–85, the comparisons still miss the runner's fixed 3 s reply timeout, so for them the evidence is CI and the weekly workflow.)
-- [ ] Removed node exits on confirmed removal; never on an uncommitted removal (deterministic test with a truncated removal); chaos `membership` 1,000 in-process seeds and 20 multi-process runs green
+- [x] Removed node exits on confirmed removal; never on an uncommitted removal (deterministic test with a truncated removal); chaos `membership` 1,000 in-process seeds and 20 multi-process runs green (P7-T2; `truncated_removal_never_stops_the_node` fails when the node exits on local evidence)
 - [x] openraft 0.10 report in BENCH.md with a recommendation (BENCH.md P7-T3: stay on 0.9.25 until 0.10.0)
-- [ ] CI and the weekly workflow green; CHANGELOG updated
+- [x] CI and the weekly workflow green; CHANGELOG updated (CI run 37310286940; weekly run 37296908216, which included P7-T2)
