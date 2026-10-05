@@ -119,6 +119,10 @@ Release tags are `v<version>` and match the workspace version in
 - Cluster `/readyz` (and `beanstalkd_cluster_ready`) now reports 503 while
   the node is isolated from the cluster and closing client connections;
   before, a cut-off leader kept answering 200.
+- A cluster node restarted before its log had caught up with the last
+  connections of its previous process now closes those connections too;
+  before, they and their reservations stayed in the cluster state until
+  the jobs' TTR expired.
 
 ## [0.5.0]
 

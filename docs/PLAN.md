@@ -559,9 +559,9 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 
 ### 9.5 Acceptance
 
-- [ ] Deterministic tests: grow 1→3 and 3→5, shrink 5→3, remove a follower holding reservations (released), remove the leader (new leader, its clients dropped), replace with a new id, replace with the same id and a wiped disk at a new address, restart with a stale config (log wins), a removed node is rejected and isolates, concurrent admin requests (one wins), admin identity checks, v3/v4 negotiation, guardrails
-- [ ] Chaos with membership faults: ≥ 1,000 in-process seeds and ≥ 100 multi-process runs, 0 violations; the existing acceptance runs still green
-- [ ] Rolling restart of a P6 cluster under load, then a membership change, scripted and green
-- [ ] The rejoin safety argument for changing voter sets written in DESIGN §8 and reviewed
-- [ ] No hot-path regression (cluster benchmark at 100 connections within ±5%)
+- [x] Deterministic tests: grow 1→3 and 3→5, shrink 5→3, remove a follower holding reservations (released), remove the leader (new leader, its clients dropped), replace with a new id, replace with the same id and a wiped disk at a new address, restart with a stale config (log wins), a removed node is rejected and isolates, concurrent admin requests (one wins), admin identity checks, v3/v4 negotiation, guardrails (done; v4 has no negotiation, decision 6, so a version mismatch is a named rejection)
+- [x] Chaos with membership faults: ≥ 1,000 in-process seeds and ≥ 100 multi-process runs, 0 violations; the existing acceptance runs still green (P6-T7: 1,000 in-process and 20 multi-process runs, plus 300 and 6 of the fixed-membership runs; P6-T8: in-process seeds 7000–7999 and multi-process seeds 520–599)
+- [x] Rolling restart of a P6 cluster under load, then a membership change, scripted and green (`scripts/rolling-restart.py`: 4 runs with TLS and 2 in plaintext, no job lost)
+- [x] The rejoin safety argument for changing voter sets written in DESIGN §8 and reviewed
+- [x] No hot-path regression (cluster benchmark at 100 connections within ±5%; BENCH.md P6-T8: 0.98 of P5 through the leader and through a follower)
 - [ ] OPERATIONS runbooks executed as written; CI green; CHANGELOG updated

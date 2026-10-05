@@ -17,6 +17,48 @@ end.
 - **Reference build.** `scripts/build-ref.sh` (both the debug and the `--optimized` tree, which the benchmarks use) patches one comparison in the reference's `conn_timeout` (docs/COMPAT.md D14) and, where the compiler knows it, passes `-Wno-error=stringop-truncation` (gcc 14). Neither changes the hot paths, so the numbers below, measured before the patch existed, stay comparable.
 - **Linux container.** Copy the tree in with `COPYFILE_DISABLE=1` (no `._*` files from macOS tar) and leave out `clients/python/.venv`, `target/`, `.ref/` and `.git`; rebuild `.ref/` inside the container. Run it with `docker run --init`, so that orphaned servers are reaped.
 
+## P6-T8: hot-path regression check (2026-10-05)
+
+HEAD `3ce7157` against the accepted P5 build (`5004d6e`, built from a git
+worktree with its own target directory), macOS, release builds, 100
+connections, 16-byte bodies, `bench/run-matrix.sh` with the P5 binary in
+the `ref` slot (standalone, alternated) and as separate order-flipped
+rounds (3-node cluster, plaintext cluster traffic, 6 s per run, ops/s
+through the leader and through a follower). Criterion: within +/-5%.
+
+The shared Mac was loaded by system daemons for most of the session (1-minute
+load 25 to 150 early, 6 to 12 in the final sets), and the early sets spread 3x
+(cluster runs from 14k to 65k ops/s), too much to tell 5% from noise. The
+table is the last, quietest set (medians; the first rounds of it, at about
+100k and 85k ops/s with 1% spread, agree with it); the earlier sets are
+listed below it.
+
+| mode | runs per build | P5 ops/s | HEAD ops/s | HEAD/P5 | cluster CPU per op HEAD/P5 |
+|---|---:|---:|---:|---:|---:|
+| cluster, via the leader | 12 | 100,204 | 97,961 | 0.98 | 1.01 |
+| cluster, via a follower | 12 | 85,430 | 83,983 | 0.98 | 1.02 |
+| standalone put-reserve-delete | 10 | 139,875 | 153,088 | 1.09 | 0.89 (server CPU per op) |
+| standalone producers-consumers | 10 | 140,777 | 139,526 | 0.99 | 1.01 |
+
+Result: no regression; standalone and cluster are within 5% except
+standalone put-reserve-delete, where HEAD is faster (that cell spreads
+80k to 190k on this machine).
+
+Earlier sets on the loaded machine (not conclusive): standalone, 7 and 15
+alternated runs, put-reserve-delete 1.04 and 0.97, producers-consumers 1.01 and
+1.05 (medians of the ratio of medians); cluster, 8 rounds (10 s) and 12 rounds
+(6 s), via the leader 1.46 and 1.07, via a follower 1.06 and 0.99, with
+interquartile ranges of 2x; CPU per operation in those sets HEAD/P5 0.92 to
+1.05. The 0.77 to 0.92 paired-ratio medians of the follower sets came from
+runs where one build happened to hit a load spike; the quiet set shows 0.99.
+
+Commands: `REF_BIN=<P5 binary> RS_BIN=target/release/beanstalkd-rs
+SERVERS="ref rs" SCENARIOS="put-reserve-delete producers-consumers" CONNS=100
+BODIES=16 RUNS=10 DURATION=4 bench/run-matrix.sh`; cluster: `RS_BIN=<binary>
+SERVERS=rs SCENARIOS=put-reserve-delete CONNS=100 BODIES=16 RUNS=1 DURATION=6
+CLUSTER_NODES=3 SERVER_MODES="cluster-leader cluster-follower"` for each build
+in turn, order flipped every round, 12 rounds.
+
 ## P5-T2: Linux (ratios only)
 
 ### Summary

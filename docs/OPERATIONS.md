@@ -980,6 +980,16 @@ Rules that hold for every runbook:
   voters: an even count tolerates no more failures than 3 voters; change to
   an odd count`). No voter change runs while a voter does not answer or is
   rejoining, except removing that voter.
+- **`bcl` names nodes 1 to 3 as its entry points.** The tool asks them in
+  order and learns the other members' addresses from the first answer, so
+  it keeps working while at least one of them runs; once all three have
+  been removed or replaced, change the `--node` list in `bcl` to nodes that
+  are still members (with none answering the command exits 3).
+- **`/readyz` can flip to 503 under load.** A node answers 503 while it
+  lags behind the commit index it has learned, which happens briefly on a
+  busy cluster (a sustained load of thousands of puts per second, a node
+  that has just restarted or joined). Poll it, as `wait_ready` does, and do
+  not treat one 503 as a failure; a node that stays 503 is the signal.
 - **A removed node is not told**: stop it right after `remove`. Until then
   it serves nothing (`/readyz` 503), its clients' connections are dropped
   (their reservations return to ready), it logs failed vote requests
