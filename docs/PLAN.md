@@ -619,7 +619,7 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 |---|---|---|
 | P8-T1 | Profile a 3-node cluster (100 connections and 1 connection, via leader and via follower): CPU per node, then per component, from sampled stacks; a ranked list of candidate savings with estimated µs/op each | subagent |
 | P8-T2 | Write the unsynced commit hint (`save_committed`) at most every few milliseconds and at shutdown, not per commit (T1 #5) | subagent |
-| P8-T3 | A persistent flush thread instead of `spawn_blocking` per flush run (T1 #6) | subagent |
+| P8-T3 | A persistent flush thread instead of `spawn_blocking` per flush run (T1 #6). **Dropped**: wake-ups per entry unchanged (condvar signals 3.0 and kevents 4.2 per entry on a follower before and after; `spawn_blocking` already costs one notify, as does waking the thread), and the in-process harness would need a test-only hook to keep its paused clock from jumping during real I/O | subagent |
 | P8-T4 | A tail cache of recent decoded log entries for replication and apply (T1 #3) | subagent |
 | P8-T5 | Tick and connection refresh once per batch entry instead of per item, if the differential suites prove it equivalent; otherwise dropped (T1 #4) | subagent |
 | P8-T6 | Experiments on cross-thread cost: a separate runtime thread for the Raft chain, tokio settings (T1 #2); keep only what measures | subagent |
