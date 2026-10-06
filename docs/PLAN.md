@@ -205,7 +205,8 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 | P5 | Production readiness: Linux validation, CI, packaging, operations guide, hardening; see §8 (done) | see §8.5 |
 | P6 | Dynamic cluster membership (add, remove, replace a node online); see §9 | see §9.5 |
 | P7 | Consolidation: robust timing-sensitive tests, a removed node stops by itself, an openraft 0.10 evaluation; see §10 (done) | see §10.4 |
-| later | openraft 0.10 (cluster CPU targets of §7.5), once it leaves alpha | — |
+| P8 | Cluster CPU per operation (the open §7.5 target); see §11 | see §11.4 |
+| later | openraft 0.10 for leader transfer, once 0.10.0 is released (it does not lower CPU, BENCH P7-T3) | — |
 
 ## 4. P1: Write-Ahead Log (detailed plan)
 
@@ -597,3 +598,31 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 - [x] Removed node exits on confirmed removal; never on an uncommitted removal (deterministic test with a truncated removal); chaos `membership` 1,000 in-process seeds and 20 multi-process runs green (P7-T2; `truncated_removal_never_stops_the_node` fails when the node exits on local evidence)
 - [x] openraft 0.10 report in BENCH.md with a recommendation (BENCH.md P7-T3: stay on 0.9.25 until 0.10.0)
 - [x] CI and the weekly workflow green; CHANGELOG updated (CI run 37310286940; weekly run 37296908216, which included P7-T2)
+
+## 11. P8: Cluster CPU per Operation (detailed plan)
+
+### 11.1 Scope
+
+- Meet the open cluster target of §7.5: CPU per operation (all three nodes) at 100 connections ≤ 15 µs, and at one connection ≤ 0.5× of P3 (P3: 343.6 µs via the leader, 409.7 via a follower; BENCH P4-T6). Now 17.4–17.8 and 0.73–0.77× via the leader, 25.3 and 0.55× via a follower.
+- **Invariants**: replicated semantics only change through a new, versioned `Op` or a snapshot payload version, with mixed-version rules written down; the differential, chaos and smoke suites stay green; no client-visible change; no throughput loss of more than 5% at 100 connections.
+- **Out of scope**: openraft 0.10 (no CPU gain, BENCH P7-T3), patching openraft.
+
+### 11.2 Facts checked before planning
+
+- Inputs are already batched before Raft (`Op::Batch`, at most one batch outstanding, P3-FD), and replies are built only by the owner (P4-T5a). So "one log entry per operation" holds only at low concurrency, where the cost is per entry: client → leader → propose → append and flush → AppendEntries to each follower → their flush → commit → apply → a second, commit-only AppendEntries, with thread wake-ups on every node at every step (P4-T5b).
+- No current profile splits the cluster cost by node and component (openraft core, our network and codec, flush worker, engine apply, tokio scheduling, syscalls). P8-T1 measures that first; the remaining tasks are chosen from its numbers.
+- The development machine is shared and often loaded (load average 15–85 in P7), so absolute numbers drift; plans compare interleaved runs and use profile shares, and the acceptance numbers come from a quiet window or a Linux runner, stated with the load.
+
+### 11.3 Tasks
+
+| Task | Content | Owner |
+|---|---|---|
+| P8-T1 | Profile a 3-node cluster (100 connections and 1 connection, via leader and via follower): CPU per node, then per component, from sampled stacks; a ranked list of candidate savings with estimated µs/op each | subagent |
+| P8-T2… | Chosen from T1's list, one small change per task, each measured against its parent commit | subagents |
+| P8-Tn | P8 acceptance | lead |
+
+### 11.4 Acceptance
+
+- [ ] Cluster CPU per operation at 100 connections ≤ 15 µs via the leader, and at one connection ≤ 0.5× of P3 (or the reached values with the reason the rest is out of reach)
+- [ ] Throughput at 100 connections not lower than before P8 by more than 5%
+- [ ] Differential suites, chaos (1,000 in-process seeds, 20 multi-process runs per scenario), smoke and CI green
