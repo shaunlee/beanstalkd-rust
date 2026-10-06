@@ -18,6 +18,7 @@ impl StoreBuilder<TypeConfig, LogStore, ClusterStateMachine, TempDir> for Builde
             LogOptions {
                 segment_size: 256,
                 max_read_bytes: 1 << 20,
+                ..LogOptions::default()
             },
             sm_opts(1, Arc::new(RecSink::default())),
         )

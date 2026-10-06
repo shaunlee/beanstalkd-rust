@@ -82,6 +82,7 @@ fn limited_reads_are_bounded_but_nonempty() {
         LogOptions {
             segment_size: 1 << 20,
             max_read_bytes: 100,
+            ..LogOptions::default()
         },
     )
     .unwrap();
@@ -486,6 +487,7 @@ fn big_segments(dir: &Path) -> LogStore {
         LogOptions {
             segment_size: 64 << 20,
             max_read_bytes: 1 << 20,
+            ..LogOptions::default()
         },
     )
     .unwrap()
@@ -684,4 +686,69 @@ fn crash_with_pending_syncs_across_a_rollover() {
     let last = last.unwrap();
     assert!((3..=40).contains(&last));
     assert_eq!(indexes(&read_all(&mut log)), (1..=last).collect::<Vec<_>>());
+}
+
+fn committed_bytes(dir: &Path) -> Vec<u8> {
+    std::fs::read(dir.join("committed")).unwrap()
+}
+
+#[test]
+fn committed_hint_is_written_at_most_once_per_interval() {
+    let d = tempfile::tempdir().unwrap();
+    let mut log = LogStore::open(
+        d.path(),
+        LogOptions {
+            committed_interval: std::time::Duration::from_millis(300),
+            ..small_log_opts()
+        },
+    )
+    .unwrap();
+    append(&mut log, (1..=5).map(|i| filler(1, i)));
+    // The first one is written at once; the memory always has the latest.
+    block_on(log.save_committed(Some(lid(1, 1)))).unwrap();
+    let first = committed_bytes(d.path());
+    assert!(!first.is_empty());
+    for i in 2..=4 {
+        block_on(log.save_committed(Some(lid(1, i)))).unwrap();
+        assert_eq!(block_on(log.read_committed()).unwrap(), Some(lid(1, i)));
+    }
+    assert_eq!(
+        committed_bytes(d.path()),
+        first,
+        "written within the interval"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(350));
+    block_on(log.save_committed(Some(lid(1, 5)))).unwrap();
+    assert_ne!(committed_bytes(d.path()), first, "not written after it");
+    drop(log);
+    let mut log = open_log(d.path());
+    assert_eq!(block_on(log.read_committed()).unwrap(), Some(lid(1, 5)));
+}
+
+#[test]
+fn clean_stop_writes_the_latest_hint_and_a_crash_leaves_a_stale_one() {
+    let d = tempfile::tempdir().unwrap();
+    let opts = LogOptions {
+        committed_interval: std::time::Duration::from_secs(3600),
+        ..small_log_opts()
+    };
+    let mut log = LogStore::open(d.path(), opts.clone()).unwrap();
+    append(&mut log, (1..=5).map(|i| filler(1, i)));
+    block_on(log.save_committed(Some(lid(1, 2)))).unwrap();
+    let stale = committed_bytes(d.path());
+    block_on(log.save_committed(Some(lid(1, 4)))).unwrap();
+    assert_eq!(committed_bytes(d.path()), stale);
+    drop(log);
+    let mut log = LogStore::open(d.path(), opts.clone()).unwrap();
+    assert_eq!(block_on(log.read_committed()).unwrap(), Some(lid(1, 4)));
+    drop(log);
+    // A crash: the file still holds the hint from before the last commits.
+    std::fs::write(d.path().join("committed"), &stale).unwrap();
+    let mut log = LogStore::open(d.path(), opts).unwrap();
+    assert_eq!(block_on(log.read_committed()).unwrap(), Some(lid(1, 2)));
+    // The store goes on: later commits are saved and survive a clean stop.
+    block_on(log.save_committed(Some(lid(1, 5)))).unwrap();
+    drop(log);
+    let mut log = open_log(d.path());
+    assert_eq!(block_on(log.read_committed()).unwrap(), Some(lid(1, 5)));
 }

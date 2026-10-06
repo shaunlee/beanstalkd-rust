@@ -29,7 +29,9 @@
 //!   `fdatasync`ed, renamed over the old file, and the directory is `fsync`ed.
 //! - `committed` is only a hint that lets a restarted node re-apply
 //!   committed entries before it hears from a leader; it is overwritten in
-//!   place without a sync, and an unreadable value reads as `None`.
+//!   place without a sync (at most every `committed_interval` and when the
+//!   store is dropped, so after a crash it may lag by that much), and an
+//!   unreadable value reads as `None`.
 //! - The state machine is not persistent; it is rebuilt from the latest
 //!   snapshot and openraft re-applies the log after it.
 

@@ -55,6 +55,7 @@ use std::ops::{Bound, RangeBounds};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use openraft::storage::{LogFlushed, RaftLogStorage};
 use openraft::{
@@ -83,6 +84,11 @@ pub struct LogOptions {
     /// `limited_get_log_entries` stops after this many bytes of records
     /// (always returning at least one entry).
     pub max_read_bytes: u64,
+    /// The commit hint is written to disk at most this often (and when the
+    /// store is dropped). The hint is a `pwrite` per commit otherwise, and
+    /// a stale one only makes a restart re-apply the entries committed in
+    /// the last interval.
+    pub committed_interval: Duration,
 }
 
 impl Default for LogOptions {
@@ -90,6 +96,7 @@ impl Default for LogOptions {
         LogOptions {
             segment_size: 64 << 20,
             max_read_bytes: 16 << 20,
+            committed_interval: Duration::from_millis(50),
         }
     }
 }
@@ -118,6 +125,15 @@ struct Segment {
     end: u64,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // The only shutdown hook: a clean stop leaves the latest hint.
+        if self.committed_dirty {
+            let _ = self.write_committed();
+        }
+    }
+}
+
 impl Segment {
     fn next(&self) -> u64 {
         self.first + self.offsets.len() as u64
@@ -141,6 +157,10 @@ struct Inner {
     vote: Option<Vote<NodeId>>,
     committed: Option<Sid>,
     committed_file: File,
+    /// When the hint was last written, and whether `committed` is ahead of
+    /// the file.
+    committed_written: Option<Instant>,
+    committed_dirty: bool,
 }
 
 /// The Raft log, vote and commit marker of one node. Cloning gives another
@@ -405,6 +425,8 @@ impl LogStore {
                 vote,
                 committed,
                 committed_file,
+                committed_written: None,
+                committed_dirty: false,
             })),
             flusher: Flusher::default(),
         })
@@ -723,12 +745,28 @@ impl Inner {
     }
 
     fn save_committed(&mut self, committed: Option<Sid>) -> io::Result<()> {
+        if committed == self.committed {
+            return Ok(());
+        }
+        self.committed = committed;
+        self.committed_dirty = true;
+        let due = self
+            .committed_written
+            .is_none_or(|t| t.elapsed() >= self.opts.committed_interval);
+        if due {
+            self.write_committed()?;
+        }
+        Ok(())
+    }
+
+    fn write_committed(&mut self) -> io::Result<()> {
         // A hint only (see the module docs of `storage`): overwritten in
         // place and never synced; a torn write fails its checksum and
         // reads back as `None`.
-        let rec = fsutil::record(&encode(&committed)?)?;
+        let rec = fsutil::record(&encode(&self.committed)?)?;
         self.committed_file.write_all_at(&rec, 0)?;
-        self.committed = committed;
+        self.committed_written = Some(Instant::now());
+        self.committed_dirty = false;
         Ok(())
     }
 

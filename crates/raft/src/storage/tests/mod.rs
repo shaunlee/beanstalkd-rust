@@ -70,6 +70,7 @@ pub(super) fn small_log_opts() -> LogOptions {
     LogOptions {
         segment_size: 400,
         max_read_bytes: 1 << 20,
+        ..LogOptions::default()
     }
 }
 
