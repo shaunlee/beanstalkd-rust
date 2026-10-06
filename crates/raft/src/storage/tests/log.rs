@@ -752,3 +752,212 @@ fn clean_stop_writes_the_latest_hint_and_a_crash_leaves_a_stale_one() {
     let mut log = open_log(d.path());
     assert_eq!(block_on(log.read_committed()).unwrap(), Some(lid(1, 5)));
 }
+
+/// Zero every record byte on disk (the files keep their length): what the
+/// tail cache still answers is then visibly not read from the segments.
+fn clobber_segments(dir: &Path) {
+    use std::os::unix::fs::FileExt;
+    for p in segments(dir) {
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        let len = f.metadata().unwrap().len();
+        f.write_all_at(&vec![0u8; len as usize - 24], 24).unwrap();
+    }
+}
+
+fn open_cached(dir: &Path, bytes: u64, entries: usize) -> LogStore {
+    LogStore::open(
+        dir,
+        LogOptions {
+            tail_cache_bytes: bytes,
+            tail_cache_entries: entries,
+            ..small_log_opts()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn tail_cache_serves_appended_entries() {
+    let d = tempfile::tempdir().unwrap();
+    let mut log = open_log(d.path());
+    append(&mut log, (1..=5).map(|i| filler(1, i)));
+    append(&mut log, (6..=20).map(|i| filler(1, i)));
+    let want: Vec<_> = (1..=20).map(|i| filler(1, i)).collect();
+    clobber_segments(d.path());
+    assert_eq!(read_all(&mut log), want);
+    assert_eq!(
+        block_on(log.limited_get_log_entries(7, 12)).unwrap(),
+        want[6..11]
+    );
+    // A restart starts with an empty cache.
+    let d = tempfile::tempdir().unwrap();
+    let mut log = open_log(d.path());
+    append(&mut log, (1..=5).map(|i| filler(1, i)));
+    drop(log);
+    let mut log = open_log(d.path());
+    clobber_segments(d.path());
+    assert!(block_on(log.try_get_log_entries(..)).is_err());
+}
+
+#[test]
+fn tail_cache_follows_truncate() {
+    let d = tempfile::tempdir().unwrap();
+    let mut log = open_log(d.path());
+    append(&mut log, (1..=10).map(|i| filler(1, i)));
+    block_on(log.truncate(lid(1, 6))).unwrap();
+    assert_eq!(indexes(&read_all(&mut log)), vec![1, 2, 3, 4, 5]);
+    append(&mut log, (6..=8).map(|i| filler(2, i)));
+    let want: Vec<_> = (1..=5)
+        .map(|i| filler(1, i))
+        .chain((6..=8).map(|i| filler(2, i)))
+        .collect();
+    clobber_segments(d.path());
+    assert_eq!(read_all(&mut log), want);
+    assert!(block_on(log.try_get_log_entries(9..)).unwrap().is_empty());
+}
+
+#[test]
+fn tail_cache_follows_purge() {
+    let d = tempfile::tempdir().unwrap();
+    let mut log = open_log(d.path());
+    append(&mut log, (1..=12).map(|i| filler(1, i)));
+    block_on(log.purge(lid(1, 4))).unwrap();
+    clobber_segments(d.path());
+    let got = read_all(&mut log);
+    assert_eq!(got, (5..=12).map(|i| filler(1, i)).collect::<Vec<_>>());
+    block_on(log.purge(lid(1, 12))).unwrap();
+    assert!(read_all(&mut log).is_empty());
+    append(&mut log, [filler(1, 13)]);
+    assert_eq!(indexes(&read_all(&mut log)), vec![13]);
+}
+
+#[test]
+fn tail_cache_is_bounded_oldest_first() {
+    let d = tempfile::tempdir().unwrap();
+    // Room for a few records only.
+    let mut log = open_cached(d.path(), 400, 1000);
+    append(&mut log, (1..=30).map(|i| filler(1, i)));
+    clobber_segments(d.path());
+    let newest = block_on(log.try_get_log_entries(30..)).unwrap();
+    assert_eq!(newest, vec![filler(1, 30)]);
+    assert!(block_on(log.try_get_log_entries(1..=2)).is_err());
+    drop(log);
+
+    // The entry bound alone also evicts.
+    let d = tempfile::tempdir().unwrap();
+    let mut log = open_cached(d.path(), 1 << 20, 3);
+    append(&mut log, (1..=10).map(|i| filler(1, i)));
+    clobber_segments(d.path());
+    assert_eq!(
+        indexes(&block_on(log.try_get_log_entries(8..)).unwrap()),
+        vec![8, 9, 10]
+    );
+    assert!(block_on(log.try_get_log_entries(7..)).is_err());
+
+    // A record bigger than the whole cache is never cached (and does not
+    // leave the older ones behind it with a hole).
+    let d = tempfile::tempdir().unwrap();
+    let mut log = open_cached(d.path(), 200, 1000);
+    let big = normal(
+        1,
+        3,
+        Request {
+            now: 3,
+            op: Op::Conn {
+                seq: 3,
+                input: EngineInput::Command {
+                    conn: 1,
+                    cmd: bstk_proto::Command::Put {
+                        pri: 1,
+                        delay: 0,
+                        ttr: 1,
+                        body: vec![7u8; 5000].into(),
+                    },
+                },
+            },
+        },
+    );
+    append(
+        &mut log,
+        [filler(1, 1), filler(1, 2), big.clone(), filler(1, 4)],
+    );
+    let got = read_all(&mut log);
+    assert_eq!(got.len(), 4);
+    assert_eq!(got[2], big);
+}
+
+/// The same operations on a store without the cache and on stores with
+/// tiny caches give identical reads, whatever mix of cache and disk
+/// answers.
+#[test]
+fn tail_cache_reads_equal_disk_reads() {
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self, n: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) % n
+        }
+    }
+    for seed in 0..40u64 {
+        let mut rng = Rng(seed + 1);
+        let max_read = [1, 100, 300, 1 << 20][rng.next(4) as usize];
+        let seg = 200 + rng.next(600);
+        let cache = [0, 150, 500, 2000][rng.next(4) as usize];
+        let opts = |bytes| LogOptions {
+            segment_size: seg,
+            max_read_bytes: max_read,
+            tail_cache_bytes: bytes,
+            tail_cache_entries: 1 + rng.0 as usize % 40,
+            ..LogOptions::default()
+        };
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (oa, ob) = (opts(0), opts(cache));
+        let mut a = LogStore::open(da.path(), oa.clone()).unwrap();
+        let mut b = LogStore::open(db.path(), ob.clone()).unwrap();
+        let (mut next, mut term, mut purged) = (1u64, 1u64, 0u64);
+        for _ in 0..60 {
+            match rng.next(10) {
+                0..=3 => {
+                    let n = 1 + rng.next(6);
+                    let ents: Vec<_> = (next..next + n).map(|i| filler(term, i)).collect();
+                    append(&mut a, ents.clone());
+                    append(&mut b, ents);
+                    next += n;
+                }
+                4 if next > purged + 1 => {
+                    let since = purged + 1 + rng.next(next - purged - 1);
+                    block_on(a.truncate(lid(term, since))).unwrap();
+                    block_on(b.truncate(lid(term, since))).unwrap();
+                    next = since;
+                    term += 1;
+                }
+                5 if next > purged + 1 => {
+                    let upto = purged + 1 + rng.next(next - purged - 1);
+                    block_on(a.purge(lid(1, upto))).unwrap();
+                    block_on(b.purge(lid(1, upto))).unwrap();
+                    purged = upto;
+                }
+                6 if rng.next(4) == 0 => {
+                    drop((a, b));
+                    a = LogStore::open(da.path(), oa.clone()).unwrap();
+                    b = LogStore::open(db.path(), ob.clone()).unwrap();
+                }
+                _ => {}
+            }
+            let lo = rng.next(next + 2);
+            let hi = lo + rng.next(30);
+            assert_eq!(
+                block_on(a.try_get_log_entries(lo..hi)).unwrap(),
+                block_on(b.try_get_log_entries(lo..hi)).unwrap(),
+                "seed {seed} range {lo}..{hi}"
+            );
+            let got_a = block_on(a.limited_get_log_entries(lo, hi)).unwrap();
+            let got_b = block_on(b.limited_get_log_entries(lo, hi)).unwrap();
+            assert_eq!(got_a, got_b, "seed {seed} limited {lo}..{hi}");
+            assert_eq!(state(&mut a), state(&mut b));
+        }
+    }
+}

@@ -45,9 +45,12 @@
 //!   surviving segment are ignored.
 //!
 //! Reads use `pread` on the segment files; only record offsets are kept in
-//! memory. State is behind one mutex: openraft serializes writes, and readers
-//! take it briefly.
+//! memory, plus a bounded cache of the newest decoded entries (`Tail`) that
+//! replication streams and the state machine read right after the append.
+//! State is behind one mutex: openraft serializes writes, and readers take it
+//! briefly.
 
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -89,6 +92,15 @@ pub struct LogOptions {
     /// a stale one only makes a restart re-apply the entries committed in
     /// the last interval.
     pub committed_interval: Duration,
+    /// The newest appended entries are kept decoded in memory up to this many
+    /// bytes of their records (0 turns the cache off). Replication to each
+    /// follower and the apply loop read the entry that was just appended;
+    /// a few MiB covers the usual lag at three `pread`s per entry saved. A
+    /// follower further behind reads from disk.
+    pub tail_cache_bytes: u64,
+    /// ... and at most this many entries, so that many tiny entries do not
+    /// cost more memory than their record bytes suggest.
+    pub tail_cache_entries: usize,
 }
 
 impl Default for LogOptions {
@@ -97,6 +109,8 @@ impl Default for LogOptions {
             segment_size: 64 << 20,
             max_read_bytes: 16 << 20,
             committed_interval: Duration::from_millis(50),
+            tail_cache_bytes: 4 << 20,
+            tail_cache_entries: 8192,
         }
     }
 }
@@ -146,12 +160,99 @@ impl Segment {
     }
 }
 
+/// The newest entries of the log, consecutive and ending at or before the
+/// last appended one. Entries carry `Bytes` bodies, so a clone is cheap
+/// where a read from disk copies and decodes the whole record.
+#[derive(Debug)]
+struct Tail {
+    /// Each entry with the size of its on-disk record.
+    ents: VecDeque<(Ent, u64)>,
+    bytes: u64,
+    max_bytes: u64,
+    max_entries: usize,
+}
+
+impl Tail {
+    fn new(opts: &LogOptions) -> Tail {
+        Tail {
+            ents: VecDeque::new(),
+            bytes: 0,
+            max_bytes: opts.tail_cache_bytes,
+            max_entries: opts.tail_cache_entries,
+        }
+    }
+
+    fn first(&self) -> Option<u64> {
+        self.ents.front().map(|(e, _)| e.log_id.index)
+    }
+
+    fn get(&self, index: u64) -> Option<&(Ent, u64)> {
+        let k = usize::try_from(index.checked_sub(self.first()?)?).ok()?;
+        self.ents.get(k)
+    }
+
+    fn clear(&mut self) {
+        self.ents.clear();
+        self.bytes = 0;
+    }
+
+    /// Called once the record is in the segment file, in log order.
+    fn push(&mut self, ent: Ent, rec_len: u64) {
+        if rec_len > self.max_bytes || self.max_entries == 0 {
+            // Skipping an entry would leave a hole.
+            self.clear();
+            return;
+        }
+        if self
+            .ents
+            .back()
+            .is_some_and(|(b, _)| b.log_id.index + 1 != ent.log_id.index)
+        {
+            self.clear();
+        }
+        self.bytes += rec_len;
+        self.ents.push_back((ent, rec_len));
+        while self.bytes > self.max_bytes || self.ents.len() > self.max_entries {
+            if let Some((_, n)) = self.ents.pop_front() {
+                self.bytes -= n;
+            }
+        }
+    }
+
+    /// Drop the entries at `since` and after.
+    fn truncate(&mut self, since: u64) {
+        while self
+            .ents
+            .back()
+            .is_some_and(|(e, _)| e.log_id.index >= since)
+        {
+            if let Some((_, n)) = self.ents.pop_back() {
+                self.bytes -= n;
+            }
+        }
+    }
+
+    /// Drop the entries at `upto` and before.
+    fn purge(&mut self, upto: u64) {
+        while self
+            .ents
+            .front()
+            .is_some_and(|(e, _)| e.log_id.index <= upto)
+        {
+            if let Some((_, n)) = self.ents.pop_front() {
+                self.bytes -= n;
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Inner {
     dir: PathBuf,
     _lock: File,
     opts: LogOptions,
     segs: Vec<Segment>,
+    tail: Tail,
     purged: Option<Sid>,
     last_entry: Option<Sid>,
     vote: Option<Vote<NodeId>>,
@@ -418,6 +519,7 @@ impl LogStore {
             inner: Arc::new(Mutex::new(Inner {
                 dir: dir.to_path_buf(),
                 _lock: lock,
+                tail: Tail::new(&opts),
                 opts,
                 segs,
                 purged,
@@ -489,11 +591,47 @@ impl Inner {
     }
 
     /// Read entries `[lo, hi)` (all present), stopping once `max_bytes`
-    /// have been read (at least one entry).
+    /// have been read (at least one entry). The cache serves what it holds
+    /// and the segment files the rest.
     fn read_entries(&self, lo: u64, hi: u64, max_bytes: u64) -> io::Result<Vec<Ent>> {
         let mut out = Vec::new();
         let mut idx = lo;
         let mut bytes = 0u64;
+        while idx < hi && bytes < max_bytes {
+            if let Some((ent, len)) = self.tail.get(idx) {
+                if !out.is_empty() && bytes + len > max_bytes {
+                    break;
+                }
+                out.push(ent.clone());
+                bytes += len;
+                idx += 1;
+                continue;
+            }
+            let stop = match self.tail.first() {
+                Some(f) if f > idx => f.min(hi),
+                _ => hi,
+            };
+            let next = self.read_disk(idx, stop, max_bytes, &mut out, &mut bytes)?;
+            if next < stop {
+                break;
+            }
+            idx = next;
+        }
+        Ok(out)
+    }
+
+    /// Append the entries `[lo, hi)` read from the segment files to `out`;
+    /// returns the next index to read (below `hi` when the byte limit
+    /// stopped it).
+    fn read_disk(
+        &self,
+        lo: u64,
+        hi: u64,
+        max_bytes: u64,
+        out: &mut Vec<Ent>,
+        bytes: &mut u64,
+    ) -> io::Result<u64> {
+        let mut idx = lo;
         while idx < hi {
             let (si, k) = self
                 .locate(idx)
@@ -508,7 +646,7 @@ impl Inner {
             let mut end = start;
             while cnt < want {
                 let (_, e) = seg.range(k + cnt);
-                if cnt > 0 && bytes + (e - start) > max_bytes {
+                if (cnt > 0 || !out.is_empty()) && *bytes + (e - start) > max_bytes {
                     break;
                 }
                 end = e;
@@ -537,12 +675,12 @@ impl Inner {
                 pos += total;
                 idx += 1;
             }
-            bytes += end - start;
-            if bytes >= max_bytes {
+            *bytes += end - start;
+            if cnt < want || *bytes >= max_bytes {
                 break;
             }
         }
-        Ok(out)
+        Ok(idx)
     }
 
     fn entry_id(&self, index: u64) -> io::Result<Sid> {
@@ -597,6 +735,9 @@ impl Inner {
         let mut buf = Vec::new();
         let mut offs = Vec::new();
         let mut unsynced: Option<usize> = None;
+        // Cached only after the whole batch is written, so a failed append
+        // leaves a gap that `Tail::push` notices rather than a stale entry.
+        let mut fresh: Vec<(Ent, u64)> = Vec::new();
         for ent in entries {
             let idx = ent.log_id.index;
             if self.purged.is_some_and(|p| idx <= p.index) {
@@ -655,8 +796,12 @@ impl Inner {
             fsutil::encode_record(&payload, &mut buf)?;
             unsynced = Some(self.segs.len() - 1);
             self.last_entry = Some(ent.log_id);
+            fresh.push((ent, rec_len));
         }
         self.flush(&mut buf, &mut offs)?;
+        for (ent, rec_len) in fresh {
+            self.tail.push(ent, rec_len);
+        }
         Ok(unsynced.map(|si| self.segs[si].file.clone()))
     }
 
@@ -691,6 +836,7 @@ impl Inner {
                 p.index
             )));
         }
+        self.tail.truncate(since);
         let mut changed = false;
         while self.segs.last().is_some_and(|s| s.first >= since) {
             if let Some(s) = self.segs.pop() {
@@ -732,6 +878,7 @@ impl Inner {
         }
         fsutil::atomic_write(&self.dir, PURGED_FILE, &fsutil::record(&encode(&upto)?)?)?;
         self.purged = Some(upto);
+        self.tail.purge(upto.index);
         if self.last_entry.is_some_and(|l| l.index <= upto.index) {
             self.last_entry = None;
         }
