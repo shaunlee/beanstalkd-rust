@@ -17,6 +17,142 @@ end.
 - **Reference build.** `scripts/build-ref.sh` (both the debug and the `--optimized` tree, which the benchmarks use) patches one comparison in the reference's `conn_timeout` (docs/COMPAT.md D14) and, where the compiler knows it, passes `-Wno-error=stringop-truncation` (gcc 14). Neither changes the hot paths, so the numbers below, measured before the patch existed, stay comparable.
 - **Linux container.** Copy the tree in with `COPYFILE_DISABLE=1` (no `._*` files from macOS tar) and leave out `clients/python/.venv`, `target/`, `.ref/` and `.git`; rebuild `.ref/` inside the container. Run it with `docker run --init`, so that orphaned servers are reaped.
 
+## P8-T6: cluster with one worker thread (2026-10-06)
+
+Build `0c951ae` on the Linux host of "P8 progress" (16 cores), quiet machine (load1 median at run start 3.06, mostly our own load generator).
+
+### Method
+
+- Same as "P8 progress": 3-node loopback cluster, plaintext, default `[cluster]` settings, fresh cluster per run, put-reserve-delete body 16, `bstk-bench --duration 14`, 10.0 s window starting 2.5 s after bench start. CPU/op = utime+stime of all three node processes / delta of cmd-put+reserve+delete on the leader's /admin; ops/s = bstk-bench `ops_per_sec`. Leader CPU % = leader process utime+stime over the window / window (100 = one core).
+- **Data dirs are on tmpfs**, so fdatasync is nearly free and the disk does not cap throughput. Absolute numbers (esp. 1 connection) are not what a real disk gives (see "P8 progress on NVMe": on the NVMe ext4 root, throughput is sync-bound at ~18k ops/s at 100 conns and thread count would not matter for throughput there).
+- Variants: **T1** = `--threads 1` on all three nodes (flag from `--help`: "Tokio worker-thread count ... 2 with `[cluster]`"); **T2** = no flag (cluster default, 2 workers). Interleaved, order flipped each round (T1,T2 in even rounds, T2,T1 in odd). 8 rounds x 8 runs = 64 runs, no failures.
+- Configs: leader 1, leader 100, follower 100, leader 300 connections. Median and inclusive-quartile IQR over 8 runs.
+
+### Results
+
+| mode | conns | variant | ops/s median | IQR | CPU us/op median | IQR | leader proc CPU % median | IQR | runs |
+|---|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| leader | 1 | T1 | 4,594 | 144 | 322.8 | 15.8 | 71 | 1 | 8 |
+| leader | 1 | T2 | 4,438 | 84 | 459.4 | 4.9 | 104 | 1 | 8 |
+| leader | 100 | T1 | 48,395 | 821 | 22.0 | 0.4 | 74 | 0 | 8 |
+| leader | 100 | T2 | 67,764 | 1,544 | 30.5 | 0.8 | 138 | 0 | 8 |
+| follower | 100 | T1 | 44,836 | 1,207 | 35.4 | 1.1 | 52 | 1 | 8 |
+| follower | 100 | T2 | 55,305 | 1,704 | 55.7 | 2.0 | 103 | 0 | 8 |
+| leader | 300 | T1 | 54,775 | 579 | 17.0 | 0.3 | 71 | 0 | 8 |
+| leader | 300 | T2 | 81,025 | 1,519 | 22.4 | 0.4 | 135 | 0 | 8 |
+
+(For follower rows the leader CPU % column is the process of the node that is the Raft leader, not the node clients connect to.)
+
+### Ratios of medians, 1 thread / 2 threads
+
+| mode | conns | ops/s T1/T2 | CPU/op T1/T2 |
+|---|---:|---:|---:|
+| leader | 1 | 1.035 | 0.703 |
+| leader | 100 | 0.714 | 0.722 |
+| follower | 100 | 0.811 | 0.635 |
+| leader | 300 | 0.676 | 0.760 |
+
+### Findings
+
+- 1 connection: 1 thread is 30% cheaper per op (322.8 vs 459.4 us) with no throughput loss (+3.5%, T1 IQR 144 against a 156 ops/s gap, small but T1 was faster in 7 of 8 pairs by the per-round data). Consistent with the Mac result (19% cheaper) and larger.
+- 100 connections: 1 thread is 28% cheaper per op via the leader (22.0 vs 30.5) and 37% cheaper via a follower, **but throughput drops 29% via the leader (48.4k vs 67.8k) and 19% via a follower**. This is far beyond the 5% budget. 300 connections: -32% throughput (54.8k vs 81.0k), CPU/op -24%. So the Mac observation (cap at ~100k there) reproduces on a quiet Linux box as a cap at ~48k to 55k ops/s.
+- Saturation: the 1-thread leader process is **not** at 100% of a core: 74% at 100 connections and 71% at 300 (flat across all rounds, IQR 0). Per-thread probe (one run each, `/proc/<pid>/task`): at 100 conns the single worker thread ran at 73% (other threads 0 to 1%), at 300 conns 71%; with 2 threads each worker ran at 68% (100) / 67% (300), i.e. 136% / 134% total. So a single worker is busy about 70% and does not look CPU-saturated by this measure, yet throughput stops at ~55k and does not grow from 100 to 300 connections (48k to 55k). The ceiling is therefore not a pegged core by `/proc` accounting; the worker is probably stalled (blocked/idle wake-up latency, serialized hand-off between the connection, Raft and apply stages) about 30% of the time. This was not diagnosed further. With 2 workers the two threads sit at ~67 to 68% each as well, suggesting a similar per-thread utilisation ceiling driven by the pipeline rather than raw CPU.
+- Why CPU/op falls with 1 thread: fewer cross-thread wake-ups/work stealing; the per-op saving is largest where throughput is lowest (1 conn) and shrinks relative to the lost throughput as load rises. Note the total CPU/op also depends on throughput (at higher ops/s each wake-up and sync amortises over more ops), so part of the T2 CPU/op at 100 conns reflects its higher rate.
+- Round 0 of every cell is 10 to 20% faster and cheaper for both variants (warm host); the medians are not affected, and the ratios are stable per round.
+
+### Verdict
+
+`--threads 1` as the cluster default does **not** meet "no more than 5% throughput loss at 100 connections" (loses 29% via the leader, 19% via a follower). It lowers CPU/op by 28% (leader) to 37% (follower) at 100 connections and 30% at 1 connection (where it loses nothing). Keep the default of 2 for throughput; 1 thread is a valid knob for low-concurrency or CPU-constrained deployments, not a general cluster default.
+
+Caveats: tmpfs data dirs; load generator shares the 16 cores; per-thread utilisation probe is a single run per cell; follower rows depend on which node became leader in that run (leader process % for them is the leader node, clients on a follower).
+
+## P8 progress on NVMe: P3 vs P7 vs P8-T4 (2026-10-06)
+
+The "P8 progress" comparison repeated with the node data dirs on the NVMe ext4 root filesystem of the same Linux host.
+
+### Method
+
+- Same builds (P3 `e9cbb1f`, P7 `4c3e3fc`, HEAD `0c951ae`), same bench binary, same driver logic as "P8 progress". The only change: node data dir (and node config/log files) in a scratch directory on the root filesystem, deleted after each run.
+- Filesystem: ext4 on NVMe.
+- 3-node loopback cluster, plaintext, defaults, fresh cluster per run. 10 s window after 2.5 s warm-up. CPU/op = utime+stime of the three node processes (/proc) / delta of cmd-put+reserve+delete on the leader's /admin. ops/s = bstk-bench `ops_per_sec` (whole 14 s run). put-reserve-delete, body 16.
+- Configs: leader and follower at 1 connection; leader and follower at 100 connections (the follower at 100 added for symmetry with the tmpfs run). 8 rounds, 12 runs per round (96 runs, no failures); builds interleaved P3,P7,HEAD in even rounds and HEAD,P7,P3 in odd rounds. Median and inclusive-quartile IQR.
+- fdatasync probe (after the run, python, 200-byte append + `os.fdatasync`, 2000 samples, same dir): p50 3.85 ms, p90 4.24 ms, p99 6.06 ms. (Measured once, after the run, so it reflects the disk state at that moment only.)
+
+### IMPORTANT: the disk changed regime during the session
+
+Every build and config shows the same step change in throughput between rounds 5 and 6, independent of build or order:
+
+| config | ops/s rounds 0-4 | ops/s rounds 6-7 |
+|---|---:|---:|
+| leader 1 conn | ~380 | ~108 |
+| follower 1 conn | ~367 | ~108 |
+| leader 100 conn | ~17,500-18,000 | ~5,400 |
+| follower 100 conn | ~18,200-18,700 | ~5,300-5,400 |
+
+(round 5 is mixed: leader-1/P3 308, follower 1-conn already 110.) The nodes are fsync-bound on this disk, so the device got about 3.5x slower per sync (likely drive-internal: SLC cache exhausted / thermal / background GC; not diagnosed, no other jobs seen). CPU/op also rises in the slow regime (1 conn leader P3 905 -> 1449 us; 100 conn leader P3 44.7 -> 58 us), because the slower sync means fewer ops share each sync and each op carries more fixed work. The all-rounds medians therefore sit in between the regimes with a huge IQR. The tables below give both: **stable regime (rounds 0-4, n=5)** as the primary result (IQR is tiny there) and all 8 rounds for completeness.
+
+### Results, stable regime (rounds 0-4, n=5 per cell)
+
+| mode | conns | build | ops/s median | IQR | CPU us/op median | IQR |
+|---|---:|---|---:|---:|---:|---:|
+| leader | 1 | P3 | 384 | 1 | 905.3 | 1.9 |
+| leader | 1 | P7 | 379 | 1 | 678.2 | 5.1 |
+| leader | 1 | HEAD | 383 | 0 | 629.4 | 7.5 |
+| leader | 100 | P3 | 17,951 | 36 | 44.7 | 0.1 |
+| leader | 100 | P7 | 17,335 | 34 | 28.1 | 0.2 |
+| leader | 100 | HEAD | 17,488 | 18 | 27.7 | 0.1 |
+| follower | 1 | P3 | 367 | 1 | 972.0 | 7.3 |
+| follower | 1 | P7 | 366 | 3 | 728.4 | 17.5 |
+| follower | 1 | HEAD | 369 | 2 | 699.4 | 3.1 |
+| follower | 100 | P3 | 18,207 | 46 | 43.1 | 0.1 |
+| follower | 100 | P7 | 18,336 | 20 | 29.8 | 0.1 |
+| follower | 100 | HEAD | 18,698 | 44 | 28.9 | 0.2 |
+
+Ratios of medians (HEAD / other), stable regime:
+
+| mode | conns | ops/s HEAD/P7 | CPU/op HEAD/P7 | ops/s HEAD/P3 | CPU/op HEAD/P3 |
+|---|---:|---:|---:|---:|---:|
+| leader | 1 | 1.01 | 0.93 | 1.00 | 0.70 |
+| leader | 100 | 1.01 | 0.98 | 0.97 | 0.62 |
+| follower | 1 | 1.01 | 0.96 | 1.01 | 0.72 |
+| follower | 100 | 1.02 | 0.97 | 1.03 | 0.67 |
+
+### Results, all 8 rounds (both regimes mixed; n=8 per cell)
+
+| mode | conns | build | ops/s median | IQR | CPU us/op median | IQR |
+|---|---:|---|---:|---:|---:|---:|
+| leader | 1 | P3 | 382 | 125 | 907.1 | 170.3 |
+| leader | 1 | P7 | 379 | 68 | 680.8 | 109.5 |
+| leader | 1 | HEAD | 383 | 69 | 638.0 | 112.8 |
+| leader | 100 | P3 | 17,919 | 12,459 | 44.7 | 13.1 |
+| leader | 100 | P7 | 17,310 | 12,019 | 28.3 | 15.0 |
+| leader | 100 | HEAD | 17,482 | 12,101 | 27.7 | 14.5 |
+| follower | 1 | P3 | 366 | 256 | 978.7 | 504.8 |
+| follower | 1 | P7 | 365 | 258 | 737.5 | 406.3 |
+| follower | 1 | HEAD | 368 | 260 | 705.1 | 389.2 |
+| follower | 100 | P3 | 18,152 | 12,846 | 43.3 | 14.5 |
+| follower | 100 | P7 | 18,334 | 12,974 | 29.8 | 12.7 |
+| follower | 100 | HEAD | 18,688 | 13,267 | 29.0 | 12.5 |
+
+Ratios, all 8 rounds: CPU/op HEAD/P3 0.70 / 0.62 / 0.72 / 0.67 (leader-1, leader-100, follower-1, follower-100), HEAD/P7 0.94 / 0.98 / 0.96 / 0.97; ops/s HEAD/P3 1.00 / 0.98 / 1.01 / 1.03, HEAD/P7 1.01 / 1.01 / 1.01 / 1.02. Within each round the ratios are stable even in the slow regime (per-run leader-100 CPU/op: P3 44.7 x5 then 58.2 57.6 58.5; P7 28.1 x5 then 42.8 44.0 44.2; HEAD 27.7 x5 then 41.7 43.6 44.6), so the ratios hold; the absolute values do not.
+
+### Comparison with the tmpfs run (`bench-linux.md`, 8 rounds, no regime change)
+
+| mode | conns | CPU/op tmpfs P3 / P7 / HEAD | CPU/op NVMe (stable) P3 / P7 / HEAD | HEAD/P3 tmpfs -> NVMe | HEAD/P7 tmpfs -> NVMe | ops/s tmpfs HEAD -> NVMe |
+|---|---:|---|---|---|---|---|
+| leader | 1 | 793 / 469 / 444 | 905 / 678 / 629 | 0.56 -> 0.70 | 0.95 -> 0.93 | 4,584 -> 383 |
+| leader | 100 | 69.3 / 29.2 / 28.8 | 44.7 / 28.1 / 27.7 | 0.42 -> 0.62 | 0.99 -> 0.98 | 71,642 -> 17,488 |
+| follower | 1 | 812 / 522 / 497 | 972 / 728 / 699 | 0.61 -> 0.72 | 0.95 -> 0.96 | 3,384 -> 369 |
+| follower | 100 | 94.7 / 53.0 / 51.6 | 43.1 / 29.8 / 28.9 | 0.54 -> 0.67 | 0.97 -> 0.97 | 59,721 -> 18,698 |
+
+Observations:
+
+- With a real fdatasync (about 2.6 ms put latency at 1 connection; the probe shows 3.9 ms per sync in isolation), throughput is sync-bound: ops/s are essentially identical across the three builds (ratios 0.97 to 1.03), so P7/P8 gains show only in CPU, not in throughput, on this disk.
+- 1 connection: CPU/op per op is higher than tmpfs (extra ~100 to 200 us/op for P3 and 200 us for P7/HEAD, i.e. kernel journal/commit and wake-up work), and HEAD/P3 is 0.70 to 0.72, so the "1 conn <= 0.5x P3" gate is further away on NVMe than on tmpfs (0.56 there). HEAD/P7 is 0.93 to 0.96 (4 to 7% lower, small but outside the stable-regime IQR in the leader cases only marginally: leader-1 IQR 5 to 7 us vs a 49 us gap, so real).
+- 100 connections: absolute CPU/op of P7 and HEAD (28 to 30 us) is essentially unchanged from tmpfs (the 15 us/op gate remains unmet, 27.7 us leader), but P3 is much cheaper than on tmpfs (44 vs 69 to 95 us) because with ~18k ops/s instead of ~70k the P3 build spends less CPU on spin/contention; hence HEAD/P3 at 100 conns is 0.62 to 0.67 rather than 0.42 to 0.54. The ratio improvement from P3 is thus smaller on a real disk.
+- HEAD vs P7: 2 to 7% lower CPU/op in all four configs, consistent with the tmpfs run; 100-connection leader gap (27.7 vs 28.1) is small but beyond the tiny stable-regime IQR (0.1 to 0.2).
+- Caveats: (1) disk regime change after round 5 (see above); (2) only 5 stable rounds per cell, so IQRs there are optimistic; (3) the load generator shares the 16 cores; (4) fdatasync latency was probed once, post-run, not per regime.
+
 ## P8 progress: P3 vs P7 vs P8-T4 on Linux (2026-10-06)
 
 Host: a quiet Linux workstation: Manjaro, kernel 7.2.3, 16 cores, rustc 1.98.1 (`cargo +1.98.1`; the default stable 1.95 is too old for the workspace).
@@ -42,7 +178,7 @@ Host: a quiet Linux workstation: Manjaro, kernel 7.2.3, 16 cores, rustc 1.98.1 (
 
 #### Deviations to be aware of
 
-1. **Data dirs are on tmpfs, not NVMe.** `df -T /tmp` on pc is `tmpfs` (the root filesystem, `/dev/nvme0n1p5` ext4, is not under `/tmp`). So the Raft logs lived in RAM and `fdatasync` is nearly free. Absolute numbers (especially at 1 connection, where the flush wait is on the critical path) are therefore not what a real disk would give; the per-op CPU for the sync itself (journal commit work in the kernel) is missing. A rerun with the data dirs on the ext4 root would need a path outside `/tmp/bstk-p8/`.
+1. **Data dirs are on tmpfs, not NVMe.** So the Raft logs lived in RAM and `fdatasync` is nearly free. Absolute numbers (especially at 1 connection, where the flush wait is on the critical path) are therefore not what a real disk gives; the per-op CPU of the sync itself (journal commit work in the kernel) is missing. See "P8 progress on NVMe".
 2. The load generator shares the 16 cores with the nodes (as in all earlier benches).
 3. ops/s are over the whole 14 s run; CPU/op over the 10 s window.
 

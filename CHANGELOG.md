@@ -67,6 +67,12 @@ Release tags are `v<version>` and match the workspace version in
 
 ### Changed
 
+- **Cluster CPU per operation**: a node keeps recent log entries in
+  memory for replication and apply (up to 4 MiB) instead of reading them
+  back from disk, and writes its commit marker at most every 50 ms. That
+  removes about one write and one to three reads per log entry and node,
+  2–7% less CPU per operation (docs/BENCH.md "P8 progress").
+
 - Cluster `/readyz` (and `beanstalkd_cluster_ready`) is 503 on a node that
   is not in the membership: one waiting to be added, or a removed node that
   still runs. A removed node's clients are disconnected, and their

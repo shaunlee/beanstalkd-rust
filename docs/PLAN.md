@@ -205,7 +205,7 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 | P5 | Production readiness: Linux validation, CI, packaging, operations guide, hardening; see §8 (done) | see §8.5 |
 | P6 | Dynamic cluster membership (add, remove, replace a node online); see §9 | see §9.5 |
 | P7 | Consolidation: robust timing-sensitive tests, a removed node stops by itself, an openraft 0.10 evaluation; see §10 (done) | see §10.4 |
-| P8 | Cluster CPU per operation (the open §7.5 target); see §11 | see §11.4 |
+| P8 | Cluster CPU per operation (the open §7.5 target); see §11 (done: met at 100 connections, not at one) | see §11.4 |
 | later | openraft 0.10 for leader transfer, once 0.10.0 is released (it does not lower CPU, BENCH P7-T3) | — |
 
 ## 4. P1: Write-Ahead Log (detailed plan)
@@ -455,7 +455,7 @@ Only one agent at a time edits the server's wiring (T4); T1–T3 work in separat
 - [x] TLS, `-b` and cluster throughput not below their P3 numbers (±5%) — TLS and `-b` after P4-T6b (2 workers): 0.98–1.07x; cluster 1.06–1.52x; one cluster mTLS cell 0.94x, single block (BENCH P4-T6)
 - [x] Deleting or kicking 1M buried jobs, and releasing 100k reservations of one connection in random order, run in time linear in the count; the oracle proptest still passes (P4-T3)
 - [x] Memory per job ≤ 1.5x the reference and binlog bytes written per operation ≤ 1.2x the reference (or a documented reason) — worst 1.19x and 0.95x
-- [ ] Cluster: CPU per operation at 100 connections ≤ 15 µs (was 20); one-connection CPU per operation at least halved; snapshot peak memory ≤ 1.5x the state size — **partly met**: snapshot peak 0.04–0.17x (P4-T5c); CPU per operation 17.4–17.8 µs (P3 measured 24–26 on the same loaded machine) and one connection 0.55–0.77x of P3: not met, cause and next step in BENCH P4-T6; openraft 0.10 does not lower it (BENCH P7-T3)
+- [ ] Cluster: CPU per operation at 100 connections ≤ 15 µs (was 20); one-connection CPU per operation at least halved; snapshot peak memory ≤ 1.5x the state size — **partly met**: snapshot peak 0.04–0.17x (P4-T5c); CPU per operation 17.4–17.8 µs (P3 measured 24–26 on the same loaded machine) and one connection 0.55–0.77x of P3: not met, cause and next step in BENCH P4-T6; openraft 0.10 does not lower it (BENCH P7-T3); continued in P8 (§11), where the 100-connection part is met as a ratio to P3
 - [x] All differential suites, chaos acceptance (≥ 1,000 in-process seeds, ≥ 100 multi-process runs) and smoke tests green
 - [x] `docs/BENCH.md`, `docs/DESIGN.md` updated
 
@@ -621,13 +621,13 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 | P8-T2 | Write the unsynced commit hint (`save_committed`) at most every few milliseconds and at shutdown, not per commit (T1 #5) | subagent |
 | P8-T3 | A persistent flush thread instead of `spawn_blocking` per flush run (T1 #6). **Dropped**: wake-ups per entry unchanged (condvar signals 3.0 and kevents 4.2 per entry on a follower before and after; `spawn_blocking` already costs one notify, as does waking the thread), and the in-process harness would need a test-only hook to keep its paused clock from jumping during real I/O | subagent |
 | P8-T4 | A tail cache of recent decoded log entries for replication and apply (T1 #3) | subagent |
-| P8-T5 | Tick and connection refresh once per batch entry instead of per item, if the differential suites prove it equivalent; otherwise dropped (T1 #4) | subagent |
-| P8-T6 | Experiments on cross-thread cost: a separate runtime thread for the Raft chain, tokio settings (T1 #2); keep only what measures | subagent |
-| P8-T7 | Coalescing the commit-only AppendEntries (T1 #1): a written design first, reviewed for its effect on openraft's quorum-ack time and our isolation detection, then the change | subagent + reviewer |
+| P8-T5 | Tick and connection refresh once per batch entry instead of per item (T1 #4). **Not done**: 1–3 µs of the 180 µs gap at one connection on a real disk, against a change to how every node applies a batch | — |
+| P8-T6 | Cross-thread cost (T1 #2), measured as one worker thread per node (BENCH "P8-T6"): 30% less CPU per operation at one connection with no throughput loss, but 19–32% less throughput at 100–300 connections, so the default stays at two; documented as an option for low-concurrency clusters (OPERATIONS §2.2). A separate runtime for the Raft chain was not tried | subagent |
+| P8-T7 | Coalescing the commit-only AppendEntries (T1 #1). **Analysis only** (DESIGN §8 "The commit-only AppendEntries"): no openraft option; the workaround answers empty AppendEntries locally (a bounded false quorum ack, delayed follower applies) for an estimated 30–45 µs at one connection, not enough against the real-disk ratio | subagent |
 | P8-Tn | P8 acceptance | lead |
 
 ### 11.4 Acceptance
 
-- [ ] Cluster CPU per operation, as ratios to P3 (`e9cbb1f`) measured on the same machine in interleaved runs, because absolute values differ about 2× between the macOS and Linux hosts: at 100 connections via the leader ≤ 0.75× (the §7.5 "15 µs, was 20"), at one connection ≤ 0.5× (or the reached values with the reason the rest is out of reach). Linux, after P8-T4 (BENCH "P8 progress"): 0.42× at 100 connections (met), 0.56× via the leader and 0.61× via a follower at one connection (not met; tmpfs data dirs)
-- [ ] Throughput at 100 connections not lower than before P8 by more than 5%
+- [x] Cluster CPU per operation, as ratios to P3 (`e9cbb1f`) measured on the same machine in interleaved runs, because absolute values differ about 2× between the macOS and Linux hosts: at 100 connections via the leader ≤ 0.75× (the §7.5 "15 µs, was 20"), at one connection ≤ 0.5× (or the reached values with the reason the rest is out of reach). **100 connections: met** (0.42× on tmpfs, 0.62× on NVMe; BENCH "P8 progress", "P8 progress on NVMe"). **One connection: not met with the default settings** (0.56× on tmpfs, 0.70× on NVMe via the leader). There the cost is per log entry: the `fdatasync` on every node, which P3 pays too, and openraft 0.9's second, commit-only AppendEntries, which cannot be removed without patching openraft (DESIGN §8). With `--threads 1` it is 0.41× on tmpfs (BENCH "P8-T6"), an option for low-concurrency clusters.
+- [x] Throughput at 100 connections not lower than before P8 by more than 5% (P8-T4 vs P7: 1.01–1.06× on tmpfs, 1.01–1.02× on NVMe)
 - [ ] Differential suites, chaos (1,000 in-process seeds, 20 multi-process runs per scenario), smoke and CI green

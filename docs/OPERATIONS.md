@@ -289,7 +289,11 @@ measurement, see [BENCH.md](BENCH.md) "P4-T2" and "P4-T6b"):
 `--threads N` or `server.threads` (1 to 256) overrides it. One thread
 gives the most operations per CPU second; more threads give more
 throughput with many connections or TLS, at a higher CPU cost per
-operation. With a binlog the engine runs on its own extra thread.
+operation. With a binlog the engine runs on its own extra thread. A
+cluster that serves few concurrent clients can use `--threads 1`: about
+30% less CPU per operation at one connection with the same throughput,
+but about 20–30% less peak throughput at 100 or more connections
+(BENCH.md "P8-T6").
 
 ### 2.3 Limits
 
