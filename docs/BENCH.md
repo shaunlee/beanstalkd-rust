@@ -17,6 +17,291 @@ end.
 - **Reference build.** `scripts/build-ref.sh` (both the debug and the `--optimized` tree, which the benchmarks use) patches one comparison in the reference's `conn_timeout` (docs/COMPAT.md D14) and, where the compiler knows it, passes `-Wno-error=stringop-truncation` (gcc 14). Neither changes the hot paths, so the numbers below, measured before the patch existed, stay comparable.
 - **Linux container.** Copy the tree in with `COPYFILE_DISABLE=1` (no `._*` files from macOS tar) and leave out `clients/python/.venv`, `target/`, `.ref/` and `.git`; rebuild `.ref/` inside the container. Run it with `docker run --init`, so that orphaned servers are reaped.
 
+## P8-T1: where cluster CPU per operation goes (2026-10-06)
+
+Binary: HEAD `4c3e3fc`, `cargo build --release` with
+`CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`. 3 nodes on loopback
+(plaintext cluster traffic, default 2 tokio workers, default `[cluster]` settings, data dirs under `/private/tmp`),
+`bstk-bench --scenario put-reserve-delete --body-size 16`, 24 s runs. macOS (Apple M6, 12 cores), shared machine:
+**load average 5 to 12 during all runs** (per-run values in T1); numbers drift by up to 2x with load, so rely on shares and ratios.
+
+### Method
+
+- **CPU per op per node**: `rusage-utime + rusage-stime` from each node's `/admin` before and after an unsampled 6 s window
+  (t = 4 s to 10 s of the run), divided by the operations applied in the window (`cmd-put + cmd-reserve + cmd-delete` of
+  the node; every node applies all ops). Log entries from `last_log_index`.
+- **Component shares**: `/usr/bin/sample` (1 ms, 8 s, run on all three nodes at the same time, later in the same run, after
+  the rusage window), call trees folded into stacks (`parse.py`), Rust v0 symbols demangled with `rustfilt`
+  (scratch install). Idle stacks (`__psynch_cvwait`; `kevent` under tokio's park path) are dropped; shares are of the
+  remaining "busy" samples and are multiplied with the node's rusage us/op to get us/op per component (so absolute
+  per-component numbers carry the error of both). A frame is assigned from the leaf upward: the first frame that matches
+  a component pattern wins (`analyze.py`); socket/file syscalls are attributed to the code that called them. A second
+  view classifies by what the leaf was doing (syscall kind, allocation, clock, user code).
+  Two sampled runs per scenario (`s1`, `s2`) are merged. Caveat: `sample` under-counts running time (it sees 35 to 65% of the
+  rusage CPU in the busy leader) and cannot see kernel time spent in blocking calls' entry/exit, context switches and
+  wake-ups, which is large at one connection (rusage: sys is 65 to 70% of the CPU there). Treat the one-connection
+  shares as "visible user-space + syscall time", and use T3 counters for the wake-up chain.
+- **Counters per entry** (T3): a 40-line C interposer (`interpose.c`, `libcnt.dylib`, `DYLD_INSERT_LIBRARIES`) counts libc
+  `fdatasync/pwrite/pread/recvfrom/sendto/kevent/pthread_cond_signal` per process; separate runs (`c1`, `c2`),
+  deltas over the same 6 s window. These count calls, not time. AppendEntries RPCs per entry: a follower does exactly
+  2 `recvfrom` and 2 `sendto` per entry in every scenario, i.e. 2 RPCs (one with the entry, one commit-only) per entry.
+- Raw data: `raw/<run>/` (`sample{1,2,3}.txt`, `snap*.txt`, `cnt*.txt`, `bench1.json`, `ids.txt`, `load.txt`);
+  scripts `run.sh cluster.sh account.py analyze.py parse.py mkmd.py top.py standalone.sh thr.sh all.sh`.
+- Scenarios: (a) 100 connections via the leader, (b) 1 connection via the leader, (c) 100 via a follower, (d) 1 via a
+  follower. Run names: `s*`/`c*` + `<conns>-<leader|follower>`; thread-count runs `t<threads>-r<rep>-...`.
+
+### Headline findings
+
+1. **At 100 connections via the leader the cluster is already near its floor, and the floor is client socket I/O.**
+   Quiet-window totals: 15.3 to 16.0 us/op (c1, c2, s2; leader 11.5 to 12.0 + 2 x ~2.0 for the followers); 21.7 us/op in the
+   loaded run s1 (load 5 to 8 but with competing compile jobs: leader 16.3). The leader burns 2/3 of its CPU (9.3 of 14.1 us/op in
+   the merged sample view) in `recvfrom`/`sendto` of client connections: exactly 1 recv + 1 send per op (T3: 54.3 recv per
+   entry for 50.1 ops per entry), the same cost a standalone server pays. Standalone with the same tool and load: 5.9 to 6.1 us/op at
+   the standalone default of 1 worker, **8.2 to 12.2 us/op with 2 workers** (`standalone.txt`). So
+   leader ~ standalone-with-2-workers; the cluster-only extras on the leader are about 1.2 (log) + 0.7 (apply) + 0.4 (glue) +
+   0.9 (replication network) + 0.2 (openraft) us/op. The two followers add 2 x 1.9 to 2.4 us/op.
+2. **openraft core is nearly free**: 1.3 to 3.5% of busy samples on every node and scenario (0.2 us/op leader at 100 conn;
+   1.5 to 3.9 us per entry at one connection). Our wire codec (postcard) is 1 to 5%. Nothing here is worth optimizing
+   in openraft's algorithms; the cost is syscalls, thread hand-offs and per-entry file I/O.
+3. **At one connection every log entry (= one op) costs ~206 us of CPU on three nodes (four default-setting runs: 206 to 212; thread-count
+   runs at 2 workers 191 to 257; 354 in the busiest run c2)**: leader 92 to 96, each follower 57, of which sys is 65 to 70%. Per entry and node the counters are fixed:
+   1 `fdatasync`, 2 `pwrite`, 1 to 3 `pread`, 2 AppendEntries in and out (4 socket calls on a follower, 4 + client I/O on the leader),
+   4.2 kevent (4.1 blocking = parks) and 3.0 `pthread_cond_signal` (leader 4.1 to 4.8) per entry.
+   Then ~34% of a follower's visible time is `fdatasync` + `pwrite`/`pread`, ~28% socket calls, 12 to 17% scheduler/park/wake.
+4. **At 100 connections the per-entry cost is amortized over 50 ops** (33 via a follower), so per-entry savings count
+   1/50 as much in us/op as at one connection; the 100-connection levers are per-op: client I/O (66% on the leader) and the
+   followers' apply (0.5 us/op each) and per-op share of log/network (1 to 1.4 us/op each).
+5. **Entries**: no entries at idle (no tick or heartbeat entries; checked 20 s idle: 0). `Op::Tick` is not a factor in this
+   workload. ops per entry: 50 via the leader, 33 via a follower (the follower's forward round-trip limits the batch).
+6. **Worker threads matter more than any single code path**: `--threads 1` on all nodes: 154 to 207 us/op at one connection vs 191
+   to 257 at 2 workers vs 203 to 296 at 3 (-19% in both pairs / baseline / +7 to +15%; runs `t1-*`, `t2-*`, `t3-*`); at 100 connections 12.5 to 13.2 vs 12.7 to
+   19.3 vs 14.9 to 22.4 us/op, but 1 worker caps throughput at ~100k ops/s (the 2-worker leader runs at 148 to 154% CPU
+   and reaches up to 154k in a quiet moment; observed 91k to 154k with the same build). The existing invariant (no throughput loss > 5%)
+   rules out a plain switch to 1 worker.
+
+
+### Tables
+
+#### T1. CPU per operation per node (rusage over an unsampled 6 s window; all runs listed)
+
+| scenario | run | load (start / end) | ops/s | ops per log entry | leader us/op | target-follower us/op | plain-follower us/op (each) | total us/op |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| 1-follower | c1 (syscall counters) |  10.76 8.91 7.75  to  11.75 9.26 7.91  | 3199 | 1.0 | 108.4 | 84.7 | 63.6 | 256.6 |
+| 1-leader | c1 (syscall counters) |  6.29 8.23 7.39  to  6.73 8.19 7.40  | 6272 | 1.0 | 92.3 | - | 56.9 | 206.2 |
+| 100-follower | c1 (syscall counters) |  7.46 8.21 7.44  to  6.80 8.01 7.39  | 111273 | 33.7 | 4.8 | 12.5 | 2.7 | 20.1 |
+| 100-leader | c1 (syscall counters) |  6.81 8.57 7.45  to  7.72 8.67 7.52  | 125777 | 50.1 | 11.9 | - | 2.0 | 15.9 |
+| 1-follower | c2 (syscall counters) |  9.65 9.32 8.19  to  8.33 9.04 8.12  | 3043 | 1.0 | 155.7 | 124.6 | 93.3 | 373.6 |
+| 1-leader | c2 (syscall counters) |  9.40 8.90 7.89  to  9.09 8.87 7.91  | 3796 | 1.0 | 165.4 | - | 94.5 | 354.3 |
+| 100-follower | c2 (syscall counters) |  10.50 9.18 8.05  to  11.75 9.60 8.24  | 76777 | 32.6 | 7.4 | 18.7 | 4.2 | 30.3 |
+| 100-leader | c2 (syscall counters) |  9.19 8.90 7.83  to  8.61 8.78 7.82  | 130407 | 50.1 | 11.5 | - | 1.9 | 15.3 |
+| 1-follower | s1 (sampled later) |  8.01 8.24 7.48  to  11.61 9.05 7.79  | 2223 | 1.0 | 125.6 | 101.7 | 73.3 | 300.6 |
+| 1-leader | s1 (sampled later) |  7.18 8.54 7.48  to  6.49 8.30 7.41  | 6101 | 1.0 | 94.7 | - | 57.6 | 209.9 |
+| 100-follower | s1 (sampled later) |  6.67 8.15 7.40  to  8.03 8.33 7.48  | 106999 | 34.0 | 5.0 | 13.1 | 2.9 | 21.0 |
+| 100-leader | s1 (sampled later) |  4.72 8.37 7.34  to  7.22 8.68 7.48  | 91197 | 50.2 | 16.3 | - | 2.7 | 21.7 |
+| 1-follower | s2 (sampled later) |  11.53 9.59 8.24  to  10.05 9.39 8.21  | 3038 | 1.0 | 159.8 | 122.4 | 93.5 | 375.7 |
+| 1-leader | s2 (sampled later) |  8.24 8.70 7.79  to  7.89 8.59 7.77  | 5827 | 1.0 | 96.6 | - | 57.6 | 211.9 |
+| 100-follower | s2 (sampled later) |  8.60 8.77 7.88  to  10.02 9.07 8.01  | 77203 | 33.1 | 7.1 | 18.1 | 4.1 | 29.3 |
+| 100-leader | s2 (sampled later) |  11.04 9.16 7.88  to  9.56 8.97 7.85  | 125154 | 50.1 | 12.0 | - | 2.0 | 16.0 |
+
+#### T2. Component shares of busy samples, with us/op (share x the role's mean rusage CPU of the s1,s2 runs)
+
+**100-leader** (cpu us/op: leader 14.1 (user 4.0, sys 10.1), plain follower 2.4 (user 1.1, sys 1.3))
+
+| component | leader share | us/op | plain follower share | us/op |
+|---|---:|---:|---:|---:|
+| client connection + protocol | 65.5% | 9.25 | 0.0% | 0.00 |
+| state machine apply / engine | 5.2% | 0.74 | 19.8% | 0.47 |
+| our cluster glue (actor/proposer/forward) | 2.9% | 0.41 | 0.3% | 0.01 |
+| openraft core | 1.3% | 0.19 | 2.6% | 0.06 |
+| our network: client/listener/IO | 6.5% | 0.92 | 21.3% | 0.50 |
+| our network: codec (postcard/wire) | 0.9% | 0.13 | 5.1% | 0.12 |
+| log storage / flush worker | 8.8% | 1.24 | 41.5% | 0.98 |
+| tokio scheduler/park/wake/sync | 8.9% | 1.26 | 9.3% | 0.22 |
+| other | 0.0% | 0.00 | 0.2% | 0.00 |
+
+| leaf class (what the sampled instruction was doing) | leader share | us/op | plain follower share | us/op |
+|---|---:|---:|---:|---:|
+| syscall: socket read/write | 66.2% | 9.35 | 16.0% | 0.38 |
+| syscall: file pread/pwrite | 2.6% | 0.36 | 16.5% | 0.39 |
+| syscall: fdatasync | 3.7% | 0.52 | 18.4% | 0.43 |
+| syscall: thread signal/lock | 1.5% | 0.21 | 2.8% | 0.07 |
+| memory allocation | 2.1% | 0.30 | 5.2% | 0.12 |
+| clock reads | 1.9% | 0.27 | 1.6% | 0.04 |
+| kevent | 0.3% | 0.05 | 1.2% | 0.03 |
+| user code | 21.7% | 3.07 | 38.3% | 0.90 |
+
+**1-leader** (cpu us/op: leader 95.7 (user 34.0, sys 61.6), plain follower 57.6 (user 16.9, sys 40.7))
+
+| component | leader share | us/op | plain follower share | us/op |
+|---|---:|---:|---:|---:|
+| client connection + protocol | 10.6% | 10.10 | 0.0% | 0.00 |
+| state machine apply / engine | 1.7% | 1.61 | 1.7% | 0.97 |
+| our cluster glue (actor/proposer/forward) | 1.7% | 1.61 | 0.3% | 0.16 |
+| openraft core | 3.1% | 2.95 | 2.6% | 1.50 |
+| our network: client/listener/IO | 31.4% | 30.08 | 32.6% | 18.81 |
+| our network: codec (postcard/wire) | 1.5% | 1.44 | 2.2% | 1.27 |
+| log storage / flush worker | 36.3% | 34.71 | 48.5% | 27.96 |
+| tokio scheduler/park/wake/sync | 13.6% | 13.02 | 11.8% | 6.79 |
+| other | 0.1% | 0.13 | 0.3% | 0.16 |
+
+| leaf class (what the sampled instruction was doing) | leader share | us/op | plain follower share | us/op |
+|---|---:|---:|---:|---:|
+| syscall: socket read/write | 37.5% | 35.92 | 28.2% | 16.26 |
+| syscall: file pread/pwrite | 12.2% | 11.68 | 15.9% | 9.17 |
+| syscall: fdatasync | 16.1% | 15.37 | 26.4% | 15.19 |
+| syscall: thread signal/lock | 4.6% | 4.36 | 3.5% | 2.04 |
+| memory allocation | 2.5% | 2.42 | 2.5% | 1.47 |
+| clock reads | 3.5% | 3.39 | 2.2% | 1.29 |
+| kevent | 1.1% | 1.04 | 1.2% | 0.67 |
+| user code | 22.5% | 21.48 | 20.0% | 11.54 |
+
+**100-follower** (cpu us/op: leader 6.1 (user 2.5, sys 3.5), target follower 15.6 (user 3.9, sys 11.7), plain follower 3.5 (user 1.3, sys 2.2))
+
+| component | leader share | us/op | target follower share | us/op | plain follower share | us/op |
+|---|---:|---:|---:|---:|---:|---:|
+| client connection + protocol | 0.0% | 0.00 | 64.6% | 10.07 | 0.0% | 0.00 |
+| state machine apply / engine | 11.6% | 0.71 | 5.3% | 0.83 | 15.1% | 0.53 |
+| our cluster glue (actor/proposer/forward) | 2.3% | 0.14 | 3.1% | 0.48 | 0.6% | 0.02 |
+| openraft core | 3.5% | 0.21 | 0.8% | 0.12 | 2.8% | 0.10 |
+| our network: client/listener/IO | 31.4% | 1.90 | 7.5% | 1.17 | 22.8% | 0.80 |
+| our network: codec (postcard/wire) | 4.4% | 0.26 | 1.2% | 0.18 | 4.5% | 0.16 |
+| log storage / flush worker | 34.0% | 2.06 | 9.2% | 1.43 | 40.4% | 1.42 |
+| tokio scheduler/park/wake/sync | 12.8% | 0.77 | 8.3% | 1.29 | 13.5% | 0.47 |
+| other | 0.2% | 0.01 | 0.0% | 0.00 | 0.3% | 0.01 |
+
+| leaf class (what the sampled instruction was doing) | leader share | us/op | target follower share | us/op | plain follower share | us/op |
+|---|---:|---:|---:|---:|---:|---:|
+| syscall: socket read/write | 24.5% | 1.48 | 65.1% | 10.15 | 18.1% | 0.64 |
+| syscall: file pread/pwrite | 10.5% | 0.63 | 2.5% | 0.38 | 14.7% | 0.52 |
+| syscall: fdatasync | 13.1% | 0.80 | 5.4% | 0.83 | 18.4% | 0.65 |
+| syscall: thread signal/lock | 3.3% | 0.20 | 1.4% | 0.22 | 3.9% | 0.14 |
+| memory allocation | 5.2% | 0.32 | 2.1% | 0.32 | 3.6% | 0.13 |
+| clock reads | 3.6% | 0.22 | 1.8% | 0.28 | 2.5% | 0.09 |
+| kevent | 1.2% | 0.07 | 0.2% | 0.03 | 1.5% | 0.05 |
+| user code | 38.6% | 2.34 | 21.6% | 3.37 | 37.4% | 1.31 |
+
+**1-follower** (cpu us/op: leader 142.7 (user 54.5, sys 88.2), target follower 112.0 (user 35.8, sys 76.3), plain follower 83.4 (user 25.7, sys 57.7))
+
+| component | leader share | us/op | target follower share | us/op | plain follower share | us/op |
+|---|---:|---:|---:|---:|---:|---:|
+| client connection + protocol | 0.0% | 0.00 | 8.6% | 9.60 | 0.0% | 0.00 |
+| state machine apply / engine | 2.6% | 3.67 | 3.1% | 3.45 | 2.6% | 2.18 |
+| our cluster glue (actor/proposer/forward) | 2.4% | 3.49 | 3.5% | 3.96 | 0.9% | 0.73 |
+| openraft core | 2.7% | 3.85 | 3.1% | 3.45 | 2.9% | 2.42 |
+| our network: client/listener/IO | 36.2% | 51.69 | 32.7% | 36.61 | 30.1% | 25.09 |
+| our network: codec (postcard/wire) | 1.9% | 2.78 | 1.5% | 1.68 | 2.6% | 2.18 |
+| log storage / flush worker | 38.9% | 55.46 | 33.9% | 37.96 | 43.0% | 35.88 |
+| tokio scheduler/park/wake/sync | 15.3% | 21.77 | 13.3% | 14.90 | 17.3% | 14.42 |
+| other | 0.0% | 0.00 | 0.4% | 0.42 | 0.6% | 0.48 |
+
+| leaf class (what the sampled instruction was doing) | leader share | us/op | target follower share | us/op | plain follower share | us/op |
+|---|---:|---:|---:|---:|---:|---:|
+| syscall: socket read/write | 29.1% | 41.57 | 32.2% | 36.11 | 23.4% | 19.51 |
+| syscall: file pread/pwrite | 10.9% | 15.50 | 11.6% | 13.05 | 13.5% | 11.27 |
+| syscall: fdatasync | 14.8% | 21.14 | 15.8% | 17.68 | 21.8% | 18.18 |
+| syscall: thread signal/lock | 5.1% | 7.26 | 3.5% | 3.87 | 4.9% | 4.12 |
+| memory allocation | 3.4% | 4.84 | 4.7% | 5.30 | 3.8% | 3.15 |
+| clock reads | 2.3% | 3.23 | 2.2% | 2.44 | 1.7% | 1.45 |
+| kevent | 0.8% | 1.16 | 1.1% | 1.18 | 2.3% | 1.94 |
+| user code | 33.6% | 48.02 | 28.9% | 32.41 | 28.5% | 23.76 |
+
+#### T3. Per-entry counters (interposed libc calls over the same 6 s window; mean of c1,c2 runs)
+
+| scenario | node role | fdatasync | pwrite | pread | recvfrom | sendto | kevent (blocking) | cond_signal | entries/s |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 100-leader | leader | 1.00 | 2.00 | 3.00 | 54.3 | 54.1 | 14.1 (12.1) | 4.79 | 2555 |
+| 100-leader | plain follower | 1.00 | 2.00 | 1.00 | 2.0 | 2.0 | 4.2 (4.1) | 2.98 | 2555 |
+| 1-leader | leader | 1.00 | 2.00 | 3.00 | 5.0 | 5.0 | 7.4 (7.1) | 4.09 | 5034 |
+| 1-leader | plain follower | 1.00 | 2.00 | 1.00 | 2.0 | 2.0 | 4.2 (4.1) | 2.97 | 5034 |
+| 100-follower | leader | 1.01 | 2.01 | 3.00 | 6.1 | 6.1 | 8.3 (8.0) | 4.02 | 2829 |
+| 100-follower | target follower | 1.00 | 2.00 | 1.01 | 37.7 | 37.5 | 10.5 (9.2) | 4.05 | 2829 |
+| 100-follower | plain follower | 1.00 | 2.01 | 1.00 | 2.0 | 2.0 | 4.3 (4.1) | 3.01 | 2829 |
+| 1-follower | leader | 1.00 | 2.00 | 3.01 | 5.0 | 5.0 | 7.3 (7.0) | 4.55 | 3121 |
+| 1-follower | target follower | 1.00 | 2.01 | 1.00 | 4.0 | 4.0 | 6.7 (6.4) | 3.00 | 3121 |
+| 1-follower | plain follower | 1.00 | 1.99 | 1.00 | 2.0 | 2.0 | 4.2 (4.1) | 2.97 | 3121 |
+
+Notes on T3: AppendEntries RPCs per entry per follower = 2 (recvfrom 2.0, sendto 2.0 on a plain follower); `kevent (blocking)`
+is the number of kevent calls with a non-zero timeout (parks of the IO driver); a leader at 100 connections also does
+~1.0 recv + 1.0 send per op for clients (54.3 recvfrom per entry = 50.1 client + 4 from the two followers). Leader preads:
+2 for the two replication streams + 1 for apply; follower: 1 for apply. The 2 pwrites per entry and node are the log append and
+`save_committed` (an unsynced hint, `log_store.rs:725`). One `fdatasync` per entry and node: group commit already merges ops
+into entries; it cannot merge entries at one connection.
+
+#### T4. Reference: standalone and thread counts (same tool, same load window)
+
+Standalone (`standalone.txt`, 1 node, put-reserve-delete, rusage over 8 s):
+
+| conns | threads | us/op (user + sys), 2 runs |
+|---:|---|---|
+| 100 | 1 (standalone default) | 5.9 (1.1 + 4.8); 6.1 (1.2 + 4.9) |
+| 100 | 2 | 12.2 (2.4 + 9.8); 8.2 (1.6 + 6.6) |
+| 1 | 1 | 9.7 (2.5 + 7.2); 7.0 (1.8 + 5.2) |
+| 1 | 2 | 8.9 (2.3 + 6.6); 8.1 (2.1 + 6.0) |
+
+Cluster, 3 nodes via the leader, `--threads N` on every node (`t<N>-r<rep>-*`; total us/op over the 3 nodes; 6 s window):
+
+| conns | threads | rep 1: ops/s, total us/op (leader CPU%) | rep 2: ops/s, total us/op (leader CPU%) |
+|---:|---:|---|---|
+| 100 | 1 | 99.7k, 13.2 (91%) | 105k, 12.5 (91%) |
+| 100 | 2 | 107k, 19.3 (154%) | 154k, 12.7 (148%) |
+| 100 | 3 | 104k, 22.4 (179%) | 148k, 14.9 (172%) |
+| 1 | 1 | 5.4k, 207 (48%) | 7.9k, 154 (52%) |
+| 1 | 2 | 5.4k, 257 (63%) | 7.8k, 191 (70%) |
+| 1 | 3 | 4.9k, 296 (70%) | 7.7k, 204 (76%) |
+
+(The two reps differ by load; compare within a rep. P3 reference at one connection: 343.6 us/op via the leader, so the
+"0.5x" gate is 172 us/op: reached only by 1 worker in a quiet window, 154.)
+
+### Per-role reading
+
+- **Leader, 100 connections**: 11.5 to 16.3 us/op depending on load; 2/3 is client socket recv/send (1 + 1 per op), 9% scheduler, 9% log
+  (append + 3 preads + the flusher), 5% apply, 3% proposer/actor glue, 1.3% openraft, 7% replication network + codec. It runs at
+  148 to 154% CPU, i.e. both workers are busy: it is the throughput bottleneck, so every leader us/op saved is also throughput.
+- **Plain follower, 100 connections**: 1.9 to 2.8 us/op = ~100 to 140 us per entry of 50 ops: 41% log (fdatasync 18%, pwrite 15%
+  incl. `save_committed` 4%, `read_entries` 4%), 20% apply (0.47 us/op: engine `handle` 12%, `refresh_conn_tick` 3.4%,
+  `process_queue` 3.4%, decode of the `EngineInput`s 2.8%), 21% listener socket calls + 5% codec, 9% scheduler. One
+  follower is ~25% busy, so its 2nd worker is mostly idle weight (1 worker would save ~19% of its one-connection CPU, nothing measurable at 100).
+- **Target follower (100 via a follower)**: 12.5 to 18.7 us/op: 65% client socket I/O (same as a leader), plus forward/glue 3%;
+  the leader then costs 4.8 to 7.4 us/op (no client I/O but 33 ops per entry instead of 50, so per-entry costs weigh 1.5x).
+  Totals via a follower: 20.1 / 29.3 / 30.3 / 21.0 (c1, s2, c2, s1) vs 15.3 to 21.7 via the leader.
+- **One connection**: per entry the leader spends 92 to 96 us (35% log incl. fdatasync 15, 31% replication/listener socket calls, 14% scheduler,
+  10% client socket) and each follower 57 (48% log: fdatasync 15 + pwrite/pread 9 + flusher hand-off, 33% socket calls, 12% scheduler),
+  with sys time 65 to 70%. Ten of the ~14 libc calls per entry on a follower are not "work": 2 kevent-parks, 3 cond-signals,
+  the AppendEntries pair carrying no entry, and the `save_committed` write.
+
+### Ranked candidate savings
+
+Savings are estimates (us per op at 100 connections via the leader, 3 nodes together; us per op = per entry at one connection,
+out of ~206), derived from the per-entry counters (T3) times the per-call costs in the profile (socket call 4.1 us on a follower,
+`pread`/`pwrite` ~3 us, `fdatasync` 15 to 18 us, park/wake chain ~5 us) and the component inclusive shares; they are not measured
+gains and are listed from largest expected gain at 100 connections (the open gate) down.
+
+| # | candidate | est. save at 100 conn via leader (us/op) | est. save at 1 conn (us/op) | needs openraft 0.9 patch? | evidence |
+|---|---|---:|---:|---|---|
+| 1 | **Defer / coalesce the commit-only AppendEntries** (empty AE sent right after each commit; 2 RPCs per entry per follower today). In `PeerClient::append_entries` answer a no-entry, no-new-info AE locally with the matching success and carry `leader_commit` on the next real AE or within a short bound (heartbeats must still pass; a follower with forwarded inputs outstanding, i.e. the via-follower target, must not be delayed). | 0.8 to 1.1 (5 to 7%) | 40 to 55 (20 to 27%) | no (network layer only; relies on how openraft 0.9 treats the reply to an empty AE, to be verified by the differential and chaos suites) | T3: 2.0 recvfrom + 2.0 sendto per entry on every follower at every concurrency; follower socket calls = 28% of its visible time, leader replication socket calls ~31% at 1 conn; each RPC also costs a wake-up chain (cond_signal 3.0/entry, parks 4.1/entry on a follower). |
+| 2 | **Reduce 2-worker cross-thread cost of client I/O on the leader** (experiments, not a known fix): standalone 2 workers cost 8.2 to 12.2 us/op vs 5.9 to 6.1 with 1; the leader at 100 conn is 66% socket syscalls at 4.5 us per call vs ~3 at one worker. Ideas to test one by one: separate runtime/thread for the Raft chain (RaftCore, replication, flusher callbacks, `serve_peer`) so client workers are not woken for Raft events; `disable_lifo_slot`; fewer wake-ups between connection task and actor. | 2 to 4 (if it reaches the 1-worker figure; unproven) | about 40 (-19% in both 1-worker pairs, T4) | no (runtime/config) | T4: cluster 1 worker 12.5 to 13.2 us/op vs 12.7 to 19.3 at 2, but 1 worker loses throughput (91% CPU, ~100k vs up to 154k); the gate "no throughput loss > 5%" forbids simply setting 1 worker. |
+| 3 | **Tail cache of recent decoded log entries** instead of `pread` + postcard decode per read: 3 reads per entry on the leader (2 replication streams + apply), 1 per follower. | 0.3 to 0.4 | 15 to 25 (7 to 12%) | no (our `LogStore`) | T3: pread 3.0 leader / 1.0 follower per entry; `read_entries` 4% of a follower (1.8% at 1 conn), leader file pread/pwrite leaf 0.36 us/op; `Entry`/`EngineInput` deserialize 1.9 to 2.8% on followers. |
+| 4 | **Cheaper apply per item**: the state machine applies each batch item as engine call + `tick(now)` + `refresh_conn_tick` + `process_queue` (3.4% each on a follower). Do the tick/refresh once per entry (same `now` for all items of an entry). Must be shown idempotent under the differential suites; if not, it needs a versioned `Op`. Also avoid re-decoding items (`EngineInput` deserialize 2.8%). | 0.3 to 0.5 (leader 0.74 + follower 0.47 x 2 us/op of apply; guess a third of it) | 1 to 3 | no | `apply_conn` 16% of a follower busy at 100 conn (0.38 to 0.47 us/op), leader apply 5.2% (0.74 us/op). |
+| 5 | **Stop writing `save_committed` on every commit** (unsynced hint, one `pwrite` per entry and node): write it at most every N entries or every few ms and at shutdown/leader change. Semantics: the hint must stay safe if stale (module doc in `storage`). | 0.1 to 0.2 | 6 to 12 (3 to 6%) | no (our `LogStore`; openraft keeps calling it) | T3: pwrite 2.0 per entry (append + hint); `save_committed` 3.9 to 4.3% of a follower's visible time. |
+| 6 | **Persistent flush thread** (a dedicated thread + condvar/channel) instead of `spawn_blocking` per flush run: today each idle -> busy transition goes through tokio's blocking pool (spawn, mutex, condvar signal), then the callback wakes RaftCore across threads. | 0.1 to 0.2 | 5 to 10 | no | `Flusher::push/submit` 2.0%, `spawn_blocking` 1.9%, `Condvar::notify_one_slow` 2.0% of a follower at 1 conn; 4% (of which ~2.5% non-sync) at 100. |
+| 7 | **Larger batches via a follower** (33 vs 50 ops per entry via the leader): let more items ride in one forward message / batch. Applies to the via-follower mode only. | 0 via the leader; 1 to 2 of the 20 to 30 via a follower | 0 | no | via-follower leader costs 4.8 to 7.4 us/op vs ~2 to 5 non-client us/op via the leader; entries/s 2.8k vs 2.6k although ops/s is lower. |
+| - | Not a candidate: `fdatasync` (1 per entry and node, 15 to 18 us; 45 to 54 us per entry = 22 to 26% at 1 conn, 0.4 to 0.65 us/op at 100); needed for durability; only amortized by bigger batches, which cost latency. openraft core (1.3 to 3.5%), postcard codec (1 to 5%), allocation (2 to 5%), clock reads (1.6 to 3.6%, nearly all inside tokio's worker/time driver), no tick or heartbeat entries. | | | | |
+
+Combined (1 + 3 + 5 + 6, none overlapping, all without patching openraft): ~65 to 100 us of ~206 per op at 1 conn (32 to 48%),
+which would meet the "<= 0.5x of P3 = 172 us" gate with margin (the combined estimate is ~106 to 141 us; the 2-worker runs at 191 to 257
+us need at least ~20 to 85 us). At 100 conn via the leader the same set saves ~1.4 to 1.9 us/op (9 to 12%): 15.3 to 16.0 -> ~13.5 to 14.5
+in a quiet window. Reaching "<= 15 us" robustly under load needs item 2 (the client-I/O floor is 66% of the leader and the leader is the
+throughput bottleneck at 148 to 154% CPU), because the cluster-only part (everything but client socket calls) is only ~5 us/op on the
+leader and ~4 us/op on the two followers together.
+
+### Gate status from these data
+
+- 100 connections via the leader, total CPU per op: 15.3, 15.9, 16.0 (quiet-ish), 21.7 (noisy); 12.5 to 13.2 with 1 worker; 12.7 with 2
+  workers in the quietest run (t2-r2, 154k ops/s). So the 15 us gate is within noise of the current build; the lead should take the
+  acceptance numbers from a quiet window and compare interleaved A/B runs.
+- 1 connection via the leader: 206 to 212 (default 2 workers, load 6 to 8), 191 (t2-r2); P3 343.6 -> 0.56 to 0.62x; gate 172.
+  Counters and the ranking say items 1, 3, 5, 6 can close that without touching openraft.
+
 ## P7-T3: openraft 0.10 evaluation (2026-10-05)
 
 Question: does `openraft 0.10.0-alpha.36` reach the cluster CPU targets of

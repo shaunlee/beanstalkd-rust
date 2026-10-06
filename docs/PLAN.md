@@ -610,7 +610,7 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 ### 11.2 Facts checked before planning
 
 - Inputs are already batched before Raft (`Op::Batch`, at most one batch outstanding, P3-FD), and replies are built only by the owner (P4-T5a). So "one log entry per operation" holds only at low concurrency, where the cost is per entry: client → leader → propose → append and flush → AppendEntries to each follower → their flush → commit → apply → a second, commit-only AppendEntries, with thread wake-ups on every node at every step (P4-T5b).
-- No current profile splits the cluster cost by node and component (openraft core, our network and codec, flush worker, engine apply, tokio scheduling, syscalls). P8-T1 measures that first; the remaining tasks are chosen from its numbers.
+- P8-T1 (BENCH "P8-T1") profiled the cluster: at 100 connections via the leader it is at 15.3–16.0 µs/op in a quiet window, two thirds of the leader's CPU being client socket I/O (as standalone with two workers); openraft's core is 1–4% and the codec 1–5%. At one connection each entry costs about 206 µs on three nodes, 65–70% in the kernel: per node and entry one `fdatasync`, two `pwrite`, one to three `pread`, two AppendEntries (one commit-only), four parks. Each per-entry saving below is measured by call counters (deterministic) and interleaved CPU runs, since single gains are smaller than the machine's noise.
 - The development machine is shared and often loaded (load average 15–85 in P7), so absolute numbers drift; plans compare interleaved runs and use profile shares, and the acceptance numbers come from a quiet window or a Linux runner, stated with the load.
 
 ### 11.3 Tasks
@@ -618,7 +618,12 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 | Task | Content | Owner |
 |---|---|---|
 | P8-T1 | Profile a 3-node cluster (100 connections and 1 connection, via leader and via follower): CPU per node, then per component, from sampled stacks; a ranked list of candidate savings with estimated µs/op each | subagent |
-| P8-T2… | Chosen from T1's list, one small change per task, each measured against its parent commit | subagents |
+| P8-T2 | Write the unsynced commit hint (`save_committed`) at most every few milliseconds and at shutdown, not per commit (T1 #5) | subagent |
+| P8-T3 | A persistent flush thread instead of `spawn_blocking` per flush run (T1 #6) | subagent |
+| P8-T4 | A tail cache of recent decoded log entries for replication and apply (T1 #3) | subagent |
+| P8-T5 | Tick and connection refresh once per batch entry instead of per item, if the differential suites prove it equivalent; otherwise dropped (T1 #4) | subagent |
+| P8-T6 | Experiments on cross-thread cost: a separate runtime thread for the Raft chain, tokio settings (T1 #2); keep only what measures | subagent |
+| P8-T7 | Coalescing the commit-only AppendEntries (T1 #1): a written design first, reviewed for its effect on openraft's quorum-ack time and our isolation detection, then the change | subagent + reviewer |
 | P8-Tn | P8 acceptance | lead |
 
 ### 11.4 Acceptance
