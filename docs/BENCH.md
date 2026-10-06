@@ -17,6 +17,77 @@ end.
 - **Reference build.** `scripts/build-ref.sh` (both the debug and the `--optimized` tree, which the benchmarks use) patches one comparison in the reference's `conn_timeout` (docs/COMPAT.md D14) and, where the compiler knows it, passes `-Wno-error=stringop-truncation` (gcc 14). Neither changes the hot paths, so the numbers below, measured before the patch existed, stay comparable.
 - **Linux container.** Copy the tree in with `COPYFILE_DISABLE=1` (no `._*` files from macOS tar) and leave out `clients/python/.venv`, `target/`, `.ref/` and `.git`; rebuild `.ref/` inside the container. Run it with `docker run --init`, so that orphaned servers are reaped.
 
+## P8 progress: P3 vs P7 vs P8-T4 on Linux (2026-10-06)
+
+Host: a quiet Linux workstation: Manjaro, kernel 7.2.3, 16 cores, rustc 1.98.1 (`cargo +1.98.1`; the default stable 1.95 is too old for the workspace).
+
+### Builds
+
+| label | commit | note |
+|---|---|---|
+| P3 | `e9cbb1f` | "Accept P3"; named as the P3 baseline in docs/BENCH.md "P4-T6" (the last P3 commit; P4 planning follows it) |
+| P7 | `4c3e3fc` | before P8 |
+| HEAD | `0c951ae` | P8-T2 commit hint (50 ms) + P8-T4 tail cache |
+
+`cargo +1.98.1 build --release -p bstk-server` in one `git worktree` per commit (separate target dirs). One `bstk-bench` binary, built from HEAD, drove all three (its CLI is the same; `--scenario put-reserve-delete --body-size 16 --conns N --json`). All three builds accept the same node config (`[[listener]]`, `[http]`, `[cluster]` with `insecure_plaintext = true`, three `[[cluster.peer]]`) and `--cluster-init`, and expose `/admin`.
+
+### Method
+
+- 3-node cluster on loopback, plaintext cluster traffic, default `[cluster]` settings, default 2 tokio workers, a fresh cluster and empty data dirs per run, generated like `bench/run-matrix.sh` `start_cluster`. Driver: a Python driver (raw rows kept outside the repo).
+- Per run: wait until all nodes are ready and a leader is known, then start `bstk-bench` with `--duration 14`. Snapshot at t = 2.5 s and t = 12.5 s after the bench was started: **10.0 s window, the first 2.5 s (setup + warm-up) excluded**.
+- **CPU/op** = (utime + stime of all three node processes from `/proc/<pid>/stat`, delta over the window, 100 Hz ticks) / (delta of `cmd-put + cmd-reserve + cmd-delete` on the leader's `/admin` over the same window). Every node applies every op, so this is cluster-wide CPU per client op. **ops/s** is the `ops_per_sec` figure of the bstk-bench output (whole 14 s run).
+- Configs: put-reserve-delete, body 16, via the leader and via a follower, at 1 and 100 connections. 8 rounds (12 runs each = 96 runs); in every round all configs run, builds interleaved P3, P7, HEAD in even rounds and HEAD, P7, P3 in odd rounds. One run (HEAD follower 1 conn, round 3) failed to get ready and was rerun at the end, same round tag.
+- Load average (1 min, `/proc/loadavg`) recorded at the start and end of every run. Idle before the session: 0.26. During the runs: start 3.1 to 6.6 (median 4.2); the load is mostly our own load generator and nodes (the 1-minute average carries the previous runs), no other jobs were seen. Machine otherwise quiet.
+- Median and IQR (inclusive quartiles) over the 8 runs.
+
+#### Deviations to be aware of
+
+1. **Data dirs are on tmpfs, not NVMe.** `df -T /tmp` on pc is `tmpfs` (the root filesystem, `/dev/nvme0n1p5` ext4, is not under `/tmp`). So the Raft logs lived in RAM and `fdatasync` is nearly free. Absolute numbers (especially at 1 connection, where the flush wait is on the critical path) are therefore not what a real disk would give; the per-op CPU for the sync itself (journal commit work in the kernel) is missing. A rerun with the data dirs on the ext4 root would need a path outside `/tmp/bstk-p8/`.
+2. The load generator shares the 16 cores with the nodes (as in all earlier benches).
+3. ops/s are over the whole 14 s run; CPU/op over the 10 s window.
+
+### Results
+
+| mode | conns | build | ops/s median | IQR | CPU us/op median | IQR | load1 at start (median) | runs |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| leader | 1 | P3 | 3,564 | 189 | 793.3 | 28.5 | 4.6 | 8 |
+| leader | 1 | P7 | 4,435 | 165 | 468.6 | 17.8 | 4.4 | 8 |
+| leader | 1 | HEAD | 4,584 | 123 | 443.5 | 14.4 | 4.5 | 8 |
+| leader | 100 | P3 | 68,805 | 5,693 | 69.3 | 5.4 | 3.9 | 8 |
+| leader | 100 | P7 | 70,929 | 5,045 | 29.2 | 2.3 | 4.2 | 8 |
+| leader | 100 | HEAD | 71,642 | 7,435 | 28.8 | 2.9 | 4.2 | 8 |
+| follower | 1 | P3 | 2,684 | 164 | 811.9 | 46.0 | 4.1 | 8 |
+| follower | 1 | P7 | 3,207 | 230 | 521.9 | 39.1 | 4.1 | 8 |
+| follower | 1 | HEAD | 3,384 | 205 | 496.7 | 26.9 | 4.1 | 8 |
+| follower | 100 | P3 | 53,976 | 7,055 | 94.7 | 12.7 | 3.7 | 8 |
+| follower | 100 | P7 | 57,955 | 6,985 | 53.0 | 5.8 | 4.2 | 8 |
+| follower | 100 | HEAD | 59,721 | 6,648 | 51.6 | 5.7 | 3.8 | 8 |
+
+#### Ratios of medians (HEAD / other)
+
+| mode | conns | ops/s HEAD/P7 | CPU/op HEAD/P7 | ops/s HEAD/P3 | CPU/op HEAD/P3 |
+|---|---:|---:|---:|---:|---:|
+| leader | 1 | 1.03 | 0.95 | 1.29 | 0.56 |
+| leader | 100 | 1.01 | 0.99 | 1.04 | 0.42 |
+| follower | 1 | 1.06 | 0.95 | 1.26 | 0.61 |
+| follower | 100 | 1.03 | 0.97 | 1.11 | 0.54 |
+
+HEAD vs P7: CPU/op 1 to 5% lower at every config (P8-T2 and P8-T4 together); at 100 connections via the leader the difference (28.8 vs 29.2) is inside the IQR (2.3 to 2.9).
+
+#### Gates (this machine)
+
+| gate | result | verdict |
+|---|---|---|
+| 100 conn via leader <= 15 us/op | 28.8 us/op (IQR 2.9; best single run 24.6; P7 29.2, P3 69.3) | **not met** |
+| 1 conn <= 0.5x P3 (CPU/op) | 0.56x via the leader (443.5 vs 793.3); 0.61x via a follower | **not met** (0.56; every HEAD run is 0.52 to 0.68 of the P3 median; see caveat 1: tmpfs) |
+
+Per-run CPU/op (us), in round order 0 to 7, for the gate cells:
+
+- leader 1: P3 676.8 754.4 781.4 794.9 791.7 796.6 824.2 822.8; P7 430.2 453.9 464.7 461.8 472.6 475.5 486.4 483.6; HEAD 410.1 419.8 437.0 443.1 446.3 444.0 449.8 461.1
+- leader 100: P3 55.8 61.8 67.7 68.1 70.5 70.9 74.1 74.1; P7 25.7 27.2 28.1 29.1 29.4 30.0 32.7 30.7; HEAD 24.6 26.9 26.8 29.0 28.7 29.8 30.0 31.1
+
+The absolute CPU/op here (about 29 us at 100 connections) is about twice the macOS figure (14 to 16 us, docs/BENCH.md P8-T1); the 15 us gate was set from macOS runs, so it is not comparable without a Linux-specific baseline.
+
 ## P8-T1: where cluster CPU per operation goes (2026-10-06)
 
 Binary: HEAD `4c3e3fc`, `cargo build --release` with

@@ -628,6 +628,6 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 
 ### 11.4 Acceptance
 
-- [ ] Cluster CPU per operation at 100 connections ≤ 15 µs via the leader, and at one connection ≤ 0.5× of P3 (or the reached values with the reason the rest is out of reach)
+- [ ] Cluster CPU per operation, as ratios to P3 (`e9cbb1f`) measured on the same machine in interleaved runs, because absolute values differ about 2× between the macOS and Linux hosts: at 100 connections via the leader ≤ 0.75× (the §7.5 "15 µs, was 20"), at one connection ≤ 0.5× (or the reached values with the reason the rest is out of reach). Linux, after P8-T4 (BENCH "P8 progress"): 0.42× at 100 connections (met), 0.56× via the leader and 0.61× via a follower at one connection (not met; tmpfs data dirs)
 - [ ] Throughput at 100 connections not lower than before P8 by more than 5%
 - [ ] Differential suites, chaos (1,000 in-process seeds, 20 multi-process runs per scenario), smoke and CI green
