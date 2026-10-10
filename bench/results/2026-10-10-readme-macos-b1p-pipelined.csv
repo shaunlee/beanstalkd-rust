@@ -1,0 +1,11 @@
+server,scenario,conns,body_size,pipeline,run,ops_per_sec,server_cpu_pct,put_p50_us,put_p99_us,put_p999_us,reserve_p50_us,reserve_p99_us,reserve_p999_us,delete_p50_us,delete_p99_us,delete_p999_us,load_avg,idle_conns,delayed_tubes,server_mode,proxy_cpu_pct,nodes,target_role,cluster_cpu_pct,node_cpu,resent_inputs,forward_rewinds,drop_node_proposals,refused_connections,rejected_puts,term_changes,leader_changes,isolated_after,burst_attempted,burst_completed,burst_errors,burst_rate_achieved,burst_hs_p50_ms,burst_hs_p99_ms
+ref,put-reserve-delete,100,16,16,1,324323.6,98.7,2908.0,5646.5,6510.3,2609.7,4926.2,6367.6,2580.3,5039.0,5276.0,5.12,0,0,none,,,,,,,,,,,,,,,,,,,
+rs,put-reserve-delete,100,16,16,1,443302.8,98.5,2040.0,3793.0,4608.8,2042.5,3789.1,4048.2,2038.1,3779.9,4017.8,5.35,0,0,none,,,,,,,,,,,,,,,,,,,
+ref,put-reserve-delete,100,16,16,2,322736.5,98.7,2809.7,5493.2,6646.3,2686.8,5161.8,6412.7,2628.6,5118.3,6370.5,5.53,0,0,none,,,,,,,,,,,,,,,,,,,
+rs,put-reserve-delete,100,16,16,2,449830.5,98.8,2004.2,3717.5,4864.4,2008.8,3715.1,4116.5,2004.2,3707.2,4049.8,5.57,0,0,none,,,,,,,,,,,,,,,,,,,
+ref,put-reserve-delete,100,16,16,3,320881.1,98.1,2804.1,6069.0,8880.5,2672.6,5569.0,9116.7,2630.0,5647.9,8768.8,5.55,0,0,none,,,,,,,,,,,,,,,,,,,
+rs,put-reserve-delete,100,16,16,3,433563.5,97.7,2049.0,4923.1,7321.2,2051.1,4839.4,7197.5,2047.9,4862.2,7382.1,5.59,0,0,none,,,,,,,,,,,,,,,,,,,
+ref,put-reserve-delete,100,16,16,4,328275.6,98.8,2884.2,5551.5,7054.0,2579.3,5013.4,7199.2,2535.0,4985.2,6800.7,5.19,0,0,none,,,,,,,,,,,,,,,,,,,
+rs,put-reserve-delete,100,16,16,4,443934.1,98.3,2014.3,4202.8,7087.8,2016.0,4110.5,7073.6,2012.8,4076.5,7010.1,5.09,0,0,none,,,,,,,,,,,,,,,,,,,
+ref,put-reserve-delete,100,16,16,5,327089.0,98.7,2792.3,5457.0,7620.8,2629.8,5029.5,6704.5,2588.1,5039.5,5958.5,5.00,0,0,none,,,,,,,,,,,,,,,,,,,
+rs,put-reserve-delete,100,16,16,5,449094.6,98.6,2008.0,3801.7,5234.1,2008.6,3789.3,5186.5,2005.8,3776.2,5106.0,5.00,0,0,none,,,,,,,,,,,,,,,,,,,

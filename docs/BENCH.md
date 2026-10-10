@@ -2,7 +2,7 @@
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`). The newest numbers
-are from tasks P9-T2 and P9-T1 (cluster worker threads), then P8, then P5-T2 (Linux, ratios only), then P4-T6 (the final P4 matrix), then P4-T6b (thread default per mode), then P4-T5c (snapshot memory), then P4-T5b
+are the README numbers (Linux and macOS on an Apple M6), then tasks P9-T2 and P9-T1 (cluster worker threads), then P8, then P5-T2 (Linux, ratios only), then P4-T6 (the final P4 matrix), then P4-T6b (thread default per mode), then P4-T5c (snapshot memory), then P4-T5b
 (cluster wake-ups at low load), then
 P4-T4 (footprint: memory per job, binlog bytes per operation). P4-T2 (tokio worker-thread count and its
 default, the lever the P4-T1 spike found for CPU efficiency) follows,
@@ -16,6 +16,53 @@ end.
 
 - **Reference build.** `scripts/build-ref.sh` (both the debug and the `--optimized` tree, which the benchmarks use) patches one comparison in the reference's `conn_timeout` (docs/COMPAT.md D14) and, where the compiler knows it, passes `-Wno-error=stringop-truncation` (gcc 14). Neither changes the hot paths, so the numbers below, measured before the patch existed, stay comparable.
 - **Linux container.** Copy the tree in with `COPYFILE_DISABLE=1` (no `._*` files from macOS tar) and leave out `clients/python/.venv`, `target/`, `.ref/` and `.git`; rebuild `.ref/` inside the container. Run it with `docker run --init`, so that orphaned servers are reaped.
+
+## README numbers: Linux and macOS on an Apple M6 (2026-10-10)
+
+beanstalkd-rs `30b285d` (0.5.0 plus documentation) against the reference beanstalkd (`25085c5`, `scripts/build-ref.sh --optimized`), default flags on both, measured twice on the same Apple M6 (12 cores, 32 GB):
+
+- **Linux**: kernel 7.0 (aarch64) in an OrbStack VM (12 CPUs, 16 GB), container `rust:1.98.1-slim`, gcc 14.2. Servers pinned to CPUs 0–5 and `bstk-bench` to 6–11 (`taskset`; pinned was 7–25% faster than unpinned for both servers). Binlog and cluster data on a btrfs Docker volume; the cluster also on tmpfs. CPU from `/proc/<pid>/stat` (a container copy of `run-matrix.sh`).
+- **macOS**: native, macOS 27.0.1, APFS, no pinning (client and servers share the 12 cores).
+- Both: `bench/run-matrix.sh`, servers alternated, a fresh server per run, 5 runs × 7 s per cell, loopback, medians (IQR ≤ 4% unless noted). The Mac's load1 at block start was 2.5–5.5, mostly the preceding block. Raw rows: `bench/results/2026-10-10-readme-{linux,macos}-*.csv`.
+
+### put-reserve-delete and producers-consumers (ops/s)
+
+| cell (body 16 unless noted) | Linux ref | Linux rs | rs/ref | macOS ref | macOS rs | rs/ref |
+|---|---:|---:|---:|---:|---:|---:|
+| put-reserve-delete, 1 conn | 56,176 | 53,943 | 0.96 | 60,018 | 60,837 | 1.01 |
+| put-reserve-delete, 10 conns | 339,283 | 468,310 | 1.38 | 168,470 | 207,395 | 1.23 |
+| put-reserve-delete, 100 conns | 392,713 | 516,336 | 1.31 | 206,759 | 249,402 | 1.21 |
+| put-reserve-delete, 100 conns, body 4096 | 362,247 | 463,416 | 1.28 | 195,775 | 236,732 | 1.21 |
+| put-reserve-delete, 100 conns, pipelined ×16 | 490,247 | 643,204 | 1.31 | 324,324 | 443,934 | 1.37 |
+| producers-consumers, 2 conns | 87,693 | 91,682 | 1.05 | 93,613 | 92,062 | 0.98 |
+| producers-consumers, 10 conns | 328,257 | 447,304 | 1.36 | 161,136 | 204,894 | 1.27 |
+| producers-consumers, 100 conns | 422,349 | 500,891 | 1.19 | 205,536 | 242,354 | 1.18 |
+| binlog (`-b`, default fsync), 10 conns | 187,001 | 178,635 | 0.96 | 108,691 | 163,384 | 1.50 |
+| binlog (`-b`, default fsync), 100 conns | 267,391 | 594,148 | 2.22 | 131,105 | 244,972 | 1.87 |
+| binlog, `-f0`, 10 conns | 4,014 | 4,242 | 1.06 | 51,396 | 71,088 | 1.38 |
+
+- Server CPU per operation, rs/ref: 0.76–0.90 on Linux and 0.73–0.90 on macOS at 10 and 100 connections without a binlog (100 conns, body 16: 1.94 against 2.55 µs on Linux); 1.10 on Linux and 1.0 on macOS at one connection. With a binlog rs runs two workers by default and uses 1.0–1.4× the reference's CPU per operation.
+- `-f0` on Linux is bound by the volume's fsync (about 4k ops/s for both), so that ratio says nothing about the servers; APFS's fsync is much cheaper.
+- Where rs does not win: one connection on Linux (0.96, a latency-bound cell at about 18 µs per round trip for both), `-b` at 10 connections on Linux (0.96), CPU per operation with a binlog, and memory per small job (below).
+
+### Cluster, 3 nodes on one machine (beanstalkd-rs only), put-reserve-delete, body 16
+
+| conns | Linux, tmpfs: via leader / via follower | Linux, btrfs volume: via leader | macOS, APFS: via leader / via follower |
+|---:|---|---|---|
+| 1 | 10,604 / 9,125 | 939 | 7,979 / 6,767 |
+| 10 | 58,301 / 44,440 | 5,002 | 39,324 / 33,755 |
+| 100 | 315,667 / 235,685 | 47,718 (IQR 25%) | 167,039 / 138,209 |
+
+CPU of all three nodes per operation at 100 connections via the leader: 6.0 µs (Linux, tmpfs), 12.1 µs (macOS). On the btrfs volume every commit waits for a durable fsync on a majority, which bounds throughput (three cells there spread 25–37%).
+
+### Memory per job (1,000,000 jobs, `bench/footprint.py mem`)
+
+| body | Linux ref | Linux rs | rs/ref | macOS ref | macOS rs | rs/ref |
+|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 219 B | 249 B | 1.13 | 242 B | 286 B | 1.18 |
+| 4096 | 4,299 B | 4,331 B | 1.01 | 5,280 B | 4,383 B | 0.83 |
+
+Idle RSS: rs 6.5 MB (Linux) / 8.1 MB (macOS), the reference 1.6 / 1.8 MB.
 
 ## P9-T2: one against two workers off loopback (2026-10-10)
 
