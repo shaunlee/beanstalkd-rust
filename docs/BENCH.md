@@ -23,7 +23,7 @@ beanstalkd-rs `30b285d` (0.5.0 plus documentation) against the reference beansta
 
 - **Linux**: kernel 7.0 (aarch64) in an OrbStack VM (12 CPUs, 16 GB), container `rust:1.98.1-slim`, gcc 14.2. Servers pinned to CPUs 0–5 and `bstk-bench` to 6–11 (`taskset`; pinned was 7–25% faster than unpinned for both servers). Binlog and cluster data on a btrfs Docker volume; the cluster also on tmpfs. CPU from `/proc/<pid>/stat` (a container copy of `run-matrix.sh`).
 - **macOS**: native, macOS 27.0.1, APFS, no pinning (client and servers share the 12 cores).
-- Both: `bench/run-matrix.sh`, servers alternated, a fresh server per run, 5 runs × 7 s per cell, loopback, medians (IQR ≤ 4% unless noted). The Mac's load1 at block start was 2.5–5.5, mostly the preceding block. Raw rows: `bench/results/2026-10-10-readme-{linux,macos}-*.csv`.
+- Both: `bench/run-matrix.sh`, servers alternated, a fresh server per run, 5 runs × 7 s per cell, loopback, medians (IQR ≤ 4% unless noted). The Mac's load1 at block start was 2.5–5.5, mostly the preceding block. Raw rows: `bench/results/2026-10-10-readme-{linux,macos}-*.csv`. The README chart is drawn from the Linux column by `bench/readme-chart.py`.
 
 ### put-reserve-delete and producers-consumers (ops/s)
 

@@ -50,6 +50,11 @@ Operations per second, beanstalkd-rs against beanstalkd
 `bstk-bench` load generator on the other 6, loopback, 5 alternated runs
 per cell, medians. 16-byte job bodies unless noted.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/perf-dark.svg">
+  <img alt="Operations per second, beanstalkd against beanstalkd-rs, for the workloads in the table below" src="docs/images/perf-light.svg">
+</picture>
+
 | Workload | beanstalkd | beanstalkd-rs | |
 |---|---:|---:|---:|
 | put-reserve-delete, 1 connection | 56,176 | 53,943 | 0.96× |
