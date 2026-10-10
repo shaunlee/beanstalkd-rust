@@ -206,7 +206,7 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 | P6 | Dynamic cluster membership (add, remove, replace a node online); see §9 | see §9.5 |
 | P7 | Consolidation: robust timing-sensitive tests, a removed node stops by itself, an openraft 0.10 evaluation; see §10 (done) | see §10.4 |
 | P8 | Cluster CPU per operation (the open §7.5 target); see §11 (done: met at 100 connections, not at one) | see §11.4 |
-| P9 | One worker thread per cluster node without the throughput loss, for the one-connection CPU target; see §12 | see §12.4 |
+| P9 | One worker thread per cluster node without the throughput loss, for the one-connection CPU target; see §12 (done: not reachable, the single worker is CPU-bound; default stays two) | see §12.4 |
 | later | openraft 0.10 for leader transfer, once 0.10.0 is released (it does not lower CPU, BENCH P7-T3) | — |
 
 ## 4. P1: Write-Ahead Log (detailed plan)
@@ -652,12 +652,11 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 | Task | Content | Owner |
 |---|---|---|
 | P9-T1 | Measure throughput and CPU per operation for one and two workers × `MAX_INFLIGHT` 1, 2 and 4 (an experimental build), at 1, 100 and 300 connections via the leader, tmpfs; find where the single worker waits if `MAX_INFLIGHT` is not it. **Done** (BENCH "P9-T1"): `MAX_INFLIGHT` stays 1; the single worker's core is saturated | subagent |
-| P9-T2 | One against two workers with the clients on another host over the LAN (client traffic through a real network interface), at 1, 100 and 300 connections via the leader and 100 via a follower: does the single-worker cap survive off loopback? | subagent |
-| P9-T3… | Chosen from T2: change the default and its docs, or close P9 with the reached values | subagents |
+| P9-T2 | One against two workers with the clients on another host over the LAN (client traffic through a real network interface), at 1, 100 and 300 connections via the leader and 100 via a follower: does the single-worker cap survive off loopback? **Done** (BENCH "P9-T2"): yes, one worker gives 0.68–0.79 of two at 100–1000 connections, its core full of its own user and system time | subagent |
 | P9-Tn | P9 acceptance | lead |
 
 ### 12.4 Acceptance
 
-- [ ] With the new cluster default, one-connection CPU per operation ≤ 0.5× of P3 on tmpfs and on NVMe (interleaved runs on the Linux host), or the reached values with the reason
-- [ ] Throughput at 100 and 300 connections (leader and follower) within 5% of the P8 default, on tmpfs and on NVMe
-- [ ] Differential suites, chaos (1,000 in-process seeds, 20 multi-process runs per scenario), smoke and CI green
+- [x] With the new cluster default, one-connection CPU per operation ≤ 0.5× of P3 on tmpfs and on NVMe (interleaved runs on the Linux host), or the reached values with the reason. **Reached values, default unchanged at two workers**: 0.56× on tmpfs and 0.70× on NVMe (§11.4). One worker meets the target, but it is CPU-bound on one core at 100 connections and more, on loopback and over a real network alike (BENCH "P9-T1", "P9-T2"), and more outstanding batches do not help; parity would need about 25–30% less CPU per operation on the worker, of which over half is system time for socket I/O. `--threads 1` stays the documented option for low-concurrency clusters (OPERATIONS §2.2)
+- [x] Throughput at 100 and 300 connections (leader and follower) within 5% of the P8 default, on tmpfs and on NVMe (the default did not change)
+- [x] Differential suites, chaos (1,000 in-process seeds, 20 multi-process runs per scenario), smoke and CI green (no code change in P9; CI run 38034910728)

@@ -2,7 +2,7 @@
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`). The newest numbers
-are from task P9-T1 (cluster inflight × threads), then P8, then P5-T2 (Linux, ratios only), then P4-T6 (the final P4 matrix), then P4-T6b (thread default per mode), then P4-T5c (snapshot memory), then P4-T5b
+are from tasks P9-T2 and P9-T1 (cluster worker threads), then P8, then P5-T2 (Linux, ratios only), then P4-T6 (the final P4 matrix), then P4-T6b (thread default per mode), then P4-T5c (snapshot memory), then P4-T5b
 (cluster wake-ups at low load), then
 P4-T4 (footprint: memory per job, binlog bytes per operation). P4-T2 (tokio worker-thread count and its
 default, the lever the P4-T1 spike found for CPU efficiency) follows,
@@ -16,6 +16,35 @@ end.
 
 - **Reference build.** `scripts/build-ref.sh` (both the debug and the `--optimized` tree, which the benchmarks use) patches one comparison in the reference's `conn_timeout` (docs/COMPAT.md D14) and, where the compiler knows it, passes `-Wno-error=stringop-truncation` (gcc 14). Neither changes the hot paths, so the numbers below, measured before the patch existed, stay comparable.
 - **Linux container.** Copy the tree in with `COPYFILE_DISABLE=1` (no `._*` files from macOS tar) and leave out `clients/python/.venv`, `target/`, `.ref/` and `.git`; rebuild `.ref/` inside the container. Run it with `docker run --init`, so that orphaned servers are reaped.
+
+## P9-T2: one against two workers off loopback (2026-10-10)
+
+Build `7b9ba5d`. The question: is the one-worker cap of "P9-T1" a loopback artifact, since on loopback the TCP receive work lands on the sender's core?
+
+### Method
+
+- 3-node plaintext cluster on the Linux host of "P9-T1", tmpfs data dirs, defaults, fresh cluster per run. Client listeners on the wired 1 GbE interface; Raft traffic stays on loopback. The NIC has one IRQ (CPU 8), so the node processes are pinned to the other cores except CPU 8's SMT sibling.
+- Clients: `bstk-bench` on the macOS host over the LAN (ping 0.5–1 ms), put-reserve-delete, body 16, `--duration 14`; the 10 s window starts 2.5 s after the leader's command counters start rising (connection setup at 1000 connections takes seconds). Mac load1 1.2–4.3.
+- T1 = `--threads 1`, T2 = default 2 workers, interleaved, order flipped each round, 6 rounds, 60 runs, no failures. Ratios are per round, then the median.
+
+### Results
+
+| cell | T1 ops/s | T2 ops/s | T1/T2 (IQR) | T1 µs/op | T2 µs/op |
+|---|---:|---:|---:|---:|---:|
+| leader 1 | 3,322 | 3,170 | 1.05 (0.03) | 368 | 499 |
+| leader 100 | 47,291 | 64,764 | 0.74 (0.07) | 28.4 | 42.0 |
+| leader 300 | 59,696 | 85,578 | 0.68 (0.04) | 21.1 | 30.2 |
+| leader 1000 | 58,939 | 84,100 | 0.71 (0.07) | 20.8 | 30.7 |
+| follower 100 | 45,079 | 56,159 | 0.79 (0.08) | 43.4 | 66.8 |
+
+No round at 100 or more connections reached 0.95 (highest 0.88, follower 100). Throughput drifted down over the rounds as in "P9-T1".
+
+### Findings
+
+- The receive work moved off the nodes as expected: softirq is 0.3–2.5% on the node cores (25% of the worker's core on loopback) and lands on the NIC's IRQ core instead (47–54% busy with T1, 72–90% with T2).
+- **The one-worker cap is not a loopback artifact.** With the worker pinned (T1, 300 and 1000 connections) it is runnable 99.4–99.8% of the time, its own run time is 97%, and its core is user 43–45% + sys 52–54%, idle under 1%. Its µs/op is the same as on loopback, so the cap is the worker's own CPU per operation; the loopback softirq was only hidden from the accounting.
+- The client is not the limit: the same client drives T2 to 84–110k ops/s, and T1 gives the same throughput at 300 and 1000 connections.
+- T2 at 300 and 1000 connections probably hits the single NIC IRQ core (88–90% softirq), so the true T1/T2 ratio is if anything lower.
 
 ## P9-T1: proposal inflight × worker threads (2026-10-10)
 
