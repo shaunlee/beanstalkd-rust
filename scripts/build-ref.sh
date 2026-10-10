@@ -15,8 +15,9 @@
 # Two deviations from the pinned source, applied to every tree built:
 #   - prot.c conn_timeout: `deadline_at >= nanoseconds()` becomes `>`
 #     (docs/COMPAT.md D14: a reference bug that loses a TTR timer on Linux).
-#   - -Wno-error=stringop-truncation when the compiler knows it (gcc 14 trips
-#     on tube.c under -Werror; clang rejects the unknown flag).
+#   - -Wno-error=stringop-truncation and -Wno-error=discarded-qualifiers when
+#     the compiler knows them (gcc 14 trips on tube.c and gcc 16 on prot.c's
+#     memchr under -Werror; clang rejects unknown flags).
 set -euo pipefail
 REF_COMMIT=25085c5f090031fd7110613a77fd6f816681d801
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -33,9 +34,11 @@ JOBS="$(getconf _NPROCESSORS_ONLN)"
 
 # -Werror in the probe turns clang's "unknown warning option" into a failure.
 EXTRA_CFLAGS=""
-if echo 'int x;' | "${CC:-cc}" -Werror -Wno-error=stringop-truncation -x c -fsyntax-only - 2>/dev/null; then
-  EXTRA_CFLAGS="-Wno-error=stringop-truncation"
-fi
+for flag in -Wno-error=stringop-truncation -Wno-error=discarded-qualifiers; do
+  if echo 'int x;' | "${CC:-cc}" -Werror "$flag" -x c -fsyntax-only - 2>/dev/null; then
+    EXTRA_CFLAGS="${EXTRA_CFLAGS:+$EXTRA_CFLAGS }$flag"
+  fi
+done
 
 patch_ref_source() {
   local file="$1/prot.c"
