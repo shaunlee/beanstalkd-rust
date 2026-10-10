@@ -30,7 +30,7 @@ done. See [CHANGELOG.md](CHANGELOG.md) and the plan in
 | SIGUSR1 | drain mode | drain mode (cluster-wide in a cluster) |
 | Threads | one | one, or two with TLS, a binlog or a cluster; `--threads N` |
 | Memory safety | C | Rust, no `unsafe` code (`unsafe_code = "forbid"`) |
-| Packages | distribution packages | release archives for Linux x86_64 and aarch64 (glibc or static musl) and macOS aarch64, with a systemd unit; a Dockerfile |
+| Packages | distribution packages | release archives for Linux x86_64 and aarch64 (glibc or static musl) and macOS aarch64, with a systemd unit; a Docker image (`shonhen/beanstalkd-rs`) |
 
 The few intentional behavior differences are listed in
 [docs/COMPAT.md](docs/COMPAT.md); with no configuration file the server
@@ -81,11 +81,11 @@ cargo build --release --locked -p bstk-server
 ./target/release/beanstalkd-rs -l 127.0.0.1 -p 11300 -b ./binlog
 ```
 
-With Docker (the image is built locally; none is published):
+With Docker ([`shonhen/beanstalkd-rs`](https://hub.docker.com/r/shonhen/beanstalkd-rs)
+on Docker Hub, linux/amd64 and linux/arm64; or `docker build -t beanstalkd-rs .`):
 
 ```sh
-docker build -t beanstalkd-rs .
-docker run -d -p 127.0.0.1:11300:11300 -v bstk-data:/data beanstalkd-rs -l 0.0.0.0 -p 11300 -b /data
+docker run -d -p 127.0.0.1:11300:11300 -v bstk-data:/data shonhen/beanstalkd-rs -l 0.0.0.0 -p 11300 -b /data
 ```
 
 From a release archive (Linux x86_64 / aarch64, glibc or static musl;

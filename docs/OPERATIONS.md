@@ -74,14 +74,19 @@ xattr -d com.apple.quarantine beanstalkd-rs-0.5.0-aarch64-apple-darwin/beanstalk
 
 ### 1.2 Container image
 
-No image is published to a registry: build it from the repository's
-`Dockerfile` (multi-stage, Debian 13 runtime). It runs as
+The image is published on Docker Hub as
+[`shonhen/beanstalkd-rs`](https://hub.docker.com/r/shonhen/beanstalkd-rs)
+(tags `<version>`, `<major>.<minor>` and `latest`; linux/amd64 and
+linux/arm64), built from the repository's `Dockerfile` (multi-stage,
+Debian 13 runtime); `docker build -t beanstalkd-rs .` builds the same
+image locally. It runs as
 the non-root user `beanstalkd` (uid 10001), keeps data in the `/data`
 volume, exposes 11300 and has a `HEALTHCHECK` that sends `stats` to
 `127.0.0.1:11300`.
 
 ```sh
-docker build -t beanstalkd-rs .
+docker pull shonhen/beanstalkd-rs:0.5.0
+docker tag shonhen/beanstalkd-rs:0.5.0 beanstalkd-rs   # the examples use this name
 docker volume create bstk-data
 docker run -d --init --name bstk -p 127.0.0.1:11300:11300 -v bstk-data:/data \
     beanstalkd-rs -l 0.0.0.0 -p 11300 -b /data -V
