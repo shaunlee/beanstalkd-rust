@@ -1365,12 +1365,11 @@ the whole cluster or a mistake that deleted jobs everywhere.
   upgrading; a change of the binlog, cluster data or protocol format is a
   user-facing change and is called out there.
 
-**From 0.5.x**: 0.5.x speaks cluster protocol version 3, later versions
-version 4 (membership changes), so 0.5.x and later nodes cannot be mixed
-in one cluster: stop every node, replace every binary, start every node
-(section 5.7; the data directories are kept). Standalone servers upgrade
-as in 7.2. **Later versions** (same protocol version): a rolling restart
-(7.3).
+0.5.0 speaks cluster protocol version 4. A later version with the same
+protocol version upgrades with a rolling restart (7.3); one that changes
+it needs a full cluster restart: stop every node, replace every binary,
+start every node (section 5.7; the data directories are kept). Standalone
+servers upgrade as in 7.2.
 
 0.5.0 is the first release, so no upgrade between two releases has been
 tested yet. What was tested is replacing the binary with a build of the
@@ -1438,8 +1437,7 @@ acknowledged: puts in flight when a connection closed were committed
 without their reply reaching the client, as with any disconnect). A
 second run: 88,572 acknowledged puts, all present, longest pause 195 ms.
 
-If a release changes the protocol version (as 0.5.x to later versions
-does, section 7.1), the upgrade is a full cluster restart: stop every
+If a release changes the protocol version (section 7.1), the upgrade is a full cluster restart: stop every
 node, replace the binaries, start every node; the release notes say so.
 
 ## 8. Monitoring
