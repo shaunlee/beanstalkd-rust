@@ -13,7 +13,7 @@ Release tags are `v<version>` and match the workspace version in
 
 ### Added
 
-- **Operations guide** ([docs/OPERATIONS.md](https://github.com/shaunlee/beanstalkd-rust/blob/main/docs/OPERATIONS.md)):
+- **Operations guide** ([docs/OPERATIONS.md](https://github.com/shaunlee/beanstalkd-rs/blob/main/docs/OPERATIONS.md)):
   install, configuration, persistence, security, cluster bootstrap, node
   loss and rejoin, membership runbooks (grow 1 → 3 and 3 → 5, shrink,
   replace a failed node or disk, remove the leader, change an address, CA
@@ -67,6 +67,9 @@ Release tags are `v<version>` and match the workspace version in
 
 ### Changed
 
+- The repository is now `shaunlee/beanstalkd-rs`, matching the binary,
+  image and archive names; the old `beanstalkd-rust` URLs redirect. The
+  Go client module path changes accordingly.
 - **Cluster CPU per operation**: a node keeps recent log entries in
   memory for replication and apply (up to 4 MiB) instead of reading them
   back from disk, and writes its commit marker at most every 50 ms. That
@@ -161,7 +164,7 @@ clients can use unmodified.
   of the beanstalkd text protocol, checked byte for byte against the
   reference server by differential tests and real clients (Python
   greenstalk, Go go-beanstalk). The few intentional differences are listed
-  in [docs/COMPAT.md](https://github.com/shaunlee/beanstalkd-rust/blob/main/docs/COMPAT.md).
+  in [docs/COMPAT.md](https://github.com/shaunlee/beanstalkd-rs/blob/main/docs/COMPAT.md).
 - **Reference command line**: `-l`, `-p`, `-z`, `-b`, `-f`, `-F`, `-s`,
   `-V`, `-v` with the reference's defaults; `--version` as an alias of `-v`.
   `-u` is rejected: run the server as the desired user (for example with the
@@ -174,8 +177,8 @@ clients can use unmodified.
   exits abruptly), and drain mode on SIGUSR1 as in the reference.
 - **Configuration file** (`--config FILE`, TOML; `--check-config` validates
   it): several listeners, binlog, logging, HTTP and cluster settings. See
-  [docs/beanstalkd-rs.example.toml](https://github.com/shaunlee/beanstalkd-rust/blob/main/docs/beanstalkd-rs.example.toml) and
-  the ready-made files in [packaging/examples/](https://github.com/shaunlee/beanstalkd-rust/tree/main/packaging/examples).
+  [docs/beanstalkd-rs.example.toml](https://github.com/shaunlee/beanstalkd-rs/blob/main/docs/beanstalkd-rs.example.toml) and
+  the ready-made files in [packaging/examples/](https://github.com/shaunlee/beanstalkd-rs/tree/main/packaging/examples).
 - **TLS and mutual TLS** listeners, and an optional token authentication
   extension (`auth <token>`, needs client support) on TLS listeners, with
   limits on unauthenticated connections.
@@ -185,17 +188,17 @@ clients can use unmodified.
   connection through Raft over mutual TLS, keep serving through the loss of
   a minority of nodes, and look like one beanstalkd server to clients
   connected to any node. Bootstrap with `--cluster-init`; a node with an
-  empty data directory rejoins safely. See [docs/DESIGN.md](https://github.com/shaunlee/beanstalkd-rust/blob/main/docs/DESIGN.md)
-  §8 and [docs/OPERATIONS.md](https://github.com/shaunlee/beanstalkd-rust/blob/main/docs/OPERATIONS.md).
+  empty data directory rejoins safely. See [docs/DESIGN.md](https://github.com/shaunlee/beanstalkd-rs/blob/main/docs/DESIGN.md)
+  §8 and [docs/OPERATIONS.md](https://github.com/shaunlee/beanstalkd-rs/blob/main/docs/OPERATIONS.md).
 - **Performance**: in standalone plaintext mode, more operations per CPU
   second than the reference (1.04x to 1.29x on the benchmark matrix);
   worker threads are tunable with `--threads` / `server.threads`. See
-  [docs/BENCH.md](https://github.com/shaunlee/beanstalkd-rust/blob/main/docs/BENCH.md).
+  [docs/BENCH.md](https://github.com/shaunlee/beanstalkd-rs/blob/main/docs/BENCH.md).
 - **Packaging**: release archives for Linux (x86_64, aarch64; glibc 2.34
   or newer, or fully static with musl) and macOS (aarch64) with SHA-256
   checksums, a container image (`Dockerfile`), a
   hardened systemd unit and example configurations
-  ([packaging/](https://github.com/shaunlee/beanstalkd-rust/tree/main/packaging)).
+  ([packaging/](https://github.com/shaunlee/beanstalkd-rs/tree/main/packaging)).
 
-[Unreleased]: https://github.com/shaunlee/beanstalkd-rust/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/shaunlee/beanstalkd-rust/releases/tag/v0.5.0
+[Unreleased]: https://github.com/shaunlee/beanstalkd-rs/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/shaunlee/beanstalkd-rs/releases/tag/v0.5.0

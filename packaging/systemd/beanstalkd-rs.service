@@ -18,7 +18,7 @@
 
 [Unit]
 Description=beanstalkd-rs work queue
-Documentation=https://github.com/shaunlee/beanstalkd-rust
+Documentation=https://github.com/shaunlee/beanstalkd-rs
 After=network-online.target
 Wants=network-online.target
 

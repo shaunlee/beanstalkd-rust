@@ -1,4 +1,4 @@
-# beanstalkd-rust Design
+# beanstalkd-rs Design
 
 > Status: v0.5 (matches P0–P3 as shipped). Reference implementation: C beanstalkd commit `25085c5` (built into `.ref/` by `scripts/build-ref.sh`). See the [changelog](#10-changelog) for what changed since v0.1 and why.
 

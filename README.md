@@ -1,6 +1,6 @@
-# beanstalkd-rust
+# beanstalkd-rs
 
-[![CI](https://github.com/shaunlee/beanstalkd-rust/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shaunlee/beanstalkd-rust/actions/workflows/ci.yml)
+[![CI](https://github.com/shaunlee/beanstalkd-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/shaunlee/beanstalkd-rs/actions/workflows/ci.yml)
 
 `beanstalkd-rs` is a Rust reimplementation of
 [beanstalkd](https://github.com/beanstalkd/beanstalkd), the simple work
@@ -58,7 +58,7 @@ docker run -d -p 127.0.0.1:11300:11300 -v bstk-data:/data beanstalkd-rs -l 0.0.0
 
 From a release archive (Linux x86_64 / aarch64, glibc or static musl;
 macOS aarch64), on the
-[releases page](https://github.com/shaunlee/beanstalkd-rust/releases):
+[releases page](https://github.com/shaunlee/beanstalkd-rs/releases):
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS

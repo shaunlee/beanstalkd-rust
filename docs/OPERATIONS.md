@@ -30,7 +30,7 @@ dependencies besides the C library. Pick one of the four ways below.
 ### 1.1 Release archive
 
 Each release on the
-[releases page](https://github.com/shaunlee/beanstalkd-rust/releases)
+[releases page](https://github.com/shaunlee/beanstalkd-rs/releases)
 has one archive per target and a `SHA256SUMS` file:
 
 | Target | Notes |
@@ -191,8 +191,8 @@ Notes on the unit:
 Requires Rust 1.98 or newer (the workspace's `rust-version`).
 
 ```sh
-git clone https://github.com/shaunlee/beanstalkd-rust
-cd beanstalkd-rust
+git clone https://github.com/shaunlee/beanstalkd-rs
+cd beanstalkd-rs
 cargo build --release --locked -p bstk-server
 ./target/release/beanstalkd-rs --version
 ```

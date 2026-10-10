@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 # Deliberately its own workspace: excluded from the top-level
-# beanstalkd-rust workspace (see docs/PLAN.md T1) and from
+# beanstalkd-rs workspace (see docs/PLAN.md T1) and from
 # `scripts/check.sh`. Requires nightly + cargo-fuzz; not run in CI.
 [workspace]
 

@@ -1,4 +1,4 @@
-module github.com/shaunlee/beanstalkd-rust/clients/go
+module github.com/shaunlee/beanstalkd-rs/clients/go
 
 go 1.22
 
