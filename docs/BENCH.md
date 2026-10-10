@@ -78,7 +78,7 @@ Absolute throughput fell over the rounds as the host settled (leader 100, defaul
 - **No inflight value lets one worker reach 95% of the default** at 100 or 300 connections; the best is inflight 1 (0.80 and 0.72). More inflight batches do what they should mechanically (fewer ops per entry, more entries) and cost CPU per op without adding throughput, with one or two workers. `MAX_INFLIGHT` stays 1.
 - **The single worker does not wait; its core is saturated.** At 100 connections via the leader the worker thread is runnable in 98.9% of the samples (asleep 1%; asleep while a follower thread runs 0.3%, so acks are not late). Its own run time is 73.6% of the window, the figure "P8-T6" read as "70% busy", but with the worker pinned its CPU is user 28.3%, sys 45.2%, softirq 24.7%, idle 1.0%: loopback TCP receive work (NET_RX) runs on the sending thread's CPU and is charged to softirq, not to the thread. The followers' workers run 14–16%. The log flush thread (present with `--threads 1` too) takes one wake-up per entry and about 1% CPU.
 - At one connection the worker sleeps 31% of the time (latency-bound, one entry per op) and one worker is already faster and cheaper.
-- So one worker caps where one core is full of connection I/O, Raft, apply and the loopback softirq work; parity would need less CPU per op on that core, not more overlap.
+- So one worker caps where one core is full of connection I/O, Raft, apply and the loopback softirq work (P9-T2: the cap stays without the softirq); parity would need less CPU per op on that core, not more overlap.
 
 ### Caveat for every CPU/op figure in this file
 
