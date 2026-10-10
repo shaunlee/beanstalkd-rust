@@ -1,8 +1,20 @@
 name: CI
 
+# Pushes and pull requests that only touch documentation, images or
+# recorded benchmark results build and test nothing new.
 on:
   push:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/images/**"
+      - "bench/results/**"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/images/**"
+      - "bench/results/**"
+      - "LICENSE"
 
 permissions:
   contents: read
