@@ -206,6 +206,7 @@ T6 found per-operation cost growing linearly with the number of tubes and connec
 | P6 | Dynamic cluster membership (add, remove, replace a node online); see §9 | see §9.5 |
 | P7 | Consolidation: robust timing-sensitive tests, a removed node stops by itself, an openraft 0.10 evaluation; see §10 (done) | see §10.4 |
 | P8 | Cluster CPU per operation (the open §7.5 target); see §11 (done: met at 100 connections, not at one) | see §11.4 |
+| P9 | One worker thread per cluster node without the throughput loss, for the one-connection CPU target; see §12 | see §12.4 |
 | later | openraft 0.10 for leader transfer, once 0.10.0 is released (it does not lower CPU, BENCH P7-T3) | — |
 
 ## 4. P1: Write-Ahead Log (detailed plan)
@@ -631,3 +632,30 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 - [x] Cluster CPU per operation, as ratios to P3 (`e9cbb1f`) measured on the same machine in interleaved runs, because absolute values differ about 2× between the macOS and Linux hosts: at 100 connections via the leader ≤ 0.75× (the §7.5 "15 µs, was 20"), at one connection ≤ 0.5× (or the reached values with the reason the rest is out of reach). **100 connections: met** (0.42× on tmpfs, 0.62× on NVMe; BENCH "P8 progress", "P8 progress on NVMe"). **One connection: not met with the default settings** (0.56× on tmpfs, 0.70× on NVMe via the leader). There the cost is per log entry: the `fdatasync` on every node, which P3 pays too, and openraft 0.9's second, commit-only AppendEntries, which cannot be removed without patching openraft (DESIGN §8). With `--threads 1` it is 0.41× on tmpfs (BENCH "P8-T6"), an option for low-concurrency clusters.
 - [x] Throughput at 100 connections not lower than before P8 by more than 5% (P8-T4 vs P7: 1.01–1.06× on tmpfs, 1.01–1.02× on NVMe)
 - [x] Differential suites, chaos (1,000 in-process seeds, 20 multi-process runs per scenario), smoke and CI green (weekly run 37415910280 and CI run 37415991925, both after P8-T4)
+
+## 12. P9: Single-Worker Cluster Nodes (detailed plan)
+
+### 12.1 Scope
+
+- The open one-connection target of §11.4 (≤ 0.5× of P3 with the default settings). One worker thread per node meets it (0.41× on tmpfs, BENCH "P8-T6") and costs 28–37% less CPU per operation at 100 connections, but loses 19–32% of throughput at 100–300 connections while its single worker is only about 70% busy, so the limit is waiting, not CPU. Find what the single worker waits on, remove it, and make one worker the cluster default if throughput then stays within 5% of today's default.
+- **Invariants**: as §11.1; replicated semantics unchanged.
+- **Out of scope**: openraft 0.10 (still `0.10.0-alpha.36` on 2026-10-10), patching openraft.
+
+### 12.2 Facts checked before planning
+
+- The leader keeps at most one proposal batch outstanding (`proposer::MAX_INFLIGHT = 1`, P3-FD: 133k ops/s against 35k unbounded at 100 connections via the leader with the defaults of then). With one worker, each batch's whole cycle (append and flush, replication, follower flushes, commit, apply, replies) runs on one thread, so the next batch waits for it; two outstanding batches might overlap the cycle's waits. This is the first hypothesis, not a finding.
+- Benchmarks for P9 run on the quiet Linux host (BENCH "P8 progress"), both on tmpfs (CPU) and on NVMe (real disk).
+
+### 12.3 Tasks
+
+| Task | Content | Owner |
+|---|---|---|
+| P9-T1 | Measure throughput and CPU per operation for one and two workers × `MAX_INFLIGHT` 1, 2 and 4 (an experimental build), at 1, 100 and 300 connections via the leader, tmpfs; find where the single worker waits if `MAX_INFLIGHT` is not it | subagent |
+| P9-T2… | Chosen from T1 | subagents |
+| P9-Tn | P9 acceptance | lead |
+
+### 12.4 Acceptance
+
+- [ ] With the new cluster default, one-connection CPU per operation ≤ 0.5× of P3 on tmpfs and on NVMe (interleaved runs on the Linux host), or the reached values with the reason
+- [ ] Throughput at 100 and 300 connections (leader and follower) within 5% of the P8 default, on tmpfs and on NVMe
+- [ ] Differential suites, chaos (1,000 in-process seeds, 20 multi-process runs per scenario), smoke and CI green
