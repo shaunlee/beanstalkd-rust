@@ -64,6 +64,11 @@ CPU of all three nodes per operation at 100 connections via the leader: 6.0 µs 
 
 Idle RSS: rs 6.5 MB (Linux) / 8.1 MB (macOS), the reference 1.6 / 1.8 MB.
 
+### Binlog bytes per operation (macOS, `bench/footprint.py binlog`, 20,000 cycles, one run per cell)
+
+beanstalkd-rs wrote 0.56–0.97× the reference's bytes per operation in every cell but one: churn with 16-byte bodies and 10 MiB segments, 637 against 196 B per cycle (3.2×). That cell is a fixed cost, not a per-operation one. beanstalkd-rs keeps one empty, preallocated segment in reserve (docs/COMPAT.md D6), allocated on the first put after startup by writing 10 MiB of zeros; the reference zero-fills each file only when it opens it. The run writes about 2.1 MB of records, so the one spare is 83% of its total (12.7 MB − 10.5 MB ≈ 2.2 MB of records, 112 B per cycle, against the reference's 196). In steady state each side zero-fills every segment once, so the spare only shifts that write one segment earlier; over the 200,000 cycles of "P4-T4" the same cell is 0.68×.
+
+
 ## P9-T2: one against two workers off loopback (2026-10-10)
 
 Build `7b9ba5d`. The question: is the one-worker cap of "P9-T1" a loopback artifact, since on loopback the TCP receive work lands on the sender's core?
