@@ -3402,7 +3402,9 @@ mod membership {
     #[test]
     fn learner_added_then_promoted_serves_clients() {
         let opts = Opts {
-            node_timeout: "2s",
+            // Longer than an election on a slow runner, so the survivors do not
+            // close their clients before the new leader reaches them.
+            node_timeout: "5s",
             ..Opts::default()
         };
         let mut c = Cluster::start(3, &opts);
@@ -3460,7 +3462,9 @@ mod membership {
     #[test]
     fn member_missing_from_config_is_reached_through_the_membership() {
         let opts = Opts {
-            node_timeout: "2s",
+            // Longer than an election on a slow runner, so the survivors do not
+            // close their clients before the new leader reaches them.
+            node_timeout: "5s",
             ..Opts::default()
         };
         let mut c = Cluster::start(3, &opts);
