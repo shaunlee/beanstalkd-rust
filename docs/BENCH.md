@@ -2,7 +2,7 @@
 
 `beanstalkd-rs` against the reference C beanstalkd (commit `25085c5`),
 driven by the `bstk-bench` load generator (`bench/`). The newest numbers
-are from task P5-T2 (Linux, ratios only), then P4-T6 (the final P4 matrix), then P4-T6b (thread default per mode), then P4-T5c (snapshot memory), then P4-T5b
+are from task P9-T1 (cluster inflight × threads), then P8, then P5-T2 (Linux, ratios only), then P4-T6 (the final P4 matrix), then P4-T6b (thread default per mode), then P4-T5c (snapshot memory), then P4-T5b
 (cluster wake-ups at low load), then
 P4-T4 (footprint: memory per job, binlog bytes per operation). P4-T2 (tokio worker-thread count and its
 default, the lever the P4-T1 spike found for CPU efficiency) follows,
@@ -16,6 +16,44 @@ end.
 
 - **Reference build.** `scripts/build-ref.sh` (both the debug and the `--optimized` tree, which the benchmarks use) patches one comparison in the reference's `conn_timeout` (docs/COMPAT.md D14) and, where the compiler knows it, passes `-Wno-error=stringop-truncation` (gcc 14). Neither changes the hot paths, so the numbers below, measured before the patch existed, stay comparable.
 - **Linux container.** Copy the tree in with `COPYFILE_DISABLE=1` (no `._*` files from macOS tar) and leave out `clients/python/.venv`, `target/`, `.ref/` and `.git`; rebuild `.ref/` inside the container. Run it with `docker run --init`, so that orphaned servers are reaped.
+
+## P9-T1: proposal inflight × worker threads (2026-10-10)
+
+Build `6ad5df1` (code as `955dd58`) on the Linux host of "P8 progress" (Ryzen 9 5900HX, 16 logical CPUs, governor `powersave`). Variants differ only in `proposer::MAX_INFLIGHT` (1, 2, 4; experimental builds) and `--threads` (1, or the cluster default 2).
+
+### Method
+
+- As "P8-T6": 3-node loopback cluster, plaintext, defaults, tmpfs data dirs, fresh cluster per run, put-reserve-delete body 16, `bstk-bench --duration 14`, 10 s window after 2.5 s. 6 rounds, the 6 variants interleaved within each cell, order reversed on odd rounds; 144 runs, one failed to start (i2t2 follower 100, so 5 runs there).
+- Ops/entry = window ops / delta of the leader's `cluster.last_log_index`.
+- Probes after the matrix (one run each): every thread's state from `/proc/<pid>/task/<tid>/stat` sampled at 2–4 kHz for 5 s, per-thread schedstat, per-CPU `/proc/stat`, and a run with the worker pinned to its own CPU.
+
+### Results
+
+ops/s relative to the default (inflight 1, 2 threads), medians over the rounds; CPU in µs/op (utime+stime, see the caveat below):
+
+| conns | variant | ops/s vs default | µs/op | ops/entry |
+|---|---|---:|---:|---:|
+| leader 1 | i1 t1 / i2 t1 / i4 t1 | 1.11 / 1.08 / 1.07 | 363 / 372 / 376 | 1.0 |
+| leader 1 | i1 t2 / i2 t2 / i4 t2 | 1.00 / 1.02 / 0.98 | 558 / 545 / 564 | 1.0 |
+| leader 100 | i1 t1 / i2 t1 / i4 t1 | 0.80 / 0.77 / 0.73 | 28.4 / 31.1 / 32.9 | 50 / 30 / 17 |
+| leader 100 | i1 t2 / i2 t2 / i4 t2 | 1.00 / 0.97 / 0.96 | 44.5 / 50.8 / 51.6 | 51 / 31 / 17 |
+| follower 100 | i1 t1 / i2 t1 / i4 t1 | 0.86 / 0.85 / 0.84 | 48.2 / 46.4 / 46.2 | 18 / 17 / 17 |
+| follower 100 | i1 t2 / i2 t2 / i4 t2 | 1.00 / 0.96 / 0.98 | 77.8 / 80.5 / 78.0 | 23 / 18 / 17 |
+| leader 300 | i1 t1 / i2 t1 / i4 t1 | 0.72 / 0.71 / 0.69 | 21.9 / 23.0 / 23.8 | 151 / 98 / 52 |
+| leader 300 | i1 t2 / i2 t2 / i4 t2 | 1.00 / 0.97 / 0.94 | 30.6 / 34.0 / 35.3 | 155 / 100 / 56 |
+
+Absolute throughput fell over the rounds as the host settled (leader 100, default: 76.5k in round 0, 44.8k in round 5), and the 1/2-thread ratio moved with it (0.68, 0.74, then 0.80 in rounds 2–5), so only ratios within a round are compared, and the absolute values are lower than in "P8-T6".
+
+### Findings
+
+- **No inflight value lets one worker reach 95% of the default** at 100 or 300 connections; the best is inflight 1 (0.80 and 0.72). More inflight batches do what they should mechanically (fewer ops per entry, more entries) and cost CPU per op without adding throughput, with one or two workers. `MAX_INFLIGHT` stays 1.
+- **The single worker does not wait; its core is saturated.** At 100 connections via the leader the worker thread is runnable in 98.9% of the samples (asleep 1%; asleep while a follower thread runs 0.3%, so acks are not late). Its own run time is 73.6% of the window, the figure "P8-T6" read as "70% busy", but with the worker pinned its CPU is user 28.3%, sys 45.2%, softirq 24.7%, idle 1.0%: loopback TCP receive work (NET_RX) runs on the sending thread's CPU and is charged to softirq, not to the thread. The followers' workers run 14–16%. The log flush thread (present with `--threads 1` too) takes one wake-up per entry and about 1% CPU.
+- At one connection the worker sleeps 31% of the time (latency-bound, one entry per op) and one worker is already faster and cheaper.
+- So one worker caps where one core is full of connection I/O, Raft, apply and the loopback softirq work; parity would need less CPU per op on that core, not more overlap.
+
+### Caveat for every CPU/op figure in this file
+
+CPU/op here, in "P8-T6", "P8 progress" and the P3 baseline is utime+stime of the node processes, which leaves out softirq time (on loopback, about a quarter of a saturated worker's core). Both sides of a ratio leave it out, so a fixed per-packet softirq cost makes the true HEAD/P3 ratios somewhat closer to 1 than the reported ones.
 
 ## P8-T6: cluster with one worker thread (2026-10-06)
 
@@ -56,7 +94,7 @@ Build `0c951ae` on the Linux host of "P8 progress" (16 cores), quiet machine (lo
 
 - 1 connection: 1 thread is 30% cheaper per op (322.8 vs 459.4 us) with no throughput loss (+3.5%, T1 IQR 144 against a 156 ops/s gap, small but T1 was faster in 7 of 8 pairs by the per-round data). Consistent with the Mac result (19% cheaper) and larger.
 - 100 connections: 1 thread is 28% cheaper per op via the leader (22.0 vs 30.5) and 37% cheaper via a follower, **but throughput drops 29% via the leader (48.4k vs 67.8k) and 19% via a follower**. This is far beyond the 5% budget. 300 connections: -32% throughput (54.8k vs 81.0k), CPU/op -24%. So the Mac observation (cap at ~100k there) reproduces on a quiet Linux box as a cap at ~48k to 55k ops/s.
-- Saturation: the 1-thread leader process is **not** at 100% of a core: 74% at 100 connections and 71% at 300 (flat across all rounds, IQR 0). Per-thread probe (one run each, `/proc/<pid>/task`): at 100 conns the single worker thread ran at 73% (other threads 0 to 1%), at 300 conns 71%; with 2 threads each worker ran at 68% (100) / 67% (300), i.e. 136% / 134% total. So a single worker is busy about 70% and does not look CPU-saturated by this measure, yet throughput stops at ~55k and does not grow from 100 to 300 connections (48k to 55k). The ceiling is therefore not a pegged core by `/proc` accounting; the worker is probably stalled (blocked/idle wake-up latency, serialized hand-off between the connection, Raft and apply stages) about 30% of the time. This was not diagnosed further. With 2 workers the two threads sit at ~67 to 68% each as well, suggesting a similar per-thread utilisation ceiling driven by the pipeline rather than raw CPU.
+- Saturation: the 1-thread leader process is **not** at 100% of a core: 74% at 100 connections and 71% at 300 (flat across all rounds, IQR 0). Per-thread probe (one run each, `/proc/<pid>/task`): at 100 conns the single worker thread ran at 73% (other threads 0 to 1%), at 300 conns 71%; with 2 threads each worker ran at 68% (100) / 67% (300), i.e. 136% / 134% total. So a single worker is busy about 70% and does not look CPU-saturated by this measure, yet throughput stops at ~55k and does not grow from 100 to 300 connections (48k to 55k). The ceiling is therefore not a pegged core by `/proc` accounting; the worker is probably stalled (blocked/idle wake-up latency, serialized hand-off between the connection, Raft and apply stages) about 30% of the time. This was not diagnosed further. (P9-T1 did: the core is saturated once softirq is counted; see "P9-T1".) With 2 workers the two threads sit at ~67 to 68% each as well, suggesting a similar per-thread utilisation ceiling driven by the pipeline rather than raw CPU.
 - Why CPU/op falls with 1 thread: fewer cross-thread wake-ups/work stealing; the per-op saving is largest where throughput is lowest (1 conn) and shrinks relative to the lost throughput as load rises. Note the total CPU/op also depends on throughput (at higher ops/s each wake-up and sync amortises over more ops), so part of the T2 CPU/op at 100 conns reflects its higher rate.
 - Round 0 of every cell is 10 to 20% faster and cheaper for both variants (warm host); the medians are not affected, and the ratios are stable per round.
 

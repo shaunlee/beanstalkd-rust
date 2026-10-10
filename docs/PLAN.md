@@ -637,21 +637,23 @@ Order: T1, T3, T4, T5, T6, T2, T7.
 
 ### 12.1 Scope
 
-- The open one-connection target of §11.4 (≤ 0.5× of P3 with the default settings). One worker thread per node meets it (0.41× on tmpfs, BENCH "P8-T6") and costs 28–37% less CPU per operation at 100 connections, but loses 19–32% of throughput at 100–300 connections while its single worker is only about 70% busy, so the limit is waiting, not CPU. Find what the single worker waits on, remove it, and make one worker the cluster default if throughput then stays within 5% of today's default.
+- The open one-connection target of §11.4 (≤ 0.5× of P3 with the default settings). One worker thread per node meets it (0.41× on tmpfs, BENCH "P8-T6") and costs 28–37% less CPU per operation at 100 connections, but loses 19–32% of throughput at 100–300 connections. Make one worker the cluster default if throughput can be kept within 5% of today's default; otherwise record the reached values and the reason.
 - **Invariants**: as §11.1; replicated semantics unchanged.
 - **Out of scope**: openraft 0.10 (still `0.10.0-alpha.36` on 2026-10-10), patching openraft.
 
 ### 12.2 Facts checked before planning
 
-- The leader keeps at most one proposal batch outstanding (`proposer::MAX_INFLIGHT = 1`, P3-FD: 133k ops/s against 35k unbounded at 100 connections via the leader with the defaults of then). With one worker, each batch's whole cycle (append and flush, replication, follower flushes, commit, apply, replies) runs on one thread, so the next batch waits for it; two outstanding batches might overlap the cycle's waits. This is the first hypothesis, not a finding.
+- The leader keeps at most one proposal batch outstanding (`proposer::MAX_INFLIGHT = 1`, P3-FD: 133k ops/s against 35k unbounded at 100 connections via the leader with the defaults of then). With one worker, each batch's whole cycle (append and flush, replication, follower flushes, commit, apply, replies) runs on one thread, so the next batch waits for it; two outstanding batches might overlap the cycle's waits. This was the first hypothesis; P9-T1 refuted it (below).
+- P9-T1 (BENCH "P9-T1"): no `MAX_INFLIGHT` value brings one worker within 5% (best 0.80 at 100 connections, 0.72 at 300; more inflight batches only add CPU per op). The single worker does not wait: it is runnable 99% of the time, and its core is full once softirq is counted (user 28%, sys 45%, softirq 25%); the "about 70% busy" of P8-T6 was its own run time, which leaves out the loopback TCP receive work charged to softirq on the sender's CPU. On real network interfaces that receive work runs on the receiving host, so the cap measured on one loopback host may overstate the loss.
 - Benchmarks for P9 run on the quiet Linux host (BENCH "P8 progress"), both on tmpfs (CPU) and on NVMe (real disk).
 
 ### 12.3 Tasks
 
 | Task | Content | Owner |
 |---|---|---|
-| P9-T1 | Measure throughput and CPU per operation for one and two workers × `MAX_INFLIGHT` 1, 2 and 4 (an experimental build), at 1, 100 and 300 connections via the leader, tmpfs; find where the single worker waits if `MAX_INFLIGHT` is not it | subagent |
-| P9-T2… | Chosen from T1 | subagents |
+| P9-T1 | Measure throughput and CPU per operation for one and two workers × `MAX_INFLIGHT` 1, 2 and 4 (an experimental build), at 1, 100 and 300 connections via the leader, tmpfs; find where the single worker waits if `MAX_INFLIGHT` is not it. **Done** (BENCH "P9-T1"): `MAX_INFLIGHT` stays 1; the single worker's core is saturated | subagent |
+| P9-T2 | One against two workers with the clients on another host over the LAN (client traffic through a real network interface), at 1, 100 and 300 connections via the leader and 100 via a follower: does the single-worker cap survive off loopback? | subagent |
+| P9-T3… | Chosen from T2: change the default and its docs, or close P9 with the reached values | subagents |
 | P9-Tn | P9 acceptance | lead |
 
 ### 12.4 Acceptance
